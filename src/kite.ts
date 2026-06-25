@@ -39,6 +39,12 @@ export interface Instrument {
   exchange: string;
 }
 
+export interface OhlcQuote {
+  instrument_token: number;
+  last_price: number;
+  ohlc: { open: number; high: number; low: number; close: number };
+}
+
 export class KiteError extends Error {
   status: number;
   constructor(message: string, status = 500) {
@@ -175,8 +181,39 @@ export class KiteClient {
   }
 
   /**
-   * Fetch the full instrument dump (CSV) for an exchange and parse it.
-   * Pass an exchange (e.g. "NSE") to limit the dump, or omit for everything.
+   * Fetch OHLC + last price for a set of instruments via REST.
+   * Identifiers are "exchange:tradingsymbol" (e.g. "NSE:INFY", "NFO:INFY24JULFUT").
+   * Works regardless of market hours (returns the latest available snapshot),
+   * and handles the 500-instruments-per-request limit by chunking.
+   */
+  async getQuoteOhlc(identifiers: string[]): Promise<OhlcQuote[]> {
+    const out: OhlcQuote[] = [];
+    for (let i = 0; i < identifiers.length; i += 500) {
+      const chunk = identifiers.slice(i, i + 500);
+      const qs = chunk.map((id) => `i=${encodeURIComponent(id)}`).join("&");
+      const res = await fetch(`${KITE_API_ROOT}/quote/ohlc?${qs}`, {
+        headers: this.authHeader(),
+      });
+      const json = (await res.json()) as {
+        status: string;
+        data?: Record<string, OhlcQuote>;
+        message?: string;
+      };
+      if (!res.ok || json.status !== "success" || !json.data) {
+        if (res.status === 401 || res.status === 403) this.clearSession();
+        throw new KiteError(
+          json.message ?? `Failed to fetch quotes (HTTP ${res.status}).`,
+          res.status || 500,
+        );
+      }
+      for (const v of Object.values(json.data)) {
+        if (v && typeof v.instrument_token === "number") out.push(v);
+      }
+    }
+    return out;
+  }
+
+  /**
    *
    * The instruments master is a static daily file. We try WITHOUT an access
    * token first (so you can get the stock list with no login). If Zerodha

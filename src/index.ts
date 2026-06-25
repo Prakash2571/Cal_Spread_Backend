@@ -217,6 +217,47 @@ app.get("/api/fno-stocks/:symbol", async (req: Request, res: Response) => {
   }
 });
 
+// --- Snapshot quotes (REST): last price + close for the given tokens.
+// Works regardless of market hours, so prices/premiums show even after close. ---
+app.get("/api/quotes", async (req: Request, res: Response) => {
+  const tokens = String(req.query.tokens ?? "")
+    .split(",")
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0);
+
+  if (tokens.length === 0) {
+    res.status(400).json({ error: "Provide ?tokens=token1,token2,..." });
+    return;
+  }
+  if (!kite.getAccessToken()) {
+    res.status(401).json({
+      error: "Quotes require a one-time Zerodha login.",
+    });
+    return;
+  }
+
+  try {
+    const all = await getAllInstrumentsCached();
+    const byToken = new Map<number, string>();
+    for (const inst of all) {
+      byToken.set(inst.instrument_token, `${inst.exchange}:${inst.tradingsymbol}`);
+    }
+    const identifiers = tokens
+      .map((t) => byToken.get(t))
+      .filter((s): s is string => typeof s === "string");
+
+    const quotes = await kite.getQuoteOhlc(identifiers);
+    const ticks = quotes.map((q) => ({
+      token: q.instrument_token,
+      last_price: q.last_price,
+      close_price: q.ohlc?.close ?? 0,
+    }));
+    res.json({ ticks });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
 // --- Live data: Server-Sent Events stream of ticks for the given tokens. ---
 // The backend opens a Kite WebSocket (using the stored access token), parses
 // the binary ticks, and relays them to the browser as JSON SSE events.
