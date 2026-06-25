@@ -31,6 +31,8 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
+app.use(express.json());
+
 // --- Health check ---
 app.get("/", (_req: Request, res: Response) => {
   res.json({
@@ -45,7 +47,30 @@ app.get("/login", (_req: Request, res: Response) => {
   res.redirect(kite.getLoginUrl());
 });
 
-// --- Step 2/3: Zerodha redirects back here with ?request_token=... ---
+// --- Step 2/3 (frontend-driven): the frontend receives the request_token at
+// its registered redirect URL (e.g. http://localhost:5173/zerodha/verify)
+// and POSTs it here so the backend can do the secret checksum exchange. ---
+app.post("/api/session", async (req: Request, res: Response) => {
+  const requestToken = String(req.body?.request_token ?? "");
+  if (!requestToken) {
+    res.status(400).json({ error: "Missing request_token." });
+    return;
+  }
+  try {
+    const session = await kite.generateSession(requestToken);
+    console.log(`Authenticated as ${session.user_name} (${session.user_id}).`);
+    res.json({
+      authenticated: true,
+      user_id: session.user_id,
+      user_name: session.user_name,
+    });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// --- Legacy/alternative: Zerodha redirects straight to the backend with
+// ?request_token=... (used only if the app's Redirect URL points here). ---
 app.get("/callback", async (req: Request, res: Response) => {
   const requestToken = String(req.query.request_token ?? "");
   const status = String(req.query.status ?? "");
