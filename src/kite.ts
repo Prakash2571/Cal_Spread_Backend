@@ -135,6 +135,11 @@ export class KiteClient {
     return this.accessToken;
   }
 
+  /** Forget the current session (logout). Subsequent calls require re-login. */
+  clearSession(): void {
+    this.accessToken = null;
+  }
+
   private authHeader(): Record<string, string> {
     if (!this.accessToken) {
       throw new KiteError(
@@ -159,6 +164,8 @@ export class KiteClient {
       message?: string;
     };
     if (!res.ok || json.status !== "success" || !json.data) {
+      // A rejected/expired token means the session is dead — drop it.
+      if (res.status === 401 || res.status === 403) this.clearSession();
       throw new KiteError(
         json.message ?? `Failed to fetch profile (HTTP ${res.status}).`,
         res.status || 500,
@@ -192,6 +199,7 @@ export class KiteClient {
     if (!res.ok) {
       const text = await res.text();
       if (res.status === 401 || res.status === 403) {
+        this.clearSession(); // token rejected → log out so state stays clean
         throw new KiteError(
           "Zerodha would not serve the instruments list without a session. " +
             "A one-time login is required (click “Connect to Zerodha”).",

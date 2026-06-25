@@ -92,6 +92,12 @@ app.get("/callback", async (req: Request, res: Response) => {
   }
 });
 
+// --- Logout: forget the stored Kite session. ---
+app.post("/api/logout", (_req: Request, res: Response) => {
+  kite.clearSession();
+  res.json({ authenticated: false });
+});
+
 // --- Authenticated user profile (the /user/ docs endpoint) ---
 app.get("/api/profile", async (_req: Request, res: Response) => {
   try {
@@ -244,7 +250,9 @@ app.get("/api/stream", (req: Request, res: Response) => {
       res.write(`data: ${JSON.stringify(ticks)}\n\n`);
     },
     onError: (message) => {
-      res.write(`event: error\ndata: ${JSON.stringify({ message })}\n\n`);
+      // A WebSocket auth rejection means the token is dead — log out.
+      kite.clearSession();
+      res.write(`event: kite_error\ndata: ${JSON.stringify({ message })}\n\n`);
     },
   });
 
@@ -302,6 +310,9 @@ async function getAllInstrumentsCached(): Promise<Instrument[]> {
 
 function sendError(res: Response, err: unknown): void {
   if (err instanceof KiteError) {
+    // An auth failure means the session is no longer valid — clear it so the
+    // app reflects a logged-out state instead of staying half-broken.
+    if (err.status === 401 || err.status === 403) kite.clearSession();
     res.status(err.status).json({ error: err.message });
     return;
   }
