@@ -1,2 +1,135 @@
-import env from "dotenv";
-console.log(process.env.api_key)
+import "dotenv/config";
+import express from "express";
+import type { Request, Response, NextFunction } from "express";
+import { KiteClient, KiteError, type Instrument } from "./kite.js";
+
+const PORT = Number(process.env.PORT ?? 3001);
+const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
+
+const kite = new KiteClient({
+  apiKey: process.env.KITE_API_KEY ?? "",
+  apiSecret: process.env.KITE_API_SECRET ?? "",
+});
+
+// In-memory cache of the instrument dump so we don't re-download the (large)
+// CSV on every frontend request. Kite refreshes instruments once a day.
+let instrumentCache: { at: number; data: Instrument[] } | null = null;
+const CACHE_TTL_MS = 1000 * 60 * 60; // 1 hour
+
+const app = express();
+
+// --- CORS (so the Vite frontend can call this API) ---
+app.use((req: Request, res: Response, next: NextFunction) => {
+  res.header("Access-Control-Allow-Origin", FRONTEND_URL);
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Access-Control-Allow-Credentials", "true");
+  if (req.method === "OPTIONS") {
+    res.sendStatus(204);
+    return;
+  }
+  next();
+});
+
+// --- Health check ---
+app.get("/", (_req: Request, res: Response) => {
+  res.json({
+    status: "ok",
+    authenticated: kite.hasSession(),
+    hint: "Visit /login to authenticate with Zerodha.",
+  });
+});
+
+// --- Step 1: send the user to Zerodha's login page ---
+app.get("/login", (_req: Request, res: Response) => {
+  res.redirect(kite.getLoginUrl());
+});
+
+// --- Step 2/3: Zerodha redirects back here with ?request_token=... ---
+app.get("/callback", async (req: Request, res: Response) => {
+  const requestToken = String(req.query.request_token ?? "");
+  const status = String(req.query.status ?? "");
+
+  if (status !== "success" || !requestToken) {
+    res.redirect(`${FRONTEND_URL}/?auth=failed`);
+    return;
+  }
+
+  try {
+    const session = await kite.generateSession(requestToken);
+    console.log(`Authenticated as ${session.user_name} (${session.user_id}).`);
+    res.redirect(`${FRONTEND_URL}/?auth=success`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    console.error("Session generation failed:", message);
+    res.redirect(`${FRONTEND_URL}/?auth=failed`);
+  }
+});
+
+// --- Authenticated user profile (the /user/ docs endpoint) ---
+app.get("/api/profile", async (_req: Request, res: Response) => {
+  try {
+    const profile = await kite.getProfile();
+    res.json(profile);
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// --- All stocks: instrument dump, filtered to equities by default ---
+// Query params:
+//   exchange   default "NSE"  (set to "" to fetch every exchange)
+//   type       default "EQ"   (instrument_type filter; set to "" to disable)
+//   q          optional text search over symbol/name
+app.get("/api/instruments", async (req: Request, res: Response) => {
+  const exchange = req.query.exchange === undefined ? "NSE" : String(req.query.exchange);
+  const type = req.query.type === undefined ? "EQ" : String(req.query.type);
+  const q = String(req.query.q ?? "").trim().toLowerCase();
+
+  try {
+    let data = await getInstrumentsCached(exchange || undefined);
+
+    if (type) {
+      data = data.filter((i) => i.instrument_type === type);
+    }
+    if (q) {
+      data = data.filter(
+        (i) =>
+          i.tradingsymbol.toLowerCase().includes(q) ||
+          i.name.toLowerCase().includes(q),
+      );
+    }
+
+    res.json({ count: data.length, instruments: data });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+async function getInstrumentsCached(exchange?: string): Promise<Instrument[]> {
+  const fresh = instrumentCache && Date.now() - instrumentCache.at < CACHE_TTL_MS;
+  if (fresh && instrumentCache) {
+    return instrumentCache.data;
+  }
+  const data = await kite.getInstruments(exchange);
+  instrumentCache = { at: Date.now(), data };
+  return data;
+}
+
+function sendError(res: Response, err: unknown): void {
+  if (err instanceof KiteError) {
+    res.status(err.status).json({ error: err.message });
+    return;
+  }
+  const message = err instanceof Error ? err.message : "Unknown error";
+  res.status(500).json({ error: message });
+}
+
+app.listen(PORT, () => {
+  console.log(`Cal_Spread backend listening on http://localhost:${PORT}`);
+  if (!process.env.KITE_API_KEY || !process.env.KITE_API_SECRET) {
+    console.warn(
+      "WARNING: KITE_API_KEY / KITE_API_SECRET are not set. Copy .env.example to .env and fill them in.",
+    );
+  }
+});
