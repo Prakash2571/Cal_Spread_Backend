@@ -266,6 +266,77 @@ app.get("/api/stream", (req: Request, res: Response) => {
   });
 });
 
+// --- F&O board: every F&O stock with its spot token + 3 nearest futures,
+// so the frontend can render them all stacked and stream every token live. ---
+app.get("/api/fno-board", async (req: Request, res: Response) => {
+  const q = String(req.query.q ?? "").trim().toLowerCase();
+  try {
+    const all = await getAllInstrumentsCached();
+    let board = deriveFnoBoard(all);
+    if (q) {
+      board = board.filter(
+        (b) =>
+          b.symbol.toLowerCase().includes(q) ||
+          b.name.toLowerCase().includes(q),
+      );
+    }
+    res.json({ count: board.length, board });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+interface BoardFuture {
+  token: number;
+  expiry: string;
+  lot_size: number;
+}
+
+interface BoardItem {
+  symbol: string;
+  name: string;
+  spot_token: number;
+  futures: BoardFuture[];
+}
+
+/** Build the full F&O board: each underlying with its spot + 3 nearest futures. */
+function deriveFnoBoard(all: Instrument[]): BoardItem[] {
+  const futuresByUnderlying = new Map<string, Instrument[]>();
+  const eqBySymbol = new Map<string, Instrument>();
+
+  for (const i of all) {
+    if (i.exchange === "NFO" && i.instrument_type === "FUT" && i.name) {
+      const arr = futuresByUnderlying.get(i.name) ?? [];
+      arr.push(i);
+      futuresByUnderlying.set(i.name, arr);
+    } else if (i.exchange === "NSE" && i.instrument_type === "EQ") {
+      eqBySymbol.set(i.tradingsymbol, i);
+    }
+  }
+
+  const out: BoardItem[] = [];
+  for (const [symbol, futs] of futuresByUnderlying) {
+    const eq = eqBySymbol.get(symbol);
+    if (!eq) continue; // skip indices (no NSE equity)
+    const futures = futs
+      .sort((a, b) => a.expiry.localeCompare(b.expiry))
+      .slice(0, 3)
+      .map((f) => ({
+        token: f.instrument_token,
+        expiry: f.expiry,
+        lot_size: f.lot_size,
+      }));
+    out.push({
+      symbol,
+      name: eq.name,
+      spot_token: eq.instrument_token,
+      futures,
+    });
+  }
+  out.sort((a, b) => a.symbol.localeCompare(b.symbol));
+  return out;
+}
+
 interface FnoStock extends Instrument {
   fno_lot_size: number;
 }
