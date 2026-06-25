@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
 import { KiteClient, KiteError, type Instrument } from "./kite.js";
+import { connectTicker } from "./ticker.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
@@ -157,6 +158,104 @@ app.get("/api/fno-stocks", async (req: Request, res: Response) => {
   } catch (err) {
     sendError(res, err);
   }
+});
+
+// --- Detail for one F&O stock: spot instrument + the 3 nearest futures. ---
+app.get("/api/fno-stocks/:symbol", async (req: Request, res: Response) => {
+  const symbol = String(req.params.symbol).toUpperCase();
+  try {
+    const all = await getAllInstrumentsCached();
+
+    const spot = all.find(
+      (i) =>
+        i.exchange === "NSE" &&
+        i.instrument_type === "EQ" &&
+        i.tradingsymbol === symbol,
+    );
+    if (!spot) {
+      res.status(404).json({ error: `No NSE equity found for "${symbol}".` });
+      return;
+    }
+
+    const futures = all
+      .filter(
+        (i) =>
+          i.exchange === "NFO" &&
+          i.instrument_type === "FUT" &&
+          i.name === symbol,
+      )
+      .sort((a, b) => a.expiry.localeCompare(b.expiry)) // ISO dates sort chronologically
+      .slice(0, 3)
+      .map((f) => ({
+        instrument_token: f.instrument_token,
+        tradingsymbol: f.tradingsymbol,
+        expiry: f.expiry,
+        lot_size: f.lot_size,
+      }));
+
+    res.json({
+      symbol,
+      spot: {
+        instrument_token: spot.instrument_token,
+        tradingsymbol: spot.tradingsymbol,
+        name: spot.name,
+      },
+      futures,
+    });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// --- Live data: Server-Sent Events stream of ticks for the given tokens. ---
+// The backend opens a Kite WebSocket (using the stored access token), parses
+// the binary ticks, and relays them to the browser as JSON SSE events.
+//   tokens   comma-separated instrument tokens
+app.get("/api/stream", (req: Request, res: Response) => {
+  const tokens = String(req.query.tokens ?? "")
+    .split(",")
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0);
+
+  if (tokens.length === 0) {
+    res.status(400).json({ error: "Provide ?tokens=token1,token2,..." });
+    return;
+  }
+
+  const accessToken = kite.getAccessToken();
+  if (!accessToken) {
+    res.status(401).json({
+      error:
+        "Live prices require a one-time Zerodha login. Click “Connect to Zerodha”.",
+    });
+    return;
+  }
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  const ticker = connectTicker({
+    apiKey: kite.getApiKey(),
+    accessToken,
+    tokens,
+    onTick: (ticks) => {
+      res.write(`data: ${JSON.stringify(ticks)}\n\n`);
+    },
+    onError: (message) => {
+      res.write(`event: error\ndata: ${JSON.stringify({ message })}\n\n`);
+    },
+  });
+
+  // Keep the connection alive through proxies.
+  const keepAlive = setInterval(() => res.write(`: ping\n\n`), 20000);
+
+  req.on("close", () => {
+    clearInterval(keepAlive);
+    ticker.close();
+    res.end();
+  });
 });
 
 interface FnoStock extends Instrument {

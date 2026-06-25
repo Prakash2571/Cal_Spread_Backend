@@ -125,6 +125,16 @@ export class KiteClient {
     return this.accessToken !== null;
   }
 
+  /** The app's API key (public; needed for the WebSocket URL). */
+  getApiKey(): string {
+    return this.apiKey;
+  }
+
+  /** The current access token, or null if not yet authenticated. */
+  getAccessToken(): string | null {
+    return this.accessToken;
+  }
+
   private authHeader(): Record<string, string> {
     if (!this.accessToken) {
       throw new KiteError(
