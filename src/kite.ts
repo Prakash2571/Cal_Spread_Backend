@@ -160,15 +160,34 @@ export class KiteClient {
   /**
    * Fetch the full instrument dump (CSV) for an exchange and parse it.
    * Pass an exchange (e.g. "NSE") to limit the dump, or omit for everything.
+   *
+   * The instruments master is a static daily file. We try WITHOUT an access
+   * token first (so you can get the stock list with no login). If Zerodha
+   * rejects the unauthenticated request and we do have a session, we retry
+   * with the Authorization header.
    */
   async getInstruments(exchange?: string): Promise<Instrument[]> {
     const url = exchange
       ? `${KITE_API_ROOT}/instruments/${encodeURIComponent(exchange)}`
       : `${KITE_API_ROOT}/instruments`;
 
-    const res = await fetch(url, { headers: this.authHeader() });
+    // Attempt 1: no access token (works for the public instruments dump).
+    let res = await fetch(url, { headers: { "X-Kite-Version": "3" } });
+
+    // Attempt 2: if blocked and we have a session, retry authenticated.
+    if (!res.ok && this.accessToken) {
+      res = await fetch(url, { headers: this.authHeader() });
+    }
+
     if (!res.ok) {
       const text = await res.text();
+      if (res.status === 401 || res.status === 403) {
+        throw new KiteError(
+          "Zerodha would not serve the instruments list without a session. " +
+            "A one-time login is required (click “Connect to Zerodha”).",
+          res.status,
+        );
+      }
       throw new KiteError(
         `Failed to fetch instruments (HTTP ${res.status}): ${text.slice(0, 200)}`,
         res.status || 500,
