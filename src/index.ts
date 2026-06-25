@@ -112,8 +112,11 @@ app.get("/api/instruments", async (req: Request, res: Response) => {
   const q = String(req.query.q ?? "").trim().toLowerCase();
 
   try {
-    let data = await getInstrumentsCached(exchange || undefined);
+    let data = await getAllInstrumentsCached();
 
+    if (exchange) {
+      data = data.filter((i) => i.exchange === exchange);
+    }
     if (type) {
       data = data.filter((i) => i.instrument_type === type);
     }
@@ -131,12 +134,69 @@ app.get("/api/instruments", async (req: Request, res: Response) => {
   }
 });
 
-async function getInstrumentsCached(exchange?: string): Promise<Instrument[]> {
+// --- F&O stocks only: underlyings that have stock futures on NSE (NFO). ---
+// Index F&O (NIFTY, BANKNIFTY, ...) is excluded because indices are not NSE
+// equities. Each row is the NSE equity enriched with its F&O lot size.
+//   q   optional text search over symbol/name
+app.get("/api/fno-stocks", async (req: Request, res: Response) => {
+  const q = String(req.query.q ?? "").trim().toLowerCase();
+
+  try {
+    const all = await getAllInstrumentsCached();
+    let data = deriveFnoStocks(all);
+
+    if (q) {
+      data = data.filter(
+        (i) =>
+          i.tradingsymbol.toLowerCase().includes(q) ||
+          i.name.toLowerCase().includes(q),
+      );
+    }
+
+    res.json({ count: data.length, instruments: data });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+interface FnoStock extends Instrument {
+  fno_lot_size: number;
+}
+
+/**
+ * Derive the list of F&O *stocks* from the full instrument dump.
+ * Logic: every NFO futures contract's `name` is an underlying symbol. Match it
+ * to an NSE EQ `tradingsymbol` to get the equity. Indices have no EQ row, so
+ * they drop out, leaving only stocks.
+ */
+function deriveFnoStocks(all: Instrument[]): FnoStock[] {
+  const underlyingLot = new Map<string, number>();
+  const eqBySymbol = new Map<string, Instrument>();
+
+  for (const i of all) {
+    if (i.exchange === "NFO" && i.instrument_type === "FUT" && i.name) {
+      // Prefer the nearest contract's lot size; keep the first seen.
+      if (!underlyingLot.has(i.name)) underlyingLot.set(i.name, i.lot_size);
+    } else if (i.exchange === "NSE" && i.instrument_type === "EQ") {
+      eqBySymbol.set(i.tradingsymbol, i);
+    }
+  }
+
+  const out: FnoStock[] = [];
+  for (const [symbol, lot] of underlyingLot) {
+    const eq = eqBySymbol.get(symbol);
+    if (eq) out.push({ ...eq, fno_lot_size: lot });
+  }
+  out.sort((a, b) => a.tradingsymbol.localeCompare(b.tradingsymbol));
+  return out;
+}
+
+async function getAllInstrumentsCached(): Promise<Instrument[]> {
   const fresh = instrumentCache && Date.now() - instrumentCache.at < CACHE_TTL_MS;
   if (fresh && instrumentCache) {
     return instrumentCache.data;
   }
-  const data = await kite.getInstruments(exchange);
+  const data = await kite.getInstruments(); // full multi-exchange dump
   instrumentCache = { at: Date.now(), data };
   return data;
 }
