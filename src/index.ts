@@ -66,7 +66,11 @@ app.post("/api/session", async (req: Request, res: Response) => {
       user_name: session.user_name,
     });
   } catch (err) {
-    sendError(res, err);
+    // Do NOT use sendError here: a failed (or duplicate) request_token
+    // exchange must not clear an already-valid session.
+    const status = err instanceof KiteError ? err.status : 500;
+    const message = err instanceof Error ? err.message : "Login failed.";
+    res.status(status).json({ error: message });
   }
 });
 
