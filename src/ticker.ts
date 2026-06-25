@@ -86,14 +86,16 @@ export function parseBinary(buf: ArrayBuffer): Tick[] {
     offset += 2;
     if (offset + len > dv.byteLength) break;
 
-    const token = dv.getInt32(offset, false);
+    // Token MUST be read as UNSIGNED: NFO futures tokens exceed 2^31, and a
+    // signed read would make them negative and never match the subscribed token.
+    const token = dv.getUint32(offset, false);
     const divisor = priceDivisor(token);
-    const lastPrice = dv.getInt32(offset + 4, false) / divisor;
+    const lastPrice = dv.getUint32(offset + 4, false) / divisor;
 
     // "quote"/"full" packets (>= 44 bytes) carry the close price at offset 40.
     let closePrice = 0;
     if (len >= 44) {
-      closePrice = dv.getInt32(offset + 40, false) / divisor;
+      closePrice = dv.getUint32(offset + 40, false) / divisor;
     }
 
     ticks.push({ token, last_price: lastPrice, close_price: closePrice });
