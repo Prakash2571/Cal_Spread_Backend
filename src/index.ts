@@ -3,6 +3,7 @@ import express from "express";
 import type { Request, Response, NextFunction } from "express";
 import { KiteClient, KiteError, type Instrument } from "./kite.js";
 import { connectTicker } from "./ticker.js";
+import { getDividendYields } from "./yahoo.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
@@ -16,6 +17,10 @@ const kite = new KiteClient({
 // CSV on every frontend request. Kite refreshes instruments once a day.
 let instrumentCache: { at: number; data: Instrument[] } | null = null;
 const CACHE_TTL_MS = 1000 * 60 * 60; // 1 hour
+
+// Dividend yields (%) from Yahoo, refreshed once a day.
+let dividendCache: { at: number; data: Record<string, number> } | null = null;
+const DIVIDEND_TTL_MS = 1000 * 60 * 60 * 24; // 24 hours
 
 const app = express();
 
@@ -309,6 +314,24 @@ app.get("/api/stream", (req: Request, res: Response) => {
     ticker.close();
     res.end();
   });
+});
+
+// --- Dividend yields (%) per F&O stock, sourced from Yahoo Finance.
+// Cached for 24h. Works without a Zerodha login. Failures map to 0%. ---
+app.get("/api/dividends", async (_req: Request, res: Response) => {
+  try {
+    if (dividendCache && Date.now() - dividendCache.at < DIVIDEND_TTL_MS) {
+      res.json({ yields: dividendCache.data, cachedAt: dividendCache.at });
+      return;
+    }
+    const all = await getAllInstrumentsCached();
+    const symbols = deriveFnoBoard(all).map((b) => b.symbol);
+    const yields = await getDividendYields(symbols);
+    dividendCache = { at: Date.now(), data: yields };
+    res.json({ yields, cachedAt: dividendCache.at });
+  } catch (err) {
+    sendError(res, err);
+  }
 });
 
 // --- F&O board: every F&O stock with its spot token + 3 nearest futures,
