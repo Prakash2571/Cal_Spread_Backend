@@ -108,7 +108,14 @@ app.get("/api/admin/status", (req: Request, res: Response) => {
 });
 
 // --- Step 1: send the user to Zerodha's login page ---
-app.get("/login", requireAdmin, (_req: Request, res: Response) => {
+app.get("/login", (req: Request, res: Response) => {
+  // Accept admin token from query param (browser navigation can't send headers)
+  const tokenFromQuery = req.query["x-admin-token"] as string | undefined;
+  const tokenFromHeader = req.headers["x-admin-token"] as string | undefined;
+  if (!isAdminAuthenticated(tokenFromQuery || tokenFromHeader)) {
+    res.status(403).json({ error: "Admin authentication required" });
+    return;
+  }
   res.redirect(kite.getLoginUrl());
 });
 
