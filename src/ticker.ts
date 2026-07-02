@@ -18,6 +18,8 @@ export interface Tick {
 
 export interface TickerHandle {
   close: () => void;
+  /** Subscribe to additional instrument tokens on the existing socket. */
+  subscribe: (tokens: number[]) => void;
 }
 
 interface ConnectOptions {
@@ -37,10 +39,22 @@ export function connectTicker(opts: ConnectOptions): TickerHandle {
   const ws = new WebSocket(url);
   ws.binaryType = "arraybuffer";
 
-  ws.onopen = () => {
-    ws.send(JSON.stringify({ a: "subscribe", v: opts.tokens }));
+  let isOpen = false;
+  // Tokens requested before the socket finished opening are queued here and
+  // flushed on open.
+  let pendingTokens: number[] = [...opts.tokens];
+
+  function sendSubscribe(tokens: number[]) {
+    if (tokens.length === 0) return;
+    ws.send(JSON.stringify({ a: "subscribe", v: tokens }));
     // "quote" mode includes the day's close price, which we need for change %.
-    ws.send(JSON.stringify({ a: "mode", v: ["quote", opts.tokens] }));
+    ws.send(JSON.stringify({ a: "mode", v: ["quote", tokens] }));
+  }
+
+  ws.onopen = () => {
+    isOpen = true;
+    sendSubscribe(pendingTokens);
+    pendingTokens = [];
   };
 
   ws.onmessage = (ev: MessageEvent) => {
@@ -61,6 +75,13 @@ export function connectTicker(opts: ConnectOptions): TickerHandle {
         ws.close();
       } catch {
         // already closed
+      }
+    },
+    subscribe: (tokens: number[]) => {
+      if (isOpen) {
+        sendSubscribe(tokens);
+      } else {
+        pendingTokens.push(...tokens);
       }
     },
   };

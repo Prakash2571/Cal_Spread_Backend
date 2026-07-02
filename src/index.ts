@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
 import { KiteClient, KiteError, type Instrument } from "./kite.js";
-import { connectTicker } from "./ticker.js";
+import { TickerHub } from "./hub.js";
 import { getDividendYields } from "./yahoo.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
@@ -13,6 +13,13 @@ const kite = new KiteClient({
   apiKey: process.env.KITE_API_KEY ?? "",
   apiSecret: process.env.KITE_API_SECRET ?? "",
 });
+
+// One shared Kite WebSocket fanned out to all SSE clients (keeps us within
+// Zerodha's per-key connection limit no matter how many visitors watch).
+const tickerHub = new TickerHub(
+  () => ({ apiKey: kite.getApiKey(), accessToken: kite.getAccessToken() }),
+  () => kite.clearSession(),
+);
 
 // In-memory store for admin sessions (token -> expiry timestamp)
 const adminSessions = new Map<string, number>();
@@ -323,6 +330,8 @@ app.get("/api/quotes", async (req: Request, res: Response) => {
       last_price: q.last_price,
       close_price: q.ohlc?.close ?? 0,
     }));
+    // Warm the shared hub cache so late-joining SSE clients get instant data.
+    tickerHub.seed(ticks);
     res.json({ ticks });
   } catch (err) {
     sendError(res, err);
@@ -360,26 +369,15 @@ app.get("/api/stream", (req: Request, res: Response) => {
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders?.();
 
-  const ticker = connectTicker({
-    apiKey: kite.getApiKey(),
-    accessToken,
-    tokens,
-    onTick: (ticks) => {
-      res.write(`data: ${JSON.stringify(ticks)}\n\n`);
-    },
-    onError: (message) => {
-      // A WebSocket auth rejection means the token is dead — log out.
-      kite.clearSession();
-      res.write(`event: kite_error\ndata: ${JSON.stringify({ message })}\n\n`);
-    },
-  });
+  // Register with the shared hub (one upstream Zerodha WS for all viewers).
+  const unsubscribe = tickerHub.addClient(res, tokens);
 
   // Keep the connection alive through proxies.
   const keepAlive = setInterval(() => res.write(`: ping\n\n`), 20000);
 
   req.on("close", () => {
     clearInterval(keepAlive);
-    ticker.close();
+    unsubscribe();
     res.end();
   });
 });
