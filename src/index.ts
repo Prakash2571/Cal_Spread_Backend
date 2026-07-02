@@ -59,12 +59,19 @@ const DIVIDEND_TTL_MS = 1000 * 60 * 60 * 24; // 24 hours
 
 const app = express();
 
+// Live financial data must never be cached. Disable ETag generation so the
+// backend never replies "304 Not Modified" (a 304 has an empty body, which
+// would make the frontend's res.json() fail).
+app.set("etag", false);
+
 // --- CORS (so the Vite frontend can call this API) ---
 app.use((req: Request, res: Response, next: NextFunction) => {
   res.header("Access-Control-Allow-Origin", FRONTEND_URL);
   res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, x-admin-token");
   res.header("Access-Control-Allow-Credentials", "true");
+  // Prevent browser/proxy caching of API responses (no 304 revalidation).
+  res.header("Cache-Control", "no-store");
   if (req.method === "OPTIONS") {
     res.sendStatus(204);
     return;
