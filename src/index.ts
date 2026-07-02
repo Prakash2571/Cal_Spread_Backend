@@ -79,8 +79,13 @@ app.get("/", (_req: Request, res: Response) => {
   res.json({
     status: "ok",
     authenticated: kite.hasSession(),
-    hint: "Visit /login to authenticate with Zerodha.",
+    hint: "Visit /api/login to authenticate with Zerodha.",
   });
+});
+
+// --- Status (under /api so it works behind a same-domain /api proxy) ---
+app.get("/api/status", (_req: Request, res: Response) => {
+  res.json({ status: "ok", authenticated: kite.hasSession() });
 });
 
 // --- Admin verification endpoint ---
@@ -114,7 +119,9 @@ app.get("/api/admin/status", (req: Request, res: Response) => {
 });
 
 // --- Step 1: send the user to Zerodha's login page ---
-app.get("/login", (req: Request, res: Response) => {
+// Registered at both /login and /api/login so it works whether the backend is
+// on its own origin or behind a same-domain "/api" reverse proxy.
+app.get(["/login", "/api/login"], (req: Request, res: Response) => {
   // Accept admin token from query param (browser navigation can't send headers)
   const tokenFromQuery = req.query["x-admin-token"] as string | undefined;
   const tokenFromHeader = req.headers["x-admin-token"] as string | undefined;
