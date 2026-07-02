@@ -1,5 +1,4 @@
 import "dotenv/config";
-import "dotenv/config";
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
 import { KiteClient, KiteError, type Instrument } from "./kite.js";
@@ -289,8 +288,9 @@ app.get("/api/fno-stocks/:symbol", async (req: Request, res: Response) => {
 });
 
 // --- Snapshot quotes (REST): last price + close for the given tokens.
-// Works regardless of market hours, so prices/premiums show even after close. ---
-app.get("/api/quotes", requireAdmin, async (req: Request, res: Response) => {
+// Works regardless of market hours, so prices/premiums show even after close.
+// PUBLIC: anyone can read the data once an admin has connected Zerodha. ---
+app.get("/api/quotes", async (req: Request, res: Response) => {
   const tokens = String(req.query.tokens ?? "")
     .split(",")
     .map((s) => Number(s.trim()))
@@ -332,18 +332,10 @@ app.get("/api/quotes", requireAdmin, async (req: Request, res: Response) => {
 // --- Live data: Server-Sent Events stream of ticks for the given tokens. ---
 // The backend opens a Kite WebSocket (using the stored access token), parses
 // the binary ticks, and relays them to the browser as JSON SSE events.
+// PUBLIC: anyone can subscribe to the live stream once an admin has connected
+// Zerodha. The stream only emits data while a valid Zerodha session exists.
 //   tokens   comma-separated instrument tokens
 app.get("/api/stream", (req: Request, res: Response) => {
-  // Check admin auth from query param or header (SSE can't send custom headers)
-  const tokenFromQuery = req.query["x-admin-token"] as string | undefined;
-  const tokenFromHeader = req.headers["x-admin-token"] as string | undefined;
-  const adminTokenValue = tokenFromQuery || tokenFromHeader;
-  
-  if (!isAdminAuthenticated(adminTokenValue)) {
-    res.status(403).json({ error: "Admin authentication required" });
-    return;
-  }
-  
   const tokens = String(req.query.tokens ?? "")
     .split(",")
     .map((s) => Number(s.trim()))
