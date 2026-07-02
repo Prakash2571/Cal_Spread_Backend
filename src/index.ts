@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "dotenv/config";
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
 import { KiteClient, KiteError, type Instrument } from "./kite.js";
@@ -7,11 +8,39 @@ import { getDividendYields } from "./yahoo.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
+const ADMIN_SECRET = process.env.ADMIN_SECRET ?? "";
 
 const kite = new KiteClient({
   apiKey: process.env.KITE_API_KEY ?? "",
   apiSecret: process.env.KITE_API_SECRET ?? "",
 });
+
+// In-memory store for admin sessions (token -> expiry timestamp)
+const adminSessions = new Map<string, number>();
+const ADMIN_SESSION_TTL_MS = 1000 * 60 * 60 * 24; // 24 hours
+
+function generateAdminToken(): string {
+  return Math.random().toString(36).substring(2) + Date.now().toString(36);
+}
+
+function isAdminAuthenticated(token: string | undefined): boolean {
+  if (!token) return false;
+  const expiry = adminSessions.get(token);
+  if (!expiry || Date.now() > expiry) {
+    adminSessions.delete(token);
+    return false;
+  }
+  return true;
+}
+
+function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  const token = req.headers["x-admin-token"] as string | undefined;
+  if (!isAdminAuthenticated(token)) {
+    res.status(403).json({ error: "Admin authentication required" });
+    return;
+  }
+  next();
+}
 
 // In-memory cache of the instrument dump so we don't re-download the (large)
 // CSV on every frontend request. Kite refreshes instruments once a day.
@@ -28,7 +57,7 @@ const app = express();
 app.use((req: Request, res: Response, next: NextFunction) => {
   res.header("Access-Control-Allow-Origin", FRONTEND_URL);
   res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Access-Control-Allow-Headers", "Content-Type, x-admin-token");
   res.header("Access-Control-Allow-Credentials", "true");
   if (req.method === "OPTIONS") {
     res.sendStatus(204);
@@ -48,15 +77,45 @@ app.get("/", (_req: Request, res: Response) => {
   });
 });
 
+// --- Admin verification endpoint ---
+app.post("/api/admin/verify", (req: Request, res: Response) => {
+  const { secret } = req.body;
+  
+  if (!ADMIN_SECRET) {
+    res.status(500).json({ error: "Admin secret not configured on server" });
+    return;
+  }
+  
+  if (secret !== ADMIN_SECRET) {
+    res.status(401).json({ error: "Invalid admin secret" });
+    return;
+  }
+  
+  const token = generateAdminToken();
+  adminSessions.set(token, Date.now() + ADMIN_SESSION_TTL_MS);
+  
+  res.json({ 
+    success: true, 
+    token,
+    expiresIn: ADMIN_SESSION_TTL_MS 
+  });
+});
+
+// --- Check admin session status ---
+app.get("/api/admin/status", (req: Request, res: Response) => {
+  const token = req.headers["x-admin-token"] as string | undefined;
+  res.json({ authenticated: isAdminAuthenticated(token) });
+});
+
 // --- Step 1: send the user to Zerodha's login page ---
-app.get("/login", (_req: Request, res: Response) => {
+app.get("/login", requireAdmin, (_req: Request, res: Response) => {
   res.redirect(kite.getLoginUrl());
 });
 
 // --- Step 2/3 (frontend-driven): the frontend receives the request_token at
 // its registered redirect URL (e.g. http://localhost:5173/zerodha/verify)
 // and POSTs it here so the backend can do the secret checksum exchange. ---
-app.post("/api/session", async (req: Request, res: Response) => {
+app.post("/api/session", requireAdmin, async (req: Request, res: Response) => {
   const requestToken = String(req.body?.request_token ?? "");
   if (!requestToken) {
     res.status(400).json({ error: "Missing request_token." });
@@ -224,7 +283,7 @@ app.get("/api/fno-stocks/:symbol", async (req: Request, res: Response) => {
 
 // --- Snapshot quotes (REST): last price + close for the given tokens.
 // Works regardless of market hours, so prices/premiums show even after close. ---
-app.get("/api/quotes", async (req: Request, res: Response) => {
+app.get("/api/quotes", requireAdmin, async (req: Request, res: Response) => {
   const tokens = String(req.query.tokens ?? "")
     .split(",")
     .map((s) => Number(s.trim()))
@@ -268,6 +327,16 @@ app.get("/api/quotes", async (req: Request, res: Response) => {
 // the binary ticks, and relays them to the browser as JSON SSE events.
 //   tokens   comma-separated instrument tokens
 app.get("/api/stream", (req: Request, res: Response) => {
+  // Check admin auth from query param or header (SSE can't send custom headers)
+  const tokenFromQuery = req.query["x-admin-token"] as string | undefined;
+  const tokenFromHeader = req.headers["x-admin-token"] as string | undefined;
+  const adminTokenValue = tokenFromQuery || tokenFromHeader;
+  
+  if (!isAdminAuthenticated(adminTokenValue)) {
+    res.status(403).json({ error: "Admin authentication required" });
+    return;
+  }
+  
   const tokens = String(req.query.tokens ?? "")
     .split(",")
     .map((s) => Number(s.trim()))
