@@ -6,6 +6,8 @@ import { TickerHub } from "./hub.js";
 import type { Tick } from "./ticker.js";
 import { rateLimit } from "./ratelimit.js";
 import { getDividendYields } from "./yahoo.js";
+import { initDb, tradesCollection, ObjectId } from "./db.js";
+import type { TradeDoc } from "./db.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
@@ -503,6 +505,217 @@ app.get("/api/fno-board", async (req: Request, res: Response) => {
   }
 });
 
+// ============================================================================
+//  Calendar-spread trades (P&L) — admin only, persisted in MongoDB.
+//  A trade BUYS the discount leg and SELLS the premium leg, using the current
+//  and next month futures, for exactly 1 lot.
+// ============================================================================
+
+/** Fetch a snapshot of last prices for the given tokens (token -> last_price). */
+async function snapshotPrices(tokens: number[]): Promise<Map<number, number>> {
+  const all = await getAllInstrumentsCached();
+  const idByToken = new Map<number, string>();
+  for (const inst of all) {
+    idByToken.set(inst.instrument_token, `${inst.exchange}:${inst.tradingsymbol}`);
+  }
+  const identifiers = tokens
+    .map((t) => idByToken.get(t))
+    .filter((s): s is string => typeof s === "string");
+  const quotes = await kite.getQuoteOhlc(identifiers);
+  const out = new Map<number, number>();
+  for (const q of quotes) out.set(q.instrument_token, q.last_price);
+  return out;
+}
+
+/** Serialize a Mongo trade doc to the API shape (string id, ISO dates). */
+function serializeTrade(doc: TradeDoc & { _id: InstanceType<typeof ObjectId> }) {
+  return {
+    id: doc._id.toHexString(),
+    symbol: doc.symbol,
+    name: doc.name,
+    is_index: doc.is_index,
+    lot_size: doc.lot_size,
+    buy: doc.buy,
+    sell: doc.sell,
+    status: doc.status,
+    opened_at: doc.opened_at.toISOString(),
+    closed_at: doc.closed_at ? doc.closed_at.toISOString() : null,
+    close_pnl: doc.close_pnl,
+    buy_close: doc.buy_close,
+    sell_close: doc.sell_close,
+  };
+}
+
+// --- Take a trade: buy the discount leg, sell the premium leg (current+next). ---
+app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
+  const coll = tradesCollection();
+  if (!coll) {
+    res.status(503).json({ error: "Trade persistence is not configured (set MONGODB_URI)." });
+    return;
+  }
+  if (!kite.getAccessToken()) {
+    res.status(401).json({ error: "Connect to Zerodha before taking a trade." });
+    return;
+  }
+
+  const symbol = String(req.body?.symbol ?? "").trim().toUpperCase();
+  if (!symbol) {
+    res.status(400).json({ error: "Provide a symbol." });
+    return;
+  }
+
+  try {
+    const all = await getAllInstrumentsCached();
+    const item = deriveFnoBoard(all).find((b) => b.symbol.toUpperCase() === symbol);
+    if (!item) {
+      res.status(404).json({ error: `No F&O instrument found for "${symbol}".` });
+      return;
+    }
+    if (item.futures.length < 2) {
+      res.status(400).json({
+        error: "Need both current and next month futures to place a calendar spread.",
+      });
+      return;
+    }
+
+    const current = item.futures[0]!;
+    const next = item.futures[1]!;
+
+    // Guard against an already-open trade on the same symbol.
+    const existing = await coll.findOne({ symbol: item.symbol, status: "open" });
+    if (existing) {
+      res.status(409).json({ error: `A trade for ${item.symbol} is already open.` });
+      return;
+    }
+
+    const prices = await snapshotPrices([item.spot_token, current.token, next.token]);
+    const spot = prices.get(item.spot_token);
+    const priceCurrent = prices.get(current.token);
+    const priceNext = prices.get(next.token);
+
+    if (!spot || !priceCurrent || !priceNext) {
+      res.status(502).json({
+        error: "Could not fetch live prices for all legs right now. Try again shortly.",
+      });
+      return;
+    }
+
+    // Premium/discount vs spot. Buy the leg with the lower premium (cheaper),
+    // sell the leg with the higher premium (richer).
+    const premCurrent = priceCurrent - spot;
+    const premNext = priceNext - spot;
+
+    const currentLeg = { token: current.token, expiry: current.expiry, price: priceCurrent };
+    const nextLeg = { token: next.token, expiry: next.expiry, price: priceNext };
+
+    const [buyLeg, sellLeg] =
+      premCurrent <= premNext ? [currentLeg, nextLeg] : [nextLeg, currentLeg];
+
+    const doc: TradeDoc = {
+      symbol: item.symbol,
+      name: item.name,
+      is_index: !!item.is_index,
+      lot_size: current.lot_size,
+      buy: { token: buyLeg.token, expiry: buyLeg.expiry, entry: buyLeg.price },
+      sell: { token: sellLeg.token, expiry: sellLeg.expiry, entry: sellLeg.price },
+      status: "open",
+      opened_at: new Date(),
+      closed_at: null,
+      close_pnl: null,
+      buy_close: null,
+      sell_close: null,
+    };
+
+    const result = await coll.insertOne(doc);
+    res.json({ trade: serializeTrade({ ...doc, _id: result.insertedId }) });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// --- List all trades (open + closed), newest first. ---
+app.get("/api/trades", requireAdmin, async (_req: Request, res: Response) => {
+  const coll = tradesCollection();
+  if (!coll) {
+    res.json({ dbEnabled: false, trades: [] });
+    return;
+  }
+  try {
+    const docs = await coll.find().sort({ opened_at: -1 }).limit(200).toArray();
+    res.json({ dbEnabled: true, trades: docs.map(serializeTrade) });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// --- Close a trade: lock in final P&L using current prices. ---
+app.post("/api/trades/:id/close", requireAdmin, async (req: Request, res: Response) => {
+  const coll = tradesCollection();
+  if (!coll) {
+    res.status(503).json({ error: "Trade persistence is not configured (set MONGODB_URI)." });
+    return;
+  }
+
+  let objectId: InstanceType<typeof ObjectId>;
+  try {
+    objectId = new ObjectId(String(req.params.id));
+  } catch {
+    res.status(400).json({ error: "Invalid trade id." });
+    return;
+  }
+
+  try {
+    const trade = await coll.findOne({ _id: objectId });
+    if (!trade) {
+      res.status(404).json({ error: "Trade not found." });
+      return;
+    }
+    if (trade.status === "closed") {
+      res.json({ trade: serializeTrade(trade) });
+      return;
+    }
+    if (!kite.getAccessToken()) {
+      res.status(401).json({ error: "Connect to Zerodha to close a trade." });
+      return;
+    }
+
+    const prices = await snapshotPrices([trade.buy.token, trade.sell.token]);
+    const curBuy = prices.get(trade.buy.token) ?? trade.buy.entry;
+    const curSell = prices.get(trade.sell.token) ?? trade.sell.entry;
+
+    const pnl =
+      trade.lot_size *
+      ((curBuy - trade.buy.entry) + (trade.sell.entry - curSell));
+
+    const closedAt = new Date();
+    await coll.updateOne(
+      { _id: objectId },
+      {
+        $set: {
+          status: "closed",
+          closed_at: closedAt,
+          close_pnl: pnl,
+          buy_close: curBuy,
+          sell_close: curSell,
+        },
+      },
+    );
+
+    res.json({
+      trade: serializeTrade({
+        ...trade,
+        status: "closed",
+        closed_at: closedAt,
+        close_pnl: pnl,
+        buy_close: curBuy,
+        sell_close: curSell,
+      }),
+    });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
 interface BoardFuture {
   token: number;
   expiry: string;
@@ -653,4 +866,6 @@ app.listen(PORT, () => {
       "WARNING: KITE_API_KEY / KITE_API_SECRET are not set. Copy .env.example to .env and fill them in.",
     );
   }
+  // Connect to MongoDB for trade persistence (no-op if MONGODB_URI is unset).
+  void initDb();
 });
