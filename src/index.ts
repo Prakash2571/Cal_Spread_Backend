@@ -3,6 +3,8 @@ import express from "express";
 import type { Request, Response, NextFunction } from "express";
 import { KiteClient, KiteError, type Instrument } from "./kite.js";
 import { TickerHub } from "./hub.js";
+import type { Tick } from "./ticker.js";
+import { rateLimit } from "./ratelimit.js";
 import { getDividendYields } from "./yahoo.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
@@ -81,6 +83,12 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
 app.use(express.json());
 
+// General per-IP rate limit for all API routes: guards the Kite quota and the
+// server against rapid refreshing / deliberate abuse. 150 req/min comfortably
+// covers a normal visitor (a page load is ~4 calls + a 15s status poll) while
+// blocking abusive loops.
+app.use("/api", rateLimit({ windowMs: 60_000, max: 150 }));
+
 // --- Health check ---
 app.get("/", (_req: Request, res: Response) => {
   res.json({
@@ -96,7 +104,15 @@ app.get("/api/status", (_req: Request, res: Response) => {
 });
 
 // --- Admin verification endpoint ---
-app.post("/api/admin/verify", (req: Request, res: Response) => {
+// Stricter limit so the secret can't be brute-forced: 10 attempts / 5 min / IP.
+app.post(
+  "/api/admin/verify",
+  rateLimit({
+    windowMs: 5 * 60_000,
+    max: 10,
+    message: "Too many attempts. Try again in a few minutes.",
+  }),
+  (req: Request, res: Response) => {
   const { secret } = req.body;
   
   if (!ADMIN_SECRET) {
@@ -308,6 +324,13 @@ app.get("/api/fno-stocks/:symbol", async (req: Request, res: Response) => {
   }
 });
 
+// Short-lived cache of the REST quote snapshot, keyed by the requested token
+// set. This means that no matter how many visitors load/refresh the page, we
+// hit Zerodha's rate-limited quote API at most once every QUOTES_TTL_MS —
+// protecting the API quota from repeated refreshes or deliberate abuse.
+const quotesCache = new Map<string, { at: number; ticks: Tick[] }>();
+const QUOTES_TTL_MS = 4000;
+
 // --- Snapshot quotes (REST): last price + close for the given tokens.
 // Works regardless of market hours, so prices/premiums show even after close.
 // PUBLIC: anyone can read the data once an admin has connected Zerodha. ---
@@ -328,6 +351,14 @@ app.get("/api/quotes", async (req: Request, res: Response) => {
     return;
   }
 
+  // Serve from the short-lived cache when fresh (protects the Kite quota).
+  const cacheKey = tokens.slice().sort((a, b) => a - b).join(",");
+  const cached = quotesCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < QUOTES_TTL_MS) {
+    res.json({ ticks: cached.ticks });
+    return;
+  }
+
   try {
     const all = await getAllInstrumentsCached();
     const byToken = new Map<number, string>();
@@ -344,6 +375,7 @@ app.get("/api/quotes", async (req: Request, res: Response) => {
       last_price: q.last_price,
       close_price: q.ohlc?.close ?? 0,
     }));
+    quotesCache.set(cacheKey, { at: Date.now(), ticks });
     // Warm the shared hub cache so late-joining SSE clients get instant data.
     tickerHub.seed(ticks);
     res.json({ ticks });
