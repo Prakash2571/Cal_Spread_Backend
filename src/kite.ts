@@ -45,6 +45,34 @@ export interface OhlcQuote {
   ohlc: { open: number; high: number; low: number; close: number };
 }
 
+/** Full quote fields we use: last price, day close, and open interest. */
+export interface FullQuote {
+  instrument_token: number;
+  last_price: number;
+  close: number;
+  oi: number;
+}
+
+/** Raw shape of a /quote entry (only the fields we read). */
+interface RawFullQuote {
+  instrument_token: number;
+  last_price?: number;
+  ohlc?: { close?: number };
+  oi?: number;
+}
+
+/** One order line for the basket-margin request. */
+export interface BasketOrder {
+  exchange: string;
+  tradingsymbol: string;
+  transaction_type: "BUY" | "SELL";
+  variety: string;
+  product: string;
+  order_type: string;
+  quantity: number;
+  price: number;
+}
+
 export class KiteError extends Error {
   status: number;
   constructor(message: string, status = 500) {
@@ -211,6 +239,76 @@ export class KiteClient {
       }
     }
     return out;
+  }
+
+  /**
+   * Full quote (/quote): includes last price, OHLC close AND open interest (oi)
+   * for F&O instruments. Chunked at 500 identifiers per request.
+   */
+  async getQuoteFull(identifiers: string[]): Promise<FullQuote[]> {
+    const out: FullQuote[] = [];
+    for (let i = 0; i < identifiers.length; i += 500) {
+      const chunk = identifiers.slice(i, i + 500);
+      const qs = chunk.map((id) => `i=${encodeURIComponent(id)}`).join("&");
+      const res = await fetch(`${KITE_API_ROOT}/quote?${qs}`, {
+        headers: this.authHeader(),
+      });
+      const json = (await res.json()) as {
+        status: string;
+        data?: Record<string, RawFullQuote>;
+        message?: string;
+      };
+      if (!res.ok || json.status !== "success" || !json.data) {
+        if (res.status === 401 || res.status === 403) this.clearSession();
+        throw new KiteError(
+          json.message ?? `Failed to fetch quotes (HTTP ${res.status}).`,
+          res.status || 500,
+        );
+      }
+      for (const v of Object.values(json.data)) {
+        if (v && typeof v.instrument_token === "number") {
+          out.push({
+            instrument_token: v.instrument_token,
+            last_price: v.last_price ?? 0,
+            close: v.ohlc?.close ?? 0,
+            oi: v.oi ?? 0,
+          });
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Basket margin (/margins/basket): net margin for a set of orders, factoring
+   * in hedge/spread benefits. Used to size a calendar spread's capital.
+   */
+  async getBasketMargin(
+    orders: BasketOrder[],
+  ): Promise<{ initial: number; final: number; total: number }> {
+    const res = await fetch(
+      `${KITE_API_ROOT}/margins/basket?consider_positions=true`,
+      {
+        method: "POST",
+        headers: { ...this.authHeader(), "Content-Type": "application/json" },
+        body: JSON.stringify(orders),
+      },
+    );
+    const json = (await res.json()) as {
+      status: string;
+      data?: { initial?: { total?: number }; final?: { total?: number } };
+      message?: string;
+    };
+    if (!res.ok || json.status !== "success" || !json.data) {
+      if (res.status === 401 || res.status === 403) this.clearSession();
+      throw new KiteError(
+        json.message ?? `Failed to fetch basket margin (HTTP ${res.status}).`,
+        res.status || 500,
+      );
+    }
+    const initial = json.data.initial?.total ?? 0;
+    const final = json.data.final?.total ?? 0;
+    return { initial, final, total: final || initial };
   }
 
   /**

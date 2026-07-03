@@ -14,6 +14,7 @@ export interface Tick {
   token: number;
   last_price: number;
   close_price: number;
+  oi: number; // open interest (F&O only; 0 for spot/index)
 }
 
 export interface TickerHandle {
@@ -47,8 +48,8 @@ export function connectTicker(opts: ConnectOptions): TickerHandle {
   function sendSubscribe(tokens: number[]) {
     if (tokens.length === 0) return;
     ws.send(JSON.stringify({ a: "subscribe", v: tokens }));
-    // "quote" mode includes the day's close price, which we need for change %.
-    ws.send(JSON.stringify({ a: "mode", v: ["quote", tokens] }));
+    // "full" mode includes the day's close price AND open interest (oi).
+    ws.send(JSON.stringify({ a: "mode", v: ["full", tokens] }));
   }
 
   ws.onopen = () => {
@@ -119,7 +120,14 @@ export function parseBinary(buf: ArrayBuffer): Tick[] {
       closePrice = dv.getUint32(offset + 40, false) / divisor;
     }
 
-    ticks.push({ token, last_price: lastPrice, close_price: closePrice });
+    // "full" packets (>= 184 bytes) carry open interest at offset 48 (a count,
+    // not a price, so it is NOT divided).
+    let oi = 0;
+    if (len >= 184) {
+      oi = dv.getUint32(offset + 48, false);
+    }
+
+    ticks.push({ token, last_price: lastPrice, close_price: closePrice, oi });
     offset += len;
   }
 

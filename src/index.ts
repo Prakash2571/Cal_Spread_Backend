@@ -371,11 +371,12 @@ app.get("/api/quotes", async (req: Request, res: Response) => {
       .map((t) => byToken.get(t))
       .filter((s): s is string => typeof s === "string");
 
-    const quotes = await kite.getQuoteOhlc(identifiers);
+    const quotes = await kite.getQuoteFull(identifiers);
     const ticks = quotes.map((q) => ({
       token: q.instrument_token,
       last_price: q.last_price,
-      close_price: q.ohlc?.close ?? 0,
+      close_price: q.close,
+      oi: q.oi,
     }));
     quotesCache.set(cacheKey, { at: Date.now(), ticks });
     // Warm the shared hub cache so late-joining SSE clients get instant data.
@@ -543,6 +544,7 @@ function serializeTrade(doc: TradeDoc & { _id: InstanceType<typeof ObjectId> }) 
     close_pnl: doc.close_pnl,
     buy_close: doc.buy_close,
     sell_close: doc.sell_close,
+    margin: doc.margin,
   };
 }
 
@@ -611,6 +613,50 @@ app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
     const [buyLeg, sellLeg] =
       premCurrent <= premNext ? [currentLeg, nextLeg] : [nextLeg, currentLeg];
 
+    // Look up tradingsymbol + exchange for each leg (needed by the margin API).
+    const instByToken = new Map<number, { tradingsymbol: string; exchange: string }>();
+    for (const inst of all) {
+      instByToken.set(inst.instrument_token, {
+        tradingsymbol: inst.tradingsymbol,
+        exchange: inst.exchange,
+      });
+    }
+    const buyInst = instByToken.get(buyLeg.token);
+    const sellInst = instByToken.get(sellLeg.token);
+
+    // Fetch the net basket margin for [BUY 1 lot, SELL 1 lot]. Non-fatal: if it
+    // fails, we still record the trade with margin = null.
+    let margin: number | null = null;
+    if (buyInst && sellInst) {
+      try {
+        const res = await kite.getBasketMargin([
+          {
+            exchange: buyInst.exchange,
+            tradingsymbol: buyInst.tradingsymbol,
+            transaction_type: "BUY",
+            variety: "regular",
+            product: "NRML",
+            order_type: "MARKET",
+            quantity: current.lot_size,
+            price: 0,
+          },
+          {
+            exchange: sellInst.exchange,
+            tradingsymbol: sellInst.tradingsymbol,
+            transaction_type: "SELL",
+            variety: "regular",
+            product: "NRML",
+            order_type: "MARKET",
+            quantity: current.lot_size,
+            price: 0,
+          },
+        ]);
+        margin = Math.round(res.total);
+      } catch (marginErr) {
+        console.warn("Basket margin fetch failed:", marginErr);
+      }
+    }
+
     const doc: TradeDoc = {
       symbol: item.symbol,
       name: item.name,
@@ -624,6 +670,7 @@ app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
       close_pnl: null,
       buy_close: null,
       sell_close: null,
+      margin,
     };
 
     const result = await coll.insertOne(doc);

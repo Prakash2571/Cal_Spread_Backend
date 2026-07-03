@@ -28,6 +28,7 @@ export interface TradeDoc {
   close_pnl: number | null;
   buy_close: number | null;
   sell_close: number | null;
+  margin: number | null; // net basket margin (₹) captured at trade time
 }
 
 /** Connect to MongoDB. Safe to call once at startup; no-op if URI is unset. */
