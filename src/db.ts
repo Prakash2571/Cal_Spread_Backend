@@ -1,14 +1,6 @@
-import { MongoClient, ObjectId } from "mongodb";
-import type { Collection, Db } from "mongodb";
+import mongoose from "mongoose";
 
 const MONGODB_URI = process.env.MONGODB_URI ?? "";
-// Optional override; if unset we use the database embedded in the connection
-// string (e.g. mongodb+srv://.../myDb). Falls back to "cal_spread" only when
-// the URI has no database path.
-const DB_NAME = process.env.MONGODB_DB ?? "";
-
-let client: MongoClient | null = null;
-let db: Db | null = null;
 
 /** One leg of a calendar-spread trade. */
 export interface TradeLeg {
@@ -17,8 +9,8 @@ export interface TradeLeg {
   entry: number; // price captured at trade time
 }
 
-/** A persisted calendar-spread trade (buy the discount leg, sell the premium leg). */
-export interface TradeDoc {
+/** A calendar-spread trade (buy the discount leg, sell the premium leg). */
+export interface ITrade {
   symbol: string;
   name: string;
   is_index: boolean;
@@ -34,7 +26,48 @@ export interface TradeDoc {
   margin: number | null; // net basket margin (₹) captured at trade time
 }
 
-/** Connect to MongoDB. Safe to call once at startup; no-op if URI is unset. */
+/** A plain trade record (lean / toObject) including the Mongo _id. */
+export interface TradeRecord extends ITrade {
+  _id: mongoose.Types.ObjectId;
+}
+
+const legSchema = new mongoose.Schema<TradeLeg>(
+  {
+    token: { type: Number, required: true },
+    expiry: { type: String, required: true },
+    entry: { type: Number, required: true },
+  },
+  { _id: false },
+);
+
+const tradeSchema = new mongoose.Schema<ITrade>({
+  symbol: { type: String, required: true, index: true },
+  name: { type: String, default: "" },
+  is_index: { type: Boolean, default: false },
+  lot_size: { type: Number, required: true },
+  buy: { type: legSchema, required: true },
+  sell: { type: legSchema, required: true },
+  status: {
+    type: String,
+    enum: ["open", "closed"],
+    default: "open",
+    index: true,
+  },
+  opened_at: { type: Date, default: () => new Date() },
+  closed_at: { type: Date, default: null },
+  close_pnl: { type: Number, default: null },
+  buy_close: { type: Number, default: null },
+  sell_close: { type: Number, default: null },
+  margin: { type: Number, default: null },
+});
+
+/** The Trade model (collection: "trades"). */
+export const Trade = mongoose.model<ITrade>("Trade", tradeSchema);
+
+/**
+ * Connect to MongoDB using the connection string. The database is taken from
+ * the connection string itself (no separate DB-name config). No-op if unset.
+ */
 export async function initDb(): Promise<void> {
   if (!MONGODB_URI) {
     console.warn(
@@ -43,26 +76,21 @@ export async function initDb(): Promise<void> {
     return;
   }
   try {
-    client = new MongoClient(MONGODB_URI);
-    await client.connect();
-    // Use the DB from the connection string when no override is given.
-    // client.db() with no arg uses the URI's default database.
-    db = DB_NAME ? client.db(DB_NAME) : client.db();
-    await tradesCollection()?.createIndex({ opened_at: -1 });
-    console.log(`Connected to MongoDB (database "${db.databaseName}").`);
+    await mongoose.connect(MONGODB_URI);
+    console.log(
+      `Connected to MongoDB via Mongoose (database "${mongoose.connection.name}").`,
+    );
   } catch (err) {
     console.error("Failed to connect to MongoDB:", err);
-    db = null;
   }
 }
 
+/** True once Mongoose has an active connection. */
 export function isDbEnabled(): boolean {
-  return db !== null;
+  return mongoose.connection.readyState === 1;
 }
 
-export function tradesCollection(): Collection<TradeDoc> | null {
-  if (!db) return null;
-  return db.collection<TradeDoc>("trades");
+/** Validate a string as a Mongo ObjectId. */
+export function isValidId(id: string): boolean {
+  return mongoose.isValidObjectId(id);
 }
-
-export { ObjectId };

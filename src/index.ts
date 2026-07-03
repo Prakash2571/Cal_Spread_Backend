@@ -6,8 +6,8 @@ import { TickerHub } from "./hub.js";
 import type { Tick } from "./ticker.js";
 import { rateLimit } from "./ratelimit.js";
 import { getDividendYields } from "./yahoo.js";
-import { initDb, tradesCollection, ObjectId } from "./db.js";
-import type { TradeDoc } from "./db.js";
+import { initDb, isDbEnabled, isValidId, Trade } from "./db.js";
+import type { ITrade, TradeRecord } from "./db.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
@@ -528,10 +528,10 @@ async function snapshotPrices(tokens: number[]): Promise<Map<number, number>> {
   return out;
 }
 
-/** Serialize a Mongo trade doc to the API shape (string id, ISO dates). */
-function serializeTrade(doc: TradeDoc & { _id: InstanceType<typeof ObjectId> }) {
+/** Serialize a trade record to the API shape (string id, ISO dates). */
+function serializeTrade(doc: TradeRecord) {
   return {
-    id: doc._id.toHexString(),
+    id: doc._id.toString(),
     symbol: doc.symbol,
     name: doc.name,
     is_index: doc.is_index,
@@ -550,8 +550,7 @@ function serializeTrade(doc: TradeDoc & { _id: InstanceType<typeof ObjectId> }) 
 
 // --- Take a trade: buy the discount leg, sell the premium leg (current+next). ---
 app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
-  const coll = tradesCollection();
-  if (!coll) {
+  if (!isDbEnabled()) {
     res.status(503).json({ error: "Trade persistence is not configured (set MONGODB_URI)." });
     return;
   }
@@ -584,7 +583,7 @@ app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
     const next = item.futures[1]!;
 
     // Guard against an already-open trade on the same symbol.
-    const existing = await coll.findOne({ symbol: item.symbol, status: "open" });
+    const existing = await Trade.findOne({ symbol: item.symbol, status: "open" }).lean();
     if (existing) {
       res.status(409).json({ error: `A trade for ${item.symbol} is already open.` });
       return;
@@ -657,7 +656,7 @@ app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
       }
     }
 
-    const doc: TradeDoc = {
+    const payload: ITrade = {
       symbol: item.symbol,
       name: item.name,
       is_index: !!item.is_index,
@@ -673,8 +672,8 @@ app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
       margin,
     };
 
-    const result = await coll.insertOne(doc);
-    res.json({ trade: serializeTrade({ ...doc, _id: result.insertedId }) });
+    const created = await Trade.create(payload);
+    res.json({ trade: serializeTrade(created.toObject() as TradeRecord) });
   } catch (err) {
     sendError(res, err);
   }
@@ -682,13 +681,15 @@ app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
 
 // --- List all trades (open + closed), newest first. ---
 app.get("/api/trades", requireAdmin, async (_req: Request, res: Response) => {
-  const coll = tradesCollection();
-  if (!coll) {
+  if (!isDbEnabled()) {
     res.json({ dbEnabled: false, trades: [] });
     return;
   }
   try {
-    const docs = await coll.find().sort({ opened_at: -1 }).limit(200).toArray();
+    const docs = await Trade.find()
+      .sort({ opened_at: -1 })
+      .limit(200)
+      .lean<TradeRecord[]>();
     res.json({ dbEnabled: true, trades: docs.map(serializeTrade) });
   } catch (err) {
     sendError(res, err);
@@ -697,28 +698,25 @@ app.get("/api/trades", requireAdmin, async (_req: Request, res: Response) => {
 
 // --- Close a trade: lock in final P&L using current prices. ---
 app.post("/api/trades/:id/close", requireAdmin, async (req: Request, res: Response) => {
-  const coll = tradesCollection();
-  if (!coll) {
+  if (!isDbEnabled()) {
     res.status(503).json({ error: "Trade persistence is not configured (set MONGODB_URI)." });
     return;
   }
 
-  let objectId: InstanceType<typeof ObjectId>;
-  try {
-    objectId = new ObjectId(String(req.params.id));
-  } catch {
+  const id = String(req.params.id);
+  if (!isValidId(id)) {
     res.status(400).json({ error: "Invalid trade id." });
     return;
   }
 
   try {
-    const trade = await coll.findOne({ _id: objectId });
+    const trade = await Trade.findById(id);
     if (!trade) {
       res.status(404).json({ error: "Trade not found." });
       return;
     }
     if (trade.status === "closed") {
-      res.json({ trade: serializeTrade(trade) });
+      res.json({ trade: serializeTrade(trade.toObject() as TradeRecord) });
       return;
     }
     if (!kite.getAccessToken()) {
@@ -734,30 +732,14 @@ app.post("/api/trades/:id/close", requireAdmin, async (req: Request, res: Respon
       trade.lot_size *
       ((curBuy - trade.buy.entry) + (trade.sell.entry - curSell));
 
-    const closedAt = new Date();
-    await coll.updateOne(
-      { _id: objectId },
-      {
-        $set: {
-          status: "closed",
-          closed_at: closedAt,
-          close_pnl: pnl,
-          buy_close: curBuy,
-          sell_close: curSell,
-        },
-      },
-    );
+    trade.status = "closed";
+    trade.closed_at = new Date();
+    trade.close_pnl = pnl;
+    trade.buy_close = curBuy;
+    trade.sell_close = curSell;
+    await trade.save();
 
-    res.json({
-      trade: serializeTrade({
-        ...trade,
-        status: "closed",
-        closed_at: closedAt,
-        close_pnl: pnl,
-        buy_close: curBuy,
-        sell_close: curSell,
-      }),
-    });
+    res.json({ trade: serializeTrade(trade.toObject() as TradeRecord) });
   } catch (err) {
     sendError(res, err);
   }
