@@ -2,7 +2,10 @@ import { MongoClient, ObjectId } from "mongodb";
 import type { Collection, Db } from "mongodb";
 
 const MONGODB_URI = process.env.MONGODB_URI ?? "";
-const DB_NAME = process.env.MONGODB_DB ?? "cal_spread";
+// Optional override; if unset we use the database embedded in the connection
+// string (e.g. mongodb+srv://.../myDb). Falls back to "cal_spread" only when
+// the URI has no database path.
+const DB_NAME = process.env.MONGODB_DB ?? "";
 
 let client: MongoClient | null = null;
 let db: Db | null = null;
@@ -42,9 +45,11 @@ export async function initDb(): Promise<void> {
   try {
     client = new MongoClient(MONGODB_URI);
     await client.connect();
-    db = client.db(DB_NAME);
+    // Use the DB from the connection string when no override is given.
+    // client.db() with no arg uses the URI's default database.
+    db = DB_NAME ? client.db(DB_NAME) : client.db();
     await tradesCollection()?.createIndex({ opened_at: -1 });
-    console.log(`Connected to MongoDB (database "${DB_NAME}").`);
+    console.log(`Connected to MongoDB (database "${db.databaseName}").`);
   } catch (err) {
     console.error("Failed to connect to MongoDB:", err);
     db = null;
