@@ -437,7 +437,9 @@ app.get("/api/dividends", async (_req: Request, res: Response) => {
       return;
     }
     const all = await getAllInstrumentsCached();
-    const symbols = deriveFnoBoard(all).map((b) => b.symbol);
+    const symbols = deriveFnoBoard(all)
+      .filter((b) => !b.is_index) // indices have no Yahoo dividend yield
+      .map((b) => b.symbol);
     const yields = await getDividendYields(symbols);
     dividendCache = { at: Date.now(), data: yields };
     res.json({ yields, cachedAt: dividendCache.at });
@@ -477,12 +479,24 @@ interface BoardItem {
   name: string;
   spot_token: number;
   futures: BoardFuture[];
+  is_index?: boolean;
 }
+
+// F&O index underlyings (as they appear on NFO futures `name`) mapped to their
+// NSE spot index tradingsymbol (in the INDICES segment of the instrument dump).
+const INDEX_SPOT_MAP: Record<string, string> = {
+  NIFTY: "NIFTY 50",
+  BANKNIFTY: "NIFTY BANK",
+  FINNIFTY: "NIFTY FIN SERVICE",
+  MIDCPNIFTY: "NIFTY MID SELECT",
+  NIFTYNXT50: "NIFTY NEXT 50",
+};
 
 /** Build the full F&O board: each underlying with its spot + 3 nearest futures. */
 function deriveFnoBoard(all: Instrument[]): BoardItem[] {
   const futuresByUnderlying = new Map<string, Instrument[]>();
   const eqBySymbol = new Map<string, Instrument>();
+  const indexBySymbol = new Map<string, Instrument>();
 
   for (const i of all) {
     if (i.exchange === "NFO" && i.instrument_type === "FUT" && i.name) {
@@ -491,13 +505,16 @@ function deriveFnoBoard(all: Instrument[]): BoardItem[] {
       futuresByUnderlying.set(i.name, arr);
     } else if (i.exchange === "NSE" && i.instrument_type === "EQ") {
       eqBySymbol.set(i.tradingsymbol, i);
+    } else if (i.segment === "INDICES") {
+      // Spot index instruments (e.g. "NIFTY 50", "NIFTY BANK").
+      indexBySymbol.set(i.tradingsymbol, i);
     }
   }
 
-  const out: BoardItem[] = [];
+  const stocks: BoardItem[] = [];
+  const indices: BoardItem[] = [];
+
   for (const [symbol, futs] of futuresByUnderlying) {
-    const eq = eqBySymbol.get(symbol);
-    if (!eq) continue; // skip indices (no NSE equity)
     const futures = futs
       .sort((a, b) => a.expiry.localeCompare(b.expiry))
       .slice(0, 3)
@@ -506,15 +523,37 @@ function deriveFnoBoard(all: Instrument[]): BoardItem[] {
         expiry: f.expiry,
         lot_size: f.lot_size,
       }));
-    out.push({
-      symbol,
-      name: eq.name,
-      spot_token: eq.instrument_token,
-      futures,
-    });
+
+    const eq = eqBySymbol.get(symbol);
+    if (eq) {
+      stocks.push({
+        symbol,
+        name: eq.name,
+        spot_token: eq.instrument_token,
+        futures,
+      });
+      continue;
+    }
+
+    // Not an equity — try to resolve it as an index underlying.
+    const indexTradingSymbol = INDEX_SPOT_MAP[symbol];
+    const idx = indexTradingSymbol ? indexBySymbol.get(indexTradingSymbol) : undefined;
+    if (idx) {
+      indices.push({
+        symbol,
+        name: idx.tradingsymbol, // e.g. "NIFTY 50"
+        spot_token: idx.instrument_token,
+        futures,
+        is_index: true,
+      });
+    }
+    // else: unknown underlying with no spot → skip
   }
-  out.sort((a, b) => a.symbol.localeCompare(b.symbol));
-  return out;
+
+  stocks.sort((a, b) => a.symbol.localeCompare(b.symbol));
+  indices.sort((a, b) => a.symbol.localeCompare(b.symbol));
+  // Indices first, then stocks alphabetically.
+  return [...indices, ...stocks];
 }
 
 interface FnoStock extends Instrument {
