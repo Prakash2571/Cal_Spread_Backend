@@ -448,6 +448,41 @@ app.get("/api/dividends", async (_req: Request, res: Response) => {
   }
 });
 
+// --- Debug: inspect how indices are detected (helps diagnose deployments). ---
+app.get("/api/debug/indices", async (_req: Request, res: Response) => {
+  try {
+    const all = await getAllInstrumentsCached();
+    const indexInstruments = all
+      .filter((i) => i.segment === "INDICES")
+      .map((i) => i.tradingsymbol);
+    const futNames = new Set(
+      all
+        .filter((i) => i.exchange === "NFO" && i.instrument_type === "FUT")
+        .map((i) => i.name),
+    );
+    const resolved = Object.entries(INDEX_SPOT_MAP).map(([underlying, spot]) => ({
+      underlying,
+      hasFutures: futNames.has(underlying),
+      spotSymbol: spot,
+      spotFound: indexInstruments.includes(spot),
+    }));
+    const board = deriveFnoBoard(all);
+    res.json({
+      totalIndexInstruments: indexInstruments.length,
+      sampleIndexTradingSymbols: indexInstruments.slice(0, 25),
+      resolved,
+      indexRowsInBoard: board.filter((b) => b.is_index).map((b) => ({
+        symbol: b.symbol,
+        name: b.name,
+        futures: b.futures.length,
+      })),
+      totalBoardRows: board.length,
+    });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
 // --- F&O board: every F&O stock with its spot token + 3 nearest futures,
 // so the frontend can render them all stacked and stream every token live. ---
 app.get("/api/fno-board", async (req: Request, res: Response) => {
@@ -503,11 +538,12 @@ function deriveFnoBoard(all: Instrument[]): BoardItem[] {
       const arr = futuresByUnderlying.get(i.name) ?? [];
       arr.push(i);
       futuresByUnderlying.set(i.name, arr);
+    } else if (i.segment === "INDICES") {
+      // Spot index instruments (e.g. "NIFTY 50", "NIFTY BANK"). Checked BEFORE
+      // the equity branch because indices may also carry instrument_type "EQ".
+      indexBySymbol.set(i.tradingsymbol, i);
     } else if (i.exchange === "NSE" && i.instrument_type === "EQ") {
       eqBySymbol.set(i.tradingsymbol, i);
-    } else if (i.segment === "INDICES") {
-      // Spot index instruments (e.g. "NIFTY 50", "NIFTY BANK").
-      indexBySymbol.set(i.tradingsymbol, i);
     }
   }
 
