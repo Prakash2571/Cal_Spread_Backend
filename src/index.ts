@@ -592,14 +592,14 @@ app.get("/api/history/:symbol", async (req: Request, res: Response) => {
     const futures: {
       token: number;
       expiry: string;
-      points: { date: string; oi: number }[];
+      points: { date: string; oi: number; close: number }[];
     }[] = [];
     for (const f of item.futures) {
       const candles = await kite.getHistoricalOi(f.token, fmtDate(from), fmtDate(to));
       futures.push({
         token: f.token,
         expiry: f.expiry,
-        points: candles.map((c) => ({ date: c.date, oi: c.oi })),
+        points: candles.map((c) => ({ date: c.date, oi: c.oi, close: c.close })),
       });
     }
 
