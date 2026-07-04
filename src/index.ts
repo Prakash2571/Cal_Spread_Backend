@@ -551,8 +551,16 @@ app.get("/api/debug/indices", async (_req: Request, res: Response) => {
 // --- Historical daily open interest (last ~1 month) for a symbol's futures. ---
 // Returns each future's closing OI per trading day, for the detail-page chart.
 // PUBLIC (needs a Zerodha session + historical-data subscription).
-const historyCache = new Map<string, { at: number; data: unknown }>();
-const HISTORY_TTL_MS = 1000 * 60 * 30; // 30 min
+//
+// Daily closing OI is fixed for a given calendar day, so we cache per symbol
+// for the whole trading day (IST) and only refetch once the date rolls over.
+const historyCache = new Map<string, { day: string; data: unknown }>();
+
+/** Current calendar day in IST (UTC+5:30) as YYYY-MM-DD. */
+function istDayKey(): string {
+  const ist = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+  return ist.toISOString().slice(0, 10);
+}
 
 app.get("/api/history/:symbol", async (req: Request, res: Response) => {
   if (!kite.getAccessToken()) {
@@ -561,8 +569,9 @@ app.get("/api/history/:symbol", async (req: Request, res: Response) => {
   }
   const symbol = String(req.params.symbol).toUpperCase();
 
+  const today = istDayKey();
   const cached = historyCache.get(symbol);
-  if (cached && Date.now() - cached.at < HISTORY_TTL_MS) {
+  if (cached && cached.day === today) {
     res.json(cached.data);
     return;
   }
@@ -600,7 +609,7 @@ app.get("/api/history/:symbol", async (req: Request, res: Response) => {
       is_index: !!item.is_index,
       futures,
     };
-    historyCache.set(symbol, { at: Date.now(), data });
+    historyCache.set(symbol, { day: today, data });
     res.json(data);
   } catch (err) {
     sendError(res, err);
