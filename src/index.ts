@@ -616,6 +616,68 @@ app.get("/api/history/:symbol", async (req: Request, res: Response) => {
   }
 });
 
+// --- Hourly closing price for the last ~1 week, per future. Cached per day. ---
+const intradayCache = new Map<string, { day: string; data: unknown }>();
+
+app.get("/api/intraday/:symbol", async (req: Request, res: Response) => {
+  if (!kite.getAccessToken()) {
+    res.status(401).json({ error: "Historical data requires a Zerodha login." });
+    return;
+  }
+  const symbol = String(req.params.symbol).toUpperCase();
+
+  const today = istDayKey();
+  const cached = intradayCache.get(symbol);
+  if (cached && cached.day === today) {
+    res.json(cached.data);
+    return;
+  }
+
+  try {
+    const all = await getAllInstrumentsCached();
+    const item = deriveFnoBoard(all).find((b) => b.symbol.toUpperCase() === symbol);
+    if (!item) {
+      res.status(404).json({ error: `No F&O instrument found for "${symbol}".` });
+      return;
+    }
+
+    const to = new Date();
+    const from = new Date();
+    from.setDate(from.getDate() - 7);
+    const fmtDate = (d: Date) => d.toISOString().slice(0, 10);
+
+    const futures: {
+      token: number;
+      expiry: string;
+      points: { t: string; close: number }[];
+    }[] = [];
+    for (const f of item.futures) {
+      const candles = await kite.getHistorical(
+        f.token,
+        fmtDate(from),
+        fmtDate(to),
+        "60minute",
+      );
+      futures.push({
+        token: f.token,
+        expiry: f.expiry,
+        points: candles.map((c) => ({ t: c.t, close: c.close })),
+      });
+    }
+
+    const data = {
+      symbol: item.symbol,
+      name: item.name,
+      is_index: !!item.is_index,
+      futures,
+    };
+    intradayCache.set(symbol, { day: today, data });
+    res.json(data);
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
 // --- F&O board: every F&O stock with its spot token + 3 nearest futures,
 // so the frontend can render them all stacked and stream every token live. ---
 app.get("/api/fno-board", async (req: Request, res: Response) => {

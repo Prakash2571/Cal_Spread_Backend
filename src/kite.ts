@@ -345,6 +345,38 @@ export class KiteClient {
   }
 
   /**
+   * Historical candles at any interval (e.g. "60minute" for hourly).
+   * Returns the full timestamp + close price per candle.
+   */
+  async getHistorical(
+    token: number,
+    from: string,
+    to: string,
+    interval: string,
+  ): Promise<{ t: string; close: number }[]> {
+    const url =
+      `${KITE_API_ROOT}/instruments/historical/${token}/${interval}` +
+      `?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
+    const res = await fetch(url, { headers: this.authHeader() });
+    const json = (await res.json()) as {
+      status: string;
+      data?: { candles?: unknown[][] };
+      message?: string;
+    };
+    if (!res.ok || json.status !== "success" || !json.data?.candles) {
+      if (res.status === 401 || res.status === 403) this.clearSession();
+      throw new KiteError(
+        json.message ?? `Failed to fetch historical data (HTTP ${res.status}).`,
+        res.status || 500,
+      );
+    }
+    return json.data.candles.map((c) => ({
+      t: String(c[0] ?? ""),
+      close: Number(c[4] ?? 0),
+    }));
+  }
+
+  /**
    *
    * The instruments master is a static daily file. We try WITHOUT an access
    * token first (so you can get the stock list with no login). If Zerodha
