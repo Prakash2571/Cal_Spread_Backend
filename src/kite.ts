@@ -312,6 +312,39 @@ export class KiteClient {
   }
 
   /**
+   * Historical daily candles WITH open interest (oi=1) for one instrument.
+   * Returns the day's close price and closing open interest per trading day.
+   * `from`/`to` are "yyyy-mm-dd". Requires the historical-data subscription.
+   */
+  async getHistoricalOi(
+    token: number,
+    from: string,
+    to: string,
+  ): Promise<{ date: string; close: number; oi: number }[]> {
+    const url =
+      `${KITE_API_ROOT}/instruments/historical/${token}/day` +
+      `?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&oi=1`;
+    const res = await fetch(url, { headers: this.authHeader() });
+    const json = (await res.json()) as {
+      status: string;
+      data?: { candles?: unknown[][] };
+      message?: string;
+    };
+    if (!res.ok || json.status !== "success" || !json.data?.candles) {
+      if (res.status === 401 || res.status === 403) this.clearSession();
+      throw new KiteError(
+        json.message ?? `Failed to fetch historical data (HTTP ${res.status}).`,
+        res.status || 500,
+      );
+    }
+    return json.data.candles.map((c) => ({
+      date: String(c[0] ?? "").slice(0, 10),
+      close: Number(c[4] ?? 0),
+      oi: Number(c[6] ?? 0),
+    }));
+  }
+
+  /**
    *
    * The instruments master is a static daily file. We try WITHOUT an access
    * token first (so you can get the stock list with no login). If Zerodha

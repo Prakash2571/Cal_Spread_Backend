@@ -548,6 +548,65 @@ app.get("/api/debug/indices", async (_req: Request, res: Response) => {
   }
 });
 
+// --- Historical daily open interest (last ~1 month) for a symbol's futures. ---
+// Returns each future's closing OI per trading day, for the detail-page chart.
+// PUBLIC (needs a Zerodha session + historical-data subscription).
+const historyCache = new Map<string, { at: number; data: unknown }>();
+const HISTORY_TTL_MS = 1000 * 60 * 30; // 30 min
+
+app.get("/api/history/:symbol", async (req: Request, res: Response) => {
+  if (!kite.getAccessToken()) {
+    res.status(401).json({ error: "Historical data requires a Zerodha login." });
+    return;
+  }
+  const symbol = String(req.params.symbol).toUpperCase();
+
+  const cached = historyCache.get(symbol);
+  if (cached && Date.now() - cached.at < HISTORY_TTL_MS) {
+    res.json(cached.data);
+    return;
+  }
+
+  try {
+    const all = await getAllInstrumentsCached();
+    const item = deriveFnoBoard(all).find((b) => b.symbol.toUpperCase() === symbol);
+    if (!item) {
+      res.status(404).json({ error: `No F&O instrument found for "${symbol}".` });
+      return;
+    }
+
+    const to = new Date();
+    const from = new Date();
+    from.setMonth(from.getMonth() - 1);
+    const fmtDate = (d: Date) => d.toISOString().slice(0, 10);
+
+    const futures: {
+      token: number;
+      expiry: string;
+      points: { date: string; oi: number }[];
+    }[] = [];
+    for (const f of item.futures) {
+      const candles = await kite.getHistoricalOi(f.token, fmtDate(from), fmtDate(to));
+      futures.push({
+        token: f.token,
+        expiry: f.expiry,
+        points: candles.map((c) => ({ date: c.date, oi: c.oi })),
+      });
+    }
+
+    const data = {
+      symbol: item.symbol,
+      name: item.name,
+      is_index: !!item.is_index,
+      futures,
+    };
+    historyCache.set(symbol, { at: Date.now(), data });
+    res.json(data);
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
 // --- F&O board: every F&O stock with its spot token + 3 nearest futures,
 // so the frontend can render them all stacked and stream every token live. ---
 app.get("/api/fno-board", async (req: Request, res: Response) => {
