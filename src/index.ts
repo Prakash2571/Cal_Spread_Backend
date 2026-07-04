@@ -12,6 +12,8 @@ import type { ITrade, TradeRecord } from "./db.js";
 const PORT = Number(process.env.PORT ?? 3001);
 const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
 const ADMIN_SECRET = process.env.ADMIN_SECRET ?? "";
+// Separate password for the trade-only access route (/admin/access).
+const ACCESS_SECRET = process.env.ACCESS_SECRET ?? "";
 
 const kite = new KiteClient({
   apiKey: process.env.KITE_API_KEY ?? "",
@@ -25,28 +27,51 @@ const tickerHub = new TickerHub(
   () => kite.clearSession(),
 );
 
-// In-memory store for admin sessions (token -> expiry timestamp)
-const adminSessions = new Map<string, number>();
+// In-memory store for admin sessions (token -> { expiry, role }).
+// "full"  = full admin (Zerodha connect + trades), via /admin/verify
+// "trade" = trade-only access (view/take/close trades), via /admin/access
+type AdminRole = "full" | "trade";
+interface AdminSession {
+  expiry: number;
+  role: AdminRole;
+}
+const adminSessions = new Map<string, AdminSession>();
 const ADMIN_SESSION_TTL_MS = 1000 * 60 * 60 * 24; // 24 hours
 
 function generateAdminToken(): string {
   return Math.random().toString(36).substring(2) + Date.now().toString(36);
 }
 
-function isAdminAuthenticated(token: string | undefined): boolean {
-  if (!token) return false;
-  const expiry = adminSessions.get(token);
-  if (!expiry || Date.now() > expiry) {
-    adminSessions.delete(token);
-    return false;
+/** The role of a token, or null if missing/expired. */
+function getAdminRole(token: string | undefined): AdminRole | null {
+  if (!token) return null;
+  const s = adminSessions.get(token);
+  if (!s || Date.now() > s.expiry) {
+    if (token) adminSessions.delete(token);
+    return null;
   }
-  return true;
+  return s.role;
 }
 
+function isAdminAuthenticated(token: string | undefined): boolean {
+  return getAdminRole(token) !== null;
+}
+
+/** Any admin (full OR trade-access) — used for the shared trade endpoints. */
 function requireAdmin(req: Request, res: Response, next: NextFunction) {
   const token = req.headers["x-admin-token"] as string | undefined;
   if (!isAdminAuthenticated(token)) {
     res.status(403).json({ error: "Admin authentication required" });
+    return;
+  }
+  next();
+}
+
+/** Full admin only — used for Zerodha connect / session / logout. */
+function requireFullAdmin(req: Request, res: Response, next: NextFunction) {
+  const token = req.headers["x-admin-token"] as string | undefined;
+  if (getAdminRole(token) !== "full") {
+    res.status(403).json({ error: "Full admin access required." });
     return;
   }
   next();
@@ -128,19 +153,56 @@ app.post(
   }
   
   const token = generateAdminToken();
-  adminSessions.set(token, Date.now() + ADMIN_SESSION_TTL_MS);
-  
-  res.json({ 
-    success: true, 
+  adminSessions.set(token, { expiry: Date.now() + ADMIN_SESSION_TTL_MS, role: "full" });
+
+  res.json({
+    success: true,
     token,
-    expiresIn: ADMIN_SESSION_TTL_MS 
+    role: "full",
+    expiresIn: ADMIN_SESSION_TTL_MS,
   });
 });
 
-// --- Check admin session status ---
+// --- Trade-access verification (/admin/access): trade-only role. ---
+app.post(
+  "/api/access/verify",
+  rateLimit({
+    windowMs: 5 * 60_000,
+    max: 10,
+    message: "Too many attempts. Try again in a few minutes.",
+  }),
+  (req: Request, res: Response) => {
+    const { secret } = req.body;
+
+    if (!ACCESS_SECRET) {
+      res.status(500).json({ error: "Access secret not configured on server" });
+      return;
+    }
+    if (secret !== ACCESS_SECRET) {
+      res.status(401).json({ error: "Invalid access code" });
+      return;
+    }
+
+    const token = generateAdminToken();
+    adminSessions.set(token, {
+      expiry: Date.now() + ADMIN_SESSION_TTL_MS,
+      role: "trade",
+    });
+
+    res.json({
+      success: true,
+      token,
+      role: "trade",
+      expiresIn: ADMIN_SESSION_TTL_MS,
+    });
+  },
+);
+
+// --- Check admin session status (returns the role too). ---
 app.get("/api/admin/status", (req: Request, res: Response) => {
   const token = req.headers["x-admin-token"] as string | undefined;
-  res.json({ authenticated: isAdminAuthenticated(token) });
+  const role = getAdminRole(token);
+  res.json({ authenticated: role !== null, role });
 });
 
 // --- Step 1: send the user to Zerodha's login page ---
@@ -150,8 +212,8 @@ app.get(["/login", "/api/login"], (req: Request, res: Response) => {
   // Accept admin token from query param (browser navigation can't send headers)
   const tokenFromQuery = req.query["x-admin-token"] as string | undefined;
   const tokenFromHeader = req.headers["x-admin-token"] as string | undefined;
-  if (!isAdminAuthenticated(tokenFromQuery || tokenFromHeader)) {
-    res.status(403).json({ error: "Admin authentication required" });
+  if (getAdminRole(tokenFromQuery || tokenFromHeader) !== "full") {
+    res.status(403).json({ error: "Full admin access required." });
     return;
   }
   res.redirect(kite.getLoginUrl());
@@ -160,7 +222,7 @@ app.get(["/login", "/api/login"], (req: Request, res: Response) => {
 // --- Step 2/3 (frontend-driven): the frontend receives the request_token at
 // its registered redirect URL (e.g. http://localhost:5173/zerodha/verify)
 // and POSTs it here so the backend can do the secret checksum exchange. ---
-app.post("/api/session", requireAdmin, async (req: Request, res: Response) => {
+app.post("/api/session", requireFullAdmin, async (req: Request, res: Response) => {
   const requestToken = String(req.body?.request_token ?? "");
   if (!requestToken) {
     res.status(400).json({ error: "Missing request_token." });
@@ -205,8 +267,8 @@ app.get("/callback", async (req: Request, res: Response) => {
   }
 });
 
-// --- Logout: forget the stored Kite session. ---
-app.post("/api/logout", (_req: Request, res: Response) => {
+// --- Logout: forget the stored Kite session (full admin only). ---
+app.post("/api/logout", requireFullAdmin, (_req: Request, res: Response) => {
   kite.clearSession();
   res.json({ authenticated: false });
 });
