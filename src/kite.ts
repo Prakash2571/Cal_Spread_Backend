@@ -61,6 +61,23 @@ interface RawFullQuote {
   oi?: number;
 }
 
+/** Raw /quote entry including market depth (best bid/ask). */
+interface RawDepthQuote {
+  instrument_token: number;
+  last_price?: number;
+  depth?: {
+    buy?: { price?: number }[];
+    sell?: { price?: number }[];
+  };
+}
+
+/** Best-bid / best-ask (plus last) for an instrument. */
+export interface QuoteDepth {
+  last: number;
+  bid: number; // best bid (you SELL into this)
+  ask: number; // best ask (you BUY at this)
+}
+
 /** One order line for the basket-margin request. */
 export interface BasketOrder {
   exchange: string;
@@ -273,6 +290,42 @@ export class KiteClient {
             close: v.ohlc?.close ?? 0,
             oi: v.oi ?? 0,
           });
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Best bid/ask (market depth) per instrument, keyed by instrument_token.
+   * Used to fill trades realistically: buy at ask, sell at bid.
+   */
+  async getQuoteDepth(identifiers: string[]): Promise<Map<number, QuoteDepth>> {
+    const out = new Map<number, QuoteDepth>();
+    for (let i = 0; i < identifiers.length; i += 500) {
+      const chunk = identifiers.slice(i, i + 500);
+      const qs = chunk.map((id) => `i=${encodeURIComponent(id)}`).join("&");
+      const res = await fetch(`${KITE_API_ROOT}/quote?${qs}`, {
+        headers: this.authHeader(),
+      });
+      const json = (await res.json()) as {
+        status: string;
+        data?: Record<string, RawDepthQuote>;
+        message?: string;
+      };
+      if (!res.ok || json.status !== "success" || !json.data) {
+        if (res.status === 401 || res.status === 403) this.clearSession();
+        throw new KiteError(
+          json.message ?? `Failed to fetch quotes (HTTP ${res.status}).`,
+          res.status || 500,
+        );
+      }
+      for (const v of Object.values(json.data)) {
+        if (v && typeof v.instrument_token === "number") {
+          const last = v.last_price ?? 0;
+          const bid = v.depth?.buy?.[0]?.price ?? last;
+          const ask = v.depth?.sell?.[0]?.price ?? last;
+          out.set(v.instrument_token, { last, bid, ask });
         }
       }
     }

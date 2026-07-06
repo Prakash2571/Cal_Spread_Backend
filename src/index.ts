@@ -568,6 +568,24 @@ function istDateTime(d: Date): string {
   return ist.toISOString().slice(0, 19).replace("T", " ");
 }
 
+/** True during NSE market hours: Mon–Fri, 09:15–15:30 IST. */
+function isMarketOpen(): boolean {
+  const ist = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+  const day = ist.getUTCDay(); // 0 Sun … 6 Sat (on the IST-shifted date)
+  if (day === 0 || day === 6) return false;
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 30;
+}
+
+/** Build a token -> "EXCHANGE:TRADINGSYMBOL" resolver from the instrument dump. */
+function makeIdResolver(all: Instrument[]): (token: number) => string | null {
+  const byToken = new Map<number, string>();
+  for (const inst of all) {
+    byToken.set(inst.instrument_token, `${inst.exchange}:${inst.tradingsymbol}`);
+  }
+  return (token: number) => byToken.get(token) ?? null;
+}
+
 app.get("/api/history/:symbol", async (req: Request, res: Response) => {
   if (!kite.getAccessToken()) {
     res.status(401).json({ error: "Historical data requires a Zerodha login." });
@@ -745,6 +763,59 @@ app.get("/api/minute/:symbol", async (req: Request, res: Response) => {
   }
 });
 
+// --- 5-minute closing price for the current day, per future (5-min cache). ---
+const fiveMinCache = new Map<string, { at: number; data: unknown }>();
+const FIVEMIN_TTL_MS = 5 * 60 * 1000;
+
+app.get("/api/fivemin/:symbol", async (req: Request, res: Response) => {
+  if (!kite.getAccessToken()) {
+    res.status(401).json({ error: "Historical data requires a Zerodha login." });
+    return;
+  }
+  const symbol = String(req.params.symbol).toUpperCase();
+
+  const cached = fiveMinCache.get(symbol);
+  if (cached && Date.now() - cached.at < FIVEMIN_TTL_MS) {
+    res.json(cached.data);
+    return;
+  }
+
+  try {
+    const all = await getAllInstrumentsCached();
+    const item = deriveFnoBoard(all).find((b) => b.symbol.toUpperCase() === symbol);
+    if (!item) {
+      res.status(404).json({ error: `No F&O instrument found for "${symbol}".` });
+      return;
+    }
+
+    const today = istDayKey();
+    const futures: {
+      token: number;
+      expiry: string;
+      points: { t: string; close: number }[];
+    }[] = [];
+    for (const f of item.futures) {
+      const candles = await kite.getHistorical(f.token, today, today, "5minute");
+      futures.push({
+        token: f.token,
+        expiry: f.expiry,
+        points: candles.map((c) => ({ t: c.t, close: c.close })),
+      });
+    }
+
+    const data = {
+      symbol: item.symbol,
+      name: item.name,
+      is_index: !!item.is_index,
+      futures,
+    };
+    fiveMinCache.set(symbol, { at: Date.now(), data });
+    res.json(data);
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
 // --- F&O board: every F&O stock with its spot token + 3 nearest futures,
 // so the frontend can render them all stacked and stream every token live. ---
 app.get("/api/fno-board", async (req: Request, res: Response) => {
@@ -770,22 +841,6 @@ app.get("/api/fno-board", async (req: Request, res: Response) => {
 //  A trade BUYS the discount leg and SELLS the premium leg, using the current
 //  and next month futures, for exactly 1 lot.
 // ============================================================================
-
-/** Fetch a snapshot of last prices for the given tokens (token -> last_price). */
-async function snapshotPrices(tokens: number[]): Promise<Map<number, number>> {
-  const all = await getAllInstrumentsCached();
-  const idByToken = new Map<number, string>();
-  for (const inst of all) {
-    idByToken.set(inst.instrument_token, `${inst.exchange}:${inst.tradingsymbol}`);
-  }
-  const identifiers = tokens
-    .map((t) => idByToken.get(t))
-    .filter((s): s is string => typeof s === "string");
-  const quotes = await kite.getQuoteOhlc(identifiers);
-  const out = new Map<number, number>();
-  for (const q of quotes) out.set(q.instrument_token, q.last_price);
-  return out;
-}
 
 /** Serialize a trade record to the API shape (string id, ISO dates). */
 function serializeTrade(doc: TradeRecord) {
@@ -815,6 +870,12 @@ app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
   }
   if (!kite.getAccessToken()) {
     res.status(401).json({ error: "Connect to Zerodha before taking a trade." });
+    return;
+  }
+  if (!isMarketOpen()) {
+    res.status(400).json({
+      error: "Trades can only be taken during market hours (Mon–Fri, 9:15–15:30 IST).",
+    });
     return;
   }
 
@@ -848,28 +909,37 @@ app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
       return;
     }
 
-    const prices = await snapshotPrices([item.spot_token, current.token, next.token]);
-    const spot = prices.get(item.spot_token);
-    const priceCurrent = prices.get(current.token);
-    const priceNext = prices.get(next.token);
+    const resolveId = makeIdResolver(all);
+    const ids = [item.spot_token, current.token, next.token]
+      .map(resolveId)
+      .filter((s): s is string => typeof s === "string");
+    const depth = await kite.getQuoteDepth(ids);
 
-    if (!spot || !priceCurrent || !priceNext) {
+    const spot = depth.get(item.spot_token)?.last;
+    const curD = depth.get(current.token);
+    const nextD = depth.get(next.token);
+
+    if (!spot || !curD || !nextD) {
       res.status(502).json({
         error: "Could not fetch live prices for all legs right now. Try again shortly.",
       });
       return;
     }
 
-    // Premium/discount vs spot. Buy the leg with the lower premium (cheaper),
-    // sell the leg with the higher premium (richer).
-    const premCurrent = priceCurrent - spot;
-    const premNext = priceNext - spot;
+    // Premium/discount vs spot (using last price). Buy the cheaper (lower
+    // premium) leg, sell the richer one.
+    const premCurrent = curD.last - spot;
+    const premNext = nextD.last - spot;
 
-    const currentLeg = { token: current.token, expiry: current.expiry, price: priceCurrent };
-    const nextLeg = { token: next.token, expiry: next.expiry, price: priceNext };
+    const currentLeg = { token: current.token, expiry: current.expiry, ...curD };
+    const nextLeg = { token: next.token, expiry: next.expiry, ...nextD };
 
     const [buyLeg, sellLeg] =
       premCurrent <= premNext ? [currentLeg, nextLeg] : [nextLeg, currentLeg];
+
+    // Realistic fills: BUY at the best ask, SELL at the best bid.
+    const buyEntry = buyLeg.ask;
+    const sellEntry = sellLeg.bid;
 
     // Look up tradingsymbol + exchange for each leg (needed by the margin API).
     const instByToken = new Map<number, { tradingsymbol: string; exchange: string }>();
@@ -920,8 +990,8 @@ app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
       name: item.name,
       is_index: !!item.is_index,
       lot_size: current.lot_size,
-      buy: { token: buyLeg.token, expiry: buyLeg.expiry, entry: buyLeg.price },
-      sell: { token: sellLeg.token, expiry: sellLeg.expiry, entry: sellLeg.price },
+      buy: { token: buyLeg.token, expiry: buyLeg.expiry, entry: buyEntry },
+      sell: { token: sellLeg.token, expiry: sellLeg.expiry, entry: sellEntry },
       status: "open",
       opened_at: new Date(),
       closed_at: null,
@@ -983,9 +1053,17 @@ app.post("/api/trades/:id/close", requireAdmin, async (req: Request, res: Respon
       return;
     }
 
-    const prices = await snapshotPrices([trade.buy.token, trade.sell.token]);
-    const curBuy = prices.get(trade.buy.token) ?? trade.buy.entry;
-    const curSell = prices.get(trade.sell.token) ?? trade.sell.entry;
+    // Realistic exit: sell the long leg at the best BID, buy back the short
+    // leg at the best ASK.
+    const all = await getAllInstrumentsCached();
+    const resolveId = makeIdResolver(all);
+    const ids = [trade.buy.token, trade.sell.token]
+      .map(resolveId)
+      .filter((s): s is string => typeof s === "string");
+    const depth = await kite.getQuoteDepth(ids);
+
+    const curBuy = depth.get(trade.buy.token)?.bid ?? trade.buy.entry;
+    const curSell = depth.get(trade.sell.token)?.ask ?? trade.sell.entry;
 
     const pnl =
       trade.lot_size *
