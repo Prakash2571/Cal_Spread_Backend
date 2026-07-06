@@ -562,6 +562,12 @@ function istDayKey(): string {
   return ist.toISOString().slice(0, 10);
 }
 
+/** A Date as an IST "YYYY-MM-DD HH:MM:SS" string (Kite expects exchange time). */
+function istDateTime(d: Date): string {
+  const ist = new Date(d.getTime() + 5.5 * 60 * 60 * 1000);
+  return ist.toISOString().slice(0, 19).replace("T", " ");
+}
+
 app.get("/api/history/:symbol", async (req: Request, res: Response) => {
   if (!kite.getAccessToken()) {
     res.status(401).json({ error: "Historical data requires a Zerodha login." });
@@ -672,6 +678,67 @@ app.get("/api/intraday/:symbol", async (req: Request, res: Response) => {
       futures,
     };
     intradayCache.set(symbol, { day: today, data });
+    res.json(data);
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// --- Minute-by-minute closing price for the last 2 hours, per future. ---
+// Short-lived cache (60s) since this is near-real-time intraday data.
+const minuteCache = new Map<string, { at: number; data: unknown }>();
+const MINUTE_TTL_MS = 60 * 1000;
+
+app.get("/api/minute/:symbol", async (req: Request, res: Response) => {
+  if (!kite.getAccessToken()) {
+    res.status(401).json({ error: "Historical data requires a Zerodha login." });
+    return;
+  }
+  const symbol = String(req.params.symbol).toUpperCase();
+
+  const cached = minuteCache.get(symbol);
+  if (cached && Date.now() - cached.at < MINUTE_TTL_MS) {
+    res.json(cached.data);
+    return;
+  }
+
+  try {
+    const all = await getAllInstrumentsCached();
+    const item = deriveFnoBoard(all).find((b) => b.symbol.toUpperCase() === symbol);
+    if (!item) {
+      res.status(404).json({ error: `No F&O instrument found for "${symbol}".` });
+      return;
+    }
+
+    const toD = new Date();
+    const fromD = new Date(Date.now() - 2 * 60 * 60 * 1000);
+
+    const futures: {
+      token: number;
+      expiry: string;
+      points: { t: string; close: number }[];
+    }[] = [];
+    for (const f of item.futures) {
+      const candles = await kite.getHistorical(
+        f.token,
+        istDateTime(fromD),
+        istDateTime(toD),
+        "minute",
+      );
+      futures.push({
+        token: f.token,
+        expiry: f.expiry,
+        points: candles.map((c) => ({ t: c.t, close: c.close })),
+      });
+    }
+
+    const data = {
+      symbol: item.symbol,
+      name: item.name,
+      is_index: !!item.is_index,
+      futures,
+    };
+    minuteCache.set(symbol, { at: Date.now(), data });
     res.json(data);
   } catch (err) {
     sendError(res, err);
