@@ -845,36 +845,34 @@ app.get("/api/fno-board", async (req: Request, res: Response) => {
 // ============================================================================
 
 /**
- * Resolve best bid/ask/last for tokens, preferring the freshest LIVE tick from
- * the WebSocket hub (lowest latency, best for real-time fills) and falling back
- * to a REST quote snapshot for anything the hub doesn't have fresh.
+ * Volume-weighted fill price for a market order of `quantity`, walking the
+ * given order-book side (best level first). This reproduces a real market
+ * order: it fills at the touch when there's enough size, and slips into deeper
+ * levels when the lot is larger than what's available — exactly like a broker.
  */
-async function resolveDepth(
-  tokens: number[],
-): Promise<Map<number, { last: number; bid: number; ask: number }>> {
-  const out = new Map<number, { last: number; bid: number; ask: number }>();
-  const missing: number[] = [];
-  for (const tk of tokens) {
-    const fresh = tickerHub.getFreshDepth(tk);
-    if (fresh && fresh.last > 0 && fresh.bid > 0 && fresh.ask > 0) {
-      out.set(tk, fresh);
-    } else {
-      missing.push(tk);
-    }
+function vwapFill(
+  levels: { price: number; qty: number }[],
+  quantity: number,
+  fallback: number,
+): number {
+  let remaining = quantity;
+  let cost = 0;
+  let filled = 0;
+  for (const lv of levels) {
+    if (remaining <= 0) break;
+    const take = Math.min(remaining, lv.qty);
+    if (take <= 0) continue;
+    cost += take * lv.price;
+    filled += take;
+    remaining -= take;
   }
-  if (missing.length > 0) {
-    const all = await getAllInstrumentsCached();
-    const resolveId = makeIdResolver(all);
-    const ids = missing
-      .map(resolveId)
-      .filter((s): s is string => typeof s === "string");
-    const rest = await kite.getQuoteDepth(ids);
-    for (const tk of missing) {
-      const d = rest.get(tk);
-      if (d) out.set(tk, d);
-    }
+  if (remaining > 0) {
+    // Not enough visible depth — fill the remainder at the deepest known price.
+    const lastPx = levels.length > 0 ? levels[levels.length - 1]!.price : fallback;
+    cost += remaining * lastPx;
+    filled += remaining;
   }
-  return out;
+  return filled > 0 ? cost / filled : fallback;
 }
 
 /** Serialize a trade record to the API shape (string id, ISO dates). */
@@ -944,14 +942,18 @@ app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
       return;
     }
 
-    // Prefer freshest live (WebSocket) bid/ask; fall back to REST snapshot.
-    const depth = await resolveDepth([item.spot_token, current.token, next.token]);
+    // Fetch the live 5-level order book for spot + both legs.
+    const resolveId = makeIdResolver(all);
+    const ids = [item.spot_token, current.token, next.token]
+      .map(resolveId)
+      .filter((s): s is string => typeof s === "string");
+    const ladders = await kite.getQuoteLadder(ids);
 
-    const spot = depth.get(item.spot_token)?.last;
-    const curD = depth.get(current.token);
-    const nextD = depth.get(next.token);
+    const spot = ladders.get(item.spot_token)?.last;
+    const curL = ladders.get(current.token);
+    const nextL = ladders.get(next.token);
 
-    if (!spot || !curD || !nextD) {
+    if (!spot || !curL || !nextL || !curL.last || !nextL.last) {
       res.status(502).json({
         error: "Could not fetch live prices for all legs right now. Try again shortly.",
       });
@@ -960,18 +962,19 @@ app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
 
     // Premium/discount vs spot (using last price). Buy the cheaper (lower
     // premium) leg, sell the richer one.
-    const premCurrent = curD.last - spot;
-    const premNext = nextD.last - spot;
+    const premCurrent = curL.last - spot;
+    const premNext = nextL.last - spot;
 
-    const currentLeg = { token: current.token, expiry: current.expiry, ...curD };
-    const nextLeg = { token: next.token, expiry: next.expiry, ...nextD };
+    const currentLeg = { token: current.token, expiry: current.expiry, ladder: curL };
+    const nextLeg = { token: next.token, expiry: next.expiry, ladder: nextL };
 
     const [buyLeg, sellLeg] =
       premCurrent <= premNext ? [currentLeg, nextLeg] : [nextLeg, currentLeg];
 
-    // Realistic fills: BUY at the best ask, SELL at the best bid.
-    const buyEntry = buyLeg.ask;
-    const sellEntry = sellLeg.bid;
+    // Realistic market-order fills: BUY walks the ask side, SELL walks the bid
+    // side, for the full lot quantity (captures slippage/partial fills).
+    const buyEntry = vwapFill(buyLeg.ladder.asks, current.lot_size, buyLeg.ladder.last);
+    const sellEntry = vwapFill(sellLeg.ladder.bids, current.lot_size, sellLeg.ladder.last);
 
     // Look up tradingsymbol + exchange for each leg (needed by the margin API).
     const instByToken = new Map<number, { tradingsymbol: string; exchange: string }>();
@@ -1085,12 +1088,23 @@ app.post("/api/trades/:id/close", requireAdmin, async (req: Request, res: Respon
       return;
     }
 
-    // Realistic exit off the freshest live bid/ask (REST fallback): sell the
-    // long leg at the best BID, buy back the short leg at the best ASK.
-    const depth = await resolveDepth([trade.buy.token, trade.sell.token]);
+    // Realistic market-order exit walking the live book for the lot: sell the
+    // long leg into the BIDS, buy back the short leg from the ASKS.
+    const all = await getAllInstrumentsCached();
+    const resolveId = makeIdResolver(all);
+    const ids = [trade.buy.token, trade.sell.token]
+      .map(resolveId)
+      .filter((s): s is string => typeof s === "string");
+    const ladders = await kite.getQuoteLadder(ids);
 
-    const curBuy = depth.get(trade.buy.token)?.bid ?? trade.buy.entry;
-    const curSell = depth.get(trade.sell.token)?.ask ?? trade.sell.entry;
+    const buyL = ladders.get(trade.buy.token);
+    const sellL = ladders.get(trade.sell.token);
+    const curBuy = buyL
+      ? vwapFill(buyL.bids, trade.lot_size, buyL.last)
+      : trade.buy.entry;
+    const curSell = sellL
+      ? vwapFill(sellL.asks, trade.lot_size, sellL.last)
+      : trade.sell.entry;
 
     const pnl =
       trade.lot_size *
