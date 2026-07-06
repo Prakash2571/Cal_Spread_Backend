@@ -15,6 +15,8 @@ export interface Tick {
   last_price: number;
   close_price: number;
   oi: number; // open interest (F&O only; 0 for spot/index)
+  bid: number; // best bid (0 if unavailable)
+  ask: number; // best ask (0 if unavailable)
 }
 
 export interface TickerHandle {
@@ -121,13 +123,26 @@ export function parseBinary(buf: ArrayBuffer): Tick[] {
     }
 
     // "full" packets (>= 184 bytes) carry open interest at offset 48 (a count,
-    // not a price, so it is NOT divided).
+    // not a price, so it is NOT divided) plus 5-level market depth from offset
+    // 64: 5 bid packets then 5 ask packets, each 12 bytes (qty, price, ...).
+    // Best bid price = offset 68, best ask price = offset 128.
     let oi = 0;
+    let bid = 0;
+    let ask = 0;
     if (len >= 184) {
       oi = dv.getUint32(offset + 48, false);
+      bid = dv.getUint32(offset + 68, false) / divisor;
+      ask = dv.getUint32(offset + 128, false) / divisor;
     }
 
-    ticks.push({ token, last_price: lastPrice, close_price: closePrice, oi });
+    ticks.push({
+      token,
+      last_price: lastPrice,
+      close_price: closePrice,
+      oi,
+      bid,
+      ask,
+    });
     offset += len;
   }
 

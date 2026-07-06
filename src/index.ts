@@ -439,6 +439,8 @@ app.get("/api/quotes", async (req: Request, res: Response) => {
       last_price: q.last_price,
       close_price: q.close,
       oi: q.oi,
+      bid: 0, // filled by the live full-mode stream
+      ask: 0,
     }));
     quotesCache.set(cacheKey, { at: Date.now(), ticks });
     // Warm the shared hub cache so late-joining SSE clients get instant data.
