@@ -136,14 +136,12 @@ export function parseBinary(buf: ArrayBuffer): Tick[] {
     let oi = 0;
     let bid = 0;
     let ask = 0;
-    let bids: DepthLevel[] | undefined;
-    let asks: DepthLevel[] | undefined;
+    const bids: DepthLevel[] = [];
+    const asks: DepthLevel[] = [];
     if (len >= 184) {
       oi = dv.getUint32(offset + 48, false);
       // Market depth: 5 bid packets (offset 64), then 5 ask packets (offset
       // 124). Each is 12 bytes: qty(4), price(4), orders(2), padding(2).
-      bids = [];
-      asks = [];
       for (let i = 0; i < 5; i++) {
         const bOff = offset + 64 + i * 12;
         const bPrice = dv.getUint32(bOff + 4, false) / divisor;
