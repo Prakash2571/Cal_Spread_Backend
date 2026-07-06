@@ -24,6 +24,8 @@ export class TickerHub {
   private subscribed = new Set<number>();
   /** Last tick seen per token, so new clients get an instant snapshot. */
   private latest = new Map<number, Tick>();
+  /** When each token's live tick was last received (for freshness checks). */
+  private latestAt = new Map<number, number>();
 
   constructor(
     private getCreds: () => HubCreds,
@@ -85,8 +87,26 @@ export class TickerHub {
     }
   }
 
+  /**
+   * Freshest live bid/ask/last for a token from the WebSocket stream, or null
+   * if we have no recent (within maxAgeMs) live tick. Used for real-time fills.
+   */
+  getFreshDepth(
+    token: number,
+    maxAgeMs = 5000,
+  ): { last: number; bid: number; ask: number } | null {
+    const t = this.latest.get(token);
+    const at = this.latestAt.get(token);
+    if (!t || at === undefined || Date.now() - at > maxAgeMs) return null;
+    return { last: t.last_price, bid: t.bid, ask: t.ask };
+  }
+
   private broadcast(ticks: Tick[]): void {
-    for (const t of ticks) this.latest.set(t.token, t);
+    const now = Date.now();
+    for (const t of ticks) {
+      this.latest.set(t.token, t);
+      this.latestAt.set(t.token, now);
+    }
     const payload = `data: ${JSON.stringify(ticks)}\n\n`;
     for (const client of this.clients) {
       try {
