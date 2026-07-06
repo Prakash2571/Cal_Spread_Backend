@@ -1,5 +1,10 @@
 import type { Response } from "express";
-import { connectTicker, type Tick, type TickerHandle } from "./ticker.js";
+import {
+  connectTicker,
+  type Tick,
+  type TickerHandle,
+  type DepthLevel,
+} from "./ticker.js";
 
 /**
  * A single shared Kite WebSocket that fans out ticks to every connected SSE
@@ -26,6 +31,12 @@ export class TickerHub {
   private latest = new Map<number, Tick>();
   /** When each token's live tick was last received (for freshness checks). */
   private latestAt = new Map<number, number>();
+  /** Latest full order book per token (kept internal, not broadcast). */
+  private latestLadder = new Map<
+    number,
+    { last: number; bids: DepthLevel[]; asks: DepthLevel[] }
+  >();
+  private latestLadderAt = new Map<number, number>();
 
   constructor(
     private getCreds: () => HubCreds,
@@ -91,23 +102,43 @@ export class TickerHub {
    * Freshest live bid/ask/last for a token from the WebSocket stream, or null
    * if we have no recent (within maxAgeMs) live tick. Used for real-time fills.
    */
-  getFreshDepth(
+  /** Freshest live full order book for a token (for real-time fills). */
+  getFreshLadder(
     token: number,
     maxAgeMs = 5000,
-  ): { last: number; bid: number; ask: number } | null {
-    const t = this.latest.get(token);
-    const at = this.latestAt.get(token);
-    if (!t || at === undefined || Date.now() - at > maxAgeMs) return null;
-    return { last: t.last_price, bid: t.bid, ask: t.ask };
+  ): { last: number; bids: DepthLevel[]; asks: DepthLevel[] } | null {
+    const l = this.latestLadder.get(token);
+    const at = this.latestLadderAt.get(token);
+    if (!l || at === undefined || Date.now() - at > maxAgeMs) return null;
+    return l;
   }
 
   private broadcast(ticks: Tick[]): void {
     const now = Date.now();
+    // Slim payload for clients (no depth arrays); keep the full ladder internal.
+    const slim: Tick[] = [];
     for (const t of ticks) {
-      this.latest.set(t.token, t);
+      const s: Tick = {
+        token: t.token,
+        last_price: t.last_price,
+        close_price: t.close_price,
+        oi: t.oi,
+        bid: t.bid,
+        ask: t.ask,
+      };
+      this.latest.set(t.token, s);
       this.latestAt.set(t.token, now);
+      if (t.bids && t.asks && (t.bids.length > 0 || t.asks.length > 0)) {
+        this.latestLadder.set(t.token, {
+          last: t.last_price,
+          bids: t.bids,
+          asks: t.asks,
+        });
+        this.latestLadderAt.set(t.token, now);
+      }
+      slim.push(s);
     }
-    const payload = `data: ${JSON.stringify(ticks)}\n\n`;
+    const payload = `data: ${JSON.stringify(slim)}\n\n`;
     for (const client of this.clients) {
       try {
         client.res.write(payload);

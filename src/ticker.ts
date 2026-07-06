@@ -10,6 +10,11 @@
 
 const WS_ROOT = "wss://ws.kite.trade";
 
+export interface DepthLevel {
+  price: number;
+  qty: number;
+}
+
 export interface Tick {
   token: number;
   last_price: number;
@@ -17,6 +22,8 @@ export interface Tick {
   oi: number; // open interest (F&O only; 0 for spot/index)
   bid: number; // best bid (0 if unavailable)
   ask: number; // best ask (0 if unavailable)
+  bids?: DepthLevel[]; // up to 5 levels (full mode only)
+  asks?: DepthLevel[];
 }
 
 export interface TickerHandle {
@@ -129,10 +136,24 @@ export function parseBinary(buf: ArrayBuffer): Tick[] {
     let oi = 0;
     let bid = 0;
     let ask = 0;
+    let bids: DepthLevel[] | undefined;
+    let asks: DepthLevel[] | undefined;
     if (len >= 184) {
       oi = dv.getUint32(offset + 48, false);
-      bid = dv.getUint32(offset + 68, false) / divisor;
-      ask = dv.getUint32(offset + 128, false) / divisor;
+      // Market depth: 5 bid packets (offset 64), then 5 ask packets (offset
+      // 124). Each is 12 bytes: qty(4), price(4), orders(2), padding(2).
+      bids = [];
+      asks = [];
+      for (let i = 0; i < 5; i++) {
+        const bOff = offset + 64 + i * 12;
+        const bPrice = dv.getUint32(bOff + 4, false) / divisor;
+        if (bPrice > 0) bids.push({ price: bPrice, qty: dv.getUint32(bOff, false) });
+        const aOff = offset + 124 + i * 12;
+        const aPrice = dv.getUint32(aOff + 4, false) / divisor;
+        if (aPrice > 0) asks.push({ price: aPrice, qty: dv.getUint32(aOff, false) });
+      }
+      bid = bids[0]?.price ?? 0;
+      ask = asks[0]?.price ?? 0;
     }
 
     ticks.push({
@@ -142,6 +163,8 @@ export function parseBinary(buf: ArrayBuffer): Tick[] {
       oi,
       bid,
       ask,
+      bids,
+      asks,
     });
     offset += len;
   }

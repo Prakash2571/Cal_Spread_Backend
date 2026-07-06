@@ -850,6 +850,40 @@ app.get("/api/fno-board", async (req: Request, res: Response) => {
  * order: it fills at the touch when there's enough size, and slips into deeper
  * levels when the lot is larger than what's available — exactly like a broker.
  */
+interface Ladder {
+  last: number;
+  bids: { price: number; qty: number }[];
+  asks: { price: number; qty: number }[];
+}
+
+/**
+ * Resolve the order book for tokens, preferring the freshest LIVE book from the
+ * WebSocket hub (lowest latency) and falling back to a REST /quote snapshot for
+ * anything the hub doesn't have fresh (e.g. index spot has no depth).
+ */
+async function resolveLadder(tokens: number[]): Promise<Map<number, Ladder>> {
+  const out = new Map<number, Ladder>();
+  const missing: number[] = [];
+  for (const tk of tokens) {
+    const fresh = tickerHub.getFreshLadder(tk);
+    if (fresh && (fresh.bids.length > 0 || fresh.asks.length > 0)) {
+      out.set(tk, fresh);
+    } else {
+      missing.push(tk);
+    }
+  }
+  if (missing.length > 0) {
+    const all = await getAllInstrumentsCached();
+    const resolveId = makeIdResolver(all);
+    const ids = missing
+      .map(resolveId)
+      .filter((s): s is string => typeof s === "string");
+    const rest = await kite.getQuoteLadder(ids);
+    for (const [tk, v] of rest) out.set(tk, v);
+  }
+  return out;
+}
+
 function vwapFill(
   levels: { price: number; qty: number }[],
   quantity: number,
@@ -942,12 +976,8 @@ app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
       return;
     }
 
-    // Fetch the live 5-level order book for spot + both legs.
-    const resolveId = makeIdResolver(all);
-    const ids = [item.spot_token, current.token, next.token]
-      .map(resolveId)
-      .filter((s): s is string => typeof s === "string");
-    const ladders = await kite.getQuoteLadder(ids);
+    // Live 5-level order book for spot + both legs (WebSocket first, REST fallback).
+    const ladders = await resolveLadder([item.spot_token, current.token, next.token]);
 
     const spot = ladders.get(item.spot_token)?.last;
     const curL = ladders.get(current.token);
@@ -1088,14 +1118,10 @@ app.post("/api/trades/:id/close", requireAdmin, async (req: Request, res: Respon
       return;
     }
 
-    // Realistic market-order exit walking the live book for the lot: sell the
-    // long leg into the BIDS, buy back the short leg from the ASKS.
-    const all = await getAllInstrumentsCached();
-    const resolveId = makeIdResolver(all);
-    const ids = [trade.buy.token, trade.sell.token]
-      .map(resolveId)
-      .filter((s): s is string => typeof s === "string");
-    const ladders = await kite.getQuoteLadder(ids);
+    // Realistic market-order exit walking the live book for the lot (WebSocket
+    // first, REST fallback): sell the long leg into the BIDS, buy back the
+    // short leg from the ASKS.
+    const ladders = await resolveLadder([trade.buy.token, trade.sell.token]);
 
     const buyL = ladders.get(trade.buy.token);
     const sellL = ladders.get(trade.sell.token);
