@@ -1082,6 +1082,34 @@ app.post("/api/trades/:id/close", requireAdmin, async (req: Request, res: Respon
   }
 });
 
+// --- Delete a CLOSED trade from history (admin only). ---
+app.delete("/api/trades/:id", requireAdmin, async (req: Request, res: Response) => {
+  if (!isDbEnabled()) {
+    res.status(503).json({ error: "Trade persistence is not configured (set MONGODB_URI)." });
+    return;
+  }
+  const id = String(req.params.id);
+  if (!isValidId(id)) {
+    res.status(400).json({ error: "Invalid trade id." });
+    return;
+  }
+  try {
+    const trade = await Trade.findById(id);
+    if (!trade) {
+      res.status(404).json({ error: "Trade not found." });
+      return;
+    }
+    if (trade.status !== "closed") {
+      res.status(400).json({ error: "Only closed trades can be deleted." });
+      return;
+    }
+    await Trade.deleteOne({ _id: trade._id });
+    res.json({ success: true, id });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
 interface BoardFuture {
   token: number;
   expiry: string;
