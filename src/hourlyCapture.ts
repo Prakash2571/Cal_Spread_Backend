@@ -65,9 +65,9 @@ function isMarketOpen(): boolean {
 }
 
 /** Hourly market slots we capture: 10:00 through 15:00.
- *  Note: 09:00 is excluded because isMarketOpen() is false until 09:15 IST,
- *  so the live scheduler can never fire at that time. The first full-hour
- *  boundary after market open is 10:00.
+ *  NSE market hours are 9:15 AM to 3:30 PM IST.
+ *  The first full-hour boundary after market open (9:15) is 10:00, and the
+ *  last full-hour boundary before market close (15:30) is 15:00.
  */
 const MARKET_HOURS = ["10:00", "11:00", "12:00", "13:00", "14:00", "15:00"];
 
@@ -474,19 +474,59 @@ function getMissingSlots(
 }
 
 /**
- * Convert a Kite candle timestamp (e.g. "2025-07-08T10:00:00+0530" or
- * "2025-07-08 10:00:00") to a slot key like "2025-07-08_10:00".
+ * Convert a Kite candle timestamp to a MARKET_HOURS slot key.
+ *
+ * Kite 60-minute candles for NSE are timestamped at the candle START time,
+ * which falls at :15 past the hour (e.g. "2025-07-08 09:15:00" covers
+ * 09:15-10:15, "2025-07-08 10:15:00" covers 10:15-11:15, etc.).
+ *
+ * Our MARKET_HOURS slots represent the top-of-hour capture points (10:00,
+ * 11:00, ..., 15:00), which correspond to candle END times rounded down.
+ * So we map: "09:15" -> "10:00", "10:15" -> "11:00", ..., "14:15" -> "15:00".
+ *
+ * The mapping: add 1 hour to the candle's start hour, then use "HH:00".
+ * Only return a slot key if the result is a valid MARKET_HOURS entry.
  */
 function candleToSlotKey(timestamp: string): string | null {
-  // The Kite API returns timestamps in IST. Extract date and hour.
-  // Format: "2025-07-08T10:00:00+0530" or "2025-07-08 10:00:00"
+  // The Kite API returns timestamps in IST.
+  // Format: "2025-07-08T09:15:00+0530" or "2025-07-08 09:15:00"
   const clean = timestamp.replace("T", " ");
   const datePart = clean.slice(0, 10);
-  const hourPart = clean.slice(11, 16); // HH:MM
+  const timePart = clean.slice(11, 16); // "HH:MM"
 
-  if (!datePart || !hourPart) return null;
+  if (!datePart || !timePart) return null;
 
-  // Normalize to HH:00 (in case it's HH:MM with non-zero minutes)
-  const hh = hourPart.slice(0, 2);
-  return `${datePart}_${hh}:00`;
+  const hh = parseInt(timePart.slice(0, 2), 10);
+  const mm = parseInt(timePart.slice(3, 5), 10);
+
+  // Kite 60-min candles start at :15 past the hour. The candle ending at
+  // the next top-of-hour is the slot we want.
+  // e.g. candle starting at 09:15 ends at 10:15 -> slot "10:00"
+  //      candle starting at 14:15 ends at 15:15 -> slot "15:00"
+  // For candles that start exactly on the hour (unlikely for NSE but safe),
+  // we still add 1 hour to get the end-of-candle slot.
+  if (mm === 15) {
+    const slotHour = hh + 1;
+    const slotKey = `${String(slotHour).padStart(2, "0")}:00`;
+    if (MARKET_HOURS.includes(slotKey)) {
+      return `${datePart}_${slotKey}`;
+    }
+  }
+
+  // Fallback: for candles starting on the hour (e.g. "10:00:00"), map to
+  // the next hour as the end-of-candle slot.
+  if (mm === 0) {
+    const slotHour = hh + 1;
+    const slotKey = `${String(slotHour).padStart(2, "0")}:00`;
+    if (MARKET_HOURS.includes(slotKey)) {
+      return `${datePart}_${slotKey}`;
+    }
+    // Also check if the hour itself is a valid slot (direct match).
+    const directKey = `${String(hh).padStart(2, "0")}:00`;
+    if (MARKET_HOURS.includes(directKey)) {
+      return `${datePart}_${directKey}`;
+    }
+  }
+
+  return null;
 }
