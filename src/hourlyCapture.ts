@@ -64,12 +64,12 @@ function isMarketOpen(): boolean {
   return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 30;
 }
 
-/** Hourly market slots we capture: 10:00 through 15:00.
+/** Market slots we capture: 10:00 through 15:30.
  *  NSE market hours are 9:15 AM to 3:30 PM IST.
  *  The first full-hour boundary after market open (9:15) is 10:00, and the
- *  last full-hour boundary before market close (15:30) is 15:00.
+ *  last capture is at market close (15:30).
  */
-const MARKET_HOURS = ["10:00", "11:00", "12:00", "13:00", "14:00", "15:00"];
+const MARKET_HOURS = ["10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "15:30"];
 
 /** Small delay utility. */
 function delay(ms: number): Promise<void> {
@@ -99,9 +99,10 @@ export async function captureHourlyPrices(
   getLatestTick: (token: number) => Tick | undefined,
   kite?: KiteClient,
   allInstruments?: Instrument[],
+  slot?: string,
 ): Promise<void> {
   const date = istDayKey();
-  const time = istHourKey();
+  const time = slot ?? istHourKey();
   const month = monthFromDate(date);
 
   // First pass: try to get prices from live ticks.
@@ -261,11 +262,34 @@ export interface HourlySchedulerDeps {
   getAllInstruments: () => Promise<Instrument[]>;
 }
 
-let lastCapturedHour = "";
+let lastCapturedSlot = "";
 
 /**
- * Sets up a setInterval (every 60s). On each tick, checks if we are at the top
- * of an hour during market hours. If so, captures prices and drains the cache.
+ * Given the current IST time, determine which MARKET_HOURS slot (if any)
+ * we are within a 2-minute capture window of.
+ * - For ":00" slots: fires when minutes are 0-2.
+ * - For "15:30": fires when hour is 15 and minutes are 30-32.
+ * Returns the matched slot string (e.g. "10:00" or "15:30") or null.
+ */
+function currentCaptureSlot(ist: Date): string | null {
+  const hh = ist.getUTCHours();
+  const mm = ist.getUTCMinutes();
+
+  for (const slot of MARKET_HOURS) {
+    const slotHour = parseInt(slot.slice(0, 2), 10);
+    const slotMin = parseInt(slot.slice(3, 5), 10);
+
+    if (hh === slotHour && mm >= slotMin && mm <= slotMin + 2) {
+      return slot;
+    }
+  }
+  return null;
+}
+
+/**
+ * Sets up a setInterval (every 60s). On each tick, checks if we are within
+ * a capture window of any MARKET_HOURS slot. If so, captures prices and
+ * drains the cache.
  */
 export function startHourlyScheduler(deps: HourlySchedulerDeps): void {
   const { getBoard, getLatestTick, kite, getAllInstruments } = deps;
@@ -276,19 +300,16 @@ export function startHourlyScheduler(deps: HourlySchedulerDeps): void {
         if (!isMarketOpen()) return;
 
         const ist = istNow();
-        const minutes = ist.getUTCMinutes();
-        // Widen from exact minute===0 to <=2 so timer drift / GC pauses
-        // don't cause a missed capture. The lastCapturedHour dedup guard
-        // prevents double captures within the same hour.
-        if (minutes > 2) return;
+        const slot = currentCaptureSlot(ist);
+        if (!slot) return;
 
-        const hourKey = `${istDayKey()}_${istHourKey()}`;
-        if (hourKey === lastCapturedHour) return;
-        lastCapturedHour = hourKey;
+        const slotKey = `${istDayKey()}_${slot}`;
+        if (slotKey === lastCapturedSlot) return;
+        lastCapturedSlot = slotKey;
 
         const board = await getBoard();
         const instruments = await getAllInstruments();
-        await captureHourlyPrices(board, getLatestTick, kite, instruments);
+        await captureHourlyPrices(board, getLatestTick, kite, instruments, slot);
         await drainCacheToDB();
       } catch (err) {
         console.error("[HourlyCapture] Scheduler error:", err);
@@ -480,11 +501,14 @@ function getMissingSlots(
  * which falls at :15 past the hour (e.g. "2025-07-08 09:15:00" covers
  * 09:15-10:15, "2025-07-08 10:15:00" covers 10:15-11:15, etc.).
  *
- * Our MARKET_HOURS slots represent the top-of-hour capture points (10:00,
- * 11:00, ..., 15:00), which correspond to candle END times rounded down.
+ * Our MARKET_HOURS slots represent capture points (10:00, 11:00, ..., 15:00,
+ * 15:30). The top-of-hour slots correspond to candle END times rounded down.
  * So we map: "09:15" -> "10:00", "10:15" -> "11:00", ..., "14:15" -> "15:00".
  *
- * The mapping: add 1 hour to the candle's start hour, then use "HH:00".
+ * Additionally, Kite produces a shorter candle from 15:15-15:30 (market close).
+ * The "15:15" candle maps to our "15:30" slot since its close price is the
+ * market closing price at 15:30.
+ *
  * Only return a slot key if the result is a valid MARKET_HOURS entry.
  */
 function candleToSlotKey(timestamp: string): string | null {
@@ -503,9 +527,12 @@ function candleToSlotKey(timestamp: string): string | null {
   // the next top-of-hour is the slot we want.
   // e.g. candle starting at 09:15 ends at 10:15 -> slot "10:00"
   //      candle starting at 14:15 ends at 15:15 -> slot "15:00"
-  // For candles that start exactly on the hour (unlikely for NSE but safe),
-  // we still add 1 hour to get the end-of-candle slot.
+  // Special case: candle starting at 15:15 ends at 15:30 -> slot "15:30"
   if (mm === 15) {
+    // For the 15:15 candle, it covers 15:15-15:30 (market close).
+    if (hh === 15) {
+      return `${datePart}_15:30`;
+    }
     const slotHour = hh + 1;
     const slotKey = `${String(slotHour).padStart(2, "0")}:00`;
     if (MARKET_HOURS.includes(slotKey)) {
