@@ -64,8 +64,12 @@ function isMarketOpen(): boolean {
   return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 30;
 }
 
-/** Hourly market slots we capture: 09:00 through 15:00. */
-const MARKET_HOURS = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00"];
+/** Hourly market slots we capture: 10:00 through 15:00.
+ *  Note: 09:00 is excluded because isMarketOpen() is false until 09:15 IST,
+ *  so the live scheduler can never fire at that time. The first full-hour
+ *  boundary after market open is 10:00.
+ */
+const MARKET_HOURS = ["10:00", "11:00", "12:00", "13:00", "14:00", "15:00"];
 
 /** Small delay utility. */
 function delay(ms: number): Promise<void> {
@@ -86,15 +90,27 @@ function isWeekday(dateStr: string): boolean {
 /**
  * For each FNO stock on the board that has at least 2 futures, grab the last
  * price of futures[0] (current month) and futures[1] (mid month) from the tick
- * getter. Compute spread = mid - current. Push into the in-memory cache.
+ * getter. If no live ticks are available (e.g. no SSE clients connected), falls
+ * back to a REST LTP call via the Kite quote API. Compute spread = mid - current.
+ * Push into the in-memory cache.
  */
-export function captureHourlyPrices(
+export async function captureHourlyPrices(
   board: BoardItem[],
   getLatestTick: (token: number) => Tick | undefined,
-): void {
+  kite?: KiteClient,
+  allInstruments?: Instrument[],
+): Promise<void> {
   const date = istDayKey();
   const time = istHourKey();
   const month = monthFromDate(date);
+
+  // First pass: try to get prices from live ticks.
+  interface PendingItem {
+    item: BoardItem;
+    currentToken: number;
+    midToken: number;
+  }
+  const needsRestFallback: PendingItem[] = [];
 
   for (const item of board) {
     if (item.futures.length < 2) continue;
@@ -108,20 +124,84 @@ export function captureHourlyPrices(
     const currentPrice = currentTick?.last_price;
     const midPrice = midTick?.last_price;
 
-    if (!currentPrice || currentPrice <= 0) continue;
-    if (!midPrice || midPrice <= 0) continue;
+    if (currentPrice && currentPrice > 0 && midPrice && midPrice > 0) {
+      const spread = midPrice - currentPrice;
+      pendingWrites.push({
+        symbol: item.symbol,
+        date,
+        time,
+        month,
+        current_month_close: currentPrice,
+        mid_month_close: midPrice,
+        spread,
+      });
+    } else {
+      // No live tick available; queue for REST fallback.
+      needsRestFallback.push({
+        item,
+        currentToken: currentFut.token,
+        midToken: midFut.token,
+      });
+    }
+  }
 
-    const spread = midPrice - currentPrice;
+  // REST fallback: fetch LTP from Kite quote API for symbols with no live tick.
+  if (needsRestFallback.length > 0 && kite && kite.hasSession() && allInstruments) {
+    try {
+      // Build a token -> NFO identifier map from the instruments list.
+      const tokenToIdentifier = new Map<number, string>();
+      for (const inst of allInstruments) {
+        if (inst.exchange === "NFO" && inst.instrument_type === "FUT") {
+          tokenToIdentifier.set(
+            inst.instrument_token,
+            `NFO:${inst.tradingsymbol}`,
+          );
+        }
+      }
 
-    pendingWrites.push({
-      symbol: item.symbol,
-      date,
-      time,
-      month,
-      current_month_close: currentPrice,
-      mid_month_close: midPrice,
-      spread,
-    });
+      // Collect all identifiers we need to fetch.
+      const identifiersNeeded: string[] = [];
+      for (const pending of needsRestFallback) {
+        const curId = tokenToIdentifier.get(pending.currentToken);
+        const midId = tokenToIdentifier.get(pending.midToken);
+        if (curId) identifiersNeeded.push(curId);
+        if (midId) identifiersNeeded.push(midId);
+      }
+
+      if (identifiersNeeded.length > 0) {
+        // Fetch OHLC quotes (includes last_price) from the REST API.
+        const quotes = await kite.getQuoteOhlc(identifiersNeeded);
+
+        // Build a token -> last_price map from the REST response.
+        const restPrices = new Map<number, number>();
+        for (const q of quotes) {
+          if (q.last_price > 0) {
+            restPrices.set(q.instrument_token, q.last_price);
+          }
+        }
+
+        // Second pass: use REST prices for the symbols that had no live tick.
+        for (const pending of needsRestFallback) {
+          const currentPrice = restPrices.get(pending.currentToken);
+          const midPrice = restPrices.get(pending.midToken);
+
+          if (currentPrice && currentPrice > 0 && midPrice && midPrice > 0) {
+            const spread = midPrice - currentPrice;
+            pendingWrites.push({
+              symbol: pending.item.symbol,
+              date,
+              time,
+              month,
+              current_month_close: currentPrice,
+              mid_month_close: midPrice,
+              spread,
+            });
+          }
+        }
+      }
+    } catch (err) {
+      console.error("[HourlyCapture] REST fallback failed:", err);
+    }
   }
 
   console.log(
@@ -136,7 +216,9 @@ export function captureHourlyPrices(
 /**
  * Takes items from the pending cache one at a time and upserts each to MongoDB,
  * with a 100ms delay between writes to avoid overloading the database.
- * Uses a flag to prevent concurrent drains.
+ * Uses a peek-then-shift approach: only removes a record from the queue after
+ * a successful write. On failure, breaks the loop and leaves the record for
+ * the next drain cycle to retry.
  */
 export async function drainCacheToDB(): Promise<void> {
   if (draining) return;
@@ -144,19 +226,22 @@ export async function drainCacheToDB(): Promise<void> {
 
   try {
     while (pendingWrites.length > 0) {
-      const doc = pendingWrites.shift()!;
+      const doc = pendingWrites[0]!;
       try {
         await HourlyPrice.updateOne(
           { symbol: doc.symbol, date: doc.date, time: doc.time },
           { $set: doc },
           { upsert: true },
         );
+        // Only remove from the queue after a successful write.
+        pendingWrites.shift();
       } catch (err) {
-        // Log but don't crash the drain loop; the record is lost for this pass.
+        // Leave the record in the queue for the next drain cycle.
         console.error(
           `[HourlyCapture] Failed to upsert ${doc.symbol} ${doc.date} ${doc.time}:`,
           err,
         );
+        break;
       }
       await delay(100);
     }
@@ -183,7 +268,7 @@ let lastCapturedHour = "";
  * of an hour during market hours. If so, captures prices and drains the cache.
  */
 export function startHourlyScheduler(deps: HourlySchedulerDeps): void {
-  const { getBoard, getLatestTick } = deps;
+  const { getBoard, getLatestTick, kite, getAllInstruments } = deps;
 
   setInterval(() => {
     void (async () => {
@@ -192,14 +277,18 @@ export function startHourlyScheduler(deps: HourlySchedulerDeps): void {
 
         const ist = istNow();
         const minutes = ist.getUTCMinutes();
-        if (minutes !== 0) return;
+        // Widen from exact minute===0 to <=2 so timer drift / GC pauses
+        // don't cause a missed capture. The lastCapturedHour dedup guard
+        // prevents double captures within the same hour.
+        if (minutes > 2) return;
 
         const hourKey = `${istDayKey()}_${istHourKey()}`;
         if (hourKey === lastCapturedHour) return;
         lastCapturedHour = hourKey;
 
         const board = await getBoard();
-        captureHourlyPrices(board, getLatestTick);
+        const instruments = await getAllInstruments();
+        await captureHourlyPrices(board, getLatestTick, kite, instruments);
         await drainCacheToDB();
       } catch (err) {
         console.error("[HourlyCapture] Scheduler error:", err);
