@@ -8,6 +8,7 @@ import { rateLimit } from "./ratelimit.js";
 import { getDividendYields } from "./yahoo.js";
 import { initDb, isDbEnabled, isValidId, Trade } from "./db.js";
 import type { ITrade, TradeRecord } from "./db.js";
+import { startHourlyScheduler, backfillMissedHours } from "./hourlyCapture.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
@@ -1328,5 +1329,15 @@ app.listen(PORT, () => {
     );
   }
   // Connect to MongoDB for trade persistence (no-op if MONGODB_URI is unset).
-  void initDb();
+  void initDb().then(() => {
+    // Start hourly price capture scheduler and backfill missed hours.
+    const hourlyDeps = {
+      getBoard: async () => deriveFnoBoard(await getAllInstrumentsCached()),
+      getLatestTick: (token: number) => tickerHub.getLatestTick(token),
+      kite,
+      getAllInstruments: getAllInstrumentsCached,
+    };
+    startHourlyScheduler(hourlyDeps);
+    void backfillMissedHours(hourlyDeps);
+  });
 });

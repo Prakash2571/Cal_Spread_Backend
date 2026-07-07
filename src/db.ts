@@ -94,3 +94,36 @@ export function isDbEnabled(): boolean {
 export function isValidId(id: string): boolean {
   return mongoose.isValidObjectId(id);
 }
+
+// ============================================================================
+//  HourlyPrice — stores hourly closing prices per FNO stock (spread tracking).
+// ============================================================================
+
+/** One hourly snapshot of current vs mid month futures prices. */
+export interface IHourlyPrice {
+  symbol: string;
+  date: string; // YYYY-MM-DD (IST)
+  time: string; // HH:MM (IST, top of hour e.g. "10:00")
+  month: string; // e.g. "2025-07"
+  current_month_close: number;
+  mid_month_close: number;
+  spread: number; // mid_month_close - current_month_close
+}
+
+const hourlyPriceSchema = new mongoose.Schema<IHourlyPrice>({
+  symbol: { type: String, required: true },
+  date: { type: String, required: true },
+  time: { type: String, required: true },
+  month: { type: String, required: true },
+  current_month_close: { type: Number, required: true },
+  mid_month_close: { type: Number, required: true },
+  spread: { type: Number, required: true },
+});
+
+hourlyPriceSchema.index({ symbol: 1, date: 1, time: 1 }, { unique: true });
+
+/** The HourlyPrice model (collection: "hourlyprices"). */
+export const HourlyPrice = mongoose.model<IHourlyPrice>(
+  "HourlyPrice",
+  hourlyPriceSchema,
+);

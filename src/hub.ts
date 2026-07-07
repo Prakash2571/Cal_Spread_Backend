@@ -113,6 +113,11 @@ export class TickerHub {
     return l;
   }
 
+  /** Public accessor: get the latest cached tick for a given token. */
+  getLatestTick(token: number): Tick | undefined {
+    return this.latest.get(token);
+  }
+
   private broadcast(ticks: Tick[]): void {
     const now = Date.now();
     const slim: Tick[] = [];

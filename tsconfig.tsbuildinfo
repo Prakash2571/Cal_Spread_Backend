@@ -1,1 +1,1 @@
-{"root":["./src/index.ts"],"version":"6.0.3"}
+{"root":["./src/db.ts","./src/hourlyCapture.ts","./src/hub.ts","./src/index.ts","./src/kite.ts","./src/ratelimit.ts","./src/ticker.ts","./src/yahoo.ts"],"version":"6.0.3"}
