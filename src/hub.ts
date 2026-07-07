@@ -115,7 +115,6 @@ export class TickerHub {
 
   private broadcast(ticks: Tick[]): void {
     const now = Date.now();
-    // Slim payload for clients (no depth arrays); keep the full ladder internal.
     const slim: Tick[] = [];
     for (const t of ticks) {
       const s: Tick = {
@@ -125,6 +124,8 @@ export class TickerHub {
         oi: t.oi,
         bid: t.bid,
         ask: t.ask,
+        ...(t.bids ? { bids: t.bids } : {}),
+        ...(t.asks ? { asks: t.asks } : {}),
       };
       this.latest.set(t.token, s);
       this.latestAt.set(t.token, now);

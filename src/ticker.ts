@@ -13,6 +13,7 @@ const WS_ROOT = "wss://ws.kite.trade";
 export interface DepthLevel {
   price: number;
   qty: number;
+  orders: number;
 }
 
 export interface Tick {
@@ -145,10 +146,10 @@ export function parseBinary(buf: ArrayBuffer): Tick[] {
       for (let i = 0; i < 5; i++) {
         const bOff = offset + 64 + i * 12;
         const bPrice = dv.getUint32(bOff + 4, false) / divisor;
-        if (bPrice > 0) bids.push({ price: bPrice, qty: dv.getUint32(bOff, false) });
+        if (bPrice > 0) bids.push({ price: bPrice, qty: dv.getUint32(bOff, false), orders: dv.getUint16(bOff + 8, false) });
         const aOff = offset + 124 + i * 12;
         const aPrice = dv.getUint32(aOff + 4, false) / divisor;
-        if (aPrice > 0) asks.push({ price: aPrice, qty: dv.getUint32(aOff, false) });
+        if (aPrice > 0) asks.push({ price: aPrice, qty: dv.getUint32(aOff, false), orders: dv.getUint16(aOff + 8, false) });
       }
       bid = bids[0]?.price ?? 0;
       ask = asks[0]?.price ?? 0;
