@@ -107,6 +107,7 @@ export interface IHourlyPrice {
   month: string; // e.g. "2025-07"
   current_month_close: number;
   mid_month_close: number;
+  far_month_close?: number | null;
   spread: number; // mid_month_close - current_month_close
 }
 
@@ -117,6 +118,7 @@ const hourlyPriceSchema = new mongoose.Schema<IHourlyPrice>({
   month: { type: String, required: true },
   current_month_close: { type: Number, required: true },
   mid_month_close: { type: Number, required: true },
+  far_month_close: { type: Number, default: null },
   spread: { type: Number, required: true },
 });
 

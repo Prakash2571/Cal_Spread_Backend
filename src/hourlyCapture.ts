@@ -110,6 +110,7 @@ export async function captureHourlyPrices(
     item: BoardItem;
     currentToken: number;
     midToken: number;
+    farToken: number | null;
   }
   const needsRestFallback: PendingItem[] = [];
 
@@ -118,12 +119,15 @@ export async function captureHourlyPrices(
 
     const currentFut = item.futures[0]!;
     const midFut = item.futures[1]!;
+    const farFut = item.futures.length >= 3 ? item.futures[2]! : null;
 
     const currentTick = getLatestTick(currentFut.token);
     const midTick = getLatestTick(midFut.token);
+    const farTick = farFut ? getLatestTick(farFut.token) : undefined;
 
     const currentPrice = currentTick?.last_price;
     const midPrice = midTick?.last_price;
+    const farPrice = farTick?.last_price ?? null;
 
     if (currentPrice && currentPrice > 0 && midPrice && midPrice > 0) {
       const spread = midPrice - currentPrice;
@@ -134,6 +138,7 @@ export async function captureHourlyPrices(
         month,
         current_month_close: currentPrice,
         mid_month_close: midPrice,
+        far_month_close: farPrice && farPrice > 0 ? farPrice : null,
         spread,
       });
     } else {
@@ -142,6 +147,7 @@ export async function captureHourlyPrices(
         item,
         currentToken: currentFut.token,
         midToken: midFut.token,
+        farToken: farFut ? farFut.token : null,
       });
     }
   }
@@ -165,8 +171,10 @@ export async function captureHourlyPrices(
       for (const pending of needsRestFallback) {
         const curId = tokenToIdentifier.get(pending.currentToken);
         const midId = tokenToIdentifier.get(pending.midToken);
+        const farId = pending.farToken ? tokenToIdentifier.get(pending.farToken) : undefined;
         if (curId) identifiersNeeded.push(curId);
         if (midId) identifiersNeeded.push(midId);
+        if (farId) identifiersNeeded.push(farId);
       }
 
       if (identifiersNeeded.length > 0) {
@@ -185,6 +193,7 @@ export async function captureHourlyPrices(
         for (const pending of needsRestFallback) {
           const currentPrice = restPrices.get(pending.currentToken);
           const midPrice = restPrices.get(pending.midToken);
+          const farPrice = pending.farToken ? restPrices.get(pending.farToken) : undefined;
 
           if (currentPrice && currentPrice > 0 && midPrice && midPrice > 0) {
             const spread = midPrice - currentPrice;
@@ -195,6 +204,7 @@ export async function captureHourlyPrices(
               month,
               current_month_close: currentPrice,
               mid_month_close: midPrice,
+              far_month_close: farPrice && farPrice > 0 ? farPrice : null,
               spread,
             });
           }
@@ -353,6 +363,7 @@ export async function backfillMissedHours(deps: HourlySchedulerDeps): Promise<vo
 
     const currentFut = item.futures[0]!;
     const midFut = item.futures[1]!;
+    const farFut = item.futures.length >= 3 ? item.futures[2]! : null;
 
     try {
       // Find the latest stored record for this symbol.
@@ -398,6 +409,18 @@ export async function backfillMissedHours(deps: HourlySchedulerDeps): Promise<vo
       );
       await delay(300); // rate limit
 
+      // Fetch far month candles if available.
+      let farCandles: { t: string; close: number }[] = [];
+      if (farFut) {
+        farCandles = await kite.getHistorical(
+          farFut.token,
+          fromDate,
+          toDate,
+          "60minute",
+        );
+        await delay(300); // rate limit
+      }
+
       // Index candles by "YYYY-MM-DD_HH:00" for quick lookup.
       const currentBySlot = new Map<string, number>();
       for (const c of currentCandles) {
@@ -411,11 +434,18 @@ export async function backfillMissedHours(deps: HourlySchedulerDeps): Promise<vo
         if (slotKey) midBySlot.set(slotKey, c.close);
       }
 
+      const farBySlot = new Map<string, number>();
+      for (const c of farCandles) {
+        const slotKey = candleToSlotKey(c.t);
+        if (slotKey) farBySlot.set(slotKey, c.close);
+      }
+
       // Match missing slots to candle data.
       for (const slot of missingSlots) {
         const key = `${slot.date}_${slot.time}`;
         const currentPrice = currentBySlot.get(key);
         const midPrice = midBySlot.get(key);
+        const farPrice = farBySlot.get(key);
 
         if (currentPrice && currentPrice > 0 && midPrice && midPrice > 0) {
           pendingWrites.push({
@@ -425,6 +455,7 @@ export async function backfillMissedHours(deps: HourlySchedulerDeps): Promise<vo
             month: monthFromDate(slot.date),
             current_month_close: currentPrice,
             mid_month_close: midPrice,
+            far_month_close: farPrice && farPrice > 0 ? farPrice : null,
             spread: midPrice - currentPrice,
           });
         }
