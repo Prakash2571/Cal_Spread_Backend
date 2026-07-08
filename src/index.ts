@@ -571,13 +571,18 @@ function istDateTime(d: Date): string {
   return ist.toISOString().slice(0, 19).replace("T", " ");
 }
 
-/** True during NSE market hours: Mon–Fri, 09:15–15:30 IST. */
+/** True during NSE market hours: Mon-Fri, 09:15-15:30 IST. */
 function isMarketOpen(): boolean {
   const ist = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
-  const day = ist.getUTCDay(); // 0 Sun … 6 Sat (on the IST-shifted date)
+  const day = ist.getUTCDay(); // 0 Sun ... 6 Sat (on the IST-shifted date)
   if (day === 0 || day === 6) return false;
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
   return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 30;
+}
+
+/** Simple delay helper to avoid rate-limiting on consecutive Kite API calls. */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Build a token -> "EXCHANGE:TRADINGSYMBOL" resolver from the instrument dump. */
@@ -637,6 +642,110 @@ app.get("/api/history/:symbol", async (req: Request, res: Response) => {
       futures,
     };
     historyCache.set(symbol, { day: today, data });
+    res.json(data);
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// --- Spread history: combined calendar-spread (next - current close) for ~2 years. ---
+// Fetches daily candles directly from Kite for each pair of consecutive futures
+// and merges their overlapping-date spreads into a single timeline with stats.
+const spreadHistoryCache = new Map<string, { day: string; data: unknown }>();
+
+app.get("/api/spread-history/:symbol", async (req: Request, res: Response) => {
+  if (!kite.getAccessToken()) {
+    res.status(401).json({ error: "Historical data requires a Zerodha login." });
+    return;
+  }
+  const symbol = String(req.params.symbol).toUpperCase();
+
+  const today = istDayKey();
+  const cached = spreadHistoryCache.get(symbol);
+  if (cached && cached.day === today) {
+    res.json(cached.data);
+    return;
+  }
+
+  try {
+    const all = await getAllInstrumentsCached();
+    const item = deriveFnoBoard(all).find((b) => b.symbol.toUpperCase() === symbol);
+    if (!item) {
+      res.status(404).json({ error: `No F&O instrument found for "${symbol}".` });
+      return;
+    }
+
+    // Date range: 2 years back to today.
+    const toDate = new Date();
+    const fromDate = new Date();
+    fromDate.setFullYear(fromDate.getFullYear() - 2);
+    const fmtDate = (d: Date) => d.toISOString().slice(0, 10);
+    const fromStr = fmtDate(fromDate);
+    const toStr = fmtDate(toDate);
+
+    // Fetch daily candles for each future (with 200ms delay between calls).
+    const futureCandles: Map<string, number>[] = []; // date -> close per future
+    for (let i = 0; i < item.futures.length; i++) {
+      if (i > 0) await delay(200);
+      const candles = await kite.getHistoricalOi(item.futures[i]!.token, fromStr, toStr);
+      const map = new Map<string, number>();
+      for (const c of candles) {
+        map.set(c.date, c.close);
+      }
+      futureCandles.push(map);
+      if (i < item.futures.length - 1) await delay(200);
+    }
+
+    // For each consecutive pair, compute spread = next_close - current_close
+    // on dates where both have data.
+    const spreadMap = new Map<string, number>(); // date -> spread (prefer earlier pair)
+    for (let p = 0; p < item.futures.length - 1; p++) {
+      const currentMap = futureCandles[p]!;
+      const nextMap = futureCandles[p + 1]!;
+      for (const [date, nextClose] of nextMap) {
+        const currentClose = currentMap.get(date);
+        if (currentClose !== undefined && !spreadMap.has(date)) {
+          spreadMap.set(date, nextClose - currentClose);
+        }
+      }
+    }
+
+    // Sort chronologically.
+    const points = Array.from(spreadMap.entries())
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([date, spread]) => ({ date, spread: Math.round(spread * 100) / 100 }));
+
+    // Compute stats.
+    let sum = 0;
+    let max = -Infinity;
+    let min = Infinity;
+    for (const pt of points) {
+      sum += pt.spread;
+      if (pt.spread > max) max = pt.spread;
+      if (pt.spread < min) min = pt.spread;
+    }
+    const count = points.length;
+    const mean = count > 0 ? Math.round((sum / count) * 100) / 100 : 0;
+    if (count === 0) {
+      max = 0;
+      min = 0;
+    }
+
+    const dataRange = {
+      from: points.length > 0 ? points[0]!.date : fromStr,
+      to: points.length > 0 ? points[points.length - 1]!.date : toStr,
+    };
+
+    const data = {
+      symbol: item.symbol,
+      name: item.name,
+      is_index: !!item.is_index,
+      dataRange,
+      points,
+      stats: { mean, max, min, count },
+    };
+
+    spreadHistoryCache.set(symbol, { day: today, data });
     res.json(data);
   } catch (err) {
     sendError(res, err);
