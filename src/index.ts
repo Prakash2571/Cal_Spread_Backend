@@ -687,13 +687,12 @@ app.get("/api/spread-history/:symbol", async (req: Request, res: Response) => {
     const futureCandles: Map<string, number>[] = []; // date -> close per future
     for (let i = 0; i < item.futures.length; i++) {
       if (i > 0) await delay(200);
-      const candles = await kite.getHistoricalOi(item.futures[i]!.token, fromStr, toStr);
+      const candles = await kite.getHistorical(item.futures[i]!.token, fromStr, toStr, "day");
       const map = new Map<string, number>();
       for (const c of candles) {
-        map.set(c.date, c.close);
+        map.set(c.t.slice(0, 10), c.close);
       }
       futureCandles.push(map);
-      if (i < item.futures.length - 1) await delay(200);
     }
 
     // For each consecutive pair, compute spread = next_close - current_close
