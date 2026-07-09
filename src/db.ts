@@ -112,16 +112,22 @@ export async function initDb(): Promise<void> {
  * No-op for any connection whose env var is unset.
  */
 export async function initNseFnoConnections(): Promise<void> {
-  const tasks: Promise<void>[] = [];
+  interface NamedTask {
+    name: string;
+    promise: Promise<void>;
+  }
+
+  const tasks: NamedTask[] = [];
 
   if (archiveConnection) {
-    tasks.push(
-      archiveConnection.asPromise().then(() => {
+    tasks.push({
+      name: "archive (NSE_FNO_ARCHIVE_URI)",
+      promise: archiveConnection.asPromise().then(() => {
         console.log(
           `Connected to archive MongoDB (database "${archiveConnection!.name}") — historical stock_futures.`,
         );
       }),
-    );
+    });
   } else {
     console.warn(
       "NSE_FNO_ARCHIVE_URI is not set — archive (historical stock_futures) is DISABLED.",
@@ -129,13 +135,14 @@ export async function initNseFnoConnections(): Promise<void> {
   }
 
   if (currentConnection) {
-    tasks.push(
-      currentConnection.asPromise().then(() => {
+    tasks.push({
+      name: "current (NSE_FNO_CURRENT_URI)",
+      promise: currentConnection.asPromise().then(() => {
         console.log(
           `Connected to current MongoDB (database "${currentConnection!.name}") — current stock_futures.`,
         );
       }),
-    );
+    });
   } else {
     console.warn(
       "NSE_FNO_CURRENT_URI is not set — current stock_futures writes are DISABLED.",
@@ -143,23 +150,30 @@ export async function initNseFnoConnections(): Promise<void> {
   }
 
   if (spreadConnection) {
-    tasks.push(
-      spreadConnection.asPromise().then(() => {
+    tasks.push({
+      name: "spread (NSE_FNO_SPREAD_URI)",
+      promise: spreadConnection.asPromise().then(() => {
         console.log(
           `Connected to spread MongoDB (database "${spreadConnection!.name}") — spread_daily & spread_summary.`,
         );
       }),
-    );
+    });
   } else {
     console.warn(
       "NSE_FNO_SPREAD_URI is not set — spread data is DISABLED.",
     );
   }
 
-  try {
-    await Promise.all(tasks);
-  } catch (err) {
-    console.error("Failed to connect to one or more nse_fno databases:", err);
+  const results = await Promise.allSettled(tasks.map((t) => t.promise));
+
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i]!;
+    if (result.status === "rejected") {
+      console.error(
+        `Failed to connect to ${tasks[i]!.name}:`,
+        result.reason,
+      );
+    }
   }
 }
 

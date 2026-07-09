@@ -408,12 +408,21 @@ export async function computeSpreads(dates: string[]): Promise<void> {
   }
 
   // Query archive DB for dates < 2026-01-01.
-  if (archiveDates.length > 0 && isArchiveDbEnabled()) {
-    const archiveDateObjects = archiveDates.map((d) => new Date(d + "T00:00:00.000Z"));
-    const archiveRecords = await StockFutureArchive.find({
-      trading_date: { $in: archiveDateObjects },
-    }).lean();
-    records = records.concat(archiveRecords);
+  // NOTE: The archive DB contains data up to Aug 31, 2025. Dates in Sep-Dec 2025
+  // are expected to return no records -- this is an intentional gap in the dataset,
+  // not a bug. The user simply does not have data for that period.
+  if (archiveDates.length > 0) {
+    if (isArchiveDbEnabled()) {
+      const archiveDateObjects = archiveDates.map((d) => new Date(d + "T00:00:00.000Z"));
+      const archiveRecords = await StockFutureArchive.find({
+        trading_date: { $in: archiveDateObjects },
+      }).lean();
+      records = records.concat(archiveRecords);
+    } else {
+      console.warn(
+        `[EODCapture] Archive DB is not connected but ${archiveDates.length} date(s) require archive data (pre-2026). Spread results will be incomplete for those dates.`,
+      );
+    }
   }
 
   // Group by (symbol, trading_date).
