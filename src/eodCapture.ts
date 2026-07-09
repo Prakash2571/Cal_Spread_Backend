@@ -4,8 +4,16 @@ import {
   SpreadDaily,
   SpreadSummary,
 } from "./db.js";
-import type { IStockFuture, ISpreadSummary } from "./db.js";
+import type { IStockFuture, ISpreadDaily, ISpreadSummary } from "./db.js";
 import type { KiteClient, Instrument } from "./kite.js";
+
+// ============================================================================
+//  Pending write queues (cache-first, drip-write to DB)
+// ============================================================================
+
+let pendingStockFutures: IStockFuture[] = [];
+let pendingSpreadDaily: ISpreadDaily[] = [];
+let drainingStockFutures = false;
 
 // ============================================================================
 //  Types
@@ -77,6 +85,71 @@ function getWeekdaysBetween(startDate: string, endDate: string): string[] {
 }
 
 // ============================================================================
+//  Drain functions: write cached docs to DB one at a time with 50ms delay
+// ============================================================================
+
+/**
+ * Drip-write pending stock_futures docs to MongoDB.
+ * Peeks at the front of the queue and only removes after a successful write.
+ * Breaks on error so the remaining docs can be retried on the next cycle.
+ */
+async function drainStockFutures(): Promise<void> {
+  if (drainingStockFutures) return;
+  drainingStockFutures = true;
+  let drained = 0;
+  try {
+    while (pendingStockFutures.length > 0) {
+      const doc = pendingStockFutures[0]!;
+      try {
+        await StockFuture.updateOne(
+          { symbol: doc.symbol, trading_date: doc.trading_date, expiry: doc.expiry },
+          { $set: doc },
+          { upsert: true },
+        );
+        pendingStockFutures.shift();
+        drained++;
+      } catch (err) {
+        console.error(`[EODCapture] Failed to upsert stock_futures ${doc.symbol}:`, err);
+        break;
+      }
+      await delay(50);
+    }
+  } finally {
+    drainingStockFutures = false;
+  }
+  if (drained > 0) {
+    console.log(`[EODCapture] Drained ${drained} stock_futures docs to DB.`);
+  }
+}
+
+/**
+ * Drip-write pending spread_daily docs to MongoDB.
+ * Same peek-then-shift pattern: breaks on failure for retry.
+ */
+async function drainSpreadDaily(): Promise<void> {
+  let drained = 0;
+  while (pendingSpreadDaily.length > 0) {
+    const doc = pendingSpreadDaily[0]!;
+    try {
+      await SpreadDaily.updateOne(
+        { symbol: doc.symbol, trading_date: doc.trading_date },
+        { $set: doc },
+        { upsert: true },
+      );
+      pendingSpreadDaily.shift();
+      drained++;
+    } catch (err) {
+      console.error(`[EODCapture] Failed to upsert spread_daily ${doc.symbol}:`, err);
+      break;
+    }
+    await delay(50);
+  }
+  if (drained > 0) {
+    console.log(`[EODCapture] Drained ${drained} spread_daily docs to DB.`);
+  }
+}
+
+// ============================================================================
 //  EOD Capture: fetch today's closing data and store in stock_futures
 // ============================================================================
 
@@ -142,7 +215,7 @@ async function captureEodData(deps: EodSchedulerDeps): Promise<void> {
   }
 
   const tradingDate = new Date(today + "T00:00:00.000Z");
-  let insertCount = 0;
+  let queuedCount = 0;
 
   for (const item of board) {
     if (item.is_index) continue;
@@ -166,29 +239,15 @@ async function captureEodData(deps: EodSchedulerDeps): Promise<void> {
         change_in_oi: 0,
       };
 
-      try {
-        await StockFuture.updateOne(
-          {
-            symbol: doc.symbol,
-            trading_date: doc.trading_date,
-            expiry: doc.expiry,
-          },
-          { $set: doc },
-          { upsert: true },
-        );
-        insertCount++;
-      } catch (err) {
-        console.error(
-          `[EODCapture] Failed to upsert ${item.symbol} expiry ${f.expiry}:`,
-          err,
-        );
-      }
+      pendingStockFutures.push(doc);
+      queuedCount++;
     }
   }
 
   console.log(
-    `[EODCapture] Captured ${insertCount} stock_futures records for ${today}.`,
+    `[EODCapture] Queued ${queuedCount} stock_futures docs for ${today}. Draining to DB...`,
   );
+  await drainStockFutures();
 
   // After capturing, compute spreads for today and check if we need monthly summary.
   await computeSpreads([today]);
@@ -255,7 +314,7 @@ export async function backfillStockFutures(deps: EodSchedulerDeps): Promise<void
   const fromDate = missingDays[0]!;
   const toDate = missingDays[missingDays.length - 1]!;
   const missingDaySet = new Set(missingDays);
-  let totalInserted = 0;
+  let totalQueued = 0;
 
   for (const item of board) {
     if (item.is_index) continue; // Only stock futures
@@ -288,20 +347,8 @@ export async function backfillStockFutures(deps: EodSchedulerDeps): Promise<void
             change_in_oi: 0,
           };
 
-          try {
-            await StockFuture.updateOne(
-              {
-                symbol: doc.symbol,
-                trading_date: doc.trading_date,
-                expiry: doc.expiry,
-              },
-              { $set: doc },
-              { upsert: true },
-            );
-            totalInserted++;
-          } catch {
-            // Duplicate key errors are fine (already exists)
-          }
+          pendingStockFutures.push(doc);
+          totalQueued++;
         }
       } catch (err) {
         console.error(
@@ -313,7 +360,11 @@ export async function backfillStockFutures(deps: EodSchedulerDeps): Promise<void
     }
   }
 
-  console.log(`[EODCapture] Backfill complete: ${totalInserted} records upserted.`);
+  console.log(
+    `[EODCapture] Backfill queued ${totalQueued} stock_futures docs. Draining to DB...`,
+  );
+  await drainStockFutures();
+  console.log("[EODCapture] Backfill drain complete.");
 
   // Compute spreads for all backfilled days.
   if (missingDays.length > 0) {
@@ -351,7 +402,7 @@ export async function computeSpreads(dates: string[]): Promise<void> {
     grouped.set(key, arr);
   }
 
-  let upsertCount = 0;
+  let queuedCount = 0;
 
   for (const [, contracts] of grouped) {
     if (contracts.length < 2) continue;
@@ -368,35 +419,24 @@ export async function computeSpreads(dates: string[]): Promise<void> {
 
     const spread = mid.close - near.close;
 
-    try {
-      await SpreadDaily.updateOne(
-        {
-          symbol: near.symbol,
-          trading_date: near.trading_date,
-        },
-        {
-          $set: {
-            symbol: near.symbol,
-            trading_date: near.trading_date,
-            near_expiry: near.expiry,
-            mid_expiry: mid.expiry,
-            near_close: near.close,
-            mid_close: mid.close,
-            spread,
-          },
-        },
-        { upsert: true },
-      );
-      upsertCount++;
-    } catch (err) {
-      console.error(
-        `[EODCapture] Failed to upsert spread for ${near.symbol}:`,
-        err,
-      );
-    }
+    const doc: ISpreadDaily = {
+      symbol: near.symbol,
+      trading_date: near.trading_date,
+      near_expiry: near.expiry,
+      mid_expiry: mid.expiry,
+      near_close: near.close,
+      mid_close: mid.close,
+      spread,
+    };
+
+    pendingSpreadDaily.push(doc);
+    queuedCount++;
   }
 
-  console.log(`[EODCapture] Computed ${upsertCount} spread_daily records.`);
+  console.log(
+    `[EODCapture] Queued ${queuedCount} spread_daily docs. Draining to DB...`,
+  );
+  await drainSpreadDaily();
 }
 
 // ============================================================================
