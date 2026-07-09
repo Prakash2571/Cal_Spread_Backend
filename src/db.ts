@@ -1,6 +1,16 @@
 import mongoose from "mongoose";
 
 const MONGODB_URI = process.env.MONGODB_URI ?? "";
+const NSE_FNO_MONGODB_URI = process.env.NSE_FNO_MONGODB_URI ?? "";
+
+// ============================================================================
+//  Second Mongoose connection for the nse_fno database
+// ============================================================================
+
+/** Separate connection for nse_fno (stock_futures, spread_daily, spread_summary). */
+export const nseFnoConnection = NSE_FNO_MONGODB_URI
+  ? mongoose.createConnection(NSE_FNO_MONGODB_URI)
+  : null;
 
 /** One leg of a calendar-spread trade. */
 export interface TradeLeg {
@@ -85,6 +95,31 @@ export async function initDb(): Promise<void> {
   }
 }
 
+/**
+ * Connect to the nse_fno MongoDB database. No-op if NSE_FNO_MONGODB_URI is unset.
+ */
+export async function initNseFnoDb(): Promise<void> {
+  if (!NSE_FNO_MONGODB_URI || !nseFnoConnection) {
+    console.warn(
+      "NSE_FNO_MONGODB_URI is not set — EOD capture is DISABLED. Set it in .env to enable.",
+    );
+    return;
+  }
+  try {
+    await nseFnoConnection.asPromise();
+    console.log(
+      `Connected to nse_fno MongoDB (database "${nseFnoConnection.name}").`,
+    );
+  } catch (err) {
+    console.error("Failed to connect to nse_fno MongoDB:", err);
+  }
+}
+
+/** True once the nse_fno connection is active. */
+export function isNseFnoDbEnabled(): boolean {
+  return nseFnoConnection !== null && nseFnoConnection.readyState === 1;
+}
+
 /** True once Mongoose has an active connection. */
 export function isDbEnabled(): boolean {
   return mongoose.connection.readyState === 1;
@@ -128,4 +163,137 @@ hourlyPriceSchema.index({ symbol: 1, date: 1, time: 1 }, { unique: true });
 export const HourlyPrice = mongoose.model<IHourlyPrice>(
   "HourlyPrice",
   hourlyPriceSchema,
+);
+
+// ============================================================================
+//  nse_fno models — registered on the separate nseFnoConnection
+// ============================================================================
+
+/** A stock futures document matching the existing MongoDB schema. */
+export interface IStockFuture {
+  trading_date: Date;
+  symbol: string;
+  instrument: string;
+  expiry: Date;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  settle_price: number;
+  contracts: number;
+  value_lakh: number;
+  open_interest: number;
+  change_in_oi: number;
+}
+
+const stockFutureSchema = new mongoose.Schema<IStockFuture>(
+  {
+    trading_date: { type: Date, required: true },
+    symbol: { type: String, required: true },
+    instrument: { type: String, default: "FUTSTK" },
+    expiry: { type: Date, required: true },
+    open: { type: Number, required: true },
+    high: { type: Number, required: true },
+    low: { type: Number, required: true },
+    close: { type: Number, required: true },
+    settle_price: { type: Number, default: 0 },
+    contracts: { type: Number, default: 0 },
+    value_lakh: { type: Number, default: 0 },
+    open_interest: { type: Number, default: 0 },
+    change_in_oi: { type: Number, default: 0 },
+  },
+  { collection: "stock_futures" },
+);
+
+stockFutureSchema.index(
+  { symbol: 1, trading_date: 1, expiry: 1 },
+  { unique: true },
+);
+
+/** A daily calendar spread record. */
+export interface ISpreadDaily {
+  symbol: string;
+  trading_date: Date;
+  near_expiry: Date;
+  mid_expiry: Date;
+  near_close: number;
+  mid_close: number;
+  spread: number;
+}
+
+const spreadDailySchema = new mongoose.Schema<ISpreadDaily>(
+  {
+    symbol: { type: String, required: true },
+    trading_date: { type: Date, required: true },
+    near_expiry: { type: Date, required: true },
+    mid_expiry: { type: Date, required: true },
+    near_close: { type: Number, required: true },
+    mid_close: { type: Number, required: true },
+    spread: { type: Number, required: true },
+  },
+  { collection: "spread_daily" },
+);
+
+spreadDailySchema.index({ symbol: 1, trading_date: 1 }, { unique: true });
+
+/** Per-symbol calendar spread summary statistics. */
+export interface ISpreadSummary {
+  symbol: string;
+  observations: number;
+  first_date: Date;
+  last_date: Date;
+  mean_spread: number;
+  max_spread: number;
+  min_spread: number;
+  mean_deviation: number;
+  max_abs_spread: number;
+}
+
+const spreadSummarySchema = new mongoose.Schema<ISpreadSummary>(
+  {
+    symbol: { type: String, required: true },
+    observations: { type: Number, required: true },
+    first_date: { type: Date, required: true },
+    last_date: { type: Date, required: true },
+    mean_spread: { type: Number, required: true },
+    max_spread: { type: Number, required: true },
+    min_spread: { type: Number, required: true },
+    mean_deviation: { type: Number, required: true },
+    max_abs_spread: { type: Number, required: true },
+  },
+  { collection: "spread_summary" },
+);
+
+spreadSummarySchema.index({ symbol: 1 }, { unique: true });
+
+// Register models on the nseFnoConnection (NOT the default mongoose connection).
+// If nseFnoConnection is null (env var not set), create dummy models on the
+// default connection that will never be used (prevents null checks everywhere).
+
+function registerNseFnoModel<T>(
+  name: string,
+  schema: mongoose.Schema<T>,
+): mongoose.Model<T> {
+  if (nseFnoConnection) {
+    return nseFnoConnection.model<T>(name, schema);
+  }
+  return mongoose.model<T>(name, schema);
+}
+
+/** StockFutures model (collection: stock_futures on nse_fno DB). */
+export const StockFuture = registerNseFnoModel<IStockFuture>(
+  "StockFuture",
+  stockFutureSchema,
+);
+
+/** SpreadDaily model (collection: spread_daily on nse_fno DB). */
+export const SpreadDaily = registerNseFnoModel<ISpreadDaily>(
+  "SpreadDaily",
+  spreadDailySchema,
+);
+
+/** SpreadSummary model (collection: spread_summary on nse_fno DB). */
+export const SpreadSummary = registerNseFnoModel<ISpreadSummary>(
+  "SpreadSummary",
+  spreadSummarySchema,
 );

@@ -8,7 +8,9 @@ import { rateLimit } from "./ratelimit.js";
 import { getDividendYields } from "./yahoo.js";
 import { initDb, isDbEnabled, isValidId, Trade } from "./db.js";
 import type { ITrade, TradeRecord } from "./db.js";
+import { initNseFnoDb } from "./db.js";
 import { startHourlyScheduler, backfillMissedHours } from "./hourlyCapture.js";
+import { startEodScheduler, backfillStockFutures } from "./eodCapture.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
@@ -1447,5 +1449,16 @@ app.listen(PORT, () => {
     };
     startHourlyScheduler(hourlyDeps);
     void backfillMissedHours(hourlyDeps);
+  });
+
+  // Connect to the nse_fno database and start EOD capture scheduler + backfill.
+  void initNseFnoDb().then(() => {
+    const eodDeps = {
+      getBoard: async () => deriveFnoBoard(await getAllInstrumentsCached()),
+      kite,
+      getAllInstruments: getAllInstrumentsCached,
+    };
+    startEodScheduler(eodDeps);
+    void backfillStockFutures(eodDeps);
   });
 });

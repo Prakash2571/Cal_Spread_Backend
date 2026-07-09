@@ -53,11 +53,33 @@ export interface FullQuote {
   oi: number;
 }
 
+/** Extended full quote that also includes OHLC for EOD capture. */
+export interface FullQuoteOhlc {
+  instrument_token: number;
+  last_price: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  oi: number;
+}
+
+/** Full historical candle data (OHLCV + OI). */
+export interface HistoricalCandle {
+  date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  oi: number;
+}
+
 /** Raw shape of a /quote entry (only the fields we read). */
 interface RawFullQuote {
   instrument_token: number;
   last_price?: number;
-  ohlc?: { close?: number };
+  ohlc?: { open?: number; high?: number; low?: number; close?: number };
   oi?: number;
 }
 
@@ -310,6 +332,48 @@ export class KiteClient {
   }
 
   /**
+   * Full quote with OHLC (/quote): includes last price, full OHLC, and open
+   * interest (oi) for F&O instruments. Used by the EOD capture scheduler.
+   * Chunked at 500 identifiers per request.
+   */
+  async getQuoteFullOhlc(identifiers: string[]): Promise<FullQuoteOhlc[]> {
+    const out: FullQuoteOhlc[] = [];
+    for (let i = 0; i < identifiers.length; i += 500) {
+      const chunk = identifiers.slice(i, i + 500);
+      const qs = chunk.map((id) => `i=${encodeURIComponent(id)}`).join("&");
+      const res = await fetch(`${KITE_API_ROOT}/quote?${qs}`, {
+        headers: this.authHeader(),
+      });
+      const json = (await res.json()) as {
+        status: string;
+        data?: Record<string, RawFullQuote>;
+        message?: string;
+      };
+      if (!res.ok || json.status !== "success" || !json.data) {
+        if (res.status === 401 || res.status === 403) this.clearSession();
+        throw new KiteError(
+          json.message ?? `Failed to fetch quotes (HTTP ${res.status}).`,
+          res.status || 500,
+        );
+      }
+      for (const v of Object.values(json.data)) {
+        if (v && typeof v.instrument_token === "number") {
+          out.push({
+            instrument_token: v.instrument_token,
+            last_price: v.last_price ?? 0,
+            open: v.ohlc?.open ?? 0,
+            high: v.ohlc?.high ?? 0,
+            low: v.ohlc?.low ?? 0,
+            close: v.ohlc?.close ?? 0,
+            oi: v.oi ?? 0,
+          });
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
    * Best bid/ask (market depth) per instrument, keyed by instrument_token.
    * Used to fill trades realistically: buy at ask, sell at bid.
    */
@@ -447,6 +511,44 @@ export class KiteClient {
     return json.data.candles.map((c) => ({
       date: String(c[0] ?? "").slice(0, 10),
       close: Number(c[4] ?? 0),
+      oi: Number(c[6] ?? 0),
+    }));
+  }
+
+  /**
+   * Historical daily candles with full OHLCV + OI data for one instrument.
+   * Kite candle format: [timestamp, open, high, low, close, volume, oi].
+   * `from`/`to` are "yyyy-mm-dd". Requires the historical-data subscription.
+   */
+  async getHistoricalFull(
+    token: number,
+    from: string,
+    to: string,
+    interval = "day",
+  ): Promise<HistoricalCandle[]> {
+    const url =
+      `${KITE_API_ROOT}/instruments/historical/${token}/${interval}` +
+      `?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&oi=1`;
+    const res = await fetch(url, { headers: this.authHeader() });
+    const json = (await res.json()) as {
+      status: string;
+      data?: { candles?: unknown[][] };
+      message?: string;
+    };
+    if (!res.ok || json.status !== "success" || !json.data?.candles) {
+      if (res.status === 401 || res.status === 403) this.clearSession();
+      throw new KiteError(
+        json.message ?? `Failed to fetch historical data (HTTP ${res.status}).`,
+        res.status || 500,
+      );
+    }
+    return json.data.candles.map((c) => ({
+      date: String(c[0] ?? "").slice(0, 10),
+      open: Number(c[1] ?? 0),
+      high: Number(c[2] ?? 0),
+      low: Number(c[3] ?? 0),
+      close: Number(c[4] ?? 0),
+      volume: Number(c[5] ?? 0),
       oi: Number(c[6] ?? 0),
     }));
   }
