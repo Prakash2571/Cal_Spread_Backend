@@ -1,6 +1,8 @@
 import {
   isNseFnoDbEnabled,
+  isArchiveDbEnabled,
   StockFuture,
+  StockFutureArchive,
   SpreadDaily,
   SpreadSummary,
 } from "./db.js";
@@ -381,17 +383,38 @@ export async function backfillStockFutures(deps: EodSchedulerDeps): Promise<void
  * For each (symbol, trading_date) in the given dates, sort futures by expiry
  * ascending, take the two nearest, compute spread = mid_close - near_close,
  * and upsert into spread_daily.
+ *
+ * Queries both the archive DB (for dates before 2026-01-01) and the current DB
+ * (for dates >= 2026-01-01), then merges results before grouping.
  */
 export async function computeSpreads(dates: string[]): Promise<void> {
   if (!isNseFnoDbEnabled()) return;
   if (dates.length === 0) return;
 
-  const dateObjects = dates.map((d) => new Date(d + "T00:00:00.000Z"));
+  const CUTOFF = "2026-01-01";
+  const archiveDates = dates.filter((d) => d < CUTOFF);
+  const currentDates = dates.filter((d) => d >= CUTOFF);
 
-  // Fetch all stock_futures records for the given dates.
-  const records = await StockFuture.find({
-    trading_date: { $in: dateObjects },
-  }).lean();
+  type StockFutureDoc = IStockFuture & { _id?: unknown };
+  let records: StockFutureDoc[] = [];
+
+  // Query current DB for dates >= 2026-01-01.
+  if (currentDates.length > 0) {
+    const currentDateObjects = currentDates.map((d) => new Date(d + "T00:00:00.000Z"));
+    const currentRecords = await StockFuture.find({
+      trading_date: { $in: currentDateObjects },
+    }).lean();
+    records = records.concat(currentRecords);
+  }
+
+  // Query archive DB for dates < 2026-01-01.
+  if (archiveDates.length > 0 && isArchiveDbEnabled()) {
+    const archiveDateObjects = archiveDates.map((d) => new Date(d + "T00:00:00.000Z"));
+    const archiveRecords = await StockFutureArchive.find({
+      trading_date: { $in: archiveDateObjects },
+    }).lean();
+    records = records.concat(archiveRecords);
+  }
 
   // Group by (symbol, trading_date).
   const grouped = new Map<string, typeof records>();

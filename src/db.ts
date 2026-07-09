@@ -1,15 +1,27 @@
 import mongoose from "mongoose";
 
 const MONGODB_URI = process.env.MONGODB_URI ?? "";
-const NSE_FNO_MONGODB_URI = process.env.NSE_FNO_MONGODB_URI ?? "";
+const NSE_FNO_ARCHIVE_URI = process.env.NSE_FNO_ARCHIVE_URI ?? "";
+const NSE_FNO_CURRENT_URI = process.env.NSE_FNO_CURRENT_URI ?? "";
+const NSE_FNO_SPREAD_URI = process.env.NSE_FNO_SPREAD_URI ?? "";
 
 // ============================================================================
-//  Second Mongoose connection for the nse_fno database
+//  Three separate Mongoose connections for the split nse_fno databases
 // ============================================================================
 
-/** Separate connection for nse_fno (stock_futures, spread_daily, spread_summary). */
-export const nseFnoConnection = NSE_FNO_MONGODB_URI
-  ? mongoose.createConnection(NSE_FNO_MONGODB_URI)
+/** Read-only connection for historical stock_futures (data up to Aug 31, 2025). */
+export const archiveConnection = NSE_FNO_ARCHIVE_URI
+  ? mongoose.createConnection(NSE_FNO_ARCHIVE_URI)
+  : null;
+
+/** Read-write connection for current stock_futures (data from Jan 1, 2026 onwards). */
+export const currentConnection = NSE_FNO_CURRENT_URI
+  ? mongoose.createConnection(NSE_FNO_CURRENT_URI)
+  : null;
+
+/** Read-write connection for spread_daily and spread_summary. */
+export const spreadConnection = NSE_FNO_SPREAD_URI
+  ? mongoose.createConnection(NSE_FNO_SPREAD_URI)
   : null;
 
 /** One leg of a calendar-spread trade. */
@@ -96,28 +108,73 @@ export async function initDb(): Promise<void> {
 }
 
 /**
- * Connect to the nse_fno MongoDB database. No-op if NSE_FNO_MONGODB_URI is unset.
+ * Connect to all three nse_fno MongoDB databases (archive, current, spread).
+ * No-op for any connection whose env var is unset.
  */
-export async function initNseFnoDb(): Promise<void> {
-  if (!NSE_FNO_MONGODB_URI || !nseFnoConnection) {
+export async function initNseFnoConnections(): Promise<void> {
+  const tasks: Promise<void>[] = [];
+
+  if (archiveConnection) {
+    tasks.push(
+      archiveConnection.asPromise().then(() => {
+        console.log(
+          `Connected to archive MongoDB (database "${archiveConnection!.name}") — historical stock_futures.`,
+        );
+      }),
+    );
+  } else {
     console.warn(
-      "NSE_FNO_MONGODB_URI is not set — EOD capture is DISABLED. Set it in .env to enable.",
+      "NSE_FNO_ARCHIVE_URI is not set — archive (historical stock_futures) is DISABLED.",
     );
-    return;
   }
-  try {
-    await nseFnoConnection.asPromise();
-    console.log(
-      `Connected to nse_fno MongoDB (database "${nseFnoConnection.name}").`,
+
+  if (currentConnection) {
+    tasks.push(
+      currentConnection.asPromise().then(() => {
+        console.log(
+          `Connected to current MongoDB (database "${currentConnection!.name}") — current stock_futures.`,
+        );
+      }),
     );
+  } else {
+    console.warn(
+      "NSE_FNO_CURRENT_URI is not set — current stock_futures writes are DISABLED.",
+    );
+  }
+
+  if (spreadConnection) {
+    tasks.push(
+      spreadConnection.asPromise().then(() => {
+        console.log(
+          `Connected to spread MongoDB (database "${spreadConnection!.name}") — spread_daily & spread_summary.`,
+        );
+      }),
+    );
+  } else {
+    console.warn(
+      "NSE_FNO_SPREAD_URI is not set — spread data is DISABLED.",
+    );
+  }
+
+  try {
+    await Promise.all(tasks);
   } catch (err) {
-    console.error("Failed to connect to nse_fno MongoDB:", err);
+    console.error("Failed to connect to one or more nse_fno databases:", err);
   }
 }
 
-/** True once the nse_fno connection is active. */
+/** True once the current (write) and spread connections are active. */
 export function isNseFnoDbEnabled(): boolean {
-  return nseFnoConnection !== null && nseFnoConnection.readyState === 1;
+  const currentReady =
+    currentConnection !== null && currentConnection.readyState === 1;
+  const spreadReady =
+    spreadConnection !== null && spreadConnection.readyState === 1;
+  return currentReady && spreadReady;
+}
+
+/** True once the archive connection is active. */
+export function isArchiveDbEnabled(): boolean {
+  return archiveConnection !== null && archiveConnection.readyState === 1;
 }
 
 /** True once Mongoose has an active connection. */
@@ -166,7 +223,7 @@ export const HourlyPrice = mongoose.model<IHourlyPrice>(
 );
 
 // ============================================================================
-//  nse_fno models — registered on the separate nseFnoConnection
+//  nse_fno models — registered on the separate connections
 // ============================================================================
 
 /** A stock futures document matching the existing MongoDB schema. */
@@ -266,34 +323,49 @@ const spreadSummarySchema = new mongoose.Schema<ISpreadSummary>(
 
 spreadSummarySchema.index({ symbol: 1 }, { unique: true });
 
-// Register models on the nseFnoConnection (NOT the default mongoose connection).
-// If nseFnoConnection is null (env var not set), create dummy models on the
-// default connection that will never be used (prevents null checks everywhere).
+// ============================================================================
+//  Model registration helpers
+// ============================================================================
 
-function registerNseFnoModel<T>(
+function registerModelOnConnection<T>(
+  connection: mongoose.Connection | null,
   name: string,
   schema: mongoose.Schema<T>,
 ): mongoose.Model<T> {
-  if (nseFnoConnection) {
-    return nseFnoConnection.model<T>(name, schema);
+  if (connection) {
+    return connection.model<T>(name, schema);
   }
+  // Fallback: register on default connection (will never be used if env var unset).
   return mongoose.model<T>(name, schema);
 }
 
-/** StockFutures model (collection: stock_futures on nse_fno DB). */
-export const StockFuture = registerNseFnoModel<IStockFuture>(
+// --- Archive connection: StockFutureArchive (read-only, historical data pre-2026) ---
+/** StockFutureArchive model (collection: stock_futures on archive DB). */
+export const StockFutureArchive = registerModelOnConnection<IStockFuture>(
+  archiveConnection,
+  "StockFutureArchive",
+  stockFutureSchema,
+);
+
+// --- Current connection: StockFuture (read-write, data from 2026 onwards) ---
+/** StockFuture model (collection: stock_futures on current DB). */
+export const StockFuture = registerModelOnConnection<IStockFuture>(
+  currentConnection,
   "StockFuture",
   stockFutureSchema,
 );
 
-/** SpreadDaily model (collection: spread_daily on nse_fno DB). */
-export const SpreadDaily = registerNseFnoModel<ISpreadDaily>(
+// --- Spread connection: SpreadDaily and SpreadSummary ---
+/** SpreadDaily model (collection: spread_daily on spread DB). */
+export const SpreadDaily = registerModelOnConnection<ISpreadDaily>(
+  spreadConnection,
   "SpreadDaily",
   spreadDailySchema,
 );
 
-/** SpreadSummary model (collection: spread_summary on nse_fno DB). */
-export const SpreadSummary = registerNseFnoModel<ISpreadSummary>(
+/** SpreadSummary model (collection: spread_summary on spread DB). */
+export const SpreadSummary = registerModelOnConnection<ISpreadSummary>(
+  spreadConnection,
   "SpreadSummary",
   spreadSummarySchema,
 );
