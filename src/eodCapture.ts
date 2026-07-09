@@ -4,7 +4,7 @@ import {
   SpreadDaily,
   SpreadSummary,
 } from "./db.js";
-import type { IStockFuture } from "./db.js";
+import type { IStockFuture, ISpreadSummary } from "./db.js";
 import type { KiteClient, Instrument } from "./kite.js";
 
 // ============================================================================
@@ -192,7 +192,7 @@ async function captureEodData(deps: EodSchedulerDeps): Promise<void> {
 
   // After capturing, compute spreads for today and check if we need monthly summary.
   await computeSpreads([today]);
-  await checkAndRecomputeMonthly();
+  await checkAndRecomputeSummary();
 }
 
 // ============================================================================
@@ -318,7 +318,7 @@ export async function backfillStockFutures(deps: EodSchedulerDeps): Promise<void
   // Compute spreads for all backfilled days.
   if (missingDays.length > 0) {
     await computeSpreads(missingDays);
-    await checkAndRecomputeMonthly();
+    await checkAndRecomputeSummary();
   }
 }
 
@@ -408,6 +408,9 @@ export async function computeSpreads(dates: string[]): Promise<void> {
  * Groups all spread_daily records by symbol and computes:
  *   observations, first_date, last_date, mean_spread, max_spread, min_spread,
  *   mean_deviation (avg of |spread - mean|), max_abs_spread (max of |spread|).
+ *
+ * Uses bulkWrite with replaceOne + upsert per symbol for atomicity -- avoids
+ * the crash window that deleteMany + insertMany would leave.
  */
 export async function recomputeSpreadSummary(): Promise<void> {
   if (!isNseFnoDbEnabled()) return;
@@ -466,14 +469,27 @@ export async function recomputeSpreadSummary(): Promise<void> {
     },
   ];
 
-  const results = await SpreadDaily.aggregate(pipeline);
+  const results: ISpreadSummary[] = await SpreadDaily.aggregate(pipeline);
 
-  // Replace the entire spread_summary collection.
-  await SpreadSummary.deleteMany({});
-
-  if (results.length > 0) {
-    await SpreadSummary.insertMany(results);
+  if (results.length === 0) {
+    console.log("[EODCapture] No spread_daily records found. Skipping summary.");
+    return;
   }
+
+  // Atomic upsert: replaceOne per symbol so the collection is never left empty.
+  const bulkOps = results.map((doc) => ({
+    replaceOne: {
+      filter: { symbol: doc.symbol },
+      replacement: doc,
+      upsert: true,
+    },
+  }));
+
+  await SpreadSummary.bulkWrite(bulkOps);
+
+  // Remove symbols that no longer have spread_daily data.
+  const activeSymbols = results.map((r) => r.symbol);
+  await SpreadSummary.deleteMany({ symbol: { $nin: activeSymbols } });
 
   console.log(
     `[EODCapture] Spread summary recomputed: ${results.length} symbols.`,
@@ -481,11 +497,11 @@ export async function recomputeSpreadSummary(): Promise<void> {
 }
 
 /**
- * Check if we should recompute the monthly summary.
- * Triggers if the latest spread_summary last_date is from a previous month
- * compared to the latest spread_daily trading_date.
+ * Check if we should recompute the spread summary.
+ * Triggers whenever the latest spread_daily trading_date is beyond the latest
+ * spread_summary last_date -- i.e., any time new daily data has been added.
  */
-async function checkAndRecomputeMonthly(): Promise<void> {
+async function checkAndRecomputeSummary(): Promise<void> {
   if (!isNseFnoDbEnabled()) return;
 
   // Get the latest date in spread_daily.
@@ -499,18 +515,14 @@ async function checkAndRecomputeMonthly(): Promise<void> {
     .sort({ last_date: -1 })
     .lean();
 
-  const latestDailyMonth = latestDaily.trading_date.toISOString().slice(0, 7);
-
   if (!existingSummary) {
     // No summary exists at all, compute it.
     await recomputeSpreadSummary();
     return;
   }
 
-  const summaryMonth = existingSummary.last_date.toISOString().slice(0, 7);
-
-  // Recompute if we are in a new month or if the summary is outdated.
-  if (latestDailyMonth !== summaryMonth) {
+  // Recompute if there are new spread_daily records beyond the summary's last_date.
+  if (latestDaily.trading_date.getTime() > existingSummary.last_date.getTime()) {
     await recomputeSpreadSummary();
   }
 }
