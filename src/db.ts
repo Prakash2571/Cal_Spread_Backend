@@ -318,6 +318,9 @@ export interface ISpreadSummary {
   min_spread: number;
   mean_deviation: number;
   max_abs_spread: number;
+  std_dev_spread: number;
+  percentile_95: number;
+  mean_reversion_probability: number;
 }
 
 const spreadSummarySchema = new mongoose.Schema<ISpreadSummary>(
@@ -331,6 +334,9 @@ const spreadSummarySchema = new mongoose.Schema<ISpreadSummary>(
     min_spread: { type: Number, required: true },
     mean_deviation: { type: Number, required: true },
     max_abs_spread: { type: Number, required: true },
+    std_dev_spread: { type: Number, required: true },
+    percentile_95: { type: Number, required: true },
+    mean_reversion_probability: { type: Number, required: true },
   },
   { collection: "spread_summary" },
 );

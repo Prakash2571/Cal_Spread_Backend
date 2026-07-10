@@ -9,6 +9,7 @@ import { getDividendYields } from "./yahoo.js";
 import { initDb, isDbEnabled, isValidId, Trade } from "./db.js";
 import type { ITrade, TradeRecord } from "./db.js";
 import { initNseFnoConnections } from "./db.js";
+import { SpreadSummary } from "./db.js";
 import { startHourlyScheduler, backfillMissedHours } from "./hourlyCapture.js";
 import { startEodScheduler, backfillStockFutures } from "./eodCapture.js";
 
@@ -944,6 +945,24 @@ app.get("/api/fno-board", async (req: Request, res: Response) => {
       );
     }
     res.json({ count: board.length, board });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// ============================================================================
+//  Spread stats: per-symbol summary from the spread_summary collection.
+// ============================================================================
+
+app.get("/api/spread-stats/:symbol", async (req: Request, res: Response) => {
+  const symbol = String(req.params.symbol).toUpperCase();
+  try {
+    const doc = await SpreadSummary.findOne({ symbol }).lean();
+    if (!doc) {
+      res.status(404).json({ error: `No spread summary found for "${symbol}".` });
+      return;
+    }
+    res.json(doc);
   } catch (err) {
     sendError(res, err);
   }

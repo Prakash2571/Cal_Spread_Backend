@@ -251,9 +251,8 @@ async function captureEodData(deps: EodSchedulerDeps): Promise<void> {
   );
   await drainStockFutures();
 
-  // After capturing, compute spreads for today and check if we need monthly summary.
+  // After capturing, compute spreads for today.
   await computeSpreads([today]);
-  await checkAndRecomputeSummary();
 }
 
 // ============================================================================
@@ -371,7 +370,6 @@ export async function backfillStockFutures(deps: EodSchedulerDeps): Promise<void
   // Compute spreads for all backfilled days.
   if (missingDays.length > 0) {
     await computeSpreads(missingDays);
-    await checkAndRecomputeSummary();
   }
 }
 
@@ -477,137 +475,167 @@ export async function computeSpreads(dates: string[]): Promise<void> {
 
 /**
  * Recompute the entire spread_summary collection from spread_daily.
- * Groups all spread_daily records by symbol and computes:
+ * Fetches all spread_daily records, groups by symbol, and computes per-symbol:
  *   observations, first_date, last_date, mean_spread, max_spread, min_spread,
- *   mean_deviation (avg of |spread - mean|), max_abs_spread (max of |spread|).
+ *   mean_deviation (avg of |spread - mean|), max_abs_spread (max of |spread|),
+ *   std_dev_spread (standard deviation), percentile_95 (95th percentile value),
+ *   mean_reversion_probability (% of times spread crossed back through mean).
  *
- * Uses bulkWrite with replaceOne + upsert per symbol for atomicity -- avoids
- * the crash window that deleteMany + insertMany would leave.
+ * Processes symbols SERIALLY with a 200ms delay between each to avoid
+ * overloading the DB. Uses bulkWrite with replaceOne + upsert per symbol.
  */
 export async function recomputeSpreadSummary(): Promise<void> {
   if (!isNseFnoDbEnabled()) return;
 
   console.log("[EODCapture] Recomputing spread_summary...");
 
-  // Use MongoDB aggregation pipeline (mirrors the Python script logic).
-  const pipeline = [
-    {
-      $group: {
-        _id: "$symbol",
-        spreads: { $push: "$spread" },
-        mean_spread: { $avg: "$spread" },
-        max_spread: { $max: "$spread" },
-        min_spread: { $min: "$spread" },
-        observations: { $sum: 1 },
-        first_date: { $min: "$trading_date" },
-        last_date: { $max: "$trading_date" },
-      },
-    },
-    {
-      $addFields: {
-        mean_deviation: {
-          $avg: {
-            $map: {
-              input: "$spreads",
-              as: "s",
-              in: { $abs: { $subtract: ["$$s", "$mean_spread"] } },
-            },
-          },
-        },
-        max_abs_spread: {
-          $max: {
-            $map: {
-              input: "$spreads",
-              as: "s",
-              in: { $abs: "$$s" },
-            },
-          },
-        },
-      },
-    },
-    {
-      $project: {
-        _id: 0,
-        symbol: "$_id",
-        observations: 1,
-        first_date: 1,
-        last_date: 1,
-        mean_spread: { $round: ["$mean_spread", 4] },
-        max_spread: { $round: ["$max_spread", 4] },
-        min_spread: { $round: ["$min_spread", 4] },
-        mean_deviation: { $round: ["$mean_deviation", 4] },
-        max_abs_spread: { $round: ["$max_abs_spread", 4] },
-      },
-    },
-  ];
+  // Fetch all spread_daily records.
+  const allRecords = await SpreadDaily.find({}).lean();
 
-  const results: ISpreadSummary[] = await SpreadDaily.aggregate(pipeline);
-
-  if (results.length === 0) {
+  if (allRecords.length === 0) {
     console.log("[EODCapture] No spread_daily records found. Skipping summary.");
     return;
   }
 
-  // Atomic upsert: replaceOne per symbol so the collection is never left empty.
-  const bulkOps = results.map((doc) => ({
+  // Group by symbol.
+  const grouped = new Map<string, typeof allRecords>();
+  for (const rec of allRecords) {
+    const arr = grouped.get(rec.symbol) ?? [];
+    arr.push(rec);
+    grouped.set(rec.symbol, arr);
+  }
+
+  const bulkOps: {
     replaceOne: {
-      filter: { symbol: doc.symbol },
-      replacement: doc,
-      upsert: true,
-    },
-  }));
+      filter: { symbol: string };
+      replacement: ISpreadSummary;
+      upsert: boolean;
+    };
+  }[] = [];
+
+  const symbols = Array.from(grouped.keys());
+
+  for (let i = 0; i < symbols.length; i++) {
+    const symbol = symbols[i]!;
+    const records = grouped.get(symbol)!;
+
+    if (i > 0) await delay(200);
+
+    const spreads = records.map((r) => r.spread);
+    const n = spreads.length;
+
+    // Basic stats.
+    let sum = 0;
+    let maxSpread = -Infinity;
+    let minSpread = Infinity;
+    let maxAbs = 0;
+    let firstDate = records[0]!.trading_date;
+    let lastDate = records[0]!.trading_date;
+
+    for (const rec of records) {
+      sum += rec.spread;
+      if (rec.spread > maxSpread) maxSpread = rec.spread;
+      if (rec.spread < minSpread) minSpread = rec.spread;
+      const abs = Math.abs(rec.spread);
+      if (abs > maxAbs) maxAbs = abs;
+      if (rec.trading_date < firstDate) firstDate = rec.trading_date;
+      if (rec.trading_date > lastDate) lastDate = rec.trading_date;
+    }
+
+    const mean = sum / n;
+
+    // Mean deviation: average of |spread - mean|.
+    let deviationSum = 0;
+    for (const s of spreads) {
+      deviationSum += Math.abs(s - mean);
+    }
+    const meanDeviation = deviationSum / n;
+
+    // Standard deviation.
+    let varianceSum = 0;
+    for (const s of spreads) {
+      varianceSum += (s - mean) ** 2;
+    }
+    const stdDev = Math.sqrt(varianceSum / n);
+
+    // Percentile 95: sort ascending, take value at index ceil(0.95 * n) - 1.
+    const sorted = spreads.slice().sort((a, b) => a - b);
+    const p95Index = Math.ceil(0.95 * n) - 1;
+    const percentile95 = sorted[Math.max(0, Math.min(p95Index, n - 1))]!;
+
+    // Mean reversion probability: count of times spread crossed back through
+    // the mean from a deviation, divided by total deviations from mean.
+    let crossings = 0;
+    let totalDeviations = 0;
+    let prevAboveMean: boolean | null = null;
+
+    for (const s of spreads) {
+      const aboveMean = s > mean;
+      const belowMean = s < mean;
+
+      if (aboveMean || belowMean) {
+        totalDeviations++;
+        if (prevAboveMean !== null && aboveMean !== prevAboveMean) {
+          // Crossed through mean (went from above to below or vice versa).
+          crossings++;
+        }
+        prevAboveMean = aboveMean;
+      }
+      // If s === mean exactly, it's a crossing point but we don't change prevAboveMean.
+    }
+
+    const meanReversionProb =
+      totalDeviations > 0
+        ? Math.round((crossings / totalDeviations) * 10000) / 100
+        : 0;
+
+    const doc: ISpreadSummary = {
+      symbol,
+      observations: n,
+      first_date: firstDate,
+      last_date: lastDate,
+      mean_spread: Math.round(mean * 10000) / 10000,
+      max_spread: Math.round(maxSpread * 10000) / 10000,
+      min_spread: Math.round(minSpread * 10000) / 10000,
+      mean_deviation: Math.round(meanDeviation * 10000) / 10000,
+      max_abs_spread: Math.round(maxAbs * 10000) / 10000,
+      std_dev_spread: Math.round(stdDev * 10000) / 10000,
+      percentile_95: Math.round(percentile95 * 10000) / 10000,
+      mean_reversion_probability: meanReversionProb,
+    };
+
+    bulkOps.push({
+      replaceOne: {
+        filter: { symbol },
+        replacement: doc,
+        upsert: true,
+      },
+    });
+  }
 
   await SpreadSummary.bulkWrite(bulkOps);
 
   // Remove symbols that no longer have spread_daily data.
-  const activeSymbols = results.map((r) => r.symbol);
+  const activeSymbols = symbols;
   await SpreadSummary.deleteMany({ symbol: { $nin: activeSymbols } });
 
   console.log(
-    `[EODCapture] Spread summary recomputed: ${results.length} symbols.`,
+    `[EODCapture] Spread summary recomputed: ${symbols.length} symbols.`,
   );
 }
 
-/**
- * Check if we should recompute the spread summary.
- * Triggers whenever the latest spread_daily trading_date is beyond the latest
- * spread_summary last_date -- i.e., any time new daily data has been added.
- */
-async function checkAndRecomputeSummary(): Promise<void> {
-  if (!isNseFnoDbEnabled()) return;
-
-  // Get the latest date in spread_daily.
-  const latestDaily = await SpreadDaily.findOne()
-    .sort({ trading_date: -1 })
-    .lean();
-  if (!latestDaily) return;
-
-  // Get any existing summary record to check the last update.
-  const existingSummary = await SpreadSummary.findOne()
-    .sort({ last_date: -1 })
-    .lean();
-
-  if (!existingSummary) {
-    // No summary exists at all, compute it.
-    await recomputeSpreadSummary();
-    return;
-  }
-
-  // Recompute if there are new spread_daily records beyond the summary's last_date.
-  if (latestDaily.trading_date.getTime() > existingSummary.last_date.getTime()) {
-    await recomputeSpreadSummary();
-  }
-}
-
 // ============================================================================
-//  Scheduler: checks at 15:35 IST and triggers EOD capture
+//  Scheduler: checks at 15:35 IST for EOD capture and 16:00 IST for summary
 // ============================================================================
 
 let schedulerInterval: ReturnType<typeof setInterval> | null = null;
+let lastComputedDay = "";
 
 /**
- * Start the EOD capture scheduler. Checks every 60 seconds, and at 15:35 IST
- * on weekdays triggers the EOD capture (5 minutes after market close at 15:30).
+ * Start the EOD scheduler. Checks every 60 seconds:
+ *   - At 15:35-15:37 IST: triggers EOD data capture (closing data).
+ *   - At 16:00-16:02 IST: triggers spread summary recomputation (ensures
+ *     today's data is included).
  */
 export function startEodScheduler(deps: EodSchedulerDeps): void {
   if (schedulerInterval) return; // Already started
@@ -623,15 +651,24 @@ export function startEodScheduler(deps: EodSchedulerDeps): void {
 
         const hh = ist.getUTCHours();
         const mm = ist.getUTCMinutes();
+        const today = istDayKey();
 
-        // Trigger at 15:35-15:37 IST (3-min window).
+        // Trigger EOD capture at 15:35-15:37 IST (3-min window).
         if (hh === 15 && mm >= 35 && mm <= 37) {
-          const today = istDayKey();
-          if (today === lastCapturedDay) return; // Already captured today
-          lastCapturedDay = today;
+          if (today !== lastCapturedDay) {
+            lastCapturedDay = today;
+            console.log("[EODCapture] Triggering EOD capture at 15:35 IST...");
+            await captureEodData(deps);
+          }
+        }
 
-          console.log("[EODCapture] Triggering EOD capture at 15:35 IST...");
-          await captureEodData(deps);
+        // Trigger summary recomputation at 16:00-16:02 IST (3-min window).
+        if (hh === 16 && mm >= 0 && mm <= 2) {
+          if (today !== lastComputedDay) {
+            lastComputedDay = today;
+            console.log("[EODCapture] Triggering spread summary recomputation at 16:00 IST...");
+            await recomputeSpreadSummary();
+          }
         }
       } catch (err) {
         console.error("[EODCapture] Scheduler error:", err);
@@ -639,5 +676,5 @@ export function startEodScheduler(deps: EodSchedulerDeps): void {
     })();
   }, 60_000);
 
-  console.log("[EODCapture] EOD scheduler started (checking every 60s for 15:35 IST).");
+  console.log("[EODCapture] EOD scheduler started (checking every 60s for 15:35 & 16:00 IST).");
 }
