@@ -489,8 +489,8 @@ export async function recomputeSpreadSummary(): Promise<void> {
 
   console.log("[EODCapture] Recomputing spread_summary...");
 
-  // Fetch all spread_daily records.
-  const allRecords = await SpreadDaily.find({}).lean();
+  // Fetch all spread_daily records (only the fields needed for stats).
+  const allRecords = await SpreadDaily.find({}, { symbol: 1, spread: 1, trading_date: 1 }).lean();
 
   if (allRecords.length === 0) {
     console.log("[EODCapture] No spread_daily records found. Skipping summary.");
@@ -520,6 +520,9 @@ export async function recomputeSpreadSummary(): Promise<void> {
     const records = grouped.get(symbol)!;
 
     if (i > 0) await delay(200);
+
+    // Sort chronologically so mean reversion crossings are computed in time order.
+    records.sort((a, b) => +a.trading_date - +b.trading_date);
 
     const spreads = records.map((r) => r.spread);
     const n = spreads.length;
@@ -677,4 +680,61 @@ export function startEodScheduler(deps: EodSchedulerDeps): void {
   }, 60_000);
 
   console.log("[EODCapture] EOD scheduler started (checking every 60s for 15:35 & 16:00 IST).");
+}
+
+// ============================================================================
+//  Startup Reconciliation
+// ============================================================================
+
+/**
+ * On startup, compare the latest trading_date in spread_daily with the latest
+ * last_date in spread_summary. If spread_daily has newer data (or spread_summary
+ * is empty), trigger a full recomputeSpreadSummary() to catch up.
+ *
+ * This covers the case where the process crashed between EOD capture (15:35)
+ * and summary recomputation (16:00), leaving today's data captured but the
+ * summary stale.
+ */
+export async function checkAndRecomputeSummary(): Promise<void> {
+  if (!isNseFnoDbEnabled()) return;
+
+  try {
+    // Get the latest trading_date from spread_daily.
+    const latestDaily = await SpreadDaily.findOne()
+      .sort({ trading_date: -1 })
+      .select({ trading_date: 1 })
+      .lean();
+
+    if (!latestDaily) {
+      console.log("[EODCapture] No spread_daily records. Skipping startup reconciliation.");
+      return;
+    }
+
+    // Get the latest last_date from spread_summary.
+    const latestSummary = await SpreadSummary.findOne()
+      .sort({ last_date: -1 })
+      .select({ last_date: 1 })
+      .lean();
+
+    if (!latestSummary) {
+      // No summary records at all - need a full recompute.
+      console.log("[EODCapture] No spread_summary records found. Triggering startup recomputation...");
+      await recomputeSpreadSummary();
+      return;
+    }
+
+    const dailyLatest = new Date(latestDaily.trading_date).getTime();
+    const summaryLatest = new Date(latestSummary.last_date).getTime();
+
+    if (dailyLatest > summaryLatest) {
+      console.log(
+        `[EODCapture] spread_daily has newer data (${new Date(dailyLatest).toISOString().slice(0, 10)}) than spread_summary (${new Date(summaryLatest).toISOString().slice(0, 10)}). Triggering startup recomputation...`,
+      );
+      await recomputeSpreadSummary();
+    } else {
+      console.log("[EODCapture] Spread summary is up to date. No startup recomputation needed.");
+    }
+  } catch (err) {
+    console.error("[EODCapture] Startup reconciliation error:", err);
+  }
 }

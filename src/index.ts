@@ -11,7 +11,7 @@ import type { ITrade, TradeRecord } from "./db.js";
 import { initNseFnoConnections } from "./db.js";
 import { SpreadSummary } from "./db.js";
 import { startHourlyScheduler, backfillMissedHours } from "./hourlyCapture.js";
-import { startEodScheduler, backfillStockFutures } from "./eodCapture.js";
+import { startEodScheduler, backfillStockFutures, checkAndRecomputeSummary } from "./eodCapture.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
@@ -1479,5 +1479,7 @@ app.listen(PORT, () => {
     };
     startEodScheduler(eodDeps);
     void backfillStockFutures(eodDeps);
+    // Startup reconciliation: recompute summary if spread_daily has newer data.
+    void checkAndRecomputeSummary();
   });
 });
