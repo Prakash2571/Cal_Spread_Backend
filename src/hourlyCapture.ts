@@ -592,3 +592,116 @@ function candleToSlotKey(timestamp: string): string | null {
 
   return null;
 }
+
+
+// ============================================================================
+//  End-of-day review (default 16:30 IST): verify the whole day is stored,
+//  and if not, backfill the gaps and re-check ("check pass").
+// ============================================================================
+
+/**
+ * Runs once after market close. Counts how many of today's expected hourly
+ * slot-records are stored (symbols x MARKET_HOURS). If the day is complete it
+ * logs a CHECK PASS; if not, it backfills the missing slots and re-verifies.
+ */
+export async function reviewDayCompleteness(deps: HourlySchedulerDeps): Promise<void> {
+  const { getBoard, kite } = deps;
+  const today = istDayKey();
+
+  if (!isWeekday(today)) {
+    console.log(`[DayReview] ${today} is a weekend — nothing to review.`);
+    return;
+  }
+
+  console.log(`[DayReview] Running end-of-day completeness check for ${today}...`);
+
+  let board: BoardItem[];
+  try {
+    board = await getBoard();
+  } catch (err) {
+    console.error("[DayReview] Could not get board:", err);
+    return;
+  }
+
+  const symbols = board.filter((b) => b.futures.length >= 2).map((b) => b.symbol);
+  if (symbols.length === 0) {
+    console.log("[DayReview] No eligible symbols on the board — skipping.");
+    return;
+  }
+  const expectedTotal = symbols.length * MARKET_HOURS.length;
+
+  const countToday = (): Promise<number> =>
+    HourlyPrice.countDocuments({ date: today, symbol: { $in: symbols } });
+
+  const before = await countToday();
+  console.log(
+    `[DayReview] Stored ${before}/${expectedTotal} slot-records for ${today} ` +
+      `(${symbols.length} symbols x ${MARKET_HOURS.length} slots).`,
+  );
+
+  if (before >= expectedTotal) {
+    console.log(`[DayReview] CHECK PASS — the full day is stored for ${today}.`);
+    return;
+  }
+
+  console.log(
+    `[DayReview] INCOMPLETE — ${expectedTotal - before} slot-records missing. Backfilling...`,
+  );
+  if (!kite.hasSession()) {
+    console.log(
+      "[DayReview] No Kite session — cannot backfill now. Log in and it will recover the gap.",
+    );
+    return;
+  }
+
+  await backfillMissedHours(deps);
+
+  const after = await countToday();
+  if (after >= expectedTotal) {
+    console.log(
+      `[DayReview] CHECK PASS after backfill — full day now stored (${after}/${expectedTotal}).`,
+    );
+  } else {
+    console.log(
+      `[DayReview] Still ${expectedTotal - after} missing after backfill ` +
+        `(${after}/${expectedTotal}). Some contracts may lack historical data for those slots.`,
+    );
+  }
+}
+
+let lastReviewDay = "";
+
+/**
+ * Fires the end-of-day review once per weekday, within a 2-minute window of the
+ * configured time (DAY_REVIEW_TIME, default "16:30" IST — an hour after close).
+ */
+export function startDayReviewScheduler(deps: HourlySchedulerDeps): void {
+  const parts = (process.env.DAY_REVIEW_TIME ?? "16:30").split(":");
+  const reviewH = Number.isFinite(Number(parts[0])) ? Number(parts[0]) : 16;
+  const reviewM = Number.isFinite(Number(parts[1])) ? Number(parts[1]) : 30;
+
+  setInterval(() => {
+    void (async () => {
+      try {
+        const ist = istNow();
+        const dow = ist.getUTCDay();
+        if (dow === 0 || dow === 6) return;
+        const hh = ist.getUTCHours();
+        const mm = ist.getUTCMinutes();
+        if (hh !== reviewH || mm < reviewM || mm > reviewM + 2) return;
+
+        const today = istDayKey();
+        if (today === lastReviewDay) return;
+        lastReviewDay = today;
+
+        await reviewDayCompleteness(deps);
+      } catch (err) {
+        console.error("[DayReview] Scheduler error:", err);
+      }
+    })();
+  }, 60_000);
+
+  console.log(
+    `[DayReview] End-of-day review scheduler started (checking for ${String(reviewH).padStart(2, "0")}:${String(reviewM).padStart(2, "0")} IST).`,
+  );
+}

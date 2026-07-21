@@ -18,7 +18,7 @@ import {
 import type { ITrade, TradeRecord } from "./db.js";
 import { initNseFnoConnections } from "./db.js";
 import { SpreadSummary } from "./db.js";
-import { startHourlyScheduler, backfillMissedHours } from "./hourlyCapture.js";
+import { startHourlyScheduler, backfillMissedHours, startDayReviewScheduler } from "./hourlyCapture.js";
 import { startEodScheduler, backfillStockFutures, checkAndRecomputeSummary } from "./eodCapture.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
@@ -1594,6 +1594,9 @@ app.listen(PORT, () => {
     };
     startHourlyScheduler(hourlyBackfillDeps);
     void backfillMissedHours(hourlyBackfillDeps);
+    // End-of-day review (default 16:30 IST): verify today's full day is stored;
+    // backfill the gaps if not.
+    startDayReviewScheduler(hourlyBackfillDeps);
   });
 
   // Connect to the split nse_fno databases (archive, current, spread) and start EOD capture scheduler + backfill.
