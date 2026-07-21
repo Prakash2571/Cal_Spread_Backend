@@ -18,6 +18,9 @@ const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
 const ADMIN_SECRET = process.env.ADMIN_SECRET ?? "";
 // Separate password for the trade-only access route (/admin/access).
 const ACCESS_SECRET = process.env.ACCESS_SECRET ?? "";
+// Shared secret for the internal token-sharing endpoint used by the local
+// market_data recorder to reuse this app's Zerodha session (no second API key).
+const INTERNAL_TOKEN_SECRET = process.env.INTERNAL_TOKEN_SECRET ?? "";
 
 const kite = new KiteClient({
   apiKey: process.env.KITE_API_KEY ?? "",
@@ -133,6 +136,35 @@ app.get("/", (_req: Request, res: Response) => {
 app.get("/api/status", (_req: Request, res: Response) => {
   res.json({ status: "ok", authenticated: kite.hasSession() });
 });
+
+// --- Internal: share the current Zerodha session with the local market_data
+// recorder so it can reuse THIS app's access token (Zerodha allows only one
+// token per API key/day). Guarded by a shared secret header, never exposed to
+// the public frontend. Returns the api_key + access_token only when a valid
+// session exists. Rate-limited to blunt brute-force of the secret. ---
+app.get(
+  "/api/internal/kite-token",
+  rateLimit({ windowMs: 60_000, max: 30 }),
+  (req: Request, res: Response) => {
+    if (!INTERNAL_TOKEN_SECRET) {
+      res.status(503).json({ error: "Internal token sharing is not configured." });
+      return;
+    }
+    const provided =
+      (req.headers["x-internal-secret"] as string | undefined) ??
+      (req.query.secret as string | undefined);
+    if (provided !== INTERNAL_TOKEN_SECRET) {
+      res.status(403).json({ error: "Forbidden." });
+      return;
+    }
+    const accessToken = kite.getAccessToken();
+    res.json({
+      api_key: kite.getApiKey(),
+      access_token: accessToken,
+      authenticated: accessToken !== null,
+    });
+  },
+);
 
 // --- Admin verification endpoint ---
 // Stricter limit so the secret can't be brute-forced: 10 attempts / 5 min / IP.
