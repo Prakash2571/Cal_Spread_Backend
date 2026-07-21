@@ -47,6 +47,11 @@ const tickerHub = new TickerHub(
   },
 );
 
+// Capture-scheduler deps, held at module scope so a login (which happens after
+// startup) can immediately trigger a backfill of any slots missed while down.
+let hourlyBackfillDeps: Parameters<typeof backfillMissedHours>[0] | null = null;
+let eodBackfillDeps: Parameters<typeof backfillStockFutures>[0] | null = null;
+
 // In-memory store for admin sessions (token -> { expiry, role }).
 // "full"  = full admin (Zerodha connect + trades), via /admin/verify
 // "trade" = trade-only access (view/take/close trades), via /admin/access
@@ -281,6 +286,7 @@ app.post("/api/session", requireFullAdmin, async (req: Request, res: Response) =
     const session = await kite.generateSession(requestToken);
     console.log(`Authenticated as ${session.user_name} (${session.user_id}).`);
     persistKiteSession(session);
+    triggerPostLoginBackfill();
     res.json({
       authenticated: true,
       user_id: session.user_id,
@@ -310,6 +316,7 @@ app.get("/callback", async (req: Request, res: Response) => {
     const session = await kite.generateSession(requestToken);
     console.log(`Authenticated as ${session.user_name} (${session.user_id}).`);
     persistKiteSession(session);
+    triggerPostLoginBackfill();
     res.redirect(`${FRONTEND_URL}/?auth=success`);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
@@ -1502,6 +1509,27 @@ function sendError(res: Response, err: unknown): void {
   res.status(500).json({ error: message });
 }
 
+/**
+ * After a login, immediately backfill any hourly/EOD slots missed while the
+ * system was down. This is what guarantees a gap is recovered whenever the app
+ * is turned on and logged in (the startup backfill is skipped when there is no
+ * session yet, so this post-login trigger covers the "logged in later" case).
+ */
+function triggerPostLoginBackfill(): void {
+  if (hourlyBackfillDeps) {
+    console.log("[HourlyCapture] Login detected — backfilling any missed slots.");
+    void backfillMissedHours(hourlyBackfillDeps).catch((e) =>
+      console.error("[HourlyCapture] post-login backfill failed:", e),
+    );
+  }
+  if (eodBackfillDeps) {
+    void backfillStockFutures(eodBackfillDeps).catch((e) =>
+      console.error("[EODCapture] post-login backfill failed:", e),
+    );
+    void checkAndRecomputeSummary();
+  }
+}
+
 /** Persist the Zerodha access token so it survives a restart (best-effort). */
 function persistKiteSession(session: {
   access_token: string;
@@ -1558,25 +1586,25 @@ app.listen(PORT, () => {
     // capture / backfill have a session immediately after a restart.
     await restoreSessionOnStartup();
     // Start hourly price capture scheduler and backfill missed hours.
-    const hourlyDeps = {
+    hourlyBackfillDeps = {
       getBoard: async () => deriveFnoBoard(await getAllInstrumentsCached()),
       getLatestTick: (token: number) => tickerHub.getLatestTick(token),
       kite,
       getAllInstruments: getAllInstrumentsCached,
     };
-    startHourlyScheduler(hourlyDeps);
-    void backfillMissedHours(hourlyDeps);
+    startHourlyScheduler(hourlyBackfillDeps);
+    void backfillMissedHours(hourlyBackfillDeps);
   });
 
   // Connect to the split nse_fno databases (archive, current, spread) and start EOD capture scheduler + backfill.
   void initNseFnoConnections().then(() => {
-    const eodDeps = {
+    eodBackfillDeps = {
       getBoard: async () => deriveFnoBoard(await getAllInstrumentsCached()),
       kite,
       getAllInstruments: getAllInstrumentsCached,
     };
-    startEodScheduler(eodDeps);
-    void backfillStockFutures(eodDeps);
+    startEodScheduler(eodBackfillDeps);
+    void backfillStockFutures(eodBackfillDeps);
     // Startup reconciliation: recompute summary if spread_daily has newer data.
     void checkAndRecomputeSummary();
   });

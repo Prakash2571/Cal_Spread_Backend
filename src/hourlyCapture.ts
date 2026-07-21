@@ -331,32 +331,51 @@ export function startHourlyScheduler(deps: HourlySchedulerDeps): void {
 }
 
 // ============================================================================
-//  Backfill missed hours on startup
+//  Backfill missed hours (startup + after login) — fills ANY missing slot
 // ============================================================================
 
+/** Prevents overlapping backfill runs (e.g. startup vs post-login trigger). */
+let backfilling = false;
+
 /**
- * On startup, for each FNO stock: find the latest HourlyPrice record, determine
- * which hourly slots are missing since then (during market hours on weekdays),
- * and backfill via the Kite historical API (60-minute candles).
+ * For each FNO stock, look back over a window and backfill EVERY missing market
+ * slot ("holes") via the Kite historical API (60-minute candles) — not just
+ * slots after the most recent record. This recovers gaps such as a missed 15:00
+ * even when a later slot (15:30) was captured. Runs on startup AND after each
+ * login, so any window missed while the system was down is recovered.
  */
 export async function backfillMissedHours(deps: HourlySchedulerDeps): Promise<void> {
   const { getBoard, kite, getAllInstruments } = deps;
 
+  if (backfilling) {
+    console.log("[HourlyCapture] Backfill already running; skipping duplicate request.");
+    return;
+  }
   if (!kite.hasSession()) {
     console.log("[HourlyCapture] No Kite session available. Skipping backfill.");
     return;
   }
+  backfilling = true;
 
   let board: BoardItem[];
   try {
     board = await getBoard();
   } catch (err) {
     console.error("[HourlyCapture] Could not get board for backfill:", err);
+    backfilling = false;
     return;
   }
 
   const todayStr = istDayKey();
   const nowHour = istHourKey();
+
+  // Look back over a window and fill ANY missing slot (holes), not just slots
+  // after the most recent record — so a missed 15:00 (with 15:30 present) is
+  // still recovered. Configurable via HOURLY_BACKFILL_LOOKBACK_DAYS (default 7).
+  const lookbackDays = Number(process.env.HOURLY_BACKFILL_LOOKBACK_DAYS ?? "7") || 7;
+  const windowStart = new Date(istNow().getTime() - lookbackDays * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
 
   for (const item of board) {
     if (item.futures.length < 2) continue;
@@ -366,27 +385,18 @@ export async function backfillMissedHours(deps: HourlySchedulerDeps): Promise<vo
     const farFut = item.futures.length >= 3 ? item.futures[2]! : null;
 
     try {
-      // Find the latest stored record for this symbol.
-      const lastRecord = await HourlyPrice.findOne({ symbol: item.symbol })
-        .sort({ date: -1, time: -1 })
-        .lean();
+      // Slots already stored for this symbol within the lookback window.
+      const existingDocs = await HourlyPrice.find(
+        { symbol: item.symbol, date: { $gte: windowStart } },
+        { date: 1, time: 1, _id: 0 },
+      ).lean();
+      const present = new Set(existingDocs.map((d) => `${d.date}_${d.time}`));
 
-      // Determine the starting point for backfill.
-      let startDate: string;
-      let startTime: string;
-
-      if (lastRecord) {
-        startDate = lastRecord.date;
-        startTime = lastRecord.time;
-      } else {
-        // No records at all; backfill from 5 trading days ago.
-        const fiveDaysAgo = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000);
-        startDate = fiveDaysAgo.toISOString().slice(0, 10);
-        startTime = "09:00";
-      }
-
-      // Build list of missing slots from startDate/startTime to now.
-      const missingSlots = getMissingSlots(startDate, startTime, todayStr, nowHour);
+      // Every market slot that SHOULD exist in the window (up to now) minus the
+      // ones already stored = the holes to backfill.
+      const missingSlots = allExpectedSlots(windowStart, todayStr, nowHour).filter(
+        (s) => !present.has(`${s.date}_${s.time}`),
+      );
       if (missingSlots.length === 0) continue;
 
       // Determine the date range for historical API calls.
@@ -476,8 +486,10 @@ export async function backfillMissedHours(deps: HourlySchedulerDeps): Promise<vo
     );
     await drainCacheToDB();
   } else {
-    console.log("[HourlyCapture] Backfill: no missing records found.");
+    console.log("[HourlyCapture] Backfill: no missing slots found.");
   }
+
+  backfilling = false;
 }
 
 // ============================================================================
@@ -490,38 +502,30 @@ interface TimeSlot {
 }
 
 /**
- * Build the list of market-hour slots between (startDate, startTime) exclusive
- * and (endDate, endTime) inclusive that are missing.
+ * All market-hour slots (weekdays only) from startDate to endDate inclusive,
+ * up to endTime on the end day. The caller subtracts the slots already stored
+ * to obtain the holes that need backfilling.
  */
-function getMissingSlots(
+function allExpectedSlots(
   startDate: string,
-  startTime: string,
   endDate: string,
   endTime: string,
 ): TimeSlot[] {
   const slots: TimeSlot[] = [];
-
-  // Iterate day by day from startDate to endDate.
   const current = new Date(startDate + "T00:00:00Z");
   const end = new Date(endDate + "T00:00:00Z");
 
   while (current <= end) {
     const dateStr = current.toISOString().slice(0, 10);
-
     if (isWeekday(dateStr)) {
       for (const hour of MARKET_HOURS) {
-        // Skip slots on or before the start point.
-        if (dateStr === startDate && hour <= startTime) continue;
-        // Skip slots after the current time on the end day.
+        // On the end (today) day, don't expect slots that haven't happened yet.
         if (dateStr === endDate && hour > endTime) continue;
-
         slots.push({ date: dateStr, time: hour });
       }
     }
-
     current.setUTCDate(current.getUTCDate() + 1);
   }
-
   return slots;
 }
 
