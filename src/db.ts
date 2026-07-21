@@ -202,6 +202,63 @@ export function isValidId(id: string): boolean {
 }
 
 // ============================================================================
+//  KiteSession — persist the daily Zerodha access token so it survives a
+//  backend restart/redeploy (Kite tokens are valid for the trading day, so we
+//  only ever restore a token that was generated on the SAME IST day).
+// ============================================================================
+
+export interface IKiteSession {
+  _id: string; // fixed "current" — single-document store
+  access_token: string;
+  user_id: string;
+  user_name: string;
+  login_date: string; // IST YYYY-MM-DD the token was generated on
+  updated_at: Date;
+}
+
+const kiteSessionSchema = new mongoose.Schema<IKiteSession>(
+  {
+    _id: { type: String },
+    access_token: { type: String, required: true },
+    user_id: { type: String, default: "" },
+    user_name: { type: String, default: "" },
+    login_date: { type: String, required: true },
+    updated_at: { type: Date, default: () => new Date() },
+  },
+  { collection: "kite_session" },
+);
+
+/** Single-doc model for the persisted Zerodha session. */
+export const KiteSession = mongoose.model<IKiteSession>("KiteSession", kiteSessionSchema);
+
+/** Persist (upsert) the current Zerodha access token. No-op if DB is disabled. */
+export async function saveKiteSession(data: {
+  access_token: string;
+  user_id: string;
+  user_name: string;
+  login_date: string;
+}): Promise<void> {
+  if (!isDbEnabled()) return;
+  await KiteSession.updateOne(
+    { _id: "current" },
+    { $set: { ...data, _id: "current", updated_at: new Date() } },
+    { upsert: true },
+  );
+}
+
+/** Load the persisted Zerodha session (or null). No-op if DB is disabled. */
+export async function loadKiteSession(): Promise<IKiteSession | null> {
+  if (!isDbEnabled()) return null;
+  return KiteSession.findById("current").lean<IKiteSession>();
+}
+
+/** Remove the persisted Zerodha session (on logout / auth failure). */
+export async function clearKiteSession(): Promise<void> {
+  if (!isDbEnabled()) return;
+  await KiteSession.deleteOne({ _id: "current" });
+}
+
+// ============================================================================
 //  HourlyPrice — stores hourly closing prices per FNO stock (spread tracking).
 // ============================================================================
 

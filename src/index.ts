@@ -6,7 +6,15 @@ import { TickerHub } from "./hub.js";
 import type { Tick } from "./ticker.js";
 import { rateLimit } from "./ratelimit.js";
 import { getDividendYields } from "./yahoo.js";
-import { initDb, isDbEnabled, isValidId, Trade } from "./db.js";
+import {
+  initDb,
+  isDbEnabled,
+  isValidId,
+  Trade,
+  saveKiteSession,
+  loadKiteSession,
+  clearKiteSession,
+} from "./db.js";
 import type { ITrade, TradeRecord } from "./db.js";
 import { initNseFnoConnections } from "./db.js";
 import { SpreadSummary } from "./db.js";
@@ -31,7 +39,12 @@ const kite = new KiteClient({
 // Zerodha's per-key connection limit no matter how many visitors watch).
 const tickerHub = new TickerHub(
   () => ({ apiKey: kite.getApiKey(), accessToken: kite.getAccessToken() }),
-  () => kite.clearSession(),
+  () => {
+    // Token was rejected by Zerodha — clear both memory and the persisted copy
+    // so we don't restore a dead token on the next restart.
+    kite.clearSession();
+    void clearKiteSession();
+  },
 );
 
 // In-memory store for admin sessions (token -> { expiry, role }).
@@ -267,6 +280,7 @@ app.post("/api/session", requireFullAdmin, async (req: Request, res: Response) =
   try {
     const session = await kite.generateSession(requestToken);
     console.log(`Authenticated as ${session.user_name} (${session.user_id}).`);
+    persistKiteSession(session);
     res.json({
       authenticated: true,
       user_id: session.user_id,
@@ -295,6 +309,7 @@ app.get("/callback", async (req: Request, res: Response) => {
   try {
     const session = await kite.generateSession(requestToken);
     console.log(`Authenticated as ${session.user_name} (${session.user_id}).`);
+    persistKiteSession(session);
     res.redirect(`${FRONTEND_URL}/?auth=success`);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
@@ -306,6 +321,7 @@ app.get("/callback", async (req: Request, res: Response) => {
 // --- Logout: forget the stored Kite session (full admin only). ---
 app.post("/api/logout", requireFullAdmin, (_req: Request, res: Response) => {
   kite.clearSession();
+  void clearKiteSession();
   res.json({ authenticated: false });
 });
 
@@ -1472,14 +1488,61 @@ async function getAllInstrumentsCached(): Promise<Instrument[]> {
 
 function sendError(res: Response, err: unknown): void {
   if (err instanceof KiteError) {
-    // An auth failure means the session is no longer valid — clear it so the
-    // app reflects a logged-out state instead of staying half-broken.
-    if (err.status === 401 || err.status === 403) kite.clearSession();
+    // An auth failure means the session is no longer valid — clear it (memory +
+    // persisted) so the app reflects a logged-out state instead of restoring a
+    // dead token on the next restart.
+    if (err.status === 401 || err.status === 403) {
+      kite.clearSession();
+      void clearKiteSession();
+    }
     res.status(err.status).json({ error: err.message });
     return;
   }
   const message = err instanceof Error ? err.message : "Unknown error";
   res.status(500).json({ error: message });
+}
+
+/** Persist the Zerodha access token so it survives a restart (best-effort). */
+function persistKiteSession(session: {
+  access_token: string;
+  user_id: string;
+  user_name: string;
+}): void {
+  void saveKiteSession({
+    access_token: session.access_token,
+    user_id: session.user_id,
+    user_name: session.user_name,
+    login_date: istDayKey(),
+  }).catch((e) => console.warn("[Session] persist failed:", e));
+}
+
+/**
+ * On startup, restore a persisted Zerodha session — but only if it was created
+ * on the SAME IST day (Kite tokens expire daily, so a token from a previous day
+ * is useless and is discarded). This is what keeps hourly/EOD capture and the
+ * market_data recorder working after a restart/redeploy without re-login.
+ */
+async function restoreSessionOnStartup(): Promise<void> {
+  try {
+    const saved = await loadKiteSession();
+    if (!saved) {
+      console.log("[Session] No persisted Zerodha session found.");
+      return;
+    }
+    if (saved.login_date !== istDayKey()) {
+      console.log(
+        `[Session] Persisted token is from ${saved.login_date} (stale) — daily Zerodha login required.`,
+      );
+      await clearKiteSession();
+      return;
+    }
+    kite.setAccessToken(saved.access_token);
+    console.log(
+      `[Session] Restored today's Zerodha session for ${saved.user_name} (${saved.user_id}) — no re-login needed.`,
+    );
+  } catch (e) {
+    console.warn("[Session] restore failed:", e);
+  }
 }
 
 app.listen(PORT, () => {
@@ -1490,7 +1553,10 @@ app.listen(PORT, () => {
     );
   }
   // Connect to MongoDB for trade persistence (no-op if MONGODB_URI is unset).
-  void initDb().then(() => {
+  void initDb().then(async () => {
+    // Restore a same-day Zerodha session BEFORE the schedulers run, so hourly
+    // capture / backfill have a session immediately after a restart.
+    await restoreSessionOnStartup();
     // Start hourly price capture scheduler and backfill missed hours.
     const hourlyDeps = {
       getBoard: async () => deriveFnoBoard(await getAllInstrumentsCached()),
