@@ -29,6 +29,10 @@ const ACCESS_SECRET = process.env.ACCESS_SECRET ?? "";
 // Shared secret for the internal token-sharing endpoint used by the local
 // market_data recorder to reuse this app's Zerodha session (no second API key).
 const INTERNAL_TOKEN_SECRET = process.env.INTERNAL_TOKEN_SECRET ?? "";
+// Passcode for the public, curl-friendly token route (GET /api/kite/token).
+// Anyone who knows this passcode can fetch the current Zerodha access token
+// once the admin has connected Zerodha — handy for scripts/tools without a UI.
+const TOKEN_ROUTE_SECRET = process.env.TOKEN_ROUTE_SECRET ?? "";
 
 const kite = new KiteClient({
   apiKey: process.env.KITE_API_KEY ?? "",
@@ -180,6 +184,50 @@ app.get(
       api_key: kite.getApiKey(),
       access_token: accessToken,
       authenticated: accessToken !== null,
+    });
+  },
+);
+
+// --- Public, curl-friendly access-token route (passcode-protected). ---
+// Once the admin has connected Zerodha, anyone holding the route passcode can
+// fetch the day's access token with a simple curl (no admin login / cookies):
+//
+//   curl "https://<host>/api/kite/token?passcode=YOUR_PASSCODE"
+//   curl -H "x-token-passcode: YOUR_PASSCODE" https://<host>/api/kite/token
+//
+// The passcode is a dedicated secret (TOKEN_ROUTE_SECRET), separate from the
+// admin secret, so it can be shared with scripts without granting admin access.
+// Rate-limited to blunt brute-forcing of the passcode.
+app.get(
+  "/api/kite/token",
+  rateLimit({ windowMs: 60_000, max: 30 }),
+  (req: Request, res: Response) => {
+    if (!TOKEN_ROUTE_SECRET) {
+      res.status(503).json({
+        error: "Token route is not configured. Set TOKEN_ROUTE_SECRET on the server.",
+      });
+      return;
+    }
+    const provided =
+      (req.headers["x-token-passcode"] as string | undefined) ??
+      (req.query.passcode as string | undefined);
+    if (provided !== TOKEN_ROUTE_SECRET) {
+      res.status(403).json({ error: "Invalid or missing passcode." });
+      return;
+    }
+    const accessToken = kite.getAccessToken();
+    if (!accessToken) {
+      res.status(409).json({
+        authenticated: false,
+        error: "No active Zerodha session. The admin must connect to Zerodha first.",
+      });
+      return;
+    }
+    res.json({
+      authenticated: true,
+      api_key: kite.getApiKey(),
+      access_token: accessToken,
+      login_date: istDayKey(),
     });
   },
 );
