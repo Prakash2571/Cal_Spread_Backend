@@ -56,6 +56,11 @@ const tickerHub = new TickerHub(
 let hourlyBackfillDeps: Parameters<typeof backfillMissedHours>[0] | null = null;
 let eodBackfillDeps: Parameters<typeof backfillStockFutures>[0] | null = null;
 
+// The risk-free rate (%) the full admin last entered in the UI. Synced from the
+// admin panel so it can be read back via GET /api/rf (same passcode as the
+// token route). null until an admin has set it at least once.
+let adminRfRate: number | null = null;
+
 // In-memory store for admin sessions (token -> { expiry, role }).
 // "full"  = full admin (Zerodha connect + trades), via /admin/verify
 // "trade" = trade-only access (view/take/close trades), via /admin/access
@@ -229,6 +234,53 @@ app.get(
       access_token: accessToken,
       login_date: istDayKey(),
     });
+  },
+);
+
+// --- Sync the admin-entered risk-free rate (%). Full admin only. ---
+// The admin panel POSTs here whenever the rf field changes, so the value can be
+// read back over the API (e.g. via curl) with the passcode route below.
+app.post("/api/rf", requireFullAdmin, (req: Request, res: Response) => {
+  const rf = Number(req.body?.rf);
+  if (!Number.isFinite(rf)) {
+    res.status(400).json({ error: "Provide a numeric rf (percent)." });
+    return;
+  }
+  adminRfRate = rf;
+  res.json({ rf: adminRfRate });
+});
+
+// --- Public, curl-friendly read of the admin's risk-free rate. ---
+// Protected by the SAME passcode as the token route (TOKEN_ROUTE_SECRET):
+//
+//   curl "https://<host>/api/rf?passcode=YOUR_PASSCODE"
+//   curl -H "x-token-passcode: YOUR_PASSCODE" https://<host>/api/rf
+//
+// Returns 409 until the admin has entered an rf value in the panel at least once.
+app.get(
+  "/api/rf",
+  rateLimit({ windowMs: 60_000, max: 30 }),
+  (req: Request, res: Response) => {
+    if (!TOKEN_ROUTE_SECRET) {
+      res.status(503).json({
+        error: "Token route is not configured. Set TOKEN_ROUTE_SECRET on the server.",
+      });
+      return;
+    }
+    const provided =
+      (req.headers["x-token-passcode"] as string | undefined) ??
+      (req.query.passcode as string | undefined);
+    if (provided !== TOKEN_ROUTE_SECRET) {
+      res.status(403).json({ error: "Invalid or missing passcode." });
+      return;
+    }
+    if (adminRfRate === null) {
+      res.status(409).json({
+        error: "No risk-free rate set yet. The admin must enter it in the panel first.",
+      });
+      return;
+    }
+    res.json({ rf: adminRfRate });
   },
 );
 
