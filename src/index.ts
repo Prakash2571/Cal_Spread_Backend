@@ -332,6 +332,25 @@ app.post("/api/logout", requireFullAdmin, (_req: Request, res: Response) => {
   res.json({ authenticated: false });
 });
 
+// --- Current Zerodha access token (full admin only). ---
+// Lets the admin copy the day's access token straight from the admin panel so
+// it can be reused in other tools (e.g. the local market_data recorder) without
+// a second Zerodha login. Zerodha issues one token per API key per day.
+app.get("/api/kite/access-token", requireFullAdmin, (_req: Request, res: Response) => {
+  const accessToken = kite.getAccessToken();
+  if (!accessToken) {
+    res.status(409).json({
+      error: "No active Zerodha session. Connect to Zerodha first.",
+    });
+    return;
+  }
+  res.json({
+    api_key: kite.getApiKey(),
+    access_token: accessToken,
+    login_date: istDayKey(),
+  });
+});
+
 // --- Authenticated user profile (the /user/ docs endpoint) ---
 app.get("/api/profile", async (_req: Request, res: Response) => {
   try {
