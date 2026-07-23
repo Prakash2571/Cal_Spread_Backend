@@ -14,6 +14,8 @@ import {
   saveKiteSession,
   loadKiteSession,
   clearKiteSession,
+  saveRfRate,
+  loadRfRate,
 } from "./db.js";
 import type { ITrade, TradeRecord } from "./db.js";
 import { initNseFnoConnections } from "./db.js";
@@ -247,6 +249,16 @@ app.post("/api/rf", requireFullAdmin, (req: Request, res: Response) => {
     return;
   }
   adminRfRate = rf;
+  // Persist so the value survives restarts and is shared across browsers.
+  void saveRfRate(rf).catch((e) => console.warn("[rf] persist failed:", e));
+  res.json({ rf: adminRfRate });
+});
+
+// --- Public read of the current risk-free rate (%) for the frontend. ---
+// Unauthenticated: rf is a non-sensitive display setting, and every visitor's
+// fair-value math must use the SAME admin-entered value. Returns { rf: null }
+// when the admin hasn't set one yet (frontend falls back to its default).
+app.get("/api/rf/current", (_req: Request, res: Response) => {
   res.json({ rf: adminRfRate });
 });
 
@@ -1704,6 +1716,17 @@ app.listen(PORT, () => {
     // Restore a same-day Zerodha session BEFORE the schedulers run, so hourly
     // capture / backfill have a session immediately after a restart.
     await restoreSessionOnStartup();
+    // Restore the admin's persisted risk-free rate so GET /api/rf and the
+    // frontend show the latest value immediately after a restart.
+    try {
+      const savedRf = await loadRfRate();
+      if (savedRf !== null) {
+        adminRfRate = savedRf;
+        console.log(`[rf] Restored persisted risk-free rate: ${savedRf}%`);
+      }
+    } catch (e) {
+      console.warn("[rf] restore failed:", e);
+    }
     // Start hourly price capture scheduler and backfill missed hours.
     hourlyBackfillDeps = {
       getBoard: async () => deriveFnoBoard(await getAllInstrumentsCached()),

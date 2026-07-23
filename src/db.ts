@@ -259,6 +259,49 @@ export async function clearKiteSession(): Promise<void> {
 }
 
 // ============================================================================
+//  AppSetting — small single-collection key/value store for app-wide settings
+//  the admin controls (currently the risk-free rate). Persisted so the value
+//  survives restarts and is shared across every browser/visitor.
+// ============================================================================
+
+export interface IAppSetting {
+  _id: string; // the setting key, e.g. "rf_rate"
+  value: number;
+  updated_at: Date;
+}
+
+const appSettingSchema = new mongoose.Schema<IAppSetting>(
+  {
+    _id: { type: String },
+    value: { type: Number, required: true },
+    updated_at: { type: Date, default: () => new Date() },
+  },
+  { collection: "app_settings" },
+);
+
+/** Key/value model for admin-controlled app settings. */
+export const AppSetting = mongoose.model<IAppSetting>("AppSetting", appSettingSchema);
+
+const RF_KEY = "rf_rate";
+
+/** Persist (upsert) the admin's risk-free rate (%). No-op if DB is disabled. */
+export async function saveRfRate(rf: number): Promise<void> {
+  if (!isDbEnabled()) return;
+  await AppSetting.updateOne(
+    { _id: RF_KEY },
+    { $set: { value: rf, updated_at: new Date() } },
+    { upsert: true },
+  );
+}
+
+/** Load the persisted risk-free rate (or null if unset). No-op if DB disabled. */
+export async function loadRfRate(): Promise<number | null> {
+  if (!isDbEnabled()) return null;
+  const doc = await AppSetting.findById(RF_KEY).lean<IAppSetting>();
+  return doc ? doc.value : null;
+}
+
+// ============================================================================
 //  HourlyPrice — stores hourly closing prices per FNO stock (spread tracking).
 // ============================================================================
 
