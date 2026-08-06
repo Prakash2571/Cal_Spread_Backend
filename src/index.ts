@@ -133,6 +133,8 @@ const CACHE_TTL_MS = 1000 * 60 * 60; // 1 hour
 // ---------------------------------------------------------------------------
 const OPTION_OI_UNDERLYING = "NIFTY";
 const OPTION_OI_INTERVAL_MS = 60 * 1000; // sample once a minute
+/** How far before a bucket boundary to take the sample that represents it. */
+const CAPTURE_LEAD_MS = 3 * 1000;
 
 interface OiSample {
   t: number;
@@ -183,6 +185,24 @@ const oiFrameStores: Record<OiFrameKey, { points: OiAggPoint[] }> = {
 // large enough to cover both the 26-below/24-above window AND intraday/multi-day
 // ATM drift over the retention window.
 const OI_BACKFILL_BAND = 45;
+
+/**
+ * Drop the still-forming bucket from a frame before serving it.
+ *
+ * Points are stamped with their bucket-END boundary, so the newest bucket carries
+ * a timestamp that hasn't arrived yet until it closes. Publishing it would label a
+ * partial reading with a future time and, on the change histograms, draw a
+ * part-interval move as a completed bar. Serving only closed buckets means every
+ * point on every chart is a real, finished interval — at the cost of the newest
+ * data being up to one bucket old.
+ */
+function completedBuckets<T extends { t: number }>(points: T[]): T[] {
+  const now = Date.now();
+  // Stamps are ascending, so this only ever trims from the tail.
+  let end = points.length;
+  while (end > 0 && points[end - 1]!.t > now) end--;
+  return end === points.length ? points : points.slice(0, end);
+}
 
 // ---------------------------------------------------------------------------
 // Multi-timeframe NIFTY FUTURES open-interest history (current/next/far month).
@@ -1487,12 +1507,11 @@ app.get("/api/option-oi-frame/:underlying", (req: Request, res: Response) => {
     frameParam === "1m" || frameParam === "5m" || frameParam === "15m"
       ? frameParam
       : "5m";
-  const store = oiFrameStores[frame];
   res.json({
     frame,
     intervalMin: OI_FRAMES[frame].intervalMin,
     retentionMs: OI_FRAMES[frame].retentionMs,
-    points: store.points,
+    points: completedBuckets(oiFrameStores[frame].points),
   });
 });
 
@@ -1506,7 +1525,7 @@ app.get("/api/futures-oi-frame/:underlying", (req: Request, res: Response) => {
     frameParam === "1m" || frameParam === "5m" || frameParam === "15m"
       ? frameParam
       : "5m";
-  const points = futOiFrameStores[frame].points;
+  const points = completedBuckets(futOiFrameStores[frame].points);
   // Report every contract this frame still holds data for (not just the ones
   // currently being captured), so a just-expired month keeps its line until it
   // falls out of the retention window.
@@ -2081,6 +2100,77 @@ function triggerPostLoginBackfill(): void {
 // Intraday option-OI capture
 // ---------------------------------------------------------------------------
 
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+/** Epoch ms of an IST wall-clock minute-of-day on the day containing `t`. */
+function istTimeOnDayMs(t: number, minutesOfDay: number): number {
+  const ist = new Date(t + IST_OFFSET_MS);
+  const istMidnight = Date.UTC(
+    ist.getUTCFullYear(),
+    ist.getUTCMonth(),
+    ist.getUTCDate(),
+  );
+  return istMidnight + minutesOfDay * 60 * 1000 - IST_OFFSET_MS;
+}
+
+/** Epoch ms of the 09:15 IST session open on the day containing `t`. */
+function sessionOpenMs(t: number): number {
+  return istTimeOnDayMs(t, 9 * 60 + 15);
+}
+
+/** Epoch ms of the 15:30 IST session close on the day containing `t`. */
+function sessionCloseMs(t: number): number {
+  return istTimeOnDayMs(t, 15 * 60 + 30);
+}
+
+/**
+ * True if a bucket ending at `bEnd` covers only pre-open time.
+ *
+ * We start capturing at 09:10 so a baseline is ready at the open, but Kite's
+ * minute candles only begin at 09:15 — so a purely pre-open bucket could never be
+ * reproduced by backfill, and the day's first bar would appear or disappear
+ * depending on whether the server happened to be up before the open. Dropping
+ * those buckets on BOTH paths keeps the two fills identical.
+ */
+function isPreOpenBucket(bEnd: number): boolean {
+  return bEnd <= sessionOpenMs(bEnd);
+}
+
+/**
+ * The bucket-END boundary a sample belongs to — i.e. the timestamp the frame
+ * point is stamped with.
+ *
+ * Frames used to be stamped with the LAST SAMPLE that landed in a bucket, which
+ * is why the 5m axis read 15:29 and the 15m axis 15:29/15:14: the last
+ * once-a-minute capture inside 15:25–15:30 is the 15:29 one. Stamping the
+ * boundary instead makes every label a real interval edge (…15:20, 15:25, 15:30)
+ * and matches the "bucket end" contract the client already assumes.
+ *
+ * IST is +05:30, an exact multiple of 1m/5m/15m, so epoch-aligned boundaries land
+ * on IST :00/:05/:15/:30 as expected. A sample exactly on a boundary closes that
+ * bucket rather than opening the next.
+ */
+function bucketEndMs(t: number, bsize: number): number {
+  const close = sessionCloseMs(t);
+  // We keep sampling until 15:35, after the 15:30 close. Those readings belong to
+  // the closing bucket — so the day's last bar carries the true closing value
+  // instead of opening a bucket that never traded.
+  if (t >= close) return close;
+  return Math.min(Math.ceil(t / bsize) * bsize, close);
+}
+
+/**
+ * Bucket-end boundary for a Kite CANDLE, which is stamped with its START.
+ *
+ * The candle labelled 09:20 describes 09:20–09:21, so its closing state is 09:21
+ * and it belongs to the bucket ending at 09:25 — not the one ending at 09:20.
+ * Without the shift every backfilled bucket would carry data one minute later
+ * than its own label and disagree with the same bucket captured live.
+ */
+function candleEndMs(candleStart: number, bsize: number): number {
+  return bucketEndMs(candleStart + 60 * 1000, bsize);
+}
+
 /** Is it a weekday within (roughly) NSE market hours, in IST? */
 function isIstMarketHours(): boolean {
   const ist = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
@@ -2146,6 +2236,11 @@ function niftyNearestExpiryOptions(all: Instrument[]): {
 async function captureOptionOi(): Promise<void> {
   if (!kite.getAccessToken()) return;
   try {
+    // Stamp the instant the tick fired, BEFORE any await. Everything after this
+    // is latency to be excluded: the instruments cache expires hourly and that
+    // refetch alone can outlast the pre-boundary capture lead, which would push
+    // the sample into the next bucket and leave this one empty.
+    const now = Date.now();
     const all = await getAllInstrumentsCached();
     const sel = niftyNearestExpiryOptions(all);
     if (!sel) return;
@@ -2165,7 +2260,6 @@ async function captureOptionOi(): Promise<void> {
 
     const quotes = await kite.getQuoteFull([sel.spotId, ...sel.ids]);
     const qmap = new Map(quotes.map((q) => [q.instrument_token, q]));
-    const now = Date.now();
 
     // Push one aligned sample for EVERY tracked token (carry forward if a
     // particular strike is missing from this response) so all series + spot
@@ -2253,24 +2347,31 @@ function currentWindowAgg(store: OptionOiDay): OiAggPoint | null {
   return { t: Date.now(), totalCe, totalPe, straddle, spot };
 }
 
-/** Append/refresh one live aggregate into all three frames (bucket-deduped + pruned). */
+/**
+ * Append/refresh one live aggregate into all three frames.
+ *
+ * Points are keyed AND stamped by their bucket-end boundary, so a bucket keeps
+ * the newest reading inside it while still being labelled with a real interval
+ * edge.
+ */
 function appendOiFrameLive(t: number, agg: OiAggPoint): void {
   for (const key of Object.keys(OI_FRAMES) as OiFrameKey[]) {
     const cfg = OI_FRAMES[key];
     const store = oiFrameStores[key];
     const bsize = cfg.intervalMin * 60 * 1000;
-    const bucket = Math.floor(t / bsize);
+    const bEnd = bucketEndMs(t, bsize);
+    // The per-day baseline cache still records the sample; only the frames skip it.
+    if (isPreOpenBucket(bEnd)) continue;
     const last = store.points[store.points.length - 1];
-    if (last && Math.floor(last.t / bsize) === bucket) {
+    if (last && last.t === bEnd) {
       // Same bucket → keep the latest value for it.
-      last.t = t;
       last.totalCe = agg.totalCe;
       last.totalPe = agg.totalPe;
       last.straddle = agg.straddle;
       last.spot = agg.spot;
     } else {
       store.points.push({
-        t,
+        t: bEnd,
         totalCe: agg.totalCe,
         totalPe: agg.totalPe,
         straddle: agg.straddle,
@@ -2282,11 +2383,21 @@ function appendOiFrameLive(t: number, agg: OiAggPoint): void {
   }
 }
 
-/** Collapse per-minute points to one-per-bucket (last wins) for a frame interval. */
+/**
+ * Collapse per-minute CANDLE points to one-per-bucket (last wins), re-stamped
+ * with the bucket-end boundary.
+ *
+ * Kite stamps a minute candle with its START, so the candle labelled 09:20 is
+ * really the state at 09:21 — see candleEndMs.
+ */
 function downsampleAgg(points: OiAggPoint[], intervalMin: number): OiAggPoint[] {
   const bsize = intervalMin * 60 * 1000;
   const byBucket = new Map<number, OiAggPoint>();
-  for (const p of points) byBucket.set(Math.floor(p.t / bsize), p);
+  for (const p of points) {
+    const bEnd = candleEndMs(p.t, bsize);
+    if (isPreOpenBucket(bEnd)) continue;
+    byBucket.set(bEnd, { ...p, t: bEnd });
+  }
   return Array.from(byBucket.values()).sort((a, b) => a.t - b.t);
 }
 
@@ -2294,12 +2405,11 @@ function downsampleAgg(points: OiAggPoint[], intervalMin: number): OiAggPoint[] 
 function mergeOiFrame(key: OiFrameKey, backfilled: OiAggPoint[]): void {
   const cfg = OI_FRAMES[key];
   const store = oiFrameStores[key];
-  const bsize = cfg.intervalMin * 60 * 1000;
+  // Both sides are already bucket-end stamped, so the stamp IS the bucket key.
   const byBucket = new Map<number, OiAggPoint>();
-  for (const p of store.points) byBucket.set(Math.floor(p.t / bsize), p);
+  for (const p of store.points) byBucket.set(p.t, p);
   for (const p of downsampleAgg(backfilled, cfg.intervalMin)) {
-    const b = Math.floor(p.t / bsize);
-    if (!byBucket.has(b)) byBucket.set(b, p);
+    if (!byBucket.has(p.t)) byBucket.set(p.t, p);
   }
   const cutoff = Date.now() - cfg.retentionMs;
   store.points = Array.from(byBucket.values())
@@ -2526,23 +2636,26 @@ function cloneFutOiPoint(p: FutOiPoint): FutOiPoint {
   return { t: p.t, legs: p.legs.map((l) => ({ ...l })) };
 }
 
-/** Append/refresh one live futures-OI point into all three frames. */
+/**
+ * Append/refresh one live futures-OI point into all three frames, keyed and
+ * stamped by the bucket-end boundary (see bucketEndMs).
+ */
 function appendFutOiFrameLive(t: number, point: FutOiPoint): void {
   for (const key of Object.keys(OI_FRAMES) as OiFrameKey[]) {
     const cfg = OI_FRAMES[key];
     const store = futOiFrameStores[key];
     const bsize = cfg.intervalMin * 60 * 1000;
-    const bucket = Math.floor(t / bsize);
+    const bEnd = bucketEndMs(t, bsize);
+    if (isPreOpenBucket(bEnd)) continue;
     const last = store.points[store.points.length - 1];
     // Each frame gets its OWN copy: the same-bucket branch below mutates the
     // stored point in place, and a shared object would corrupt other frames
     // (notably the last backfilled minute, which every frame holds).
-    if (last && Math.floor(last.t / bsize) === bucket) {
+    if (last && last.t === bEnd) {
       // Same bucket → keep the latest value for it.
-      last.t = t;
       last.legs = point.legs.map((l) => ({ ...l }));
     } else {
-      store.points.push(cloneFutOiPoint({ t, legs: point.legs }));
+      store.points.push(cloneFutOiPoint({ t: bEnd, legs: point.legs }));
     }
     const cutoff = t - cfg.retentionMs;
     while (store.points.length && store.points[0]!.t < cutoff) store.points.shift();
@@ -2554,15 +2667,21 @@ function mergeFutOiFrame(key: OiFrameKey, backfilled: FutOiPoint[]): void {
   const cfg = OI_FRAMES[key];
   const store = futOiFrameStores[key];
   const bsize = cfg.intervalMin * 60 * 1000;
+  // Both sides are bucket-end stamped, so the stamp IS the bucket key.
   const byBucket = new Map<number, FutOiPoint>();
-  for (const p of store.points) byBucket.set(Math.floor(p.t / bsize), p);
+  for (const p of store.points) byBucket.set(p.t, p);
   // Collapse per-minute points to one-per-bucket (last wins), then fill gaps.
   const collapsed = new Map<number, FutOiPoint>();
-  for (const p of backfilled) collapsed.set(Math.floor(p.t / bsize), p);
-  for (const [b, p] of collapsed) {
+  for (const p of backfilled) {
+    // Candle-derived, so shift by the candle length — see candleEndMs.
+    const bEnd = candleEndMs(p.t, bsize);
+    if (isPreOpenBucket(bEnd)) continue;
+    collapsed.set(bEnd, { ...p, t: bEnd });
+  }
+  for (const [bEnd, p] of collapsed) {
     // Clone: the caller shares `backfilled` across all three frames, and the
     // live append path mutates stored points in place.
-    if (!byBucket.has(b)) byBucket.set(b, cloneFutOiPoint(p));
+    if (!byBucket.has(bEnd)) byBucket.set(bEnd, cloneFutOiPoint(p));
   }
   const cutoff = Date.now() - cfg.retentionMs;
   store.points = Array.from(byBucket.values())
@@ -2591,6 +2710,9 @@ function futOiBackfillFromMs(now: number): number {
 async function captureFuturesOi(): Promise<void> {
   if (!kite.getAccessToken()) return;
   try {
+    // Stamped before any await — see captureOptionOi. This capture is awaited
+    // after the option one, so it has even less of the lead left.
+    const now = Date.now();
     const all = await getAllInstrumentsCached();
     const sel = niftyMonthlyFutures(all);
     if (!sel) return;
@@ -2598,7 +2720,6 @@ async function captureFuturesOi(): Promise<void> {
 
     const quotes = await kite.getQuoteFull(sel.ids);
     const qmap = new Map(quotes.map((q) => [q.instrument_token, q]));
-    const now = Date.now();
 
     // Carry-forward source: the newest 1m point (finest cadence we keep).
     const finest = futOiFrameStores["1m"].points;
@@ -2730,14 +2851,34 @@ function startOptionOiCapture(): void {
   const coldFutFrom = futOiBackfillFromMs(Date.now());
 
   const tick = () => {
-    if (!isIstMarketHours()) return;
-    void (async () => {
-      await captureOptionOi();
-      await captureFuturesOi();
-    })();
+    if (isIstMarketHours()) {
+      void (async () => {
+        await captureOptionOi();
+        await captureFuturesOi();
+      })();
+    }
+    scheduleNextTick();
+  };
+  /**
+   * Re-arm shortly BEFORE the next minute boundary rather than on a fixed 60s
+   * interval.
+   *
+   * Two reasons. A plain interval drifts by the Kite round-trip each cycle, and
+   * once the phase crosses a minute boundary a 1m bucket gets no sample at all —
+   * which the client's change histograms then have to drop. And because buckets
+   * are stamped with their END, the reading that represents a bucket should be
+   * taken near that end: sampling at 10:00:57 gives the 10:01 bucket its closing
+   * state, where sampling at 10:00:00 would give it the opening one.
+   */
+  const scheduleNextTick = () => {
+    const now = Date.now();
+    const step = OPTION_OI_INTERVAL_MS;
+    let target = Math.ceil((now + CAPTURE_LEAD_MS) / step) * step - CAPTURE_LEAD_MS;
+    // Never re-arm immediately (which would happen when we just fired).
+    if (target - now < 1000) target += step;
+    setTimeout(tick, target - now);
   };
   tick();
-  setInterval(tick, OPTION_OI_INTERVAL_MS);
 
   // Cold-start backfill of the OI-chart frames, then a periodic gap-check that
   // only hits Kite when there is an actual gap (e.g. after downtime).
