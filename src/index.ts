@@ -165,6 +165,7 @@ interface OiAggPoint {
   t: number; // epoch ms
   totalCe: number;
   totalPe: number;
+  straddle: number; // auto-ATM straddle premium (ATM CE LTP + ATM PE LTP)
 }
 const oiFrameStores: Record<OiFrameKey, { points: OiAggPoint[] }> = {
   "1m": { points: [] },
@@ -2136,16 +2137,21 @@ function currentWindowAgg(store: OptionOiDay): OiAggPoint | null {
   const hi = Math.min(strikes.length - 1, atmIdx + 24);
   let totalCe = 0;
   let totalPe = 0;
-  const lastOi = (tok: number | undefined): number => {
-    if (tok == null) return 0;
+  const lastOf = (tok: number | undefined): { oi: number; ltp: number } => {
+    if (tok == null) return { oi: 0, ltp: 0 };
     const arr = store.series.get(tok);
-    return arr && arr.length ? arr[arr.length - 1]!.oi : 0;
+    const s = arr && arr.length ? arr[arr.length - 1]! : null;
+    return { oi: s?.oi ?? 0, ltp: s?.ltp ?? 0 };
   };
   for (let k = lo; k <= hi; k++) {
-    totalCe += lastOi(ceByStrike.get(strikes[k]!));
-    totalPe += lastOi(peByStrike.get(strikes[k]!));
+    totalCe += lastOf(ceByStrike.get(strikes[k]!)).oi;
+    totalPe += lastOf(peByStrike.get(strikes[k]!)).oi;
   }
-  return { t: Date.now(), totalCe, totalPe };
+  // Auto-ATM straddle: ATM Call LTP + ATM Put LTP (0 if either leg missing).
+  const ceAtm = lastOf(ceByStrike.get(strikes[atmIdx]!)).ltp;
+  const peAtm = lastOf(peByStrike.get(strikes[atmIdx]!)).ltp;
+  const straddle = ceAtm > 0 && peAtm > 0 ? ceAtm + peAtm : 0;
+  return { t: Date.now(), totalCe, totalPe, straddle };
 }
 
 /** Append/refresh one live aggregate into all three frames (bucket-deduped + pruned). */
@@ -2161,8 +2167,14 @@ function appendOiFrameLive(t: number, agg: OiAggPoint): void {
       last.t = t;
       last.totalCe = agg.totalCe;
       last.totalPe = agg.totalPe;
+      last.straddle = agg.straddle;
     } else {
-      store.points.push({ t, totalCe: agg.totalCe, totalPe: agg.totalPe });
+      store.points.push({
+        t,
+        totalCe: agg.totalCe,
+        totalPe: agg.totalPe,
+        straddle: agg.straddle,
+      });
     }
     const cutoff = t - cfg.retentionMs;
     while (store.points.length && store.points[0]!.t < cutoff) store.points.shift();
@@ -2267,17 +2279,25 @@ async function backfillOiFrames(): Promise<void> {
     const bLo = Math.max(0, atmNow - OI_BACKFILL_BAND);
     const bHi = Math.min(strikes.length - 1, atmNow + OI_BACKFILL_BAND);
 
-    // 2) OI minute candles per band token → per-token minute→oi map.
+    // 2) OI + close minute candles per band token → per-token minute maps.
     const oiByToken = new Map<number, Map<string, number>>();
+    const closeByToken = new Map<number, Map<string, number>>();
     const fetchTok = async (tok: number | undefined) => {
       if (tok == null || oiByToken.has(tok)) return;
       try {
         const candles = await kite.getHistoricalOiSeries(tok, fromStr, toStr, "minute");
-        const m = new Map<string, number>();
-        for (const c of candles) m.set(minuteKey(c.t), c.oi);
-        oiByToken.set(tok, m);
+        const mOi = new Map<string, number>();
+        const mClose = new Map<string, number>();
+        for (const c of candles) {
+          const k = minuteKey(c.t);
+          mOi.set(k, c.oi);
+          mClose.set(k, c.close);
+        }
+        oiByToken.set(tok, mOi);
+        closeByToken.set(tok, mClose);
       } catch {
         oiByToken.set(tok, new Map()); // treat as no data (carried-forward as 0)
+        closeByToken.set(tok, new Map());
       }
       await delay(220); // stay within Kite historical rate limits
     };
@@ -2290,6 +2310,7 @@ async function backfillOiFrames(): Promise<void> {
     //    the moving 26↓/ATM/24↑ window aggregate per minute.
     const sortedMins = Array.from(spotByMin.keys()).sort();
     const lastOi = new Map<number, number>();
+    const lastClose = new Map<number, number>();
     const perMinute: OiAggPoint[] = [];
     for (const mk of sortedMins) {
       const spot = spotByMin.get(mk)!;
@@ -2307,19 +2328,29 @@ async function backfillOiFrames(): Promise<void> {
       const hi = Math.min(strikes.length - 1, atmIdx + 24);
       let totalCe = 0;
       let totalPe = 0;
-      const sideSum = (tok: number | undefined): number => {
+      // Carry-forward OI for the window sum.
+      const sumOi = (tok: number | undefined): number => {
         if (tok == null) return 0;
-        const om = oiByToken.get(tok);
-        const v = om?.get(mk);
+        const v = oiByToken.get(tok)?.get(mk);
         if (v !== undefined) lastOi.set(tok, v);
         return lastOi.get(tok) ?? 0;
       };
+      // Carry-forward close (LTP proxy) for the ATM straddle.
+      const closeOf = (tok: number | undefined): number => {
+        if (tok == null) return 0;
+        const v = closeByToken.get(tok)?.get(mk);
+        if (v !== undefined) lastClose.set(tok, v);
+        return lastClose.get(tok) ?? 0;
+      };
       for (let k = lo; k <= hi; k++) {
-        totalCe += sideSum(ceByStrike.get(strikes[k]!));
-        totalPe += sideSum(peByStrike.get(strikes[k]!));
+        totalCe += sumOi(ceByStrike.get(strikes[k]!));
+        totalPe += sumOi(peByStrike.get(strikes[k]!));
       }
+      const ceAtm = closeOf(ceByStrike.get(strikes[atmIdx]!));
+      const peAtm = closeOf(peByStrike.get(strikes[atmIdx]!));
+      const straddle = ceAtm > 0 && peAtm > 0 ? ceAtm + peAtm : 0;
       const t = new Date(`${mk}:00`).getTime();
-      if (Number.isFinite(t)) perMinute.push({ t, totalCe, totalPe });
+      if (Number.isFinite(t)) perMinute.push({ t, totalCe, totalPe, straddle });
     }
 
     for (const key of Object.keys(OI_FRAMES) as OiFrameKey[]) {
