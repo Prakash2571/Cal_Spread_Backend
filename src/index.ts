@@ -1137,6 +1137,148 @@ app.get("/api/fno-board", async (req: Request, res: Response) => {
 });
 
 // ============================================================================
+//  Options analytics: live option chain (ATM-centered band) for an index/stock.
+//  Returns the CE/PE instrument tokens for a band of strikes around the ATM so
+//  the frontend can stream LTP + OI per strike and compute the chain live.
+//  PUBLIC (data flows once an admin has connected Zerodha).
+// ============================================================================
+
+interface OptionStrikeRow {
+  strike: number;
+  ce_token: number;
+  pe_token: number;
+  ce_symbol: string;
+  pe_symbol: string;
+}
+
+app.get("/api/option-chain/:underlying", async (req: Request, res: Response) => {
+  const underlying = String(req.params.underlying).toUpperCase();
+  const expiryParam = String(req.query.expiry ?? "").trim();
+  // Strikes on EACH side of ATM to return. We return a generous band (default
+  // 40) so the ATM can drift intraday while the frontend still shows ATM ± 30.
+  const band = Math.min(80, Math.max(5, Number(req.query.band ?? 40)));
+
+  if (!kite.getAccessToken()) {
+    res.status(401).json({
+      error: "Option chain requires a one-time Zerodha login.",
+    });
+    return;
+  }
+
+  try {
+    const all = await getAllInstrumentsCached();
+
+    // All option contracts (CE/PE) for this underlying on NFO.
+    const opts = all.filter(
+      (i) =>
+        i.exchange === "NFO" &&
+        (i.instrument_type === "CE" || i.instrument_type === "PE") &&
+        i.name === underlying,
+    );
+    if (opts.length === 0) {
+      res.status(404).json({ error: `No options found for "${underlying}".` });
+      return;
+    }
+
+    const today = istDayKey();
+    // Live (non-expired) expiries, ascending. ISO dates sort chronologically.
+    const expiries = Array.from(
+      new Set(opts.map((o) => o.expiry).filter((e) => e && e >= today)),
+    ).sort();
+    if (expiries.length === 0) {
+      res.status(404).json({ error: `No live expiries for "${underlying}".` });
+      return;
+    }
+    const expiry =
+      expiryParam && expiries.includes(expiryParam) ? expiryParam : expiries[0]!;
+
+    // Resolve the underlying spot instrument (index or equity) to find the ATM.
+    const spotSymbol = INDEX_SPOT_MAP[underlying];
+    const spotInst = spotSymbol
+      ? all.find((i) => i.segment === "INDICES" && i.tradingsymbol === spotSymbol)
+      : all.find(
+          (i) =>
+            i.exchange === "NSE" &&
+            i.instrument_type === "EQ" &&
+            i.tradingsymbol === underlying,
+        );
+    if (!spotInst) {
+      res.status(404).json({ error: `No spot instrument for "${underlying}".` });
+      return;
+    }
+
+    // Current spot last price (used only to center the band; frontend recomputes
+    // the live ATM from the streamed spot tick).
+    let spot = 0;
+    try {
+      const [q] = await kite.getQuoteFull([
+        `${spotInst.exchange}:${spotInst.tradingsymbol}`,
+      ]);
+      spot = q?.last_price ?? 0;
+    } catch {
+      /* non-fatal: fall back to the median strike below */
+    }
+
+    // Group the chosen expiry's contracts by strike.
+    const byStrike = new Map<number, { ce?: Instrument; pe?: Instrument }>();
+    let lotSize = 0;
+    for (const o of opts) {
+      if (o.expiry !== expiry || !o.strike) continue;
+      const entry = byStrike.get(o.strike) ?? {};
+      if (o.instrument_type === "CE") entry.ce = o;
+      else entry.pe = o;
+      byStrike.set(o.strike, entry);
+      if (!lotSize) lotSize = o.lot_size;
+    }
+    const allStrikes = Array.from(byStrike.keys()).sort((a, b) => a - b);
+    if (allStrikes.length === 0) {
+      res.status(404).json({ error: `No strikes for expiry ${expiry}.` });
+      return;
+    }
+
+    // ATM = strike closest to spot (fallback: median strike when spot missing).
+    let atmStrike = allStrikes[Math.floor(allStrikes.length / 2)]!;
+    if (spot > 0) {
+      atmStrike = allStrikes.reduce(
+        (best, s) => (Math.abs(s - spot) < Math.abs(best - spot) ? s : best),
+        allStrikes[0]!,
+      );
+    }
+    const atmIdx = allStrikes.indexOf(atmStrike);
+    const lo = Math.max(0, atmIdx - band);
+    const hi = Math.min(allStrikes.length - 1, atmIdx + band);
+
+    const strikes: OptionStrikeRow[] = [];
+    for (let i = lo; i <= hi; i++) {
+      const s = allStrikes[i]!;
+      const entry = byStrike.get(s)!;
+      if (!entry.ce || !entry.pe) continue; // need both legs to show the row
+      strikes.push({
+        strike: s,
+        ce_token: entry.ce.instrument_token,
+        pe_token: entry.pe.instrument_token,
+        ce_symbol: entry.ce.tradingsymbol,
+        pe_symbol: entry.pe.tradingsymbol,
+      });
+    }
+
+    res.json({
+      underlying,
+      name: spotInst.tradingsymbol,
+      spot_token: spotInst.instrument_token,
+      spot,
+      atm_strike: atmStrike,
+      expiry,
+      expiries,
+      lot_size: lotSize,
+      strikes,
+    });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// ============================================================================
 //  Spread stats: per-symbol summary from the spread_summary collection.
 // ============================================================================
 
