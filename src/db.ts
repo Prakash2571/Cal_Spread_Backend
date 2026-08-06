@@ -259,6 +259,59 @@ export async function clearKiteSession(): Promise<void> {
 }
 
 // ============================================================================
+//  AdminSession — persist admin/trade-access sessions so an admin who logged
+//  in for the day stays logged in across backend restarts/redeploys (rather
+//  than the in-memory session map being wiped and forcing a fresh secret entry).
+// ============================================================================
+
+export interface IAdminSession {
+  _id: string; // the admin token
+  role: "full" | "trade";
+  expiry: number; // epoch ms
+}
+
+const adminSessionSchema = new mongoose.Schema<IAdminSession>(
+  {
+    _id: { type: String },
+    role: { type: String, enum: ["full", "trade"], required: true },
+    expiry: { type: Number, required: true },
+  },
+  { collection: "admin_sessions" },
+);
+
+/** Model for persisted admin sessions (collection: "admin_sessions"). */
+export const AdminSession = mongoose.model<IAdminSession>(
+  "AdminSession",
+  adminSessionSchema,
+);
+
+/** Persist (upsert) an admin session token. No-op if DB is disabled. */
+export async function saveAdminSession(
+  token: string,
+  role: "full" | "trade",
+  expiry: number,
+): Promise<void> {
+  if (!isDbEnabled()) return;
+  await AdminSession.updateOne(
+    { _id: token },
+    { $set: { role, expiry } },
+    { upsert: true },
+  );
+}
+
+/** Load all still-valid (non-expired) admin sessions. Empty if DB disabled. */
+export async function loadAdminSessions(): Promise<IAdminSession[]> {
+  if (!isDbEnabled()) return [];
+  return AdminSession.find({ expiry: { $gt: Date.now() } }).lean<IAdminSession[]>();
+}
+
+/** Remove a persisted admin session (on expiry / logout). */
+export async function deleteAdminSession(token: string): Promise<void> {
+  if (!isDbEnabled()) return;
+  await AdminSession.deleteOne({ _id: token });
+}
+
+// ============================================================================
 //  AppSetting — small single-collection key/value store for app-wide settings
 //  the admin controls (currently the risk-free rate). Persisted so the value
 //  survives restarts and is shared across every browser/visitor.

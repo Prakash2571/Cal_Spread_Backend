@@ -16,6 +16,9 @@ import {
   clearKiteSession,
   saveRfRate,
   loadRfRate,
+  saveAdminSession,
+  loadAdminSessions,
+  deleteAdminSession,
 } from "./db.js";
 import type { ITrade, TradeRecord } from "./db.js";
 import { initNseFnoConnections } from "./db.js";
@@ -83,7 +86,10 @@ function getAdminRole(token: string | undefined): AdminRole | null {
   if (!token) return null;
   const s = adminSessions.get(token);
   if (!s || Date.now() > s.expiry) {
-    if (token) adminSessions.delete(token);
+    if (token) {
+      adminSessions.delete(token);
+      void deleteAdminSession(token); // best-effort cleanup of the persisted copy
+    }
     return null;
   }
   return s.role;
@@ -379,7 +385,9 @@ app.post(
   }
   
   const token = generateAdminToken();
-  adminSessions.set(token, { expiry: Date.now() + ADMIN_SESSION_TTL_MS, role: "full" });
+  const expiry = Date.now() + ADMIN_SESSION_TTL_MS;
+  adminSessions.set(token, { expiry, role: "full" });
+  void saveAdminSession(token, "full", expiry); // survive backend restarts
 
   res.json({
     success: true,
@@ -410,10 +418,9 @@ app.post(
     }
 
     const token = generateAdminToken();
-    adminSessions.set(token, {
-      expiry: Date.now() + ADMIN_SESSION_TTL_MS,
-      role: "trade",
-    });
+    const expiry = Date.now() + ADMIN_SESSION_TTL_MS;
+    adminSessions.set(token, { expiry, role: "trade" });
+    void saveAdminSession(token, "trade", expiry); // survive backend restarts
 
     res.json({
       success: true,
@@ -2448,6 +2455,19 @@ app.listen(PORT, () => {
     // Restore a same-day Zerodha session BEFORE the schedulers run, so hourly
     // capture / backfill have a session immediately after a restart.
     await restoreSessionOnStartup();
+    // Restore persisted admin/trade sessions so an admin who logged in earlier
+    // today stays logged in across a backend restart (no re-entering the secret).
+    try {
+      const sessions = await loadAdminSessions();
+      for (const s of sessions) {
+        adminSessions.set(s._id, { role: s.role, expiry: s.expiry });
+      }
+      if (sessions.length > 0) {
+        console.log(`[Admin] Restored ${sessions.length} persisted admin session(s).`);
+      }
+    } catch (e) {
+      console.warn("[Admin] session restore failed:", e);
+    }
     // Restore the admin's persisted risk-free rate so GET /api/rf and the
     // frontend show the latest value immediately after a restart.
     try {
