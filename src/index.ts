@@ -2266,7 +2266,14 @@ async function backfillOiFrames(): Promise<void> {
     if (spotCandles.length === 0) return;
     const minuteKey = (t: string) => t.slice(0, 16); // "YYYY-MM-DDTHH:MM"
     const spotByMin = new Map<string, number>();
-    for (const c of spotCandles) spotByMin.set(minuteKey(c.t), c.close);
+    // Keep the ORIGINAL candle timestamp (which carries the +0530 offset) per
+    // minute so we compute a correct epoch, aligned with live Date.now() points.
+    const tsByMin = new Map<string, string>();
+    for (const c of spotCandles) {
+      const k = minuteKey(c.t);
+      spotByMin.set(k, c.close);
+      tsByMin.set(k, c.t);
+    }
 
     // Band of strikes around the current ATM to fetch OI candles for.
     const lastSpot = spotCandles[spotCandles.length - 1]!.close;
@@ -2352,7 +2359,7 @@ async function backfillOiFrames(): Promise<void> {
       const ceAtm = closeOf(ceByStrike.get(strikes[atmIdx]!));
       const peAtm = closeOf(peByStrike.get(strikes[atmIdx]!));
       const straddle = ceAtm > 0 && peAtm > 0 ? ceAtm + peAtm : 0;
-      const t = new Date(`${mk}:00`).getTime();
+      const t = new Date(tsByMin.get(mk) ?? `${mk}:00`).getTime();
       if (Number.isFinite(t))
         perMinute.push({ t, totalCe, totalPe, straddle, spot });
     }
