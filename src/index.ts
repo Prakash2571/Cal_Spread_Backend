@@ -166,6 +166,7 @@ interface OiAggPoint {
   totalCe: number;
   totalPe: number;
   straddle: number; // auto-ATM straddle premium (ATM CE LTP + ATM PE LTP)
+  spot: number; // NIFTY index spot at this bucket
 }
 const oiFrameStores: Record<OiFrameKey, { points: OiAggPoint[] }> = {
   "1m": { points: [] },
@@ -2151,7 +2152,7 @@ function currentWindowAgg(store: OptionOiDay): OiAggPoint | null {
   const ceAtm = lastOf(ceByStrike.get(strikes[atmIdx]!)).ltp;
   const peAtm = lastOf(peByStrike.get(strikes[atmIdx]!)).ltp;
   const straddle = ceAtm > 0 && peAtm > 0 ? ceAtm + peAtm : 0;
-  return { t: Date.now(), totalCe, totalPe, straddle };
+  return { t: Date.now(), totalCe, totalPe, straddle, spot };
 }
 
 /** Append/refresh one live aggregate into all three frames (bucket-deduped + pruned). */
@@ -2168,12 +2169,14 @@ function appendOiFrameLive(t: number, agg: OiAggPoint): void {
       last.totalCe = agg.totalCe;
       last.totalPe = agg.totalPe;
       last.straddle = agg.straddle;
+      last.spot = agg.spot;
     } else {
       store.points.push({
         t,
         totalCe: agg.totalCe,
         totalPe: agg.totalPe,
         straddle: agg.straddle,
+        spot: agg.spot,
       });
     }
     const cutoff = t - cfg.retentionMs;
@@ -2350,7 +2353,8 @@ async function backfillOiFrames(): Promise<void> {
       const peAtm = closeOf(peByStrike.get(strikes[atmIdx]!));
       const straddle = ceAtm > 0 && peAtm > 0 ? ceAtm + peAtm : 0;
       const t = new Date(`${mk}:00`).getTime();
-      if (Number.isFinite(t)) perMinute.push({ t, totalCe, totalPe, straddle });
+      if (Number.isFinite(t))
+        perMinute.push({ t, totalCe, totalPe, straddle, spot });
     }
 
     for (const key of Object.keys(OI_FRAMES) as OiFrameKey[]) {
