@@ -118,6 +118,31 @@ function requireFullAdmin(req: Request, res: Response, next: NextFunction) {
 let instrumentCache: { at: number; data: Instrument[] } | null = null;
 const CACHE_TTL_MS = 1000 * 60 * 60; // 1 hour
 
+// ---------------------------------------------------------------------------
+// Intraday option-OI cache (per-day, IN-MEMORY). We snapshot the nearest NIFTY
+// option expiry's OI + LTP (and the index spot) once a minute during market
+// hours so the frontend has a real 5m/15m baseline the moment it loads, at any
+// time of day. It is keyed by the IST day and is discarded/rebuilt when the day
+// rolls over (so yesterday's data is automatically removed).
+// ---------------------------------------------------------------------------
+const OPTION_OI_UNDERLYING = "NIFTY";
+const OPTION_OI_INTERVAL_MS = 60 * 1000; // sample once a minute
+
+interface OiSample {
+  t: number;
+  oi: number;
+  ltp: number;
+}
+interface OptionOiDay {
+  day: string; // IST YYYY-MM-DD this cache belongs to
+  expiry: string; // the option expiry being tracked (nearest)
+  spotToken: number;
+  meta: Map<number, { strike: number; type: "CE" | "PE" }>;
+  series: Map<number, OiSample[]>; // option token -> per-minute samples
+  spot: { t: number; ltp: number }[]; // index spot per-minute samples
+}
+let optionOiDay: OptionOiDay | null = null;
+
 // Dividend yields (%) from Yahoo, refreshed once a day.
 let dividendCache: { at: number; data: Record<string, number> } | null = null;
 const DIVIDEND_TTL_MS = 1000 * 60 * 60 * 24; // 24 hours
@@ -1278,6 +1303,98 @@ app.get("/api/option-chain/:underlying", async (req: Request, res: Response) => 
   }
 });
 
+// --- Option-OI baseline: per-token OI + LTP as of `minutes` ago (today only).
+// Powers the frontend's 5m/15m OI-change % and OI-buildup interpretation with a
+// real baseline immediately on load. Served from the per-day in-memory cache. ---
+app.get("/api/option-oi-baseline/:underlying", (req: Request, res: Response) => {
+  const minutes = Math.min(240, Math.max(1, Number(req.query.minutes ?? 5)));
+  const day = istDayKey();
+  if (!optionOiDay || optionOiDay.day !== day) {
+    res.json({ day, expiry: null, minutes, tokens: {} });
+    return;
+  }
+  const cutoff = Date.now() - minutes * 60 * 1000;
+  const tokens: Record<number, { oi: number; ltp: number; t: number }> = {};
+  for (const [token, arr] of optionOiDay.series) {
+    if (arr.length === 0) continue;
+    // Newest sample at/at-before the cutoff, else the earliest we have (so a
+    // baseline exists even when less than `minutes` of history is available).
+    let base = arr[0]!;
+    for (const s of arr) {
+      if (s.t <= cutoff) base = s;
+      else break;
+    }
+    tokens[token] = { oi: base.oi, ltp: base.ltp, t: base.t };
+  }
+  res.json({ day, expiry: optionOiDay.expiry, minutes, tokens });
+});
+
+// --- Option-OI intraday series: full-day per-minute aggregates (today only).
+// Returns total Call/Put OI (24↑/ATM/26↓ window) and the ATM straddle for each
+// captured minute so the frontend charts show the whole day right on load. ---
+app.get("/api/option-oi-series/:underlying", (_req: Request, res: Response) => {
+  const day = istDayKey();
+  if (!optionOiDay || optionOiDay.day !== day) {
+    res.json({ day, expiry: null, points: [] });
+    return;
+  }
+  const store = optionOiDay;
+
+  // Strike -> token maps, and the sorted strike ladder.
+  const ceByStrike = new Map<number, number>();
+  const peByStrike = new Map<number, number>();
+  for (const [tok, m] of store.meta) {
+    (m.type === "CE" ? ceByStrike : peByStrike).set(m.strike, tok);
+  }
+  const strikes = Array.from(
+    new Set(Array.from(store.meta.values()).map((m) => m.strike)),
+  ).sort((a, b) => a - b);
+
+  const points: {
+    t: number;
+    totalCe: number;
+    totalPe: number;
+    straddle: number;
+  }[] = [];
+  const n = store.spot.length;
+  for (let i = 0; i < n; i++) {
+    const sp = store.spot[i];
+    if (!sp) continue;
+    // ATM for this minute from the captured spot.
+    let atmIdx = 0;
+    let bestD = Infinity;
+    for (let k = 0; k < strikes.length; k++) {
+      const d = Math.abs(strikes[k]! - sp.ltp);
+      if (d < bestD) {
+        bestD = d;
+        atmIdx = k;
+      }
+    }
+    const lo = Math.max(0, atmIdx - 26);
+    const hi = Math.min(strikes.length - 1, atmIdx + 24);
+    let totalCe = 0;
+    let totalPe = 0;
+    for (let k = lo; k <= hi; k++) {
+      const ceTok = ceByStrike.get(strikes[k]!);
+      const peTok = peByStrike.get(strikes[k]!);
+      if (ceTok != null) totalCe += store.series.get(ceTok)?.[i]?.oi ?? 0;
+      if (peTok != null) totalPe += store.series.get(peTok)?.[i]?.oi ?? 0;
+    }
+    const atmStrike = strikes[atmIdx]!;
+    const ceAtm = ceByStrike.get(atmStrike);
+    const peAtm = peByStrike.get(atmStrike);
+    const ceLtp = ceAtm != null ? store.series.get(ceAtm)?.[i]?.ltp ?? 0 : 0;
+    const peLtp = peAtm != null ? store.series.get(peAtm)?.[i]?.ltp ?? 0 : 0;
+    points.push({
+      t: sp.t,
+      totalCe,
+      totalPe,
+      straddle: ceLtp > 0 && peLtp > 0 ? ceLtp + peLtp : 0,
+    });
+  }
+  res.json({ day, expiry: store.expiry, points });
+});
+
 // ============================================================================
 //  Spread stats: per-symbol summary from the spread_summary collection.
 // ============================================================================
@@ -1801,6 +1918,133 @@ function triggerPostLoginBackfill(): void {
     );
     void checkAndRecomputeSummary();
   }
+  // Seed the intraday option-OI cache right away so a baseline exists soon
+  // after connecting Zerodha (rather than waiting for the next minute tick).
+  void captureOptionOi();
+}
+
+// ---------------------------------------------------------------------------
+// Intraday option-OI capture
+// ---------------------------------------------------------------------------
+
+/** Is it a weekday within (roughly) NSE market hours, in IST? */
+function isIstMarketHours(): boolean {
+  const ist = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+  const dow = ist.getUTCDay(); // 0 = Sun ... 6 = Sat
+  if (dow === 0 || dow === 6) return false;
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  return mins >= 9 * 60 + 10 && mins <= 15 * 60 + 35; // 09:10–15:35 IST
+}
+
+/** Resolve the nearest NIFTY option expiry's tokens + strike/type metadata. */
+function niftyNearestExpiryOptions(all: Instrument[]): {
+  expiry: string;
+  spotToken: number;
+  meta: Map<number, { strike: number; type: "CE" | "PE" }>;
+  ids: string[];
+  spotId: string;
+} | null {
+  const opts = all.filter(
+    (i) =>
+      i.exchange === "NFO" &&
+      (i.instrument_type === "CE" || i.instrument_type === "PE") &&
+      i.name === OPTION_OI_UNDERLYING,
+  );
+  if (opts.length === 0) return null;
+
+  const today = istDayKey();
+  const expiries = Array.from(
+    new Set(opts.map((o) => o.expiry).filter((e) => e && e >= today)),
+  ).sort();
+  if (expiries.length === 0) return null;
+  const expiry = expiries[0]!;
+
+  const spotSymbol = INDEX_SPOT_MAP[OPTION_OI_UNDERLYING];
+  const spotInst = spotSymbol
+    ? all.find((i) => i.segment === "INDICES" && i.tradingsymbol === spotSymbol)
+    : undefined;
+  if (!spotInst) return null;
+
+  const meta = new Map<number, { strike: number; type: "CE" | "PE" }>();
+  const ids: string[] = [];
+  for (const o of opts) {
+    if (o.expiry !== expiry || !o.strike) continue;
+    meta.set(o.instrument_token, {
+      strike: o.strike,
+      type: o.instrument_type as "CE" | "PE",
+    });
+    ids.push(`${o.exchange}:${o.tradingsymbol}`);
+  }
+  return {
+    expiry,
+    spotToken: spotInst.instrument_token,
+    meta,
+    ids,
+    spotId: `${spotInst.exchange}:${spotInst.tradingsymbol}`,
+  };
+}
+
+/**
+ * Snapshot the nearest NIFTY expiry's option OI/LTP (+ index spot) into the
+ * per-day cache. A single /quote call (chunked) covers the whole chain. Resets
+ * the cache when the IST day (or the nearest expiry) changes.
+ */
+async function captureOptionOi(): Promise<void> {
+  if (!kite.getAccessToken()) return;
+  try {
+    const all = await getAllInstrumentsCached();
+    const sel = niftyNearestExpiryOptions(all);
+    if (!sel) return;
+
+    const day = istDayKey();
+    if (!optionOiDay || optionOiDay.day !== day || optionOiDay.expiry !== sel.expiry) {
+      optionOiDay = {
+        day,
+        expiry: sel.expiry,
+        spotToken: sel.spotToken,
+        meta: sel.meta,
+        series: new Map(),
+        spot: [],
+      };
+    }
+    const store = optionOiDay;
+
+    const quotes = await kite.getQuoteFull([sel.spotId, ...sel.ids]);
+    const qmap = new Map(quotes.map((q) => [q.instrument_token, q]));
+    const now = Date.now();
+
+    // Push one aligned sample for EVERY tracked token (carry forward if a
+    // particular strike is missing from this response) so all series + spot
+    // stay index-aligned by capture cycle.
+    for (const [token] of store.meta) {
+      const q = qmap.get(token);
+      const arr = store.series.get(token) ?? [];
+      const prev = arr[arr.length - 1];
+      arr.push({
+        t: now,
+        oi: q?.oi ?? prev?.oi ?? 0,
+        ltp: q?.last_price ?? prev?.ltp ?? 0,
+      });
+      store.series.set(token, arr);
+    }
+    const sq = qmap.get(store.spotToken);
+    store.spot.push({
+      t: now,
+      ltp: sq?.last_price ?? store.spot[store.spot.length - 1]?.ltp ?? 0,
+    });
+  } catch (e) {
+    // Non-fatal: a missed minute just leaves a small gap in the day's series.
+    console.warn("[OptionOI] capture failed:", e instanceof Error ? e.message : e);
+  }
+}
+
+/** Start the once-a-minute intraday option-OI capture (market hours only). */
+function startOptionOiCapture(): void {
+  const tick = () => {
+    if (isIstMarketHours()) void captureOptionOi();
+  };
+  tick();
+  setInterval(tick, OPTION_OI_INTERVAL_MS);
 }
 
 /** Persist the Zerodha access token so it survives a restart (best-effort). */
@@ -1881,6 +2125,9 @@ app.listen(PORT, () => {
     // End-of-day review (default 16:30 IST): verify today's full day is stored;
     // backfill the gaps if not.
     startDayReviewScheduler(hourlyBackfillDeps);
+    // Intraday NIFTY option-OI capture (per-day in-memory cache) so the options
+    // Analytics page has a real 5m/15m baseline at any time of day.
+    startOptionOiCapture();
   });
 
   // Connect to the split nse_fno databases (archive, current, spread) and start EOD capture scheduler + backfill.
