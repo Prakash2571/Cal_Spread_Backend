@@ -118,6 +118,66 @@ function requireFullAdmin(req: Request, res: Response, next: NextFunction) {
 let instrumentCache: { at: number; data: Instrument[] } | null = null;
 const CACHE_TTL_MS = 1000 * 60 * 60; // 1 hour
 
+// ---------------------------------------------------------------------------
+// Intraday option-OI cache (per-day, IN-MEMORY). We snapshot the nearest NIFTY
+// option expiry's OI + LTP (and the index spot) once a minute during market
+// hours so the frontend has a real 5m/15m baseline the moment it loads, at any
+// time of day. It is keyed by the IST day and is discarded/rebuilt when the day
+// rolls over (so yesterday's data is automatically removed).
+// ---------------------------------------------------------------------------
+const OPTION_OI_UNDERLYING = "NIFTY";
+const OPTION_OI_INTERVAL_MS = 60 * 1000; // sample once a minute
+
+interface OiSample {
+  t: number;
+  oi: number;
+  ltp: number;
+}
+interface OptionOiDay {
+  day: string; // IST YYYY-MM-DD this cache belongs to
+  expiry: string; // the option expiry being tracked (nearest)
+  spotToken: number;
+  meta: Map<number, { strike: number; type: "CE" | "PE" }>;
+  series: Map<number, OiSample[]>; // option token -> per-minute samples
+  spot: { t: number; ltp: number }[]; // index spot per-minute samples
+}
+let optionOiDay: OptionOiDay | null = null;
+
+// ---------------------------------------------------------------------------
+// Multi-timeframe Call/Put total-OI history (for the analytics OI chart).
+// Each frame keeps aggregate points (total CE & PE OI over the 24↑/ATM/26↓
+// window) at its own cadence and retention. Filled live once a minute and
+// backfilled from Kite historical to recover any slots missed while the server
+// was down. In-memory (rebuilt from Kite on restart).
+// ---------------------------------------------------------------------------
+type OiFrameKey = "1m" | "5m" | "15m";
+interface OiFrameCfg {
+  intervalMin: number;
+  retentionMs: number;
+  kiteInterval: string; // Kite historical interval name
+}
+const OI_FRAMES: Record<OiFrameKey, OiFrameCfg> = {
+  "1m": { intervalMin: 1, retentionMs: 1 * 24 * 60 * 60 * 1000, kiteInterval: "minute" },
+  "5m": { intervalMin: 5, retentionMs: 3 * 24 * 60 * 60 * 1000, kiteInterval: "5minute" },
+  "15m": { intervalMin: 15, retentionMs: 7 * 24 * 60 * 60 * 1000, kiteInterval: "15minute" },
+};
+interface OiAggPoint {
+  t: number; // epoch ms
+  totalCe: number;
+  totalPe: number;
+  straddle: number; // auto-ATM straddle premium (ATM CE LTP + ATM PE LTP)
+  spot: number; // NIFTY index spot at this bucket
+}
+const oiFrameStores: Record<OiFrameKey, { points: OiAggPoint[] }> = {
+  "1m": { points: [] },
+  "5m": { points: [] },
+  "15m": { points: [] },
+};
+// How far around the current ATM to fetch strike OI when backfilling. Must be
+// large enough to cover both the 26-below/24-above window AND intraday/multi-day
+// ATM drift over the retention window.
+const OI_BACKFILL_BAND = 45;
+
 // Dividend yields (%) from Yahoo, refreshed once a day.
 let dividendCache: { at: number; data: Record<string, number> } | null = null;
 const DIVIDEND_TTL_MS = 1000 * 60 * 60 * 24; // 24 hours
@@ -1137,6 +1197,259 @@ app.get("/api/fno-board", async (req: Request, res: Response) => {
 });
 
 // ============================================================================
+//  Options analytics: live option chain (ATM-centered band) for an index/stock.
+//  Returns the CE/PE instrument tokens for a band of strikes around the ATM so
+//  the frontend can stream LTP + OI per strike and compute the chain live.
+//  PUBLIC (data flows once an admin has connected Zerodha).
+// ============================================================================
+
+interface OptionStrikeRow {
+  strike: number;
+  ce_token: number;
+  pe_token: number;
+  ce_symbol: string;
+  pe_symbol: string;
+}
+
+app.get("/api/option-chain/:underlying", async (req: Request, res: Response) => {
+  const underlying = String(req.params.underlying).toUpperCase();
+  const expiryParam = String(req.query.expiry ?? "").trim();
+  // Strikes on EACH side of ATM to return. We return a generous band (default
+  // 40) so the ATM can drift intraday while the frontend still shows ATM ± 30.
+  const band = Math.min(80, Math.max(5, Number(req.query.band ?? 40)));
+
+  if (!kite.getAccessToken()) {
+    res.status(401).json({
+      error: "Option chain requires a one-time Zerodha login.",
+    });
+    return;
+  }
+
+  try {
+    const all = await getAllInstrumentsCached();
+
+    // All option contracts (CE/PE) for this underlying on NFO.
+    const opts = all.filter(
+      (i) =>
+        i.exchange === "NFO" &&
+        (i.instrument_type === "CE" || i.instrument_type === "PE") &&
+        i.name === underlying,
+    );
+    if (opts.length === 0) {
+      res.status(404).json({ error: `No options found for "${underlying}".` });
+      return;
+    }
+
+    const today = istDayKey();
+    // Live (non-expired) expiries, ascending. ISO dates sort chronologically.
+    const expiries = Array.from(
+      new Set(opts.map((o) => o.expiry).filter((e) => e && e >= today)),
+    ).sort();
+    if (expiries.length === 0) {
+      res.status(404).json({ error: `No live expiries for "${underlying}".` });
+      return;
+    }
+    const expiry =
+      expiryParam && expiries.includes(expiryParam) ? expiryParam : expiries[0]!;
+
+    // Resolve the underlying spot instrument (index or equity) to find the ATM.
+    const spotSymbol = INDEX_SPOT_MAP[underlying];
+    const spotInst = spotSymbol
+      ? all.find((i) => i.segment === "INDICES" && i.tradingsymbol === spotSymbol)
+      : all.find(
+          (i) =>
+            i.exchange === "NSE" &&
+            i.instrument_type === "EQ" &&
+            i.tradingsymbol === underlying,
+        );
+    if (!spotInst) {
+      res.status(404).json({ error: `No spot instrument for "${underlying}".` });
+      return;
+    }
+
+    // Current spot last price (used only to center the band; frontend recomputes
+    // the live ATM from the streamed spot tick).
+    let spot = 0;
+    try {
+      const [q] = await kite.getQuoteFull([
+        `${spotInst.exchange}:${spotInst.tradingsymbol}`,
+      ]);
+      spot = q?.last_price ?? 0;
+    } catch {
+      /* non-fatal: fall back to the median strike below */
+    }
+
+    // Group the chosen expiry's contracts by strike.
+    const byStrike = new Map<number, { ce?: Instrument; pe?: Instrument }>();
+    let lotSize = 0;
+    for (const o of opts) {
+      if (o.expiry !== expiry || !o.strike) continue;
+      const entry = byStrike.get(o.strike) ?? {};
+      if (o.instrument_type === "CE") entry.ce = o;
+      else entry.pe = o;
+      byStrike.set(o.strike, entry);
+      if (!lotSize) lotSize = o.lot_size;
+    }
+    const allStrikes = Array.from(byStrike.keys()).sort((a, b) => a - b);
+    if (allStrikes.length === 0) {
+      res.status(404).json({ error: `No strikes for expiry ${expiry}.` });
+      return;
+    }
+
+    // ATM = strike closest to spot (fallback: median strike when spot missing).
+    let atmStrike = allStrikes[Math.floor(allStrikes.length / 2)]!;
+    if (spot > 0) {
+      atmStrike = allStrikes.reduce(
+        (best, s) => (Math.abs(s - spot) < Math.abs(best - spot) ? s : best),
+        allStrikes[0]!,
+      );
+    }
+    const atmIdx = allStrikes.indexOf(atmStrike);
+    const lo = Math.max(0, atmIdx - band);
+    const hi = Math.min(allStrikes.length - 1, atmIdx + band);
+
+    const strikes: OptionStrikeRow[] = [];
+    for (let i = lo; i <= hi; i++) {
+      const s = allStrikes[i]!;
+      const entry = byStrike.get(s)!;
+      if (!entry.ce || !entry.pe) continue; // need both legs to show the row
+      strikes.push({
+        strike: s,
+        ce_token: entry.ce.instrument_token,
+        pe_token: entry.pe.instrument_token,
+        ce_symbol: entry.ce.tradingsymbol,
+        pe_symbol: entry.pe.tradingsymbol,
+      });
+    }
+
+    res.json({
+      underlying,
+      name: spotInst.tradingsymbol,
+      spot_token: spotInst.instrument_token,
+      spot,
+      atm_strike: atmStrike,
+      expiry,
+      expiries,
+      lot_size: lotSize,
+      strikes,
+    });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// --- Option-OI baseline: per-token OI + LTP as of `minutes` ago (today only).
+// Powers the frontend's 5m/15m OI-change % and OI-buildup interpretation with a
+// real baseline immediately on load. Served from the per-day in-memory cache. ---
+app.get("/api/option-oi-baseline/:underlying", (req: Request, res: Response) => {
+  const minutes = Math.min(240, Math.max(1, Number(req.query.minutes ?? 5)));
+  const day = istDayKey();
+  if (!optionOiDay || optionOiDay.day !== day) {
+    res.json({ day, expiry: null, minutes, tokens: {} });
+    return;
+  }
+  const cutoff = Date.now() - minutes * 60 * 1000;
+  const tokens: Record<number, { oi: number; ltp: number; t: number }> = {};
+  for (const [token, arr] of optionOiDay.series) {
+    if (arr.length === 0) continue;
+    // Newest sample at/at-before the cutoff, else the earliest we have (so a
+    // baseline exists even when less than `minutes` of history is available).
+    let base = arr[0]!;
+    for (const s of arr) {
+      if (s.t <= cutoff) base = s;
+      else break;
+    }
+    tokens[token] = { oi: base.oi, ltp: base.ltp, t: base.t };
+  }
+  res.json({ day, expiry: optionOiDay.expiry, minutes, tokens });
+});
+
+// --- Option-OI intraday series: full-day per-minute aggregates (today only).
+// Returns total Call/Put OI (24↑/ATM/26↓ window) and the ATM straddle for each
+// captured minute so the frontend charts show the whole day right on load. ---
+app.get("/api/option-oi-series/:underlying", (_req: Request, res: Response) => {
+  const day = istDayKey();
+  if (!optionOiDay || optionOiDay.day !== day) {
+    res.json({ day, expiry: null, points: [] });
+    return;
+  }
+  const store = optionOiDay;
+
+  // Strike -> token maps, and the sorted strike ladder.
+  const ceByStrike = new Map<number, number>();
+  const peByStrike = new Map<number, number>();
+  for (const [tok, m] of store.meta) {
+    (m.type === "CE" ? ceByStrike : peByStrike).set(m.strike, tok);
+  }
+  const strikes = Array.from(
+    new Set(Array.from(store.meta.values()).map((m) => m.strike)),
+  ).sort((a, b) => a - b);
+
+  const points: {
+    t: number;
+    totalCe: number;
+    totalPe: number;
+    straddle: number;
+  }[] = [];
+  const n = store.spot.length;
+  for (let i = 0; i < n; i++) {
+    const sp = store.spot[i];
+    if (!sp) continue;
+    // ATM for this minute from the captured spot.
+    let atmIdx = 0;
+    let bestD = Infinity;
+    for (let k = 0; k < strikes.length; k++) {
+      const d = Math.abs(strikes[k]! - sp.ltp);
+      if (d < bestD) {
+        bestD = d;
+        atmIdx = k;
+      }
+    }
+    const lo = Math.max(0, atmIdx - 26);
+    const hi = Math.min(strikes.length - 1, atmIdx + 24);
+    let totalCe = 0;
+    let totalPe = 0;
+    for (let k = lo; k <= hi; k++) {
+      const ceTok = ceByStrike.get(strikes[k]!);
+      const peTok = peByStrike.get(strikes[k]!);
+      if (ceTok != null) totalCe += store.series.get(ceTok)?.[i]?.oi ?? 0;
+      if (peTok != null) totalPe += store.series.get(peTok)?.[i]?.oi ?? 0;
+    }
+    const atmStrike = strikes[atmIdx]!;
+    const ceAtm = ceByStrike.get(atmStrike);
+    const peAtm = peByStrike.get(atmStrike);
+    const ceLtp = ceAtm != null ? store.series.get(ceAtm)?.[i]?.ltp ?? 0 : 0;
+    const peLtp = peAtm != null ? store.series.get(peAtm)?.[i]?.ltp ?? 0 : 0;
+    points.push({
+      t: sp.t,
+      totalCe,
+      totalPe,
+      straddle: ceLtp > 0 && peLtp > 0 ? ceLtp + peLtp : 0,
+    });
+  }
+  res.json({ day, expiry: store.expiry, points });
+});
+
+// --- Multi-timeframe Call/Put total-OI history for the analytics OI chart.
+// Returns the retained aggregate series for a frame: 1m (last 1 day), 5m (last
+// 3 days) or 15m (last 1 week). Points are { t, totalCe, totalPe } over the
+// 24↑/ATM/26↓ window. Filled live + backfilled from Kite on downtime. ---
+app.get("/api/option-oi-frame/:underlying", (req: Request, res: Response) => {
+  const frameParam = String(req.query.frame ?? "5m");
+  const frame: OiFrameKey =
+    frameParam === "1m" || frameParam === "5m" || frameParam === "15m"
+      ? frameParam
+      : "5m";
+  const store = oiFrameStores[frame];
+  res.json({
+    frame,
+    intervalMin: OI_FRAMES[frame].intervalMin,
+    retentionMs: OI_FRAMES[frame].retentionMs,
+    points: store.points,
+  });
+});
+
+// ============================================================================
 //  Spread stats: per-symbol summary from the spread_summary collection.
 // ============================================================================
 
@@ -1659,6 +1972,425 @@ function triggerPostLoginBackfill(): void {
     );
     void checkAndRecomputeSummary();
   }
+  // Seed the intraday option-OI cache right away so a baseline exists soon
+  // after connecting Zerodha (rather than waiting for the next minute tick).
+  void captureOptionOi();
+  // Recover any OI-chart frame slots missed while we had no session/were down.
+  void backfillOiFrames();
+}
+
+// ---------------------------------------------------------------------------
+// Intraday option-OI capture
+// ---------------------------------------------------------------------------
+
+/** Is it a weekday within (roughly) NSE market hours, in IST? */
+function isIstMarketHours(): boolean {
+  const ist = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+  const dow = ist.getUTCDay(); // 0 = Sun ... 6 = Sat
+  if (dow === 0 || dow === 6) return false;
+  const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+  return mins >= 9 * 60 + 10 && mins <= 15 * 60 + 35; // 09:10–15:35 IST
+}
+
+/** Resolve the nearest NIFTY option expiry's tokens + strike/type metadata. */
+function niftyNearestExpiryOptions(all: Instrument[]): {
+  expiry: string;
+  spotToken: number;
+  meta: Map<number, { strike: number; type: "CE" | "PE" }>;
+  ids: string[];
+  spotId: string;
+} | null {
+  const opts = all.filter(
+    (i) =>
+      i.exchange === "NFO" &&
+      (i.instrument_type === "CE" || i.instrument_type === "PE") &&
+      i.name === OPTION_OI_UNDERLYING,
+  );
+  if (opts.length === 0) return null;
+
+  const today = istDayKey();
+  const expiries = Array.from(
+    new Set(opts.map((o) => o.expiry).filter((e) => e && e >= today)),
+  ).sort();
+  if (expiries.length === 0) return null;
+  const expiry = expiries[0]!;
+
+  const spotSymbol = INDEX_SPOT_MAP[OPTION_OI_UNDERLYING];
+  const spotInst = spotSymbol
+    ? all.find((i) => i.segment === "INDICES" && i.tradingsymbol === spotSymbol)
+    : undefined;
+  if (!spotInst) return null;
+
+  const meta = new Map<number, { strike: number; type: "CE" | "PE" }>();
+  const ids: string[] = [];
+  for (const o of opts) {
+    if (o.expiry !== expiry || !o.strike) continue;
+    meta.set(o.instrument_token, {
+      strike: o.strike,
+      type: o.instrument_type as "CE" | "PE",
+    });
+    ids.push(`${o.exchange}:${o.tradingsymbol}`);
+  }
+  return {
+    expiry,
+    spotToken: spotInst.instrument_token,
+    meta,
+    ids,
+    spotId: `${spotInst.exchange}:${spotInst.tradingsymbol}`,
+  };
+}
+
+/**
+ * Snapshot the nearest NIFTY expiry's option OI/LTP (+ index spot) into the
+ * per-day cache. A single /quote call (chunked) covers the whole chain. Resets
+ * the cache when the IST day (or the nearest expiry) changes.
+ */
+async function captureOptionOi(): Promise<void> {
+  if (!kite.getAccessToken()) return;
+  try {
+    const all = await getAllInstrumentsCached();
+    const sel = niftyNearestExpiryOptions(all);
+    if (!sel) return;
+
+    const day = istDayKey();
+    if (!optionOiDay || optionOiDay.day !== day || optionOiDay.expiry !== sel.expiry) {
+      optionOiDay = {
+        day,
+        expiry: sel.expiry,
+        spotToken: sel.spotToken,
+        meta: sel.meta,
+        series: new Map(),
+        spot: [],
+      };
+    }
+    const store = optionOiDay;
+
+    const quotes = await kite.getQuoteFull([sel.spotId, ...sel.ids]);
+    const qmap = new Map(quotes.map((q) => [q.instrument_token, q]));
+    const now = Date.now();
+
+    // Push one aligned sample for EVERY tracked token (carry forward if a
+    // particular strike is missing from this response) so all series + spot
+    // stay index-aligned by capture cycle.
+    for (const [token] of store.meta) {
+      const q = qmap.get(token);
+      const arr = store.series.get(token) ?? [];
+      const prev = arr[arr.length - 1];
+      arr.push({
+        t: now,
+        oi: q?.oi ?? prev?.oi ?? 0,
+        ltp: q?.last_price ?? prev?.ltp ?? 0,
+      });
+      store.series.set(token, arr);
+    }
+    const sq = qmap.get(store.spotToken);
+    store.spot.push({
+      t: now,
+      ltp: sq?.last_price ?? store.spot[store.spot.length - 1]?.ltp ?? 0,
+    });
+
+    // Feed the multi-timeframe OI chart caches with this minute's aggregate.
+    const agg = currentWindowAgg(store);
+    if (agg) appendOiFrameLive(now, agg);
+  } catch (e) {
+    // Non-fatal: a missed minute just leaves a small gap in the day's series.
+    console.warn("[OptionOI] capture failed:", e instanceof Error ? e.message : e);
+  }
+}
+
+// ---- OI-frame aggregation helpers -----------------------------------------
+
+/** Sorted strike ladder + strike→token maps for a captured day. */
+function frameLadder(meta: OptionOiDay["meta"]): {
+  strikes: number[];
+  ceByStrike: Map<number, number>;
+  peByStrike: Map<number, number>;
+} {
+  const ceByStrike = new Map<number, number>();
+  const peByStrike = new Map<number, number>();
+  for (const [tok, m] of meta) {
+    (m.type === "CE" ? ceByStrike : peByStrike).set(m.strike, tok);
+  }
+  const strikes = Array.from(
+    new Set(Array.from(meta.values()).map((m) => m.strike)),
+  ).sort((a, b) => a - b);
+  return { strikes, ceByStrike, peByStrike };
+}
+
+/** Total CE/PE OI over the 26-below / ATM / 24-above window at the LATEST snapshot. */
+function currentWindowAgg(store: OptionOiDay): OiAggPoint | null {
+  if (store.spot.length === 0) return null;
+  const spot = store.spot[store.spot.length - 1]!.ltp;
+  if (!(spot > 0)) return null;
+  const { strikes, ceByStrike, peByStrike } = frameLadder(store.meta);
+  if (strikes.length === 0) return null;
+
+  let atmIdx = 0;
+  let bestD = Infinity;
+  for (let k = 0; k < strikes.length; k++) {
+    const d = Math.abs(strikes[k]! - spot);
+    if (d < bestD) {
+      bestD = d;
+      atmIdx = k;
+    }
+  }
+  const lo = Math.max(0, atmIdx - 26);
+  const hi = Math.min(strikes.length - 1, atmIdx + 24);
+  let totalCe = 0;
+  let totalPe = 0;
+  const lastOf = (tok: number | undefined): { oi: number; ltp: number } => {
+    if (tok == null) return { oi: 0, ltp: 0 };
+    const arr = store.series.get(tok);
+    const s = arr && arr.length ? arr[arr.length - 1]! : null;
+    return { oi: s?.oi ?? 0, ltp: s?.ltp ?? 0 };
+  };
+  for (let k = lo; k <= hi; k++) {
+    totalCe += lastOf(ceByStrike.get(strikes[k]!)).oi;
+    totalPe += lastOf(peByStrike.get(strikes[k]!)).oi;
+  }
+  // Auto-ATM straddle: ATM Call LTP + ATM Put LTP (0 if either leg missing).
+  const ceAtm = lastOf(ceByStrike.get(strikes[atmIdx]!)).ltp;
+  const peAtm = lastOf(peByStrike.get(strikes[atmIdx]!)).ltp;
+  const straddle = ceAtm > 0 && peAtm > 0 ? ceAtm + peAtm : 0;
+  return { t: Date.now(), totalCe, totalPe, straddle, spot };
+}
+
+/** Append/refresh one live aggregate into all three frames (bucket-deduped + pruned). */
+function appendOiFrameLive(t: number, agg: OiAggPoint): void {
+  for (const key of Object.keys(OI_FRAMES) as OiFrameKey[]) {
+    const cfg = OI_FRAMES[key];
+    const store = oiFrameStores[key];
+    const bsize = cfg.intervalMin * 60 * 1000;
+    const bucket = Math.floor(t / bsize);
+    const last = store.points[store.points.length - 1];
+    if (last && Math.floor(last.t / bsize) === bucket) {
+      // Same bucket → keep the latest value for it.
+      last.t = t;
+      last.totalCe = agg.totalCe;
+      last.totalPe = agg.totalPe;
+      last.straddle = agg.straddle;
+      last.spot = agg.spot;
+    } else {
+      store.points.push({
+        t,
+        totalCe: agg.totalCe,
+        totalPe: agg.totalPe,
+        straddle: agg.straddle,
+        spot: agg.spot,
+      });
+    }
+    const cutoff = t - cfg.retentionMs;
+    while (store.points.length && store.points[0]!.t < cutoff) store.points.shift();
+  }
+}
+
+/** Collapse per-minute points to one-per-bucket (last wins) for a frame interval. */
+function downsampleAgg(points: OiAggPoint[], intervalMin: number): OiAggPoint[] {
+  const bsize = intervalMin * 60 * 1000;
+  const byBucket = new Map<number, OiAggPoint>();
+  for (const p of points) byBucket.set(Math.floor(p.t / bsize), p);
+  return Array.from(byBucket.values()).sort((a, b) => a.t - b.t);
+}
+
+/** Merge backfilled points into a frame WITHOUT overwriting live-captured buckets. */
+function mergeOiFrame(key: OiFrameKey, backfilled: OiAggPoint[]): void {
+  const cfg = OI_FRAMES[key];
+  const store = oiFrameStores[key];
+  const bsize = cfg.intervalMin * 60 * 1000;
+  const byBucket = new Map<number, OiAggPoint>();
+  for (const p of store.points) byBucket.set(Math.floor(p.t / bsize), p);
+  for (const p of downsampleAgg(backfilled, cfg.intervalMin)) {
+    const b = Math.floor(p.t / bsize);
+    if (!byBucket.has(b)) byBucket.set(b, p);
+  }
+  const cutoff = Date.now() - cfg.retentionMs;
+  store.points = Array.from(byBucket.values())
+    .filter((p) => p.t >= cutoff)
+    .sort((a, b) => a.t - b.t);
+}
+
+/**
+ * The earliest timestamp we still NEED for any frame: for each frame it's the
+ * later of (retention start) and (newest stored point). The overall backfill
+ * `from` is the min across frames — so a warm cache only backfills the gap.
+ */
+function oiBackfillFromMs(now: number): number {
+  let from = now; // if everything is fully covered, this stays ~now (no work)
+  for (const key of Object.keys(OI_FRAMES) as OiFrameKey[]) {
+    const cfg = OI_FRAMES[key];
+    const retentionStart = now - cfg.retentionMs;
+    const pts = oiFrameStores[key].points;
+    const newest = pts.length ? pts[pts.length - 1]!.t : 0;
+    // Need data from where this frame's coverage ends (but no earlier than its
+    // retention window). Empty frame → from retentionStart.
+    const need = Math.max(retentionStart, newest || retentionStart);
+    from = Math.min(from, need);
+  }
+  return from;
+}
+
+let oiBackfillRunning = false;
+
+/**
+ * Reconstruct the Call/Put total-OI frames from Kite historical to recover any
+ * slots missed while the server was down (and to populate the caches on a cold
+ * start). Gap-aware: only fetches from the earliest still-missing slot. Uses the
+ * CURRENT nearest expiry's strikes, so periods before those contracts were
+ * listed (e.g. an already-expired earlier weekly) cannot be reconstructed.
+ */
+async function backfillOiFrames(): Promise<void> {
+  if (oiBackfillRunning || !kite.getAccessToken()) return;
+  oiBackfillRunning = true;
+  try {
+    const now = Date.now();
+    const fromMs = oiBackfillFromMs(now);
+    // A minute of slack; if we're essentially current, skip the historical hit.
+    if (now - fromMs < 90 * 1000) return;
+
+    const all = await getAllInstrumentsCached();
+    const sel = niftyNearestExpiryOptions(all);
+    if (!sel) return;
+    const { strikes, ceByStrike, peByStrike } = frameLadder(sel.meta);
+    if (strikes.length === 0) return;
+
+    const fromStr = istDateTime(new Date(fromMs));
+    const toStr = istDateTime(new Date(now));
+
+    // 1) Spot minute candles → close per minute (drives ATM per timestamp).
+    const spotCandles = await kite.getHistorical(
+      sel.spotToken,
+      fromStr,
+      toStr,
+      "minute",
+    );
+    if (spotCandles.length === 0) return;
+    const minuteKey = (t: string) => t.slice(0, 16); // "YYYY-MM-DDTHH:MM"
+    const spotByMin = new Map<string, number>();
+    // Keep the ORIGINAL candle timestamp (which carries the +0530 offset) per
+    // minute so we compute a correct epoch, aligned with live Date.now() points.
+    const tsByMin = new Map<string, string>();
+    for (const c of spotCandles) {
+      const k = minuteKey(c.t);
+      spotByMin.set(k, c.close);
+      tsByMin.set(k, c.t);
+    }
+
+    // Band of strikes around the current ATM to fetch OI candles for.
+    const lastSpot = spotCandles[spotCandles.length - 1]!.close;
+    let atmNow = 0;
+    let bestD = Infinity;
+    for (let k = 0; k < strikes.length; k++) {
+      const d = Math.abs(strikes[k]! - lastSpot);
+      if (d < bestD) {
+        bestD = d;
+        atmNow = k;
+      }
+    }
+    const bLo = Math.max(0, atmNow - OI_BACKFILL_BAND);
+    const bHi = Math.min(strikes.length - 1, atmNow + OI_BACKFILL_BAND);
+
+    // 2) OI + close minute candles per band token → per-token minute maps.
+    const oiByToken = new Map<number, Map<string, number>>();
+    const closeByToken = new Map<number, Map<string, number>>();
+    const fetchTok = async (tok: number | undefined) => {
+      if (tok == null || oiByToken.has(tok)) return;
+      try {
+        const candles = await kite.getHistoricalOiSeries(tok, fromStr, toStr, "minute");
+        const mOi = new Map<string, number>();
+        const mClose = new Map<string, number>();
+        for (const c of candles) {
+          const k = minuteKey(c.t);
+          mOi.set(k, c.oi);
+          mClose.set(k, c.close);
+        }
+        oiByToken.set(tok, mOi);
+        closeByToken.set(tok, mClose);
+      } catch {
+        oiByToken.set(tok, new Map()); // treat as no data (carried-forward as 0)
+        closeByToken.set(tok, new Map());
+      }
+      await delay(220); // stay within Kite historical rate limits
+    };
+    for (let k = bLo; k <= bHi; k++) {
+      await fetchTok(ceByStrike.get(strikes[k]!));
+      await fetchTok(peByStrike.get(strikes[k]!));
+    }
+
+    // 3) Walk minutes in order; carry forward last-known OI per token; compute
+    //    the moving 26↓/ATM/24↑ window aggregate per minute.
+    const sortedMins = Array.from(spotByMin.keys()).sort();
+    const lastOi = new Map<number, number>();
+    const lastClose = new Map<number, number>();
+    const perMinute: OiAggPoint[] = [];
+    for (const mk of sortedMins) {
+      const spot = spotByMin.get(mk)!;
+      if (!(spot > 0)) continue;
+      let atmIdx = 0;
+      let bd = Infinity;
+      for (let k = 0; k < strikes.length; k++) {
+        const d = Math.abs(strikes[k]! - spot);
+        if (d < bd) {
+          bd = d;
+          atmIdx = k;
+        }
+      }
+      const lo = Math.max(0, atmIdx - 26);
+      const hi = Math.min(strikes.length - 1, atmIdx + 24);
+      let totalCe = 0;
+      let totalPe = 0;
+      // Carry-forward OI for the window sum.
+      const sumOi = (tok: number | undefined): number => {
+        if (tok == null) return 0;
+        const v = oiByToken.get(tok)?.get(mk);
+        if (v !== undefined) lastOi.set(tok, v);
+        return lastOi.get(tok) ?? 0;
+      };
+      // Carry-forward close (LTP proxy) for the ATM straddle.
+      const closeOf = (tok: number | undefined): number => {
+        if (tok == null) return 0;
+        const v = closeByToken.get(tok)?.get(mk);
+        if (v !== undefined) lastClose.set(tok, v);
+        return lastClose.get(tok) ?? 0;
+      };
+      for (let k = lo; k <= hi; k++) {
+        totalCe += sumOi(ceByStrike.get(strikes[k]!));
+        totalPe += sumOi(peByStrike.get(strikes[k]!));
+      }
+      const ceAtm = closeOf(ceByStrike.get(strikes[atmIdx]!));
+      const peAtm = closeOf(peByStrike.get(strikes[atmIdx]!));
+      const straddle = ceAtm > 0 && peAtm > 0 ? ceAtm + peAtm : 0;
+      const t = new Date(tsByMin.get(mk) ?? `${mk}:00`).getTime();
+      if (Number.isFinite(t))
+        perMinute.push({ t, totalCe, totalPe, straddle, spot });
+    }
+
+    for (const key of Object.keys(OI_FRAMES) as OiFrameKey[]) {
+      mergeOiFrame(key, perMinute);
+    }
+    console.log(
+      `[OptionOI] Backfilled frames from ${fromStr} (${perMinute.length} minutes reconstructed).`,
+    );
+  } catch (e) {
+    console.warn("[OptionOI] frame backfill failed:", e instanceof Error ? e.message : e);
+  } finally {
+    oiBackfillRunning = false;
+  }
+}
+
+/** Start the once-a-minute intraday option-OI capture (market hours only). */
+function startOptionOiCapture(): void {
+  const tick = () => {
+    if (isIstMarketHours()) void captureOptionOi();
+  };
+  tick();
+  setInterval(tick, OPTION_OI_INTERVAL_MS);
+
+  // Cold-start backfill of the OI-chart frames, then a periodic gap-check that
+  // only hits Kite when there is an actual gap (e.g. after downtime).
+  void backfillOiFrames();
+  setInterval(() => {
+    if (isIstMarketHours()) void backfillOiFrames();
+  }, 30 * 60 * 1000);
 }
 
 /** Persist the Zerodha access token so it survives a restart (best-effort). */
@@ -1739,6 +2471,9 @@ app.listen(PORT, () => {
     // End-of-day review (default 16:30 IST): verify today's full day is stored;
     // backfill the gaps if not.
     startDayReviewScheduler(hourlyBackfillDeps);
+    // Intraday NIFTY option-OI capture (per-day in-memory cache) so the options
+    // Analytics page has a real 5m/15m baseline at any time of day.
+    startOptionOiCapture();
   });
 
   // Connect to the split nse_fno databases (archive, current, spread) and start EOD capture scheduler + backfill.
