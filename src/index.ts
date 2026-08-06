@@ -184,6 +184,46 @@ const oiFrameStores: Record<OiFrameKey, { points: OiAggPoint[] }> = {
 // ATM drift over the retention window.
 const OI_BACKFILL_BAND = 45;
 
+// ---------------------------------------------------------------------------
+// Multi-timeframe NIFTY FUTURES open-interest history (current/next/far month).
+// Reuses the OI_FRAMES cadence + retention (1m→1 day, 5m→3 days, 15m→1 week).
+// Only 3 tokens are involved, so the live snapshot is a single cheap /quote and
+// the Kite backfill is 3 historical calls. In-memory (rebuilt on restart).
+// ---------------------------------------------------------------------------
+const FUT_OI_UNDERLYING = "NIFTY";
+
+/** One futures contract's OI + price at a point in time. */
+interface FutOiLeg {
+  expiry: string; // ISO YYYY-MM-DD — stable series key across a rollover
+  oi: number;
+  ltp: number;
+}
+interface FutOiPoint {
+  t: number; // epoch ms
+  legs: FutOiLeg[]; // one per tracked contract (nearest first)
+}
+/** A tracked NIFTY futures contract. */
+interface FutContract {
+  token: number;
+  tradingsymbol: string;
+  expiry: string;
+  lot_size: number;
+}
+const futOiFrameStores: Record<OiFrameKey, { points: FutOiPoint[] }> = {
+  "1m": { points: [] },
+  "5m": { points: [] },
+  "15m": { points: [] },
+};
+/** The contracts the futures-OI frames are currently tracking (nearest first). */
+let futOiContracts: FutContract[] = [];
+/**
+ * Every contract we have ever captured, keyed by expiry. Retained points can
+ * outlive a contract's presence in `futOiContracts` (the day after an expiry),
+ * so the endpoint resolves labels from here to keep a series continuous across
+ * a rollover instead of dropping up to a week of history.
+ */
+const futOiKnownContracts = new Map<string, FutContract>();
+
 // Dividend yields (%) from Yahoo, refreshed once a day.
 let dividendCache: { at: number; data: Record<string, number> } | null = null;
 const DIVIDEND_TTL_MS = 1000 * 60 * 60 * 24; // 24 hours
@@ -1456,6 +1496,46 @@ app.get("/api/option-oi-frame/:underlying", (req: Request, res: Response) => {
   });
 });
 
+// --- Multi-timeframe NIFTY FUTURES open-interest history (3 monthly contracts).
+// Same frame contract as /api/option-oi-frame: 1m (last 1 day), 5m (last 3 days)
+// or 15m (last 1 week). Each point carries one leg per contract, keyed by expiry
+// so the client can plot current/next/far month as three series. ---
+app.get("/api/futures-oi-frame/:underlying", (req: Request, res: Response) => {
+  const frameParam = String(req.query.frame ?? "5m");
+  const frame: OiFrameKey =
+    frameParam === "1m" || frameParam === "5m" || frameParam === "15m"
+      ? frameParam
+      : "5m";
+  const points = futOiFrameStores[frame].points;
+  // Report every contract this frame still holds data for (not just the ones
+  // currently being captured), so a just-expired month keeps its line until it
+  // falls out of the retention window.
+  const expiries = new Set<string>();
+  for (const p of points) {
+    for (const l of p.legs) expiries.add(l.expiry);
+  }
+  for (const c of futOiContracts) expiries.add(c.expiry);
+  const contracts = Array.from(expiries)
+    .sort()
+    .map(
+      (expiry) =>
+        futOiKnownContracts.get(expiry) ?? {
+          token: 0,
+          tradingsymbol: "",
+          expiry,
+          lot_size: 0,
+        },
+    );
+
+  res.json({
+    frame,
+    intervalMin: OI_FRAMES[frame].intervalMin,
+    retentionMs: OI_FRAMES[frame].retentionMs,
+    contracts,
+    points,
+  });
+});
+
 // ============================================================================
 //  Spread stats: per-symbol summary from the spread_summary collection.
 // ============================================================================
@@ -1981,9 +2061,20 @@ function triggerPostLoginBackfill(): void {
   }
   // Seed the intraday option-OI cache right away so a baseline exists soon
   // after connecting Zerodha (rather than waiting for the next minute tick).
-  void captureOptionOi();
-  // Recover any OI-chart frame slots missed while we had no session/were down.
-  void backfillOiFrames();
+  // Snapshot the backfill windows FIRST: the captures below stamp every frame
+  // at `now`, which would otherwise make the gap detector believe there is
+  // nothing left to recover.
+  const optFrom = oiBackfillFromMs(Date.now());
+  const futFrom = futOiBackfillFromMs(Date.now());
+  // Sequential: shares Kite's quote/historical rate budget with the futures
+  // pipeline and the periodic capture tick.
+  void (async () => {
+    await captureOptionOi();
+    await captureFuturesOi();
+    // Recover any OI-chart frame slots missed while we had no session/were down.
+    await backfillOiFrames(optFrom);
+    await backfillFutOiFrames(futFrom);
+  })();
 }
 
 // ---------------------------------------------------------------------------
@@ -2245,12 +2336,14 @@ let oiBackfillRunning = false;
  * CURRENT nearest expiry's strikes, so periods before those contracts were
  * listed (e.g. an already-expired earlier weekly) cannot be reconstructed.
  */
-async function backfillOiFrames(): Promise<void> {
+async function backfillOiFrames(fromMsOverride?: number): Promise<void> {
   if (oiBackfillRunning || !kite.getAccessToken()) return;
   oiBackfillRunning = true;
   try {
     const now = Date.now();
-    const fromMs = oiBackfillFromMs(now);
+    // See backfillFutOiFrames: callers that capture first must snapshot the
+    // window beforehand, because a live point sets `newest` to `now`.
+    const fromMs = fromMsOverride ?? oiBackfillFromMs(now);
     // A minute of slack; if we're essentially current, skip the historical hit.
     if (now - fromMs < 90 * 1000) return;
 
@@ -2384,19 +2477,286 @@ async function backfillOiFrames(): Promise<void> {
   }
 }
 
-/** Start the once-a-minute intraday option-OI capture (market hours only). */
+// ---------------------------------------------------------------------------
+// Intraday NIFTY futures-OI capture (current / next / far month)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the 3 nearest NIFTY monthly futures contracts (nearest first). Only
+ * contracts expiring today or later are considered, and duplicate expiries are
+ * collapsed, so a rollover day still yields distinct current/next/far months.
+ */
+function niftyMonthlyFutures(
+  all: Instrument[],
+): { contracts: FutContract[]; ids: string[] } | null {
+  const today = istDayKey();
+  const futs = all
+    .filter(
+      (i) =>
+        i.exchange === "NFO" &&
+        i.instrument_type === "FUT" &&
+        i.name === FUT_OI_UNDERLYING &&
+        i.expiry &&
+        i.expiry >= today,
+    )
+    .sort((a, b) => a.expiry.localeCompare(b.expiry)); // ISO dates sort chronologically
+  if (futs.length === 0) return null;
+
+  const contracts: FutContract[] = [];
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const f of futs) {
+    if (seen.has(f.expiry)) continue;
+    seen.add(f.expiry);
+    contracts.push({
+      token: f.instrument_token,
+      tradingsymbol: f.tradingsymbol,
+      expiry: f.expiry,
+      lot_size: f.lot_size,
+    });
+    ids.push(`${f.exchange}:${f.tradingsymbol}`);
+    if (contracts.length === 3) break;
+  }
+  for (const c of contracts) futOiKnownContracts.set(c.expiry, c);
+  return { contracts, ids };
+}
+
+/** Deep-copy a futures point so each frame owns its own mutable objects. */
+function cloneFutOiPoint(p: FutOiPoint): FutOiPoint {
+  return { t: p.t, legs: p.legs.map((l) => ({ ...l })) };
+}
+
+/** Append/refresh one live futures-OI point into all three frames. */
+function appendFutOiFrameLive(t: number, point: FutOiPoint): void {
+  for (const key of Object.keys(OI_FRAMES) as OiFrameKey[]) {
+    const cfg = OI_FRAMES[key];
+    const store = futOiFrameStores[key];
+    const bsize = cfg.intervalMin * 60 * 1000;
+    const bucket = Math.floor(t / bsize);
+    const last = store.points[store.points.length - 1];
+    // Each frame gets its OWN copy: the same-bucket branch below mutates the
+    // stored point in place, and a shared object would corrupt other frames
+    // (notably the last backfilled minute, which every frame holds).
+    if (last && Math.floor(last.t / bsize) === bucket) {
+      // Same bucket → keep the latest value for it.
+      last.t = t;
+      last.legs = point.legs.map((l) => ({ ...l }));
+    } else {
+      store.points.push(cloneFutOiPoint({ t, legs: point.legs }));
+    }
+    const cutoff = t - cfg.retentionMs;
+    while (store.points.length && store.points[0]!.t < cutoff) store.points.shift();
+  }
+}
+
+/** Merge backfilled futures points into a frame WITHOUT overwriting live buckets. */
+function mergeFutOiFrame(key: OiFrameKey, backfilled: FutOiPoint[]): void {
+  const cfg = OI_FRAMES[key];
+  const store = futOiFrameStores[key];
+  const bsize = cfg.intervalMin * 60 * 1000;
+  const byBucket = new Map<number, FutOiPoint>();
+  for (const p of store.points) byBucket.set(Math.floor(p.t / bsize), p);
+  // Collapse per-minute points to one-per-bucket (last wins), then fill gaps.
+  const collapsed = new Map<number, FutOiPoint>();
+  for (const p of backfilled) collapsed.set(Math.floor(p.t / bsize), p);
+  for (const [b, p] of collapsed) {
+    // Clone: the caller shares `backfilled` across all three frames, and the
+    // live append path mutates stored points in place.
+    if (!byBucket.has(b)) byBucket.set(b, cloneFutOiPoint(p));
+  }
+  const cutoff = Date.now() - cfg.retentionMs;
+  store.points = Array.from(byBucket.values())
+    .filter((p) => p.t >= cutoff)
+    .sort((a, b) => a.t - b.t);
+}
+
+/** Earliest timestamp still needed across the futures frames (gap-aware). */
+function futOiBackfillFromMs(now: number): number {
+  let from = now;
+  for (const key of Object.keys(OI_FRAMES) as OiFrameKey[]) {
+    const cfg = OI_FRAMES[key];
+    const retentionStart = now - cfg.retentionMs;
+    const pts = futOiFrameStores[key].points;
+    const newest = pts.length ? pts[pts.length - 1]!.t : 0;
+    from = Math.min(from, Math.max(retentionStart, newest || retentionStart));
+  }
+  return from;
+}
+
+/**
+ * Snapshot the 3 nearest NIFTY futures' OI + LTP into every frame. One /quote
+ * call covers all three contracts; a leg with no usable value carries forward
+ * its last known one so a whole contract's series never gains a hole.
+ */
+async function captureFuturesOi(): Promise<void> {
+  if (!kite.getAccessToken()) return;
+  try {
+    const all = await getAllInstrumentsCached();
+    const sel = niftyMonthlyFutures(all);
+    if (!sel) return;
+    futOiContracts = sel.contracts;
+
+    const quotes = await kite.getQuoteFull(sel.ids);
+    const qmap = new Map(quotes.map((q) => [q.instrument_token, q]));
+    const now = Date.now();
+
+    // Carry-forward source: the newest 1m point (finest cadence we keep).
+    const finest = futOiFrameStores["1m"].points;
+    const prev = finest[finest.length - 1];
+    const prevByExpiry = new Map((prev?.legs ?? []).map((l) => [l.expiry, l]));
+
+    // NOTE: getQuoteFull already coalesces a missing oi/last_price to 0, so we
+    // must test for a POSITIVE value rather than null-ish — otherwise a
+    // present-but-empty quote (pre-open, or an untraded far month) would write a
+    // hard 0 and the client would drop that contract's point entirely.
+    const legs: FutOiLeg[] = sel.contracts.map((c) => {
+      const q = qmap.get(c.token);
+      const p = prevByExpiry.get(c.expiry);
+      return {
+        expiry: c.expiry,
+        oi: q && q.oi > 0 ? q.oi : p?.oi ?? 0,
+        ltp: q && q.last_price > 0 ? q.last_price : p?.ltp ?? 0,
+      };
+    });
+    appendFutOiFrameLive(now, { t: now, legs });
+  } catch (e) {
+    // Non-fatal: a missed minute just leaves a small gap in the series.
+    console.warn("[FuturesOI] capture failed:", e instanceof Error ? e.message : e);
+  }
+}
+
+let futOiBackfillRunning = false;
+
+/**
+ * Reconstruct the futures-OI frames from Kite historical to recover slots missed
+ * while the server was down (and to populate the caches on a cold start).
+ * Gap-aware: only fetches from the earliest still-missing slot.
+ */
+async function backfillFutOiFrames(fromMsOverride?: number): Promise<void> {
+  if (futOiBackfillRunning || !kite.getAccessToken()) return;
+  futOiBackfillRunning = true;
+  try {
+    const now = Date.now();
+    // The gap detector reads the newest stored point, and a single live capture
+    // stamps every frame at `now` — so callers that capture first MUST pass a
+    // window snapshotted before that capture, or nothing would ever be
+    // recovered.
+    const fromMs = fromMsOverride ?? futOiBackfillFromMs(now);
+    // A minute of slack; if we're essentially current, skip the historical hit.
+    if (now - fromMs < 90 * 1000) return;
+
+    const all = await getAllInstrumentsCached();
+    const sel = niftyMonthlyFutures(all);
+    if (!sel) return;
+    futOiContracts = sel.contracts;
+
+    const fromStr = istDateTime(new Date(fromMs));
+    const toStr = istDateTime(new Date(now));
+    const minuteKey = (t: string) => t.slice(0, 16); // "YYYY-MM-DDTHH:MM"
+
+    // Per-expiry minute maps of OI + close, plus the union of minutes seen.
+    const byExpiry = new Map<string, Map<string, { oi: number; close: number }>>();
+    const tsByMin = new Map<string, string>();
+    for (const c of sel.contracts) {
+      const candles = await kite.getHistoricalOiSeries(
+        c.token,
+        fromStr,
+        toStr,
+        "minute",
+      );
+      // Deliberately NOT caught per contract: merged buckets are never revisited,
+      // so writing a zeroed leg here would hide that contract for the whole
+      // retention window. Let the error abort this run and retry on the next
+      // gap-check instead.
+      const m = new Map<string, { oi: number; close: number }>();
+      for (const cd of candles) {
+        const k = minuteKey(cd.t);
+        m.set(k, { oi: cd.oi, close: cd.close });
+        // Keep the ORIGINAL candle timestamp (carries the +0530 offset) so the
+        // epoch matches live Date.now() points.
+        tsByMin.set(k, cd.t);
+      }
+      byExpiry.set(c.expiry, m);
+      await delay(220); // stay within Kite historical rate limits
+    }
+
+    // Walk minutes in order, carrying forward each leg's last known values.
+    const lastOi = new Map<string, number>();
+    const lastLtp = new Map<string, number>();
+    const perMinute: FutOiPoint[] = [];
+    for (const mk of Array.from(tsByMin.keys()).sort()) {
+      const legs: FutOiLeg[] = sel.contracts.map((c) => {
+        const v = byExpiry.get(c.expiry)?.get(mk);
+        if (v) {
+          lastOi.set(c.expiry, v.oi);
+          lastLtp.set(c.expiry, v.close);
+        }
+        return {
+          expiry: c.expiry,
+          oi: lastOi.get(c.expiry) ?? 0,
+          ltp: lastLtp.get(c.expiry) ?? 0,
+        };
+      });
+      const t = new Date(tsByMin.get(mk) ?? `${mk}:00`).getTime();
+      if (Number.isFinite(t)) perMinute.push({ t, legs });
+    }
+
+    for (const key of Object.keys(OI_FRAMES) as OiFrameKey[]) {
+      mergeFutOiFrame(key, perMinute);
+    }
+    console.log(
+      `[FuturesOI] Backfilled frames from ${fromStr} (${perMinute.length} minutes reconstructed).`,
+    );
+  } catch (e) {
+    console.warn(
+      "[FuturesOI] frame backfill failed:",
+      e instanceof Error ? e.message : e,
+    );
+  } finally {
+    futOiBackfillRunning = false;
+  }
+}
+
+/**
+ * Start the once-a-minute intraday option + futures OI capture (market hours
+ * only). The two pipelines are awaited in sequence rather than fired in
+ * parallel: Kite allows ~1 quote/s and ~3 historical/s, and the option backfill
+ * already paces itself to the edge of that budget.
+ */
 function startOptionOiCapture(): void {
+  // Cold-start windows, snapshotted before the first tick writes a live point
+  // (which would collapse the detected gap to zero).
+  const coldOptFrom = oiBackfillFromMs(Date.now());
+  const coldFutFrom = futOiBackfillFromMs(Date.now());
+
   const tick = () => {
-    if (isIstMarketHours()) void captureOptionOi();
+    if (!isIstMarketHours()) return;
+    void (async () => {
+      await captureOptionOi();
+      await captureFuturesOi();
+    })();
   };
   tick();
   setInterval(tick, OPTION_OI_INTERVAL_MS);
 
   // Cold-start backfill of the OI-chart frames, then a periodic gap-check that
   // only hits Kite when there is an actual gap (e.g. after downtime).
-  void backfillOiFrames();
+  void (async () => {
+    await backfillOiFrames(coldOptFrom);
+    await backfillFutOiFrames(coldFutFrom);
+  })();
   setInterval(() => {
-    if (isIstMarketHours()) void backfillOiFrames();
+    if (!isIstMarketHours()) return;
+    // Snapshot both windows up front. The option backfill can pace hundreds of
+    // historical calls, and a minute-tick capture landing before the futures run
+    // starts would otherwise collapse its window to zero — on the only retry
+    // path an aborted futures backfill has.
+    const optFrom = oiBackfillFromMs(Date.now());
+    const futFrom = futOiBackfillFromMs(Date.now());
+    void (async () => {
+      await backfillOiFrames(optFrom);
+      await backfillFutOiFrames(futFrom);
+    })();
   }, 30 * 60 * 1000);
 }
 
