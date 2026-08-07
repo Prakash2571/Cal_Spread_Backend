@@ -1,4 +1,16 @@
 import "dotenv/config";
+import {
+  hGetAllJson,
+  hashWriteCommands,
+  canSend,
+  isRedisEnabled,
+  logRedisStatus,
+  pipeline,
+  setJsonCommand,
+  getJson as redisGetJson,
+  ping as redisPing,
+  type RedisCommand,
+} from "./redis.js";
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
 import { KiteClient, KiteError, type Instrument } from "./kite.js";
@@ -179,7 +191,7 @@ let optionPrevClose: OptionPrevClose | null = null;
 // backfilled from Kite historical to recover any slots missed while the server
 // was down. In-memory (rebuilt from Kite on restart).
 // ---------------------------------------------------------------------------
-type OiFrameKey = "1m" | "5m" | "15m";
+type OiFrameKey = "1m" | "5m" | "15m" | "1h";
 interface OiFrameCfg {
   intervalMin: number;
   retentionMs: number;
@@ -189,7 +201,15 @@ const OI_FRAMES: Record<OiFrameKey, OiFrameCfg> = {
   "1m": { intervalMin: 1, retentionMs: 1 * 24 * 60 * 60 * 1000, kiteInterval: "minute" },
   "5m": { intervalMin: 5, retentionMs: 3 * 24 * 60 * 60 * 1000, kiteInterval: "5minute" },
   "15m": { intervalMin: 15, retentionMs: 7 * 24 * 60 * 60 * 1000, kiteInterval: "15minute" },
+  "1h": { intervalMin: 60, retentionMs: 4 * 24 * 60 * 60 * 1000, kiteInterval: "60minute" },
 };
+/** Frame keys in display order. Prefer this over Object.keys for stable order. */
+const OI_FRAME_KEYS = Object.keys(OI_FRAMES) as OiFrameKey[];
+/** Narrow a query-string frame to a known key, defaulting to 5m. */
+function parseFrameKey(raw: unknown): OiFrameKey {
+  const s = String(raw ?? "5m");
+  return (OI_FRAME_KEYS as string[]).includes(s) ? (s as OiFrameKey) : "5m";
+}
 interface OiAggPoint {
   t: number; // epoch ms
   totalCe: number;
@@ -201,6 +221,7 @@ const oiFrameStores: Record<OiFrameKey, { points: OiAggPoint[] }> = {
   "1m": { points: [] },
   "5m": { points: [] },
   "15m": { points: [] },
+  "1h": { points: [] },
 };
 // How far around the current ATM to fetch strike OI when backfilling. Must be
 // large enough to cover both the 26-below/24-above window AND intraday/multi-day
@@ -254,6 +275,7 @@ const futOiFrameStores: Record<OiFrameKey, { points: FutOiPoint[] }> = {
   "1m": { points: [] },
   "5m": { points: [] },
   "15m": { points: [] },
+  "1h": { points: [] },
 };
 /** The contracts the futures-OI frames are currently tracking (nearest first). */
 let futOiContracts: FutContract[] = [];
@@ -264,6 +286,501 @@ let futOiContracts: FutContract[] = [];
  * a rollover instead of dropping up to a week of history.
  */
 const futOiKnownContracts = new Map<string, FutContract>();
+
+// ---------------------------------------------------------------------------
+// Redis persistence for the analytics caches.
+//
+// Everything above is in-memory, which meant every deploy or crash threw away
+// the whole session's history and paid for it with hundreds of Kite historical
+// calls (and, when a backfill failed, a chart that started mid-session and never
+// recovered). Redis is now the durable copy: memory stays the read path, and each
+// mutation is mirrored so a restart warm-loads instead of re-fetching.
+//
+// Layout — one HASH per frame, field = bucket-end ms, value = the point as JSON:
+//
+//   calspread:oiframe:{1m,5m,15m,1h}      option Call/Put totals + straddle + spot
+//   calspread:futoiframe:{1m,5m,15m,1h}   futures per-contract OI + LTP
+//   calspread:futcontracts                contract metadata (labels across rollover)
+//   calspread:prevclose                   previous-session close baseline
+//   calspread:chainsnap:min:{IST day}     per-minute per-token OI/LTP (1 day)
+//   calspread:chainsnap:hour              per-hour  per-token OI/LTP (4 days)
+//
+// A HASH keyed by bucket makes writes IDEMPOTENT — re-writing a bucket that a
+// backfill corrected replaces the field instead of appending a duplicate, which a
+// sorted set of JSON members could not do. Retention is enforced in Redis too:
+// pruned buckets are HDEL'd and every key carries a TTL so an abandoned key
+// disappears on its own.
+// ---------------------------------------------------------------------------
+
+/** Keep a key a day past its data's retention, so a paused process can resume. */
+const REDIS_TTL_SLACK_MS = 24 * 60 * 60 * 1000;
+const redisKeys = {
+  oiFrame: (f: OiFrameKey) => `oiframe:${f}`,
+  futFrame: (f: OiFrameKey) => `futoiframe:${f}`,
+  futContracts: "futcontracts",
+  prevClose: "prevclose",
+  chainMinute: (day: string) => `chainsnap:min:${day}`,
+  // Per-day, like the minute key. A single shared key could never be trimmed
+  // correctly: fields are only HDEL'd when they're still in memory, so buckets
+  // written before a restart became orphans, and the periodic EXPIRE refresh kept
+  // resurrecting the key's lifetime. Per-day keys just age out.
+  chainHour: (day: string) => `chainsnap:hour:${day}`,
+};
+
+/**
+ * Writes are buffered and flushed once per capture cycle.
+ *
+ * Upstash bills per command, so the difference between flushing here and calling
+ * out per store is ~10 requests a minute versus one. Fields are keyed, so a buffer
+ * that is flushed late simply collapses repeated writes to the same bucket.
+ */
+interface PendingHashWrite {
+  entries: Map<string, unknown>;
+  stale: Set<string>;
+  ttlSec: number;
+  /** Backlog cap for THIS key. Fields differ enormously in size — a frame point is
+   *  ~100 bytes, a chain snapshot is a whole token map at ~12KB — so one global
+   *  field count would either wedge on body size or throw away frame history. */
+  maxFields: number;
+}
+let pendingHashWrites = new Map<string, PendingHashWrite>();
+let pendingPlainWrites = new Map<string, { value: unknown; ttlSec: number }>();
+let flushInFlight = false;
+/** A flush was requested while one was in flight — re-run it when that finishes. */
+let flushAgain = false;
+/**
+ * Caps on buffered fields per key while Redis is unreachable. Beyond these the
+ * OLDEST are dropped: the newest buckets are the ones a restart would miss, and
+ * anything older is still reconstructible from Kite by the gap-aware backfill.
+ * Sized so a full backlog stays well inside one REST body.
+ */
+const MAX_BUFFERED_FRAME_FIELDS = 3000; // ~100 bytes each
+const MAX_BUFFERED_SNAPSHOT_FIELDS = 60; // ~12KB each
+/** Last time each key's TTL was refreshed, so EXPIRE isn't re-sent every write. */
+const ttlRefreshedAt = new Map<string, number>();
+const TTL_REFRESH_EVERY_MS = 15 * 60 * 1000;
+
+function pendingFor(key: string, ttlSec: number, maxFields: number): PendingHashWrite {
+  let p = pendingHashWrites.get(key);
+  if (!p) {
+    p = { entries: new Map(), stale: new Set(), ttlSec, maxFields };
+    pendingHashWrites.set(key, p);
+  }
+  p.ttlSec = ttlSec;
+  p.maxFields = maxFields;
+  return p;
+}
+
+/** Queue `field = value` on a hash. */
+function queueHashField(
+  key: string,
+  field: string | number,
+  value: unknown,
+  ttlSec: number,
+  maxFields: number = MAX_BUFFERED_FRAME_FIELDS,
+): void {
+  if (!isRedisEnabled()) return;
+  const p = pendingFor(key, ttlSec, maxFields);
+  const f = String(field);
+  p.stale.delete(f); // a re-add supersedes a pending delete
+  p.entries.set(f, value);
+}
+
+/** Queue the removal of retention-pruned fields from a hash. */
+function queueHashDrop(key: string, fields: (string | number)[], ttlSec: number): void {
+  if (!isRedisEnabled() || fields.length === 0) return;
+  const p = pendingFor(key, ttlSec, MAX_BUFFERED_FRAME_FIELDS);
+  for (const field of fields) {
+    const f = String(field);
+    p.entries.delete(f);
+    p.stale.add(f);
+  }
+}
+
+/** Queue a whole-key JSON write. */
+function queuePlainWrite(key: string, value: unknown, ttlSec: number): void {
+  if (!isRedisEnabled()) return;
+  pendingPlainWrites.set(key, { value, ttlSec });
+}
+
+/**
+ * Send everything buffered so far as one pipeline.
+ *
+ * Never throws and never awaits anything the caller depends on — a Redis outage
+ * degrades to the pre-Redis behaviour (memory-only) rather than stalling capture.
+ */
+async function flushRedisWrites(): Promise<void> {
+  if (!isRedisEnabled()) return;
+  if (flushInFlight) {
+    // Record the intent instead of dropping it: out of market hours the capture
+    // tick isn't there to cover a skipped flush, so an overlapping chain's writes
+    // would otherwise never be sent.
+    flushAgain = true;
+    return;
+  }
+  if (pendingHashWrites.size === 0 && pendingPlainWrites.size === 0) return;
+  // Don't serialize megabytes of backlog just for `pipeline` to discard it while
+  // cooling down — leave it buffered for the retry timer.
+  if (!canSend()) return;
+  flushInFlight = true;
+  flushAgain = false;
+  // Detach the batch so writes queued during the round-trip aren't lost, but keep
+  // it so a FAILED batch can be put back — clearing before the await would have
+  // discarded those buckets permanently, since `pipeline` swallows its errors and
+  // nothing else ever re-queues a specific field.
+  const hashes = pendingHashWrites;
+  const plains = pendingPlainWrites;
+  pendingHashWrites = new Map();
+  pendingPlainWrites = new Map();
+  try {
+    const now = Date.now();
+    const cmds: RedisCommand[] = [];
+    const ttlSent: string[] = [];
+    for (const [key, p] of hashes) {
+      // EXPIRE is a billed command and the TTLs are days long, so refresh it
+      // periodically rather than on every write — it was half the command budget.
+      const last = ttlRefreshedAt.get(key) ?? 0;
+      const withTtl = now - last > TTL_REFRESH_EVERY_MS;
+      cmds.push(
+        ...hashWriteCommands(
+          key,
+          p.entries,
+          Array.from(p.stale),
+          withTtl ? p.ttlSec : undefined,
+        ),
+      );
+      if (withTtl) ttlSent.push(key);
+    }
+    for (const [key, p] of plains) cmds.push(setJsonCommand(key, p.value, p.ttlSec));
+    const out = await pipeline(cmds);
+    if (out === null) {
+      requeueFailedWrites(hashes, plains);
+    } else {
+      // Only now, having actually observed the send: stamping at build time meant a
+      // FAILED flush could mark a key as TTL'd, and the requeued HSET that created
+      // it would then go out without an EXPIRE — a key with no expiry at all.
+      for (const key of ttlSent) ttlRefreshedAt.set(key, now);
+    }
+  } catch (e) {
+    requeueFailedWrites(hashes, plains);
+    console.warn("[Redis] flush failed:", e instanceof Error ? e.message : e);
+  } finally {
+    flushInFlight = false;
+    if (flushAgain) {
+      flushAgain = false;
+      void flushRedisWrites();
+    }
+  }
+}
+
+/**
+ * Drive the write buffer independently of the capture tick.
+ *
+ * Every other flush trigger sits behind `isIstMarketHours()`, so a failure on the
+ * session's LAST tick — a 60s cooldown is more than enough to swallow it — parked
+ * the day's 15:30 closing buckets in memory until the next trading morning, and an
+ * overnight deploy dropped them. This timer is deliberately not market-hours gated.
+ */
+function startRedisFlushRetry(): void {
+  if (!isRedisEnabled()) return;
+  setInterval(() => {
+    if (pendingHashWrites.size === 0 && pendingPlainWrites.size === 0) return;
+    void flushRedisWrites();
+  }, 60 * 1000);
+}
+
+/** Put a failed batch back, letting anything queued since take precedence. */
+function requeueFailedWrites(
+  hashes: Map<string, PendingHashWrite>,
+  plains: Map<string, { value: unknown; ttlSec: number }>,
+): void {
+  for (const [key, old] of hashes) {
+    const cur = pendingHashWrites.get(key);
+    if (!cur) {
+      pendingHashWrites.set(key, old);
+      continue;
+    }
+    for (const [f, v] of old.entries) {
+      if (!cur.entries.has(f) && !cur.stale.has(f)) cur.entries.set(f, v);
+    }
+    for (const f of old.stale) if (!cur.entries.has(f)) cur.stale.add(f);
+  }
+  for (const [key, p] of plains) {
+    if (!pendingPlainWrites.has(key)) pendingPlainWrites.set(key, p);
+  }
+  // Bound the backlog of a long outage. Fields are bucket timestamps, so sorting
+  // numerically drops the oldest — the ones the Kite backfill can still rebuild.
+  for (const [key, p] of pendingHashWrites) {
+    const over = p.entries.size - p.maxFields;
+    if (over <= 0) continue;
+    const oldest = Array.from(p.entries.keys())
+      .sort((a, b) => Number(a) - Number(b))
+      .slice(0, over);
+    for (const f of oldest) p.entries.delete(f);
+    console.warn(
+      `[Redis] ${key}: dropped ${over} buffered buckets (Redis unreachable; ` +
+        `they stay recoverable from Kite).`,
+    );
+  }
+}
+
+/** TTL (seconds) for a frame's key: its retention plus a day of slack. */
+function frameTtlSec(cfg: OiFrameCfg): number {
+  return Math.floor((cfg.retentionMs + REDIS_TTL_SLACK_MS) / 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Per-token chain snapshots — the source for the chain's OI Δ% / buildup windows.
+//
+// The windows used to be resolved from `optionOiDay.series`, which is memory-only:
+// a restart erased every baseline and the columns showed dashes until enough new
+// minutes accumulated. A 1-hour window would have been unusable. These snapshots
+// are the same readings keyed by bucket instead of by token, which makes them one
+// small blob per bucket — cheap enough to mirror to Redis every minute, where a
+// per-token key would have been hundreds of writes a minute.
+//
+// Two cadences: MINUTE snapshots for a day (they serve 1m/5m/15m/1h) and HOUR
+// snapshots for four days (multi-day lookback without keeping 4×375 minutes).
+// ---------------------------------------------------------------------------
+
+/** `[oi, ltp]` per option token — a tuple purely to keep the blob small. */
+type ChainSnapTokens = Record<number, [number, number]>;
+interface ChainSnapshot {
+  t: number; // bucket-end ms
+  expiry: string;
+  tokens: ChainSnapTokens;
+}
+const CHAIN_MINUTE_RETENTION_MS = 1 * 24 * 60 * 60 * 1000; // "1m cached for a day"
+const CHAIN_HOUR_RETENTION_MS = 4 * 24 * 60 * 60 * 1000; // "1h cached for 4 days"
+/** Ascending by `t`. Written through to Redis, warm-loaded at boot. */
+let chainMinuteSnaps: ChainSnapshot[] = [];
+let chainHourSnaps: ChainSnapshot[] = [];
+
+/** Insert/replace a snapshot in an ascending-by-`t` list. */
+function upsertSnapshot(list: ChainSnapshot[], snap: ChainSnapshot): void {
+  for (let i = list.length - 1; i >= 0; i--) {
+    const cur = list[i]!;
+    if (cur.t === snap.t) {
+      list[i] = snap;
+      return;
+    }
+    if (cur.t < snap.t) {
+      list.splice(i + 1, 0, snap);
+      return;
+    }
+  }
+  list.unshift(snap);
+}
+
+/**
+ * Record this capture's readings into both snapshot cadences and mirror them.
+ *
+ * The hour bucket is deliberately overwritten by every minute inside it, so it
+ * always holds that hour's CLOSING reading — the same "bucket end" contract the
+ * frames use.
+ */
+function recordChainSnapshot(store: OptionOiDay, t: number): void {
+  const tokens: ChainSnapTokens = {};
+  let n = 0;
+  for (const [token, arr] of store.series) {
+    const last = arr[arr.length - 1];
+    if (!last || last.oi <= 0) continue; // never got a real reading for this strike
+    tokens[token] = [last.oi, last.ltp];
+    n++;
+  }
+  if (n === 0) return;
+
+  const minuteT = bucketEndMs(t, 60 * 1000);
+  const hourT = bucketEndMs(t, 60 * 60 * 1000);
+  const minuteSnap: ChainSnapshot = { t: minuteT, expiry: store.expiry, tokens };
+  const hourSnap: ChainSnapshot = { t: hourT, expiry: store.expiry, tokens };
+  upsertSnapshot(chainMinuteSnaps, minuteSnap);
+  upsertSnapshot(chainHourSnaps, hourSnap);
+
+  const minuteTtl = Math.floor((CHAIN_MINUTE_RETENTION_MS + REDIS_TTL_SLACK_MS) / 1000);
+  const hourTtl = Math.floor((CHAIN_HOUR_RETENTION_MS + REDIS_TTL_SLACK_MS) / 1000);
+  queueHashField(
+    redisKeys.chainMinute(store.day),
+    minuteT,
+    minuteSnap,
+    minuteTtl,
+    MAX_BUFFERED_SNAPSHOT_FIELDS,
+  );
+  queueHashField(
+    redisKeys.chainHour(store.day),
+    hourT,
+    hourSnap,
+    hourTtl,
+    MAX_BUFFERED_SNAPSHOT_FIELDS,
+  );
+
+  // In-memory pruning only. Both keys are per-day and carry a TTL, so Redis-side
+  // eviction is the TTL's job — there is no shared key to leak fields into.
+  const minCutoff = t - CHAIN_MINUTE_RETENTION_MS;
+  while (chainMinuteSnaps.length && chainMinuteSnaps[0]!.t < minCutoff) {
+    chainMinuteSnaps.shift();
+  }
+  const hourCutoff = t - CHAIN_HOUR_RETENTION_MS;
+  while (chainHourSnaps.length && chainHourSnaps[0]!.t < hourCutoff) {
+    chainHourSnaps.shift();
+  }
+}
+
+/**
+ * The snapshot to compare against for a window of `minutes`, or null when the
+ * cache doesn't reach back that far.
+ *
+ * Deliberately returns nothing rather than the oldest snapshot it has. Serving a
+ * 20-minute-old reading as a "1 hour" baseline would render a plausible but wrong
+ * percentage; a dash is the honest answer, and the client already handles it.
+ */
+function chainBaselineAt(cutoff: number): ChainSnapshot | null {
+  // TODAY only, and only the minute cadence. The endpoint's window is capped at
+  // 240 minutes, so the 4-day hourly cadence could never legitimately serve it —
+  // its only reachable effect would be answering an early-session "1 hour ago"
+  // with YESTERDAY's close. The hourly snapshots exist for multi-day history, not
+  // for this.
+  const dayStart = istTimeOnDayMs(Date.now(), 0);
+  const pick = (list: ChainSnapshot[]): ChainSnapshot | null => {
+    let best: ChainSnapshot | null = null;
+    for (const s of list) {
+      if (s.t > cutoff) break;
+      if (s.t >= dayStart) best = s;
+    }
+    return best;
+  };
+  // Prefer the dense minute cadence; the hourly one is the fallback for a session
+  // whose minute snapshots were lost (a restart while Redis was unreachable). Both
+  // are bounded to TODAY, which is what keeps an hourly reading from ever standing
+  // in for a session it doesn't belong to.
+  return pick(chainMinuteSnaps) ?? pick(chainHourSnaps);
+}
+
+/** Oldest/newest snapshot that could serve a window today (drives availability). */
+function chainSnapshotSpan(): { oldest: number | null; newest: number | null } {
+  const dayStart = istTimeOnDayMs(Date.now(), 0);
+  let oldest: number | null = null;
+  let newest: number | null = null;
+  for (const s of [...chainMinuteSnaps, ...chainHourSnaps]) {
+    if (s.t < dayStart) continue;
+    if (oldest === null || s.t < oldest) oldest = s.t;
+    if (newest === null || s.t > newest) newest = s.t;
+  }
+  return { oldest, newest };
+}
+
+/**
+ * Warm-load every persisted cache from Redis.
+ *
+ * MUST complete before `startOptionOiCapture()`, which snapshots the backfill
+ * windows from whatever the stores hold at that instant: running it afterwards
+ * would make the gap detector fetch from Kite everything Redis already had.
+ */
+/**
+ * Fold warm-loaded points into a store, keeping anything already there.
+ *
+ * Assigning over the store would be a race: a Zerodha session restored earlier in
+ * the same boot chain can fire triggerPostLoginBackfill(), and its reconstruction
+ * is newer than what Redis holds. Live/backfilled values therefore win, and Redis
+ * only supplies buckets nothing else has. Returns how many it added.
+ */
+function mergeWarmLoaded<T extends { t: number }>(
+  store: { points: T[] },
+  loaded: T[],
+): number {
+  if (loaded.length === 0) return 0;
+  const existing = new Set(store.points.map((p) => p.t));
+  const byBucket = new Map<number, T>();
+  for (const p of loaded) byBucket.set(p.t, p);
+  for (const p of store.points) byBucket.set(p.t, p); // existing wins
+  store.points = Array.from(byBucket.values()).sort((a, b) => a.t - b.t);
+  let added = 0;
+  for (const t of byBucket.keys()) if (!existing.has(t)) added++;
+  return added;
+}
+
+async function warmLoadFromRedis(): Promise<void> {
+  logRedisStatus();
+  if (!isRedisEnabled()) return;
+  if (!(await redisPing())) {
+    console.warn("[Redis] PING failed — starting with empty in-memory caches.");
+    return;
+  }
+  const now = Date.now();
+  let loaded = 0;
+  try {
+    for (const key of OI_FRAME_KEYS) {
+      const cfg = OI_FRAMES[key];
+      const cutoff = now - cfg.retentionMs;
+
+      const opt = await hGetAllJson<OiAggPoint>(redisKeys.oiFrame(key));
+      loaded += mergeWarmLoaded(
+        oiFrameStores[key],
+        Array.from(opt.values()).filter(
+          (p) => p && typeof p.t === "number" && p.t >= cutoff,
+        ),
+      );
+
+      const fut = await hGetAllJson<FutOiPoint>(redisKeys.futFrame(key));
+      loaded += mergeWarmLoaded(
+        futOiFrameStores[key],
+        Array.from(fut.values()).filter(
+          (p) => p && typeof p.t === "number" && Array.isArray(p.legs) && p.t >= cutoff,
+        ),
+      );
+    }
+
+    // Futures contract metadata, so a retained series keeps its label after a
+    // rollover even on the first request after a restart.
+    const contracts = await redisGetJson<FutContract[]>(redisKeys.futContracts);
+    if (Array.isArray(contracts)) {
+      for (const c of contracts) {
+        if (c && typeof c.expiry === "string") futOiKnownContracts.set(c.expiry, c);
+      }
+    }
+
+    // Previous-session close: worth ~240 Kite historical calls on every restart.
+    const prev = await redisGetJson<OptionPrevClose>(redisKeys.prevClose);
+    if (prev && prev.forDay === istDayKey() && prev.tokens) {
+      optionPrevClose = prev;
+      console.log(
+        `[Redis] Restored previous-close baseline (${Object.keys(prev.tokens).length} ` +
+          `tokens from ${prev.closedOn}) — no Kite backfill needed.`,
+      );
+    }
+
+    // Chain snapshots for the OI Δ% / buildup windows. The minute cadence only
+    // needs today (its whole retention is a day); the hourly cadence spans 4 days,
+    // so read a key per day.
+    const minute = await hGetAllJson<ChainSnapshot>(redisKeys.chainMinute(istDayKey()));
+    chainMinuteSnaps = Array.from(minute.values())
+      .filter((s) => s && typeof s.t === "number" && s.t >= now - CHAIN_MINUTE_RETENTION_MS)
+      .sort((a, b) => a.t - b.t);
+    const hourly: ChainSnapshot[] = [];
+    for (let d = 0; d <= 4; d++) {
+      const day = istDayKey(now - d * 24 * 60 * 60 * 1000);
+      const hour = await hGetAllJson<ChainSnapshot>(redisKeys.chainHour(day));
+      for (const s of hour.values()) {
+        if (s && typeof s.t === "number" && s.t >= now - CHAIN_HOUR_RETENTION_MS) {
+          hourly.push(s);
+        }
+      }
+    }
+    chainHourSnaps = hourly.sort((a, b) => a.t - b.t);
+
+    console.log(
+      `[Redis] Warm-loaded ${loaded} frame points, ${chainMinuteSnaps.length} minute ` +
+        `and ${chainHourSnaps.length} hourly chain snapshots.`,
+    );
+  } catch (e) {
+    // A partial warm load is fine: the gap-aware backfill fills whatever is
+    // missing from Kite, exactly as it did before Redis existed.
+    console.warn(
+      "[Redis] warm load failed:",
+      e instanceof Error ? e.message : e,
+    );
+  }
+}
 
 // Dividend yields (%) from Yahoo, refreshed once a day.
 let dividendCache: { at: number; data: Record<string, number> } | null = null;
@@ -896,9 +1413,9 @@ app.get("/api/debug/indices", async (_req: Request, res: Response) => {
 // for the whole trading day (IST) and only refetch once the date rolls over.
 const historyCache = new Map<string, { day: string; data: unknown }>();
 
-/** Current calendar day in IST (UTC+5:30) as YYYY-MM-DD. */
-function istDayKey(): string {
-  const ist = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+/** Calendar day in IST (UTC+5:30) as YYYY-MM-DD — defaults to right now. */
+function istDayKey(at: number = Date.now()): string {
+  const ist = new Date(at + 5.5 * 60 * 60 * 1000);
   return ist.toISOString().slice(0, 10);
 }
 
@@ -1426,30 +1943,39 @@ app.get("/api/option-chain/:underlying", async (req: Request, res: Response) => 
   }
 });
 
-// --- Option-OI baseline: per-token OI + LTP as of `minutes` ago (today only).
-// Powers the frontend's 5m/15m OI-change % and OI-buildup interpretation with a
-// real baseline immediately on load. Served from the per-day in-memory cache. ---
+// --- Option-OI baseline: per-token OI + LTP as of `minutes` ago.
+// Powers the chain's OI-change % and buildup columns for the 1m/5m/15m/1h windows
+// with a real baseline immediately on load. Served from the Redis-backed chain
+// snapshots, so it survives a restart instead of starting from nothing. ---
 app.get("/api/option-oi-baseline/:underlying", (req: Request, res: Response) => {
-  const minutes = Math.min(240, Math.max(1, Number(req.query.minutes ?? 5)));
+  const requested = Number(req.query.minutes ?? 5);
+  const minutes = Number.isFinite(requested)
+    ? Math.min(240, Math.max(1, Math.round(requested)))
+    : 5;
   const day = istDayKey();
-  if (!optionOiDay || optionOiDay.day !== day) {
-    res.json({ day, expiry: null, minutes, tokens: {} });
+  const { oldest, newest } = chainSnapshotSpan();
+  const snap = chainBaselineAt(Date.now() - minutes * 60 * 1000);
+  if (!snap) {
+    // No reading that old. Reporting empty (rather than the oldest we hold) is
+    // what stops a 20-minute-old value being presented as a 1-hour change.
+    res.json({ day, expiry: null, minutes, oldest, newest, baseT: null, tokens: {} });
     return;
   }
-  const cutoff = Date.now() - minutes * 60 * 1000;
   const tokens: Record<number, { oi: number; ltp: number; t: number }> = {};
-  for (const [token, arr] of optionOiDay.series) {
-    if (arr.length === 0) continue;
-    // Newest sample at/at-before the cutoff, else the earliest we have (so a
-    // baseline exists even when less than `minutes` of history is available).
-    let base = arr[0]!;
-    for (const s of arr) {
-      if (s.t <= cutoff) base = s;
-      else break;
-    }
-    tokens[token] = { oi: base.oi, ltp: base.ltp, t: base.t };
+  for (const [token, pair] of Object.entries(snap.tokens)) {
+    tokens[Number(token)] = { oi: pair[0], ltp: pair[1], t: snap.t };
   }
-  res.json({ day, expiry: optionOiDay.expiry, minutes, tokens });
+  res.json({
+    day,
+    expiry: snap.expiry,
+    minutes,
+    // What the cache actually spans, so the client can offer only the windows it
+    // can serve rather than showing a column of dashes.
+    oldest,
+    newest,
+    baseT: snap.t,
+    tokens,
+  });
 });
 
 // --- Option previous-session CLOSE: per-token OI + LTP at the last session's
@@ -1543,11 +2069,7 @@ app.get("/api/option-oi-series/:underlying", (_req: Request, res: Response) => {
 // 3 days) or 15m (last 1 week). Points are { t, totalCe, totalPe } over the
 // 24↑/ATM/26↓ window. Filled live + backfilled from Kite on downtime. ---
 app.get("/api/option-oi-frame/:underlying", (req: Request, res: Response) => {
-  const frameParam = String(req.query.frame ?? "5m");
-  const frame: OiFrameKey =
-    frameParam === "1m" || frameParam === "5m" || frameParam === "15m"
-      ? frameParam
-      : "5m";
+  const frame = parseFrameKey(req.query.frame);
   res.json({
     frame,
     intervalMin: OI_FRAMES[frame].intervalMin,
@@ -1561,11 +2083,7 @@ app.get("/api/option-oi-frame/:underlying", (req: Request, res: Response) => {
 // or 15m (last 1 week). Each point carries one leg per contract, keyed by expiry
 // so the client can plot current/next/far month as three series. ---
 app.get("/api/futures-oi-frame/:underlying", (req: Request, res: Response) => {
-  const frameParam = String(req.query.frame ?? "5m");
-  const frame: OiFrameKey =
-    frameParam === "1m" || frameParam === "5m" || frameParam === "15m"
-      ? frameParam
-      : "5m";
+  const frame = parseFrameKey(req.query.frame);
   const points = completedBuckets(futOiFrameStores[frame].points);
   // Report every contract this frame still holds data for (not just the ones
   // currently being captured), so a just-expired month keeps its line until it
@@ -2136,6 +2654,9 @@ function triggerPostLoginBackfill(): void {
     await backfillFutOiFrames(futFrom);
     // Baseline for the chain's "Day" column (no-op once today's is cached).
     await backfillPrevClose();
+    // Persist everything the backfills reconstructed, so the next restart
+    // warm-loads it instead of paying for the same Kite calls again.
+    await flushRedisWrites();
   })();
 }
 
@@ -2189,8 +2710,10 @@ function isPreOpenBucket(bEnd: number): boolean {
  * boundary instead makes every label a real interval edge (…15:20, 15:25, 15:30)
  * and matches the "bucket end" contract the client already assumes.
  *
- * IST is +05:30, an exact multiple of 1m/5m/15m, so epoch-aligned boundaries land
- * on IST :00/:05/:15/:30 as expected. A sample exactly on a boundary closes that
+ * Boundaries are aligned to the IST CALENDAR, not to the epoch. For 1m/5m/15m the
+ * two are identical (IST's +05:30 offset is a whole number of those intervals), but
+ * for the 1h frame epoch alignment would put every boundary on the IST half-hour
+ * (…10:30, 11:30) instead of the hour. A sample exactly on a boundary closes that
  * bucket rather than opening the next.
  */
 function bucketEndMs(t: number, bsize: number): number {
@@ -2199,7 +2722,8 @@ function bucketEndMs(t: number, bsize: number): number {
   // the closing bucket — so the day's last bar carries the true closing value
   // instead of opening a bucket that never traded.
   if (t >= close) return close;
-  return Math.min(Math.ceil(t / bsize) * bsize, close);
+  const aligned = Math.ceil((t + IST_OFFSET_MS) / bsize) * bsize - IST_OFFSET_MS;
+  return Math.min(aligned, close);
 }
 
 /**
@@ -2336,6 +2860,9 @@ async function captureOptionOi(): Promise<void> {
     const agg = currentWindowAgg(store);
     if (agg) appendOiFrameLive(now, agg);
 
+    // Record the per-token readings that back the chain's comparison windows.
+    recordChainSnapshot(store, now);
+
     // Make sure the day has a "previous close" baseline even when the rollover
     // snapshot couldn't provide one (cold start, expiry roll, a process that was
     // up overnight without a session) — otherwise the chain's Day column stays
@@ -2394,9 +2921,25 @@ function snapshotPrevClose(prev: OptionOiDay, forDay: string): void {
     complete: true, // live capture covered every tracked strike
     tokens,
   };
+  persistPrevClose();
   console.log(
     `[OptionOI] Captured ${prev.day} close for ${Object.keys(tokens).length} tokens (baseline for ${forDay}).`,
   );
+}
+
+/**
+ * Mirror the previous-close baseline to Redis and flush immediately.
+ *
+ * Not batched with the capture flush: this is the one cache that costs ~240 Kite
+ * historical calls to rebuild, so it should be durable the moment it exists rather
+ * than at the next minute tick.
+ */
+function persistPrevClose(): void {
+  if (!optionPrevClose || !isRedisEnabled()) return;
+  // Two days: long enough to survive an overnight restart, short enough that a
+  // stale baseline can't linger (the endpoint gates on `forDay` regardless).
+  queuePlainWrite(redisKeys.prevClose, optionPrevClose, 2 * 24 * 60 * 60);
+  void flushRedisWrites();
 }
 
 let prevCloseBackfillRunning = false;
@@ -2561,6 +3104,7 @@ async function backfillPrevClose(): Promise<void> {
       complete: failed === 0,
       tokens,
     };
+    persistPrevClose();
     console.log(
       `[OptionOI] Backfilled ${closedOn} close for ${Object.keys(tokens).length}/${wanted.length} band tokens ` +
         `(baseline for ${today}${failed ? `, ${failed} failed — will retry` : ""}).`,
@@ -2638,7 +3182,7 @@ function currentWindowAgg(store: OptionOiDay): OiAggPoint | null {
  * edge.
  */
 function appendOiFrameLive(t: number, agg: OiAggPoint): void {
-  for (const key of Object.keys(OI_FRAMES) as OiFrameKey[]) {
+  for (const key of OI_FRAME_KEYS) {
     const cfg = OI_FRAMES[key];
     const store = oiFrameStores[key];
     const bsize = cfg.intervalMin * 60 * 1000;
@@ -2662,7 +3206,23 @@ function appendOiFrameLive(t: number, agg: OiAggPoint): void {
       });
     }
     const cutoff = t - cfg.retentionMs;
-    while (store.points.length && store.points[0]!.t < cutoff) store.points.shift();
+    const dropped: number[] = [];
+    while (store.points.length && store.points[0]!.t < cutoff) {
+      dropped.push(store.points.shift()!.t);
+    }
+    // Mirror CLOSED buckets (and the pruning) into Redis — never the forming one.
+    // A forming bucket's value is provisional, and mergeOiFrame deliberately never
+    // overwrites a bucket that already exists; persisting it would mean a restart
+    // resurrected a half-formed reading that the backfill could then never correct
+    // (up to 59 minutes stale on the 1h frame). Leaving it out costs nothing: the
+    // backfill reconstructs that bucket properly.
+    // Only the tail can have newly closed, so this stays O(1) per capture.
+    const ttl = frameTtlSec(cfg);
+    const rk = redisKeys.oiFrame(key);
+    for (const p of store.points.slice(-2)) {
+      if (p.t <= t) queueHashField(rk, p.t, p, ttl);
+    }
+    queueHashDrop(rk, dropped, ttl);
   }
 }
 
@@ -2695,29 +3255,100 @@ function mergeOiFrame(key: OiFrameKey, backfilled: OiAggPoint[]): void {
     if (!byBucket.has(p.t)) byBucket.set(p.t, p);
   }
   const cutoff = Date.now() - cfg.retentionMs;
+  const before = new Set(store.points.map((p) => p.t));
   store.points = Array.from(byBucket.values())
     .filter((p) => p.t >= cutoff)
     .sort((a, b) => a.t - b.t);
+  // Persist the whole merged frame: a backfill both ADDS buckets and prunes past
+  // the retention edge, so field-by-field tracking would miss one or the other.
+  const ttl = frameTtlSec(cfg);
+  const rk = redisKeys.oiFrame(key);
+  const kept = new Set<number>();
+  for (const p of store.points) {
+    kept.add(p.t);
+    queueHashField(rk, p.t, p, ttl);
+  }
+  queueHashDrop(
+    rk,
+    Array.from(before).filter((t) => !kept.has(t)),
+    ttl,
+  );
 }
 
 /**
- * The earliest timestamp we still NEED for any frame: for each frame it's the
- * later of (retention start) and (newest stored point). The overall backfill
- * `from` is the min across frames — so a warm cache only backfills the gap.
+ * The earliest timestamp we still NEED for any frame. The overall backfill `from`
+ * is the min across frames, so a warm cache only fetches the gap.
+ *
+ * Two kinds of gap matter:
+ *  - the TAIL: everything after the newest point we hold.
+ *  - the HEAD of the newest session we hold. A process that first captured at,
+ *    say, 12:22 has a newest point at ~now, so tail-only detection reports "fully
+ *    covered" and 09:15–12:22 is never fetched — which is exactly how a chart ends
+ *    up permanently starting mid-session. If the oldest point we hold begins after
+ *    its own session's open, that session's head is missing and we ask for it.
  */
 function oiBackfillFromMs(now: number): number {
   let from = now; // if everything is fully covered, this stays ~now (no work)
-  for (const key of Object.keys(OI_FRAMES) as OiFrameKey[]) {
+  for (const key of OI_FRAME_KEYS) {
     const cfg = OI_FRAMES[key];
     const retentionStart = now - cfg.retentionMs;
     const pts = oiFrameStores[key].points;
-    const newest = pts.length ? pts[pts.length - 1]!.t : 0;
+    if (pts.length === 0) {
+      from = Math.min(from, retentionStart);
+      continue;
+    }
     // Need data from where this frame's coverage ends (but no earlier than its
-    // retention window). Empty frame → from retentionStart.
-    const need = Math.max(retentionStart, newest || retentionStart);
+    // retention window).
+    let need = Math.max(retentionStart, pts[pts.length - 1]!.t);
+    const headNeed = missingHeadMs("opt", pts[0]!.t, cfg, retentionStart);
+    if (headNeed !== null) need = Math.min(need, headNeed);
     from = Math.min(from, need);
   }
   return from;
+}
+
+/**
+ * `from` needed to repair a missing session head, or null when there is none.
+ *
+ * Rate-limited per (family, frame, session): when the head genuinely cannot be
+ * reconstructed — the strikes we track now weren't listed then, or Kite has no
+ * candles that far back — an unbounded check would re-fetch hundreds of candles
+ * every 30 minutes for the rest of the day and never succeed. The counter is
+ * time-based as well as capped because the window is recomputed by several callers
+ * per cycle, and a plain per-call counter would be spent before a backfill ever
+ * ran with it.
+ */
+const HEAD_REPAIR_MAX_ATTEMPTS = 4;
+const HEAD_REPAIR_MIN_GAP_MS = 25 * 60 * 1000;
+const headRepairs = new Map<string, { n: number; at: number }>();
+function missingHeadMs(
+  family: "opt" | "fut",
+  oldest: number,
+  cfg: OiFrameCfg,
+  retentionStart: number,
+): number | null {
+  const open = sessionOpenMs(oldest);
+  // One bucket of slack: a frame legitimately has no point before its first
+  // boundary after the open.
+  if (oldest <= open + cfg.intervalMin * 60 * 1000) return null;
+  if (open < retentionStart) return null; // outside what we'd keep anyway
+  const key = `${family}:${cfg.intervalMin}:${istDayKey(open)}`;
+  const seen = headRepairs.get(key);
+  const now = Date.now();
+  if (seen) {
+    if (seen.n >= HEAD_REPAIR_MAX_ATTEMPTS) return null;
+    // Same cycle (or the same 25-minute window): reuse without spending a try.
+    if (now - seen.at < HEAD_REPAIR_MIN_GAP_MS) return open;
+    headRepairs.set(key, { n: seen.n + 1, at: now });
+  } else {
+    headRepairs.set(key, { n: 1, at: now });
+    console.log(
+      `[OptionOI] ${family} ${cfg.intervalMin}m frame is missing the head of ` +
+        `${istDayKey(open)} (oldest point ${new Date(oldest).toISOString()}) — ` +
+        `backfilling from the open.`,
+    );
+  }
+  return open;
 }
 
 let oiBackfillRunning = false;
@@ -2857,7 +3488,7 @@ async function backfillOiFrames(fromMsOverride?: number): Promise<void> {
         perMinute.push({ t, totalCe, totalPe, straddle, spot });
     }
 
-    for (const key of Object.keys(OI_FRAMES) as OiFrameKey[]) {
+    for (const key of OI_FRAME_KEYS) {
       mergeOiFrame(key, perMinute);
     }
     console.log(
@@ -2910,8 +3541,29 @@ function niftyMonthlyFutures(
     ids.push(`${f.exchange}:${f.tradingsymbol}`);
     if (contracts.length === 3) break;
   }
-  for (const c of contracts) futOiKnownContracts.set(c.expiry, c);
+  rememberFutContracts(contracts);
   return { contracts, ids };
+}
+
+/**
+ * Track the contracts we've seen and mirror them, so a retained series keeps its
+ * label after a rollover even on the first request following a restart.
+ */
+function rememberFutContracts(contracts: FutContract[]): void {
+  let changed = false;
+  for (const c of contracts) {
+    const known = futOiKnownContracts.get(c.expiry);
+    if (!known || known.token !== c.token) {
+      futOiKnownContracts.set(c.expiry, c);
+      changed = true;
+    }
+  }
+  if (!changed || !isRedisEnabled()) return;
+  queuePlainWrite(
+    redisKeys.futContracts,
+    Array.from(futOiKnownContracts.values()),
+    Math.floor((OI_FRAMES["15m"].retentionMs + REDIS_TTL_SLACK_MS) / 1000),
+  );
 }
 
 /** Deep-copy a futures point so each frame owns its own mutable objects. */
@@ -2924,7 +3576,7 @@ function cloneFutOiPoint(p: FutOiPoint): FutOiPoint {
  * stamped by the bucket-end boundary (see bucketEndMs).
  */
 function appendFutOiFrameLive(t: number, point: FutOiPoint): void {
-  for (const key of Object.keys(OI_FRAMES) as OiFrameKey[]) {
+  for (const key of OI_FRAME_KEYS) {
     const cfg = OI_FRAMES[key];
     const store = futOiFrameStores[key];
     const bsize = cfg.intervalMin * 60 * 1000;
@@ -2941,7 +3593,18 @@ function appendFutOiFrameLive(t: number, point: FutOiPoint): void {
       store.points.push(cloneFutOiPoint({ t: bEnd, legs: point.legs }));
     }
     const cutoff = t - cfg.retentionMs;
-    while (store.points.length && store.points[0]!.t < cutoff) store.points.shift();
+    const dropped: number[] = [];
+    while (store.points.length && store.points[0]!.t < cutoff) {
+      dropped.push(store.points.shift()!.t);
+    }
+    // Closed buckets only — see appendOiFrameLive for why the forming one is
+    // deliberately not persisted.
+    const ttl = frameTtlSec(cfg);
+    const rk = redisKeys.futFrame(key);
+    for (const p of store.points.slice(-2)) {
+      if (p.t <= t) queueHashField(rk, p.t, p, ttl);
+    }
+    queueHashDrop(rk, dropped, ttl);
   }
 }
 
@@ -2967,20 +3630,39 @@ function mergeFutOiFrame(key: OiFrameKey, backfilled: FutOiPoint[]): void {
     if (!byBucket.has(bEnd)) byBucket.set(bEnd, cloneFutOiPoint(p));
   }
   const cutoff = Date.now() - cfg.retentionMs;
+  const before = new Set(store.points.map((p) => p.t));
   store.points = Array.from(byBucket.values())
     .filter((p) => p.t >= cutoff)
     .sort((a, b) => a.t - b.t);
+  const ttl = frameTtlSec(cfg);
+  const rk = redisKeys.futFrame(key);
+  const kept = new Set<number>();
+  for (const p of store.points) {
+    kept.add(p.t);
+    queueHashField(rk, p.t, p, ttl);
+  }
+  queueHashDrop(
+    rk,
+    Array.from(before).filter((t) => !kept.has(t)),
+    ttl,
+  );
 }
 
-/** Earliest timestamp still needed across the futures frames (gap-aware). */
+/** Earliest timestamp still needed across the futures frames (tail + head gaps). */
 function futOiBackfillFromMs(now: number): number {
   let from = now;
-  for (const key of Object.keys(OI_FRAMES) as OiFrameKey[]) {
+  for (const key of OI_FRAME_KEYS) {
     const cfg = OI_FRAMES[key];
     const retentionStart = now - cfg.retentionMs;
     const pts = futOiFrameStores[key].points;
-    const newest = pts.length ? pts[pts.length - 1]!.t : 0;
-    from = Math.min(from, Math.max(retentionStart, newest || retentionStart));
+    if (pts.length === 0) {
+      from = Math.min(from, retentionStart);
+      continue;
+    }
+    let need = Math.max(retentionStart, pts[pts.length - 1]!.t);
+    const headNeed = missingHeadMs("fut", pts[0]!.t, cfg, retentionStart);
+    if (headNeed !== null) need = Math.min(need, headNeed);
+    from = Math.min(from, need);
   }
   return from;
 }
@@ -3105,7 +3787,7 @@ async function backfillFutOiFrames(fromMsOverride?: number): Promise<void> {
       if (Number.isFinite(t)) perMinute.push({ t, legs });
     }
 
-    for (const key of Object.keys(OI_FRAMES) as OiFrameKey[]) {
+    for (const key of OI_FRAME_KEYS) {
       mergeFutOiFrame(key, perMinute);
     }
     console.log(
@@ -3138,6 +3820,9 @@ function startOptionOiCapture(): void {
       void (async () => {
         await captureOptionOi();
         await captureFuturesOi();
+        // One pipeline for everything both captures touched. Flushing here rather
+        // than inside each store keeps Redis to a single request per minute.
+        await flushRedisWrites();
       })();
     }
     scheduleNextTick();
@@ -3169,6 +3854,7 @@ function startOptionOiCapture(): void {
     await backfillOiFrames(coldOptFrom);
     await backfillFutOiFrames(coldFutFrom);
     await backfillPrevClose();
+    await flushRedisWrites();
   })();
   setInterval(() => {
     if (!isIstMarketHours()) return;
@@ -3183,6 +3869,7 @@ function startOptionOiCapture(): void {
       await backfillFutOiFrames(futFrom);
       // Covers a process that started mid-session without a baseline.
       await backfillPrevClose();
+      await flushRedisWrites();
     })();
   }, 30 * 60 * 1000);
 }
@@ -3278,8 +3965,15 @@ app.listen(PORT, () => {
     // End-of-day review (default 16:30 IST): verify today's full day is stored;
     // backfill the gaps if not.
     startDayReviewScheduler(hourlyBackfillDeps);
-    // Intraday NIFTY option-OI capture (per-day in-memory cache) so the options
-    // Analytics page has a real 5m/15m baseline at any time of day.
+    // Restore the analytics caches from Redis BEFORE the capture scheduler runs:
+    // startOptionOiCapture() snapshots its backfill windows from whatever the
+    // stores hold at that instant, so loading afterwards would make the gap
+    // detector re-fetch from Kite everything Redis already had.
+    await warmLoadFromRedis();
+    // Not market-hours gated — see startRedisFlushRetry.
+    startRedisFlushRetry();
+    // Intraday NIFTY option-OI capture so the Analytics page has a real
+    // 1m/5m/15m/1h baseline at any time of day.
     startOptionOiCapture();
   });
 
