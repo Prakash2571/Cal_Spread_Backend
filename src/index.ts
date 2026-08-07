@@ -151,6 +151,27 @@ interface OptionOiDay {
 }
 let optionOiDay: OptionOiDay | null = null;
 
+/**
+ * Previous session's CLOSING OI + LTP per option token, used as the baseline for
+ * the chain's "Day" change column.
+ *
+ * Filled two ways: snapshotted from the outgoing day's cache when the IST day
+ * rolls over (the normal path), and reconstructed from Kite daily candles on a
+ * cold start (so a restart or a first-ever run still has a baseline).
+ */
+interface OptionPrevClose {
+  forDay: string; // the IST day this baseline is the "previous close" FOR
+  closedOn: string; // the session the values were taken from
+  expiry: string;
+  // False when the daily-candle reconstruction couldn't cover the whole band
+  // (a rate limit, an expired session, a mid-loop abort). Partial data is still
+  // published — every covered strike gets a real change — but the periodic
+  // gap-check is allowed to retry and fill in the rest.
+  complete: boolean;
+  tokens: Record<number, { oi: number; ltp: number }>;
+}
+let optionPrevClose: OptionPrevClose | null = null;
+
 // ---------------------------------------------------------------------------
 // Multi-timeframe Call/Put total-OI history (for the analytics OI chart).
 // Each frame keeps aggregate points (total CE & PE OI over the 24↑/ATM/26↓
@@ -1431,6 +1452,26 @@ app.get("/api/option-oi-baseline/:underlying", (req: Request, res: Response) => 
   res.json({ day, expiry: optionOiDay.expiry, minutes, tokens });
 });
 
+// --- Option previous-session CLOSE: per-token OI + LTP at the last session's
+// close, the baseline for the chain's "Day" change column. Snapshotted at the IST
+// day rollover and reconstructed from Kite daily candles on a cold start. ---
+app.get("/api/option-prev-close/:underlying", (_req: Request, res: Response) => {
+  const today = istDayKey();
+  // A stale baseline (from an earlier day) would silently mislabel the change, so
+  // report empty until the rollover snapshot or the backfill refreshes it.
+  if (!optionPrevClose || optionPrevClose.forDay !== today) {
+    res.json({
+      forDay: today,
+      closedOn: null,
+      expiry: null,
+      complete: false,
+      tokens: {},
+    });
+    return;
+  }
+  res.json(optionPrevClose);
+});
+
 // --- Option-OI intraday series: full-day per-minute aggregates (today only).
 // Returns total Call/Put OI (24↑/ATM/26↓ window) and the ATM straddle for each
 // captured minute so the frontend charts show the whole day right on load. ---
@@ -2093,6 +2134,8 @@ function triggerPostLoginBackfill(): void {
     // Recover any OI-chart frame slots missed while we had no session/were down.
     await backfillOiFrames(optFrom);
     await backfillFutOiFrames(futFrom);
+    // Baseline for the chain's "Day" column (no-op once today's is cached).
+    await backfillPrevClose();
   })();
 }
 
@@ -2247,6 +2290,14 @@ async function captureOptionOi(): Promise<void> {
 
     const day = istDayKey();
     if (!optionOiDay || optionOiDay.day !== day || optionOiDay.expiry !== sel.expiry) {
+      // Rolling into a NEW DAY: keep the outgoing day's final readings as today's
+      // comparison baseline before the cache is discarded. An expiry change
+      // within the same day must not clobber it, and the morning after an expiry
+      // the outgoing day tracked contracts that no longer exist — those tokens
+      // are worthless as a baseline, so leave it to the daily-candle backfill.
+      if (optionOiDay && optionOiDay.day !== day && optionOiDay.expiry === sel.expiry) {
+        snapshotPrevClose(optionOiDay, day);
+      }
       optionOiDay = {
         day,
         expiry: sel.expiry,
@@ -2284,6 +2335,21 @@ async function captureOptionOi(): Promise<void> {
     // Feed the multi-timeframe OI chart caches with this minute's aggregate.
     const agg = currentWindowAgg(store);
     if (agg) appendOiFrameLive(now, agg);
+
+    // Make sure the day has a "previous close" baseline even when the rollover
+    // snapshot couldn't provide one (cold start, expiry roll, a process that was
+    // up overnight without a session) — otherwise the chain's Day column stays
+    // blank until the 30-minute gap check. Deferred to a minute tick rather than
+    // fired from the rollover branch so it never overlaps the frame backfills:
+    // all three pace historical calls at ~220ms and share one rate budget.
+    if (
+      optionPrevClose?.forDay !== day &&
+      !prevCloseBackfillRunning &&
+      !oiBackfillRunning &&
+      !futOiBackfillRunning
+    ) {
+      void backfillPrevClose();
+    }
   } catch (e) {
     // Non-fatal: a missed minute just leaves a small gap in the day's series.
     console.warn("[OptionOI] capture failed:", e instanceof Error ? e.message : e);
@@ -2291,6 +2357,223 @@ async function captureOptionOi(): Promise<void> {
 }
 
 // ---- OI-frame aggregation helpers -----------------------------------------
+
+/** Keep the outgoing day's last reading per token as `forDay`'s close baseline. */
+function snapshotPrevClose(prev: OptionOiDay, forDay: string): void {
+  // The capture gate only knows about weekends, so a mid-week exchange holiday
+  // still builds a full day of carried-forward quotes. Its values are last
+  // session's close, but stamping it as that day's close would mislabel the
+  // baseline AND (being "complete") stop the daily-candle path from correcting
+  // it. A day the index never moved on wasn't a session: leave it to the
+  // backfill, which reads real candle dates.
+  let spotLo = Infinity;
+  let spotHi = -Infinity;
+  for (const s of prev.spot) {
+    if (s.ltp <= 0) continue;
+    spotLo = Math.min(spotLo, s.ltp);
+    spotHi = Math.max(spotHi, s.ltp);
+  }
+  if (!(spotHi > spotLo)) {
+    console.log(
+      `[OptionOI] ${prev.day} had no index movement — not using it as ${forDay}'s baseline.`,
+    );
+    return;
+  }
+
+  const tokens: Record<number, { oi: number; ltp: number }> = {};
+  for (const [token, arr] of prev.series) {
+    const last = arr[arr.length - 1];
+    // A zero OI means we never got a real reading for that strike.
+    if (last && last.oi > 0) tokens[token] = { oi: last.oi, ltp: last.ltp };
+  }
+  if (Object.keys(tokens).length === 0) return;
+  optionPrevClose = {
+    forDay,
+    closedOn: prev.day,
+    expiry: prev.expiry,
+    complete: true, // live capture covered every tracked strike
+    tokens,
+  };
+  console.log(
+    `[OptionOI] Captured ${prev.day} close for ${Object.keys(tokens).length} tokens (baseline for ${forDay}).`,
+  );
+}
+
+let prevCloseBackfillRunning = false;
+// Wider than OI_BACKFILL_BAND: the chain endpoint serves ATM±40 around the LIVE
+// spot, and this baseline has to still cover it after a day's worth of drift —
+// 60 strikes is 1000 NIFTY points of room. Cheap to be generous, because the
+// values are fixed and a retry only fetches what's missing.
+const PREV_CLOSE_BAND = 60;
+// A token can fail forever (delisted contract, no historical entitlement), which
+// would otherwise keep `complete` false and re-scan the remainder every 30
+// minutes for the rest of the session. Give up after a few passes instead.
+const PREV_CLOSE_MAX_ATTEMPTS = 4;
+let prevCloseAttempts = { day: "", n: 0 };
+
+/**
+ * Reconstruct the previous session's closing OI + LTP from Kite DAILY candles.
+ *
+ * Needed on a cold start and the morning after an expiry roll — once the process
+ * survives an IST midnight on an unchanged expiry the rollover snapshot takes
+ * over. One call per token in the band the chain can actually display, paced for
+ * the rate limit, and skipped once today's baseline is complete for the expiry
+ * being traded. Callers must not run it alongside the frame backfills: all three
+ * pace historical calls at ~220ms against one shared budget.
+ */
+async function backfillPrevClose(): Promise<void> {
+  const today = istDayKey();
+  if (prevCloseBackfillRunning || !kite.getAccessToken()) return;
+  prevCloseBackfillRunning = true;
+  try {
+    const all = await getAllInstrumentsCached();
+    const sel = niftyNearestExpiryOptions(all);
+    if (!sel) return;
+    // Already covered: right day, right expiry, and nothing left to fill in. A
+    // PARTIAL baseline is deliberately not a stop condition — a rate-limited run
+    // would otherwise be locked in for the rest of the session — but the retries
+    // are capped so a permanently failing token can't re-scan all session.
+    const have =
+      optionPrevClose && optionPrevClose.forDay === today
+        ? optionPrevClose
+        : null;
+    if (have && have.expiry === sel.expiry && have.complete) return;
+    if (prevCloseAttempts.day !== today) prevCloseAttempts = { day: today, n: 0 };
+    if (prevCloseAttempts.n >= PREV_CLOSE_MAX_ATTEMPTS) return;
+    prevCloseAttempts.n++;
+
+    const to = new Date();
+    // 10 days covers a long weekend plus holidays.
+    const from = new Date(to.getTime() - 10 * 24 * 60 * 60 * 1000);
+    const fromStr = istDateTime(from);
+    const toStr = istDateTime(to);
+
+    /** Last completed daily candle strictly before today. */
+    const lastPrevSession = (
+      candles: { t: string; close: number; oi: number }[],
+    ): { t: string; close: number; oi: number } | null => {
+      let prev: { t: string; close: number; oi: number } | null = null;
+      for (const c of candles) {
+        if (c.t.slice(0, 10) < today) prev = c;
+      }
+      return prev;
+    };
+
+    // Only the strikes the client can ask about are worth fetching. That set is
+    // the chain endpoint's ATM±40 around TODAY's spot, so centre the band on
+    // today's spot too — the same reference backfillOiFrames uses — not on the
+    // session the values come from.
+    const { strikes, ceByStrike, peByStrike } = frameLadder(sel.meta);
+    if (strikes.length === 0) return;
+    let ref = optionOiDay?.spot[optionOiDay.spot.length - 1]?.ltp ?? 0;
+    if (!ref) {
+      try {
+        const q = await kite.getQuoteFull([sel.spotId]);
+        ref = q[0]?.last_price ?? 0;
+      } catch {
+        /* fall through to the previous session's close */
+      }
+    }
+    if (!ref) {
+      try {
+        const spotDaily = await kite.getHistoricalOiSeries(
+          sel.spotToken,
+          fromStr,
+          toStr,
+          "day",
+        );
+        ref = lastPrevSession(spotDaily)?.close ?? 0;
+      } catch {
+        /* no reference: bail and let the next check retry */
+      }
+    }
+    if (!ref) {
+      console.warn("[OptionOI] Previous-close backfill: no spot reference.");
+      return;
+    }
+    let atm = 0;
+    let bestD = Infinity;
+    for (let k = 0; k < strikes.length; k++) {
+      const d = Math.abs(strikes[k]! - ref);
+      if (d < bestD) {
+        bestD = d;
+        atm = k;
+      }
+    }
+    const bLo = Math.max(0, atm - PREV_CLOSE_BAND);
+    const bHi = Math.min(strikes.length - 1, atm + PREV_CLOSE_BAND);
+    const wanted: number[] = [];
+    for (let k = bLo; k <= bHi; k++) {
+      const ce = ceByStrike.get(strikes[k]!);
+      const pe = peByStrike.get(strikes[k]!);
+      if (ce != null) wanted.push(ce);
+      if (pe != null) wanted.push(pe);
+    }
+
+    // Keep anything an earlier partial run already resolved for this same
+    // day + expiry, so retries only ever add coverage.
+    const tokens: Record<number, { oi: number; ltp: number }> =
+      have && have.expiry === sel.expiry ? { ...have.tokens } : {};
+    // Which session the values came from — by majority, so one newly listed
+    // strike with a shorter history can't mislabel the whole baseline.
+    const dayVotes = new Map<string, number>();
+    let failed = 0;
+    for (const token of wanted) {
+      // A previous close never changes, so a retry only fetches what's missing.
+      if (tokens[token]) continue;
+      try {
+        const candles = await kite.getHistoricalOiSeries(token, fromStr, toStr, "day");
+        const prev = lastPrevSession(candles);
+        if (prev && prev.oi > 0) {
+          tokens[token] = { oi: prev.oi, ltp: prev.close };
+          const d = prev.t.slice(0, 10);
+          dayVotes.set(d, (dayVotes.get(d) ?? 0) + 1);
+        }
+        // No candle is a legitimate answer for a strike that never traded, so it
+        // doesn't count against completeness.
+      } catch {
+        // A real failure (rate limit, expired session): the run is incomplete and
+        // must stay retryable, but the rest of the band still gets a baseline.
+        failed++;
+      }
+      await delay(220); // stay within Kite historical rate limits
+    }
+
+    if (Object.keys(tokens).length === 0) {
+      console.warn(
+        `[OptionOI] Previous-close backfill found no data ` +
+          `(attempt ${prevCloseAttempts.n}/${PREV_CLOSE_MAX_ATTEMPTS}).`,
+      );
+      return;
+    }
+    let closedOn = have?.closedOn ?? "";
+    let topVotes = 0;
+    for (const [d, n] of dayVotes) {
+      if (n > topVotes) {
+        topVotes = n;
+        closedOn = d;
+      }
+    }
+    optionPrevClose = {
+      forDay: today,
+      closedOn: closedOn || "unknown",
+      expiry: sel.expiry,
+      complete: failed === 0,
+      tokens,
+    };
+    console.log(
+      `[OptionOI] Backfilled ${closedOn} close for ${Object.keys(tokens).length}/${wanted.length} band tokens ` +
+        `(baseline for ${today}${failed ? `, ${failed} failed — will retry` : ""}).`,
+    );
+  } catch (e) {
+    console.warn(
+      "[OptionOI] previous-close backfill failed:",
+      e instanceof Error ? e.message : e,
+    );
+  } finally {
+    prevCloseBackfillRunning = false;
+  }
+}
 
 /** Sorted strike ladder + strike→token maps for a captured day. */
 function frameLadder(meta: OptionOiDay["meta"]): {
@@ -2885,6 +3168,7 @@ function startOptionOiCapture(): void {
   void (async () => {
     await backfillOiFrames(coldOptFrom);
     await backfillFutOiFrames(coldFutFrom);
+    await backfillPrevClose();
   })();
   setInterval(() => {
     if (!isIstMarketHours()) return;
@@ -2897,6 +3181,8 @@ function startOptionOiCapture(): void {
     void (async () => {
       await backfillOiFrames(optFrom);
       await backfillFutOiFrames(futFrom);
+      // Covers a process that started mid-session without a baseline.
+      await backfillPrevClose();
     })();
   }, 30 * 60 * 1000);
 }
