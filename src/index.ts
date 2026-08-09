@@ -647,11 +647,13 @@ function recordChainSnapshot(store: OptionOiDay, t: number): void {
  * percentage; a dash is the honest answer, and the client already handles it.
  */
 function chainBaselineAt(cutoff: number): ChainSnapshot | null {
-  // TODAY only, and only the minute cadence. The endpoint's window is capped at
-  // 240 minutes, so the 4-day hourly cadence could never legitimately serve it —
-  // its only reachable effect would be answering an early-session "1 hour ago"
-  // with YESTERDAY's close. The hourly snapshots exist for multi-day history, not
-  // for this.
+  // TODAY only, both cadences. Bounding to today is the important part: it is what
+  // stops a reading from a previous session ever standing in for this one, which an
+  // unbounded search would do every morning before the cache has filled.
+  //
+  // The answer carries `baseT`, and the client grades that against the window it
+  // asked for — so an hourly fallback that is an hour older than a 5-minute cutoff
+  // is rejected there rather than being silently presented as a 5-minute change.
   const dayStart = istTimeOnDayMs(Date.now(), 0);
   const pick = (list: ChainSnapshot[]): ChainSnapshot | null => {
     let best: ChainSnapshot | null = null;
