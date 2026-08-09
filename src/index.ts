@@ -216,6 +216,18 @@ interface OiAggPoint {
   totalPe: number;
   straddle: number; // auto-ATM straddle premium (ATM CE LTP + ATM PE LTP)
   spot: number; // NIFTY index spot at this bucket
+  /**
+   * Set when this reading is KNOWN to understate the window: a quote response that
+   * didn't cover every strike in it, or a reconstruction whose historical call for
+   * one of them failed. Such a bucket is published (a gap in the chart is worse
+   * than a slightly low bar) but stays correctable — mergeOiFrame lets a complete
+   * reconstruction replace it, and the gap detector keeps asking for it.
+   *
+   * Absent means trustworthy, which is what makes the flag safe to add to a schema
+   * Redis already holds values for: everything written before it existed is read
+   * back as complete, exactly as it was treated then.
+   */
+  partial?: 1;
 }
 const oiFrameStores: Record<OiFrameKey, { points: OiAggPoint[] }> = {
   "1m": { points: [] },
@@ -699,6 +711,31 @@ function mergeWarmLoaded<T extends { t: number }>(
   return added;
 }
 
+/**
+ * The same fold for the chain snapshots, which are a list rather than a store.
+ *
+ * These were being ASSIGNED over, and the warm load is ~16 sequential REST
+ * round-trips (up to 8s each): a Zerodha session restored earlier in the boot chain
+ * fires a capture inside that window, and the assignment then dropped the readings
+ * it had just recorded. In memory that is unrecoverable — Redis kept them, but
+ * nothing re-reads it — so the chain's OI Δ% columns lost their baseline for the
+ * rest of the session. Mutates in place; returns how many it added.
+ */
+function mergeWarmLoadedSnaps(
+  list: ChainSnapshot[],
+  loaded: ChainSnapshot[],
+): number {
+  const have = new Set(list.map((s) => s.t));
+  let added = 0;
+  for (const s of loaded) {
+    if (have.has(s.t)) continue; // a live reading beats the persisted copy
+    upsertSnapshot(list, s);
+    have.add(s.t);
+    added++;
+  }
+  return added;
+}
+
 async function warmLoadFromRedis(): Promise<void> {
   logRedisStatus();
   if (!isRedisEnabled()) return;
@@ -753,20 +790,22 @@ async function warmLoadFromRedis(): Promise<void> {
     // needs today (its whole retention is a day); the hourly cadence spans 4 days,
     // so read a key per day.
     const minute = await hGetAllJson<ChainSnapshot>(redisKeys.chainMinute(istDayKey()));
-    chainMinuteSnaps = Array.from(minute.values())
-      .filter((s) => s && typeof s.t === "number" && s.t >= now - CHAIN_MINUTE_RETENTION_MS)
-      .sort((a, b) => a.t - b.t);
-    const hourly: ChainSnapshot[] = [];
+    mergeWarmLoadedSnaps(
+      chainMinuteSnaps,
+      Array.from(minute.values()).filter(
+        (s) => s && typeof s.t === "number" && s.t >= now - CHAIN_MINUTE_RETENTION_MS,
+      ),
+    );
     for (let d = 0; d <= 4; d++) {
       const day = istDayKey(now - d * 24 * 60 * 60 * 1000);
       const hour = await hGetAllJson<ChainSnapshot>(redisKeys.chainHour(day));
-      for (const s of hour.values()) {
-        if (s && typeof s.t === "number" && s.t >= now - CHAIN_HOUR_RETENTION_MS) {
-          hourly.push(s);
-        }
-      }
+      mergeWarmLoadedSnaps(
+        chainHourSnaps,
+        Array.from(hour.values()).filter(
+          (s) => s && typeof s.t === "number" && s.t >= now - CHAIN_HOUR_RETENTION_MS,
+        ),
+      );
     }
-    chainHourSnaps = hourly.sort((a, b) => a.t - b.t);
 
     console.log(
       `[Redis] Warm-loaded ${loaded} frame points, ${chainMinuteSnaps.length} minute ` +
@@ -2839,10 +2878,18 @@ async function captureOptionOi(): Promise<void> {
     // Push one aligned sample for EVERY tracked token (carry forward if a
     // particular strike is missing from this response) so all series + spot
     // stay index-aligned by capture cycle.
+    //
+    // `unseeded` collects the tokens where even the carry-forward had nothing to
+    // fall back on — absent from this response AND with no earlier sample — so the
+    // 0 written for them is an absence of data, not a reading of zero. That is the
+    // case the frames have to know about: it is how the first bucket after a
+    // restart, taken from a partial /quote, ends up understating the window.
+    const unseeded = new Set<number>();
     for (const [token] of store.meta) {
       const q = qmap.get(token);
       const arr = store.series.get(token) ?? [];
       const prev = arr[arr.length - 1];
+      if (q === undefined && prev === undefined) unseeded.add(token);
       arr.push({
         t: now,
         oi: q?.oi ?? prev?.oi ?? 0,
@@ -2857,7 +2904,7 @@ async function captureOptionOi(): Promise<void> {
     });
 
     // Feed the multi-timeframe OI chart caches with this minute's aggregate.
-    const agg = currentWindowAgg(store);
+    const agg = currentWindowAgg(store, unseeded);
     if (agg) appendOiFrameLive(now, agg);
 
     // Record the per-token readings that back the chain's comparison windows.
@@ -3136,8 +3183,20 @@ function frameLadder(meta: OptionOiDay["meta"]): {
   return { strikes, ceByStrike, peByStrike };
 }
 
-/** Total CE/PE OI over the 26-below / ATM / 24-above window at the LATEST snapshot. */
-function currentWindowAgg(store: OptionOiDay): OiAggPoint | null {
+/**
+ * Total CE/PE OI over the 26-below / ATM / 24-above window at the LATEST snapshot.
+ *
+ * `unseeded` lists tokens this cycle has no reading for AT ALL (see captureOptionOi).
+ * They contribute 0 to the totals, so if any of them falls inside the window the
+ * result understates it and the point is flagged `partial`. Note this is
+ * deliberately NOT "oi === 0": a deep-OTM strike legitimately carries no open
+ * interest, and treating that as suspect would flag almost every bucket and send
+ * the backfill re-fetching the session all day.
+ */
+function currentWindowAgg(
+  store: OptionOiDay,
+  unseeded?: ReadonlySet<number>,
+): OiAggPoint | null {
   if (store.spot.length === 0) return null;
   const spot = store.spot[store.spot.length - 1]!.ltp;
   if (!(spot > 0)) return null;
@@ -3163,15 +3222,23 @@ function currentWindowAgg(store: OptionOiDay): OiAggPoint | null {
     const s = arr && arr.length ? arr[arr.length - 1]! : null;
     return { oi: s?.oi ?? 0, ltp: s?.ltp ?? 0 };
   };
+  let missing = 0;
   for (let k = lo; k <= hi; k++) {
-    totalCe += lastOf(ceByStrike.get(strikes[k]!)).oi;
-    totalPe += lastOf(peByStrike.get(strikes[k]!)).oi;
+    const ce = ceByStrike.get(strikes[k]!);
+    const pe = peByStrike.get(strikes[k]!);
+    totalCe += lastOf(ce).oi;
+    totalPe += lastOf(pe).oi;
+    if (unseeded && ((ce != null && unseeded.has(ce)) || (pe != null && unseeded.has(pe)))) {
+      missing++;
+    }
   }
   // Auto-ATM straddle: ATM Call LTP + ATM Put LTP (0 if either leg missing).
   const ceAtm = lastOf(ceByStrike.get(strikes[atmIdx]!)).ltp;
   const peAtm = lastOf(peByStrike.get(strikes[atmIdx]!)).ltp;
   const straddle = ceAtm > 0 && peAtm > 0 ? ceAtm + peAtm : 0;
-  return { t: Date.now(), totalCe, totalPe, straddle, spot };
+  const point: OiAggPoint = { t: Date.now(), totalCe, totalPe, straddle, spot };
+  if (missing > 0) point.partial = 1;
+  return point;
 }
 
 /**
@@ -3196,14 +3263,20 @@ function appendOiFrameLive(t: number, agg: OiAggPoint): void {
       last.totalPe = agg.totalPe;
       last.straddle = agg.straddle;
       last.spot = agg.spot;
+      // The flag tracks the value, both ways: a later complete reading clears an
+      // earlier bucket's caveat, and it must not be left stale on the way in.
+      if (agg.partial) last.partial = 1;
+      else delete last.partial;
     } else {
-      store.points.push({
+      const point: OiAggPoint = {
         t: bEnd,
         totalCe: agg.totalCe,
         totalPe: agg.totalPe,
         straddle: agg.straddle,
         spot: agg.spot,
-      });
+      };
+      if (agg.partial) point.partial = 1;
+      store.points.push(point);
     }
     const cutoff = t - cfg.retentionMs;
     const dropped: number[] = [];
@@ -3211,11 +3284,12 @@ function appendOiFrameLive(t: number, agg: OiAggPoint): void {
       dropped.push(store.points.shift()!.t);
     }
     // Mirror CLOSED buckets (and the pruning) into Redis — never the forming one.
-    // A forming bucket's value is provisional, and mergeOiFrame deliberately never
-    // overwrites a bucket that already exists; persisting it would mean a restart
-    // resurrected a half-formed reading that the backfill could then never correct
-    // (up to 59 minutes stale on the 1h frame). Leaving it out costs nothing: the
-    // backfill reconstructs that bucket properly.
+    // A forming bucket holds only the part of its interval that has elapsed, yet
+    // nothing in the stored shape distinguishes it from a finished one: `partial`
+    // marks a bucket whose STRIKE COVERAGE was incomplete, not its time span. So a
+    // persisted forming bucket would warm-load looking authoritative and win over
+    // the backfill's correct version (up to 59 minutes of it on the 1h frame).
+    // Leaving it out costs nothing — the backfill reconstructs it properly.
     // Only the tail can have newly closed, so this stays O(1) per capture.
     const ttl = frameTtlSec(cfg);
     const rk = redisKeys.oiFrame(key);
@@ -3244,7 +3318,18 @@ function downsampleAgg(points: OiAggPoint[], intervalMin: number): OiAggPoint[] 
   return Array.from(byBucket.values()).sort((a, b) => a.t - b.t);
 }
 
-/** Merge backfilled points into a frame WITHOUT overwriting live-captured buckets. */
+/**
+ * Merge backfilled points into a frame without overwriting buckets we already
+ * trust — but DO replace ones flagged `partial`.
+ *
+ * A bucket that exists still wins by default: it was measured live, at the tick,
+ * from /quote, which is a better reading than one inferred from candles. The
+ * exception matters because of Redis. While the frames were memory-only, a wrong
+ * bucket lasted until the next restart and was then rebuilt correctly from Kite;
+ * now that boot warm-loads, "never overwrite" would freeze that bucket for the
+ * frame's whole retention (7 days on 15m) with nothing able to repair it. So a
+ * reading that admitted it was incomplete yields to one that is complete.
+ */
 function mergeOiFrame(key: OiFrameKey, backfilled: OiAggPoint[]): void {
   const cfg = OI_FRAMES[key];
   const store = oiFrameStores[key];
@@ -3252,7 +3337,8 @@ function mergeOiFrame(key: OiFrameKey, backfilled: OiAggPoint[]): void {
   const byBucket = new Map<number, OiAggPoint>();
   for (const p of store.points) byBucket.set(p.t, p);
   for (const p of downsampleAgg(backfilled, cfg.intervalMin)) {
-    if (!byBucket.has(p.t)) byBucket.set(p.t, p);
+    const cur = byBucket.get(p.t);
+    if (!cur || (cur.partial && !p.partial)) byBucket.set(p.t, p);
   }
   const cutoff = Date.now() - cfg.retentionMs;
   const before = new Set(store.points.map((p) => p.t));
@@ -3302,7 +3388,53 @@ function oiBackfillFromMs(now: number): number {
     let need = Math.max(retentionStart, pts[pts.length - 1]!.t);
     const headNeed = missingHeadMs("opt", pts[0]!.t, cfg, retentionStart);
     if (headNeed !== null) need = Math.min(need, headNeed);
+    const partialNeed = partialRepairFromMs(pts, cfg, retentionStart);
+    if (partialNeed !== null) need = Math.min(need, partialNeed);
     from = Math.min(from, need);
+  }
+  return from;
+}
+
+/**
+ * `from` needed to rebuild the oldest bucket still flagged `partial`, or null when
+ * there is none.
+ *
+ * Without this the flag would be decoration. The tail detector only looks at the
+ * NEWEST point, so an understated bucket sitting inside an otherwise-covered
+ * session reads as "nothing to do" and is never asked for again — which is the
+ * same blind spot that left the head of a session missing all afternoon.
+ *
+ * Rate-limited like the head repair, and for the same reason: when a strike is
+ * genuinely unavailable from Kite, the bucket cannot be completed, and retrying it
+ * every 30 minutes would re-fetch the session all day to reach the same answer.
+ */
+const PARTIAL_REPAIR_MAX_ATTEMPTS = 3;
+const partialRepairs = new Map<string, { n: number; at: number }>();
+function partialRepairFromMs(
+  pts: OiAggPoint[],
+  cfg: OiFrameCfg,
+  retentionStart: number,
+): number | null {
+  const oldest = pts.find((p) => p.partial); // points are ascending
+  if (!oldest) return null;
+  // Points are stamped with their bucket END, so reach back one interval to be
+  // sure the candles that make up the bucket are inside the window.
+  const from = Math.max(retentionStart, oldest.t - cfg.intervalMin * 60 * 1000);
+  const key = `${cfg.intervalMin}:${istDayKey(oldest.t)}`;
+  const seen = partialRepairs.get(key);
+  const now = Date.now();
+  if (seen) {
+    if (seen.n >= PARTIAL_REPAIR_MAX_ATTEMPTS) return null;
+    // Same cycle (or 25-minute window): reuse without spending an attempt, since
+    // several callers recompute this window per cycle.
+    if (now - seen.at < HEAD_REPAIR_MIN_GAP_MS) return from;
+    partialRepairs.set(key, { n: seen.n + 1, at: now });
+  } else {
+    partialRepairs.set(key, { n: 1, at: now });
+    console.log(
+      `[OptionOI] ${cfg.intervalMin}m frame has an incomplete bucket at ` +
+        `${new Date(oldest.t).toISOString()} — reconstructing it again from Kite.`,
+    );
   }
   return from;
 }
@@ -3416,23 +3548,48 @@ async function backfillOiFrames(fromMsOverride?: number): Promise<void> {
     // 2) OI + close minute candles per band token → per-token minute maps.
     const oiByToken = new Map<number, Map<string, number>>();
     const closeByToken = new Map<number, Map<string, number>>();
+    /**
+     * Tokens whose history we could NOT get. They still count as 0 in the window
+     * sum — there is nothing else to put there — but every bucket that includes one
+     * is flagged `partial` so it can be reconstructed again later.
+     *
+     * This used to be silent: one `catch` treated a rate-limited strike exactly
+     * like a strike with no candles, so a 429 blip during a cold start wrote an
+     * understated total for every reconstructed minute and, once Redis made that
+     * survive a restart, nothing could ever correct it. (backfillFutOiFrames faces
+     * the same problem with 3 contracts and answers it by aborting the run; with
+     * ~180 option tokens, abandoning everything because one strike failed would
+     * mean a flaky afternoon produced no chart at all.)
+     */
+    const unfetched = new Set<number>();
     const fetchTok = async (tok: number | undefined) => {
       if (tok == null || oiByToken.has(tok)) return;
+      let candles: { t: string; close: number; oi: number }[] = [];
       try {
-        const candles = await kite.getHistoricalOiSeries(tok, fromStr, toStr, "minute");
-        const mOi = new Map<string, number>();
-        const mClose = new Map<string, number>();
-        for (const c of candles) {
-          const k = minuteKey(c.t);
-          mOi.set(k, c.oi);
-          mClose.set(k, c.close);
-        }
-        oiByToken.set(tok, mOi);
-        closeByToken.set(tok, mClose);
+        candles = await kite.getHistoricalOiSeries(tok, fromStr, toStr, "minute");
       } catch {
-        oiByToken.set(tok, new Map()); // treat as no data (carried-forward as 0)
-        closeByToken.set(tok, new Map());
+        // A rate-limit blip is the likely cause and one absent strike skews every
+        // minute of the window, so pay for a single retry before giving up on it.
+        await delay(1200);
+        try {
+          candles = await kite.getHistoricalOiSeries(tok, fromStr, toStr, "minute");
+        } catch (e) {
+          unfetched.add(tok);
+          console.warn(
+            `[OptionOI] backfill: no history for token ${tok} ` +
+              `(${e instanceof Error ? e.message : e}) — affected buckets stay partial.`,
+          );
+        }
       }
+      const mOi = new Map<string, number>();
+      const mClose = new Map<string, number>();
+      for (const c of candles) {
+        const k = minuteKey(c.t);
+        mOi.set(k, c.oi);
+        mClose.set(k, c.close);
+      }
+      oiByToken.set(tok, mOi);
+      closeByToken.set(tok, mClose);
       await delay(220); // stay within Kite historical rate limits
     };
     for (let k = bLo; k <= bHi; k++) {
@@ -3476,23 +3633,41 @@ async function backfillOiFrames(fromMsOverride?: number): Promise<void> {
         if (v !== undefined) lastClose.set(tok, v);
         return lastClose.get(tok) ?? 0;
       };
+      // A window token we have no series for at all: either its fetch failed, or
+      // the ATM drifted out of the band we fetched (the band is centred on the LAST
+      // spot in the range, so on a multi-day catch-up the early days can reach past
+      // it). Either way this minute's total is short and must say so.
+      const unknownTok = (tok: number | undefined): boolean =>
+        tok != null && (!oiByToken.has(tok) || unfetched.has(tok));
+      let missing = 0;
       for (let k = lo; k <= hi; k++) {
-        totalCe += sumOi(ceByStrike.get(strikes[k]!));
-        totalPe += sumOi(peByStrike.get(strikes[k]!));
+        const ce = ceByStrike.get(strikes[k]!);
+        const pe = peByStrike.get(strikes[k]!);
+        totalCe += sumOi(ce);
+        totalPe += sumOi(pe);
+        if (unknownTok(ce) || unknownTok(pe)) missing++;
       }
       const ceAtm = closeOf(ceByStrike.get(strikes[atmIdx]!));
       const peAtm = closeOf(peByStrike.get(strikes[atmIdx]!));
       const straddle = ceAtm > 0 && peAtm > 0 ? ceAtm + peAtm : 0;
       const t = new Date(tsByMin.get(mk) ?? `${mk}:00`).getTime();
-      if (Number.isFinite(t))
-        perMinute.push({ t, totalCe, totalPe, straddle, spot });
+      if (Number.isFinite(t)) {
+        const point: OiAggPoint = { t, totalCe, totalPe, straddle, spot };
+        if (missing > 0) point.partial = 1;
+        perMinute.push(point);
+      }
     }
 
     for (const key of OI_FRAME_KEYS) {
       mergeOiFrame(key, perMinute);
     }
+    const partialMins = perMinute.reduce((n, p) => n + (p.partial ? 1 : 0), 0);
     console.log(
-      `[OptionOI] Backfilled frames from ${fromStr} (${perMinute.length} minutes reconstructed).`,
+      `[OptionOI] Backfilled frames from ${fromStr} (${perMinute.length} minutes reconstructed` +
+        (partialMins
+          ? `, ${partialMins} partial — ${unfetched.size} token(s) unavailable, will retry`
+          : "") +
+        `).`,
     );
   } catch (e) {
     console.warn("[OptionOI] frame backfill failed:", e instanceof Error ? e.message : e);
