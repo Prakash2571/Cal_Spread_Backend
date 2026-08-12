@@ -1446,8 +1446,8 @@ app.get("/api/debug/indices", async (_req: Request, res: Response) => {
   }
 });
 
-// --- Historical daily open interest (last ~1 month) for a symbol's futures. ---
-// Returns each future's closing OI per trading day, for the detail-page chart.
+// --- Historical daily open interest + close (last ~3 months) for a symbol's futures. ---
+// Returns each future's closing OI + price per trading day, for the detail-page chart.
 // PUBLIC (needs a Zerodha session + historical-data subscription).
 //
 // Daily closing OI is fixed for a given calendar day, so we cache per symbol
@@ -1513,7 +1513,9 @@ app.get("/api/history/:symbol", async (req: Request, res: Response) => {
 
     const to = new Date();
     const from = new Date();
-    from.setMonth(from.getMonth() - 1);
+    // Three months of daily candles: the Price/Spread "3M" view is the widest
+    // daily window the detail page offers, so this endpoint has to reach that far.
+    from.setMonth(from.getMonth() - 3);
     const fmtDate = (d: Date) => d.toISOString().slice(0, 10);
 
     const futures: {
