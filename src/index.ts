@@ -2293,20 +2293,29 @@ function round2(v: number): number {
 /** Fold Kite's per-order charge object into this app's flat per-leg record. */
 function toLegCharges(leg: ChargeLeg, oc: OrderCharges): ILegCharges {
   const c = oc.charges;
+  const brokerage = round2(c.brokerage);
+  const stt = round2(c.transaction_tax);
+  const exchange_txn = round2(c.exchange_turnover_charge);
+  const sebi = round2(c.sebi_turnover_charge);
+  const stamp_duty = round2(c.stamp_duty);
+  const gst = round2(c.gst.total);
   return {
     side: leg.side,
     tradingsymbol: leg.tradingsymbol,
     quantity: leg.quantity,
     price: round2(leg.price),
     value: round2(leg.quantity * leg.price),
-    brokerage: round2(c.brokerage),
-    stt: round2(c.transaction_tax),
+    brokerage,
+    stt,
     stt_type: c.transaction_tax_type,
-    exchange_txn: round2(c.exchange_turnover_charge),
-    sebi: round2(c.sebi_turnover_charge),
-    stamp_duty: round2(c.stamp_duty),
-    gst: round2(c.gst.total),
-    total: round2(c.total),
+    exchange_txn,
+    sebi,
+    stamp_duty,
+    gst,
+    // Sum of the ROUNDED heads rather than Kite's own total, so a leg's total
+    // always equals the heads shown for it (a client can sum heads OR totals and
+    // land on the same figure). Kite's authoritative total stays in `raw`.
+    total: round2(brokerage + stt + exchange_txn + sebi + stamp_duty + gst),
   };
 }
 
@@ -2777,20 +2786,36 @@ app.post("/api/trades/:id/close", requireAdmin, async (req: Request, res: Respon
       ((curBuy - trade.buy.entry) + (trade.sell.entry - curSell));
 
     // --- Charges for the exit fills: the real virtual contract note for the
-    // orders that actually close the spread (sell the long, buy back the short). ---
-    const allInst = await getAllInstrumentsCached();
-    const closeInstByToken = new Map<
-      number,
-      { tradingsymbol: string; exchange: string }
-    >();
-    for (const inst of allInst) {
-      closeInstByToken.set(inst.instrument_token, {
-        tradingsymbol: inst.tradingsymbol,
-        exchange: inst.exchange,
-      });
+    // orders that actually close the spread (sell the long, buy back the short).
+    //
+    // The instrument lookup is the ONLY thing here that can throw (stale-cache
+    // refresh hits Kite and a dead session raises KiteError), and it exists
+    // purely to name the legs for the charges call — so it must not be able to
+    // block the close itself. On failure we skip real exit charges (the code
+    // below falls back to the entry-fill projection) and still mark the trade
+    // closed. Charges are a record of the trade, never a precondition for it. ---
+    let longInst: { tradingsymbol: string; exchange: string } | undefined;
+    let shortInst: { tradingsymbol: string; exchange: string } | undefined;
+    try {
+      const allInst = await getAllInstrumentsCached();
+      const closeInstByToken = new Map<
+        number,
+        { tradingsymbol: string; exchange: string }
+      >();
+      for (const inst of allInst) {
+        closeInstByToken.set(inst.instrument_token, {
+          tradingsymbol: inst.tradingsymbol,
+          exchange: inst.exchange,
+        });
+      }
+      longInst = closeInstByToken.get(trade.buy.token);
+      shortInst = closeInstByToken.get(trade.sell.token);
+    } catch (instErr) {
+      console.warn(
+        "[Charges] instrument lookup for exit legs failed; closing with the entry-fill charge estimate:",
+        instErr,
+      );
     }
-    const longInst = closeInstByToken.get(trade.buy.token);
-    const shortInst = closeInstByToken.get(trade.sell.token);
 
     const exitLegs: ChargeLeg[] =
       longInst && shortInst
@@ -2841,7 +2866,9 @@ app.post("/api/trades/:id/close", requireAdmin, async (req: Request, res: Respon
       entryTotal !== null && exitTotal !== null ? round2(entryTotal + exitTotal) : null;
     const closedAt = new Date();
     const grossPnl = round2(pnl);
-    const netPnl = totalCharges !== null ? round2(pnl - totalCharges) : null;
+    // Net off the ROUNDED gross so a client showing gross, charges and net can't
+    // have them disagree by a stray paisa (net == gross - total_charges exactly).
+    const netPnl = totalCharges !== null ? round2(grossPnl - totalCharges) : null;
 
     trade.status = "closed";
     trade.closed_at = closedAt;
