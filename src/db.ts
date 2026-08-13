@@ -4,6 +4,7 @@ const MONGODB_URI = process.env.MONGODB_URI ?? "";
 const NSE_FNO_ARCHIVE_URI = process.env.NSE_FNO_ARCHIVE_URI ?? "";
 const NSE_FNO_CURRENT_URI = process.env.NSE_FNO_CURRENT_URI ?? "";
 const NSE_FNO_SPREAD_URI = process.env.NSE_FNO_SPREAD_URI ?? "";
+const TRADE_LOG_URI = process.env.TRADE_LOG_URI ?? "";
 
 // ============================================================================
 //  Three separate Mongoose connections for the split nse_fno databases
@@ -31,6 +32,50 @@ export interface TradeLeg {
   entry: number; // price captured at trade time
 }
 
+/**
+ * One order's worth of charges, as billed by Zerodha's virtual contract note.
+ * Flattened from Kite's nested shape (gst.total collapses to `gst`) so the
+ * breakdown reads like a contract note line.
+ */
+export interface ILegCharges {
+  side: "BUY" | "SELL";
+  tradingsymbol: string;
+  quantity: number;
+  price: number; // fill price the charges were computed on
+  value: number; // quantity * price (contract value / turnover)
+  brokerage: number;
+  stt: number; // securities transaction tax (sell side only, for futures)
+  stt_type: string; // "stt" / "ctt", as Kite labels it
+  exchange_txn: number; // exchange transaction charge
+  sebi: number; // SEBI turnover charge
+  stamp_duty: number; // buy side only
+  gst: number; // 18% of (brokerage + exchange + SEBI)
+  total: number;
+}
+
+/**
+ * The charges for one side of a trade (both legs together): the per-leg
+ * breakdown plus the summed heads.
+ *
+ * `source` records where the numbers came from. "kite" is the real virtual
+ * contract note for the actual fills; "kite_estimate" is the same API priced at
+ * the entry fills to project the exit cost of a still-open trade, so the live
+ * P&L can be shown net of the full round trip before it is closed.
+ */
+export interface ITradeCharges {
+  legs: ILegCharges[];
+  value: number; // total contract value both legs
+  brokerage: number;
+  stt: number;
+  exchange_txn: number;
+  sebi: number;
+  stamp_duty: number;
+  gst: number;
+  total: number;
+  source: "kite" | "kite_estimate";
+  at: Date;
+}
+
 /** A calendar-spread trade (buy the discount leg, sell the premium leg). */
 export interface ITrade {
   symbol: string;
@@ -42,10 +87,20 @@ export interface ITrade {
   status: "open" | "closed";
   opened_at: Date;
   closed_at: Date | null;
+  /** GROSS realized P&L (price move only) — charges are held separately. */
   close_pnl: number | null;
   buy_close: number | null;
   sell_close: number | null;
   margin: number | null; // net basket margin (₹) captured at trade time
+  // --- Charges & value (Zerodha virtual contract note) ---
+  entry_charges: ITradeCharges | null; // real, for the entry fills
+  exit_charges: ITradeCharges | null; // real, set when the trade is closed
+  /** Projected exit charges, priced at the entry fills while the trade is open. */
+  est_exit_charges: ITradeCharges | null;
+  entry_value: number | null; // contract value transacted on entry
+  exit_value: number | null; // contract value transacted on exit
+  total_charges: number | null; // entry + exit, once the trade is closed
+  net_pnl: number | null; // close_pnl - total_charges
 }
 
 /** A plain trade record (lean / toObject) including the Mongo _id. */
@@ -58,6 +113,42 @@ const legSchema = new mongoose.Schema<TradeLeg>(
     token: { type: Number, required: true },
     expiry: { type: String, required: true },
     entry: { type: Number, required: true },
+  },
+  { _id: false },
+);
+
+const legChargesSchema = new mongoose.Schema<ILegCharges>(
+  {
+    side: { type: String, enum: ["BUY", "SELL"], required: true },
+    tradingsymbol: { type: String, default: "" },
+    quantity: { type: Number, default: 0 },
+    price: { type: Number, default: 0 },
+    value: { type: Number, default: 0 },
+    brokerage: { type: Number, default: 0 },
+    stt: { type: Number, default: 0 },
+    stt_type: { type: String, default: "" },
+    exchange_txn: { type: Number, default: 0 },
+    sebi: { type: Number, default: 0 },
+    stamp_duty: { type: Number, default: 0 },
+    gst: { type: Number, default: 0 },
+    total: { type: Number, default: 0 },
+  },
+  { _id: false },
+);
+
+const tradeChargesSchema = new mongoose.Schema<ITradeCharges>(
+  {
+    legs: { type: [legChargesSchema], default: [] },
+    value: { type: Number, default: 0 },
+    brokerage: { type: Number, default: 0 },
+    stt: { type: Number, default: 0 },
+    exchange_txn: { type: Number, default: 0 },
+    sebi: { type: Number, default: 0 },
+    stamp_duty: { type: Number, default: 0 },
+    gst: { type: Number, default: 0 },
+    total: { type: Number, default: 0 },
+    source: { type: String, enum: ["kite", "kite_estimate"], default: "kite" },
+    at: { type: Date, default: () => new Date() },
   },
   { _id: false },
 );
@@ -81,10 +172,187 @@ const tradeSchema = new mongoose.Schema<ITrade>({
   buy_close: { type: Number, default: null },
   sell_close: { type: Number, default: null },
   margin: { type: Number, default: null },
+  // Nullable throughout: trades taken before charges existed, and trades where
+  // the charges call failed, must still load and price normally.
+  entry_charges: { type: tradeChargesSchema, default: null },
+  exit_charges: { type: tradeChargesSchema, default: null },
+  est_exit_charges: { type: tradeChargesSchema, default: null },
+  entry_value: { type: Number, default: null },
+  exit_value: { type: Number, default: null },
+  total_charges: { type: Number, default: null },
+  net_pnl: { type: Number, default: null },
 });
 
 /** The Trade model (collection: "trades"). */
 export const Trade = mongoose.model<ITrade>("Trade", tradeSchema);
+
+// ============================================================================
+//  TradeLog — an append-only ledger of what each trade actually transacted:
+//  the contract value and the full tax/brokerage breakdown, one document per
+//  EVENT (entry, exit) rather than per trade.
+//
+//  Why a separate collection instead of only the fields on `trades`: the trade
+//  document is mutable (it is updated on close) and gets deleted from history by
+//  the UI, whereas charges are accounting records. Keeping them append-only
+//  means the tax record of a trade survives editing or deleting the trade, and
+//  the collection can be exported for book-keeping as-is.
+//
+//  It lives on its own connection (TRADE_LOG_URI) so the ledger can be pointed
+//  at a dedicated cluster/database. With that unset it falls back to the main
+//  connection (MONGODB_URI), so the feature works out of the box.
+// ============================================================================
+
+/** Dedicated ledger connection, or null when TRADE_LOG_URI is unset. */
+export const tradeLogConnection = TRADE_LOG_URI
+  ? mongoose.createConnection(TRADE_LOG_URI)
+  : null;
+
+/** One leg of a logged event, including the raw Kite charge payload. */
+export interface ITradeLogLeg extends ILegCharges {
+  token: number;
+  exchange: string;
+  expiry: string;
+  /** Kite's untouched `charges` object for this leg (audit trail). */
+  raw: unknown;
+}
+
+export interface ITradeLog {
+  trade_id: string; // the Trade document this event belongs to
+  symbol: string;
+  name: string;
+  is_index: boolean;
+  lot_size: number;
+  event: "entry" | "exit";
+  at: Date;
+  legs: ITradeLogLeg[];
+  /** Contract value transacted by this event (both legs). */
+  value: number;
+  /** Summed charge heads for this event. */
+  charges: {
+    brokerage: number;
+    stt: number;
+    exchange_txn: number;
+    sebi: number;
+    stamp_duty: number;
+    gst: number;
+    total: number;
+  };
+  /**
+   * Where the charge numbers came from. "unpriced" means Kite could not price
+   * the orders (expired session, API error): the value and fills are still on
+   * record but every charge head is zero, and must not be read as a free trade.
+   */
+  source: "kite" | "kite_estimate" | "unpriced";
+  margin: number | null;
+  // Exit events only — the round-trip result.
+  gross_pnl: number | null;
+  total_charges: number | null; // entry + exit charges
+  net_pnl: number | null; // gross_pnl - total_charges
+}
+
+const tradeLogLegSchema = new mongoose.Schema<ITradeLogLeg>(
+  {
+    side: { type: String, enum: ["BUY", "SELL"], required: true },
+    token: { type: Number, default: 0 },
+    tradingsymbol: { type: String, default: "" },
+    exchange: { type: String, default: "" },
+    expiry: { type: String, default: "" },
+    quantity: { type: Number, default: 0 },
+    price: { type: Number, default: 0 },
+    value: { type: Number, default: 0 },
+    brokerage: { type: Number, default: 0 },
+    stt: { type: Number, default: 0 },
+    stt_type: { type: String, default: "" },
+    exchange_txn: { type: Number, default: 0 },
+    sebi: { type: Number, default: 0 },
+    stamp_duty: { type: Number, default: 0 },
+    gst: { type: Number, default: 0 },
+    total: { type: Number, default: 0 },
+    raw: { type: mongoose.Schema.Types.Mixed, default: null },
+  },
+  { _id: false },
+);
+
+const tradeLogSchema = new mongoose.Schema<ITradeLog>(
+  {
+    trade_id: { type: String, required: true, index: true },
+    symbol: { type: String, required: true, index: true },
+    name: { type: String, default: "" },
+    is_index: { type: Boolean, default: false },
+    lot_size: { type: Number, default: 0 },
+    event: { type: String, enum: ["entry", "exit"], required: true },
+    at: { type: Date, default: () => new Date(), index: true },
+    legs: { type: [tradeLogLegSchema], default: [] },
+    value: { type: Number, default: 0 },
+    charges: {
+      brokerage: { type: Number, default: 0 },
+      stt: { type: Number, default: 0 },
+      exchange_txn: { type: Number, default: 0 },
+      sebi: { type: Number, default: 0 },
+      stamp_duty: { type: Number, default: 0 },
+      gst: { type: Number, default: 0 },
+      total: { type: Number, default: 0 },
+    },
+    source: {
+      type: String,
+      enum: ["kite", "kite_estimate", "unpriced"],
+      default: "kite",
+    },
+    margin: { type: Number, default: null },
+    gross_pnl: { type: Number, default: null },
+    total_charges: { type: Number, default: null },
+    net_pnl: { type: Number, default: null },
+  },
+  { collection: "trade_log" },
+);
+
+/**
+ * The ledger model (collection: "trade_log"), bound to the dedicated ledger
+ * connection when one is configured and to the main connection otherwise.
+ */
+export const TradeLog = (tradeLogConnection ?? mongoose.connection).model<ITradeLog>(
+  "TradeLog",
+  tradeLogSchema,
+);
+
+/** True once the ledger has a live connection to write to. */
+export function isTradeLogEnabled(): boolean {
+  return tradeLogConnection
+    ? tradeLogConnection.readyState === 1
+    : mongoose.connection.readyState === 1;
+}
+
+/**
+ * Append one event to the charges ledger. Best-effort by design: the ledger is
+ * a record OF a trade, never a precondition for taking one, so a write failure
+ * is logged and swallowed rather than failing the request.
+ */
+export async function appendTradeLog(entry: ITradeLog): Promise<void> {
+  if (!isTradeLogEnabled()) return;
+  try {
+    await TradeLog.create(entry);
+  } catch (err) {
+    console.warn("[TradeLog] failed to append", entry.event, "event:", err);
+  }
+}
+
+/** Open the dedicated ledger connection, if one is configured. */
+export async function initTradeLogConnection(): Promise<void> {
+  if (!tradeLogConnection) {
+    console.warn(
+      "TRADE_LOG_URI is not set — the trade/charges ledger falls back to the main MONGODB_URI database.",
+    );
+    return;
+  }
+  try {
+    await tradeLogConnection.asPromise();
+    console.log(
+      `Connected to trade-log MongoDB (database "${tradeLogConnection.name}") — trade_log ledger.`,
+    );
+  } catch (err) {
+    console.error("Failed to connect to the trade-log MongoDB:", err);
+  }
+}
 
 /**
  * Connect to MongoDB using the connection string. The database is taken from

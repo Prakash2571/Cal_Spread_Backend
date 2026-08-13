@@ -124,6 +124,25 @@ admin-settable risk-free rate shared with the frontend, and two privilege levels
 take trades only). Admin sessions are persisted, so an admin stays logged in across a
 backend restart.
 
+Fills and costs are modelled end to end, so a trade's P&L is what an account would actually
+keep:
+
+- **Slippage** — entry and exit walk the live 5-level order book for the full lot (buy into the
+  asks, sell into the bids), so the bid/ask spread is paid on both sides rather than assumed away.
+- **Charges** — brokerage and every statutory head (STT, exchange transaction charge, SEBI
+  turnover charge, GST, stamp duty) come from Zerodha's virtual contract note API
+  (`POST /charges/orders`) priced at those exact fills. They are never computed from a local
+  rate card, because the rates change and a stale formula would misstate every trade.
+  `close_pnl` stays gross; `total_charges` and `net_pnl` carry the after-cost result. While a
+  trade is open the exit charges are projected at the entry fills, so a live P&L reflects the
+  whole round trip instead of only the half already paid.
+- **Ledger** — each entry and exit appends an immutable document to `trade_log` (its own
+  database via `TRADE_LOG_URI`) holding the contract value, per-leg fills, the full charge
+  breakdown and Zerodha's raw payload.
+
+Charges fail soft: if Zerodha can't price the orders the trade is still taken and recorded, with
+the charge fields left null and the UI saying so rather than implying a free trade.
+
 ---
 
 ## Endpoint surface
@@ -165,7 +184,8 @@ npm run dev            # build + start
 ```
 
 Every integration is optional and fails soft: with no `MONGODB_URI` the trade book is off,
-with no Redis the caches are memory-only, with no `NSE_FNO_*_URI` the EOD pipelines are off.
+with no Redis the caches are memory-only, with no `NSE_FNO_*_URI` the EOD pipelines are off,
+and with no `TRADE_LOG_URI` the charges ledger falls back to the `MONGODB_URI` database.
 The service starts and the rest keeps working.
 
 ## Known limitations

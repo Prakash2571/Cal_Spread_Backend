@@ -13,7 +13,13 @@ import {
 } from "./redis.js";
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
-import { KiteClient, KiteError, type Instrument } from "./kite.js";
+import {
+  KiteClient,
+  KiteError,
+  type ChargeOrder,
+  type Instrument,
+  type OrderCharges,
+} from "./kite.js";
 import { TickerHub } from "./hub.js";
 import type { Tick } from "./ticker.js";
 import { rateLimit } from "./ratelimit.js";
@@ -31,8 +37,16 @@ import {
   saveAdminSession,
   loadAdminSessions,
   deleteAdminSession,
+  appendTradeLog,
+  initTradeLogConnection,
 } from "./db.js";
-import type { ITrade, TradeRecord } from "./db.js";
+import type {
+  ILegCharges,
+  ITrade,
+  ITradeCharges,
+  ITradeLogLeg,
+  TradeRecord,
+} from "./db.js";
 import { initNseFnoConnections } from "./db.js";
 import { SpreadSummary } from "./db.js";
 import { startHourlyScheduler, backfillMissedHours, startDayReviewScheduler } from "./hourlyCapture.js";
@@ -2246,6 +2260,207 @@ function vwapFill(
   return filled > 0 ? cost / filled : fallback;
 }
 
+// ---------------------------------------------------------------------------
+// Charges (brokerage + statutory taxes)
+//
+// Every number here comes from Zerodha's virtual contract note API
+// (POST /charges/orders) priced at the ACTUAL fill we simulated. Nothing is
+// computed from a local rate card on purpose: STT, stamp duty and the exchange
+// turnover slabs change, and a hardcoded formula would quietly misstate the
+// P&L of every trade after the next rate revision.
+//
+// The fills themselves already walk the order book (see vwapFill), so a trade's
+// net P&L is now "spread paid + charges paid" — the two real costs of the round
+// trip — rather than a mid-price fantasy.
+// ---------------------------------------------------------------------------
+
+/** A leg to price charges for: the instrument plus the fill it executed at. */
+interface ChargeLeg {
+  side: "BUY" | "SELL";
+  token: number;
+  expiry: string;
+  tradingsymbol: string;
+  exchange: string;
+  quantity: number;
+  price: number;
+}
+
+/** Round money to paise so float noise never reaches the ledger. */
+function round2(v: number): number {
+  return Math.round(v * 100) / 100;
+}
+
+/** Fold Kite's per-order charge object into this app's flat per-leg record. */
+function toLegCharges(leg: ChargeLeg, oc: OrderCharges): ILegCharges {
+  const c = oc.charges;
+  return {
+    side: leg.side,
+    tradingsymbol: leg.tradingsymbol,
+    quantity: leg.quantity,
+    price: round2(leg.price),
+    value: round2(leg.quantity * leg.price),
+    brokerage: round2(c.brokerage),
+    stt: round2(c.transaction_tax),
+    stt_type: c.transaction_tax_type,
+    exchange_txn: round2(c.exchange_turnover_charge),
+    sebi: round2(c.sebi_turnover_charge),
+    stamp_duty: round2(c.stamp_duty),
+    gst: round2(c.gst.total),
+    total: round2(c.total),
+  };
+}
+
+/** Sum a set of legs into the charges record stored on the trade. */
+function aggregateCharges(
+  legs: ILegCharges[],
+  source: "kite" | "kite_estimate",
+): ITradeCharges {
+  const sum = (pick: (l: ILegCharges) => number) =>
+    round2(legs.reduce((acc, l) => acc + pick(l), 0));
+  return {
+    legs,
+    value: sum((l) => l.value),
+    brokerage: sum((l) => l.brokerage),
+    stt: sum((l) => l.stt),
+    exchange_txn: sum((l) => l.exchange_txn),
+    sebi: sum((l) => l.sebi),
+    stamp_duty: sum((l) => l.stamp_duty),
+    gst: sum((l) => l.gst),
+    total: sum((l) => l.total),
+    source,
+    at: new Date(),
+  };
+}
+
+interface PricedCharges {
+  charges: ITradeCharges;
+  /** Per-leg rows for the ledger, carrying Kite's raw charge payload. */
+  logLegs: ITradeLogLeg[];
+}
+
+/** The charge heads of a trade side, or zeros when it couldn't be priced. */
+function chargeTotals(c: ITradeCharges | null) {
+  return {
+    brokerage: c?.brokerage ?? 0,
+    stt: c?.stt ?? 0,
+    exchange_txn: c?.exchange_txn ?? 0,
+    sebi: c?.sebi ?? 0,
+    stamp_duty: c?.stamp_duty ?? 0,
+    gst: c?.gst ?? 0,
+    total: c?.total ?? 0,
+  };
+}
+
+/**
+ * Ledger rows for legs Kite couldn't price. What was transacted (instrument,
+ * quantity, fill, contract value) is still recorded — the ledger's `source`
+ * field says "unpriced" so the zeroed charge heads can't be mistaken for a
+ * genuinely free trade.
+ */
+function unpricedLogLegs(legs: ChargeLeg[]): ITradeLogLeg[] {
+  return legs.map((leg) => ({
+    side: leg.side,
+    tradingsymbol: leg.tradingsymbol,
+    quantity: leg.quantity,
+    price: round2(leg.price),
+    value: round2(leg.quantity * leg.price),
+    brokerage: 0,
+    stt: 0,
+    stt_type: "",
+    exchange_txn: 0,
+    sebi: 0,
+    stamp_duty: 0,
+    gst: 0,
+    total: 0,
+    token: leg.token,
+    exchange: leg.exchange,
+    expiry: leg.expiry,
+    raw: null,
+  }));
+}
+
+/** The same legs with both sides reversed — i.e. the order that closes them. */
+function reverseLegs(legs: ChargeLeg[]): ChargeLeg[] {
+  return legs.map((l) => ({
+    ...l,
+    side: l.side === "BUY" ? ("SELL" as const) : ("BUY" as const),
+  }));
+}
+
+/**
+ * Price one or more GROUPS of legs in a single /charges/orders call.
+ *
+ * Batching is deliberate: the virtual contract note endpoint shares Kite's
+ * order-rate quota, so taking a trade asks for the entry pair and the projected
+ * exit pair together (four order lines, one request) instead of twice.
+ *
+ * Returns null — never throws — when Kite can't price the orders. Charges are a
+ * record of a trade, not a precondition for it, so the trade still goes through
+ * with charges left null and the UI falls back to showing gross P&L.
+ */
+async function priceChargeGroups(
+  groups: { legs: ChargeLeg[]; source: "kite" | "kite_estimate" }[],
+): Promise<PricedCharges[] | null> {
+  const orders: ChargeOrder[] = [];
+  for (const [gi, g] of groups.entries()) {
+    for (const [li, leg] of g.legs.entries()) {
+      orders.push({
+        // Synthetic ids: these are simulated fills, so there is no broker order
+        // to reference. They also let us map responses back to legs by value
+        // instead of relying on the response preserving request order.
+        order_id: `calspread-${gi}-${li}`,
+        exchange: leg.exchange,
+        tradingsymbol: leg.tradingsymbol,
+        transaction_type: leg.side,
+        variety: "regular",
+        product: "NRML",
+        order_type: "MARKET",
+        quantity: leg.quantity,
+        average_price: round2(leg.price),
+      });
+    }
+  }
+  if (orders.length === 0) return null;
+
+  let priced: OrderCharges[];
+  try {
+    priced = await kite.getOrderCharges(orders);
+  } catch (err) {
+    console.warn("[Charges] virtual contract note fetch failed:", err);
+    return null;
+  }
+  if (priced.length !== orders.length) {
+    console.warn(
+      `[Charges] expected ${orders.length} priced orders, got ${priced.length} — skipping.`,
+    );
+    return null;
+  }
+
+  const byId = new Map(priced.map((p) => [p.order_id, p]));
+  const out: PricedCharges[] = [];
+  let cursor = 0;
+  for (const [gi, g] of groups.entries()) {
+    const legCharges: ILegCharges[] = [];
+    const logLegs: ITradeLogLeg[] = [];
+    for (const [li, leg] of g.legs.entries()) {
+      // Prefer the id round-trip; fall back to positional order.
+      const oc = byId.get(`calspread-${gi}-${li}`) ?? priced[cursor + li]!;
+      const lc = toLegCharges(leg, oc);
+      legCharges.push(lc);
+      logLegs.push({
+        ...lc,
+        token: leg.token,
+        exchange: leg.exchange,
+        expiry: leg.expiry,
+        raw: oc.raw,
+      });
+    }
+    cursor += g.legs.length;
+    out.push({ charges: aggregateCharges(legCharges, g.source), logLegs });
+  }
+  return out;
+}
+
 /** Serialize a trade record to the API shape (string id, ISO dates). */
 function serializeTrade(doc: TradeRecord) {
   return {
@@ -2263,6 +2478,13 @@ function serializeTrade(doc: TradeRecord) {
     buy_close: doc.buy_close,
     sell_close: doc.sell_close,
     margin: doc.margin,
+    entry_charges: doc.entry_charges ?? null,
+    exit_charges: doc.exit_charges ?? null,
+    est_exit_charges: doc.est_exit_charges ?? null,
+    entry_value: doc.entry_value ?? null,
+    exit_value: doc.exit_value ?? null,
+    total_charges: doc.total_charges ?? null,
+    net_pnl: doc.net_pnl ?? null,
   };
 }
 
@@ -2387,6 +2609,59 @@ app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
       }
     }
 
+    // --- Charges: Zerodha's virtual contract note for the entry fills, plus a
+    // projection of the exit priced at those same fills.
+    //
+    // The projection exists so an OPEN trade can be shown net of the FULL round
+    // trip: you pay entry charges now and exit charges later, and a P&L that
+    // only subtracts the entry half would flatter every open position. It is
+    // overwritten with the real contract note when the trade is closed. ---
+    const entryLegs: ChargeLeg[] =
+      buyInst && sellInst
+        ? [
+            {
+              side: "BUY",
+              token: buyLeg.token,
+              expiry: buyLeg.expiry,
+              tradingsymbol: buyInst.tradingsymbol,
+              exchange: buyInst.exchange,
+              quantity: current.lot_size,
+              price: buyEntry,
+            },
+            {
+              side: "SELL",
+              token: sellLeg.token,
+              expiry: sellLeg.expiry,
+              tradingsymbol: sellInst.tradingsymbol,
+              exchange: sellInst.exchange,
+              quantity: current.lot_size,
+              price: sellEntry,
+            },
+          ]
+        : [];
+
+    let entryCharges: ITradeCharges | null = null;
+    let estExitCharges: ITradeCharges | null = null;
+    let entryLogLegs: ITradeLogLeg[] = unpricedLogLegs(entryLegs);
+
+    if (entryLegs.length > 0) {
+      const priced = await priceChargeGroups([
+        { legs: entryLegs, source: "kite" },
+        { legs: reverseLegs(entryLegs), source: "kite_estimate" },
+      ]);
+      if (priced) {
+        entryCharges = priced[0]!.charges;
+        entryLogLegs = priced[0]!.logLegs;
+        estExitCharges = priced[1]!.charges;
+      }
+    }
+
+    // Contract value transacted, derived from the fills rather than from the
+    // charge legs: it must be recorded even when the instrument lookup or the
+    // charges call fails.
+    const entryValue = round2(current.lot_size * (buyEntry + sellEntry));
+    const openedAt = new Date();
+
     const payload: ITrade = {
       symbol: item.symbol,
       name: item.name,
@@ -2395,15 +2670,42 @@ app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
       buy: { token: buyLeg.token, expiry: buyLeg.expiry, entry: buyEntry },
       sell: { token: sellLeg.token, expiry: sellLeg.expiry, entry: sellEntry },
       status: "open",
-      opened_at: new Date(),
+      opened_at: openedAt,
       closed_at: null,
       close_pnl: null,
       buy_close: null,
       sell_close: null,
       margin,
+      entry_charges: entryCharges,
+      exit_charges: null,
+      est_exit_charges: estExitCharges,
+      entry_value: entryValue,
+      exit_value: null,
+      total_charges: null,
+      net_pnl: null,
     };
 
     const created = await Trade.create(payload);
+
+    // Append the entry to the charges ledger (best-effort, never blocks).
+    void appendTradeLog({
+      trade_id: created._id.toString(),
+      symbol: item.symbol,
+      name: item.name,
+      is_index: !!item.is_index,
+      lot_size: current.lot_size,
+      event: "entry",
+      at: openedAt,
+      legs: entryLogLegs,
+      value: entryValue,
+      charges: chargeTotals(entryCharges),
+      source: entryCharges ? "kite" : "unpriced",
+      margin,
+      gross_pnl: null,
+      total_charges: null,
+      net_pnl: null,
+    });
+
     res.json({ trade: serializeTrade(created.toObject() as TradeRecord) });
   } catch (err) {
     sendError(res, err);
@@ -2469,16 +2771,112 @@ app.post("/api/trades/:id/close", requireAdmin, async (req: Request, res: Respon
       ? vwapFill(sellL.asks, trade.lot_size, sellL.last)
       : trade.sell.entry;
 
+    // GROSS P&L: the price move only. Charges come off it below.
     const pnl =
       trade.lot_size *
       ((curBuy - trade.buy.entry) + (trade.sell.entry - curSell));
 
+    // --- Charges for the exit fills: the real virtual contract note for the
+    // orders that actually close the spread (sell the long, buy back the short). ---
+    const allInst = await getAllInstrumentsCached();
+    const closeInstByToken = new Map<
+      number,
+      { tradingsymbol: string; exchange: string }
+    >();
+    for (const inst of allInst) {
+      closeInstByToken.set(inst.instrument_token, {
+        tradingsymbol: inst.tradingsymbol,
+        exchange: inst.exchange,
+      });
+    }
+    const longInst = closeInstByToken.get(trade.buy.token);
+    const shortInst = closeInstByToken.get(trade.sell.token);
+
+    const exitLegs: ChargeLeg[] =
+      longInst && shortInst
+        ? [
+            {
+              side: "SELL", // closing the long leg
+              token: trade.buy.token,
+              expiry: trade.buy.expiry,
+              tradingsymbol: longInst.tradingsymbol,
+              exchange: longInst.exchange,
+              quantity: trade.lot_size,
+              price: curBuy,
+            },
+            {
+              side: "BUY", // buying back the short leg
+              token: trade.sell.token,
+              expiry: trade.sell.expiry,
+              tradingsymbol: shortInst.tradingsymbol,
+              exchange: shortInst.exchange,
+              quantity: trade.lot_size,
+              price: curSell,
+            },
+          ]
+        : [];
+
+    let exitLogLegs: ITradeLogLeg[] = unpricedLogLegs(exitLegs);
+    let exitCharges: ITradeCharges | null = null;
+    if (exitLegs.length > 0) {
+      const priced = await priceChargeGroups([{ legs: exitLegs, source: "kite" }]);
+      if (priced) {
+        exitCharges = priced[0]!.charges;
+        exitLogLegs = priced[0]!.logLegs;
+      }
+    }
+
+    // If Kite couldn't price the exit right now, fall back to the projection
+    // taken at entry (also a Kite contract note, just priced at the entry
+    // fills). Its `source` says "kite_estimate", so the trade never silently
+    // claims a precision it doesn't have — but the P&L still carries a real
+    // charge figure instead of dropping back to gross.
+    // Read the stored charges as plain objects (not live subdocuments) so the
+    // fallback is copied into exit_charges rather than re-parented.
+    const before = trade.toObject() as TradeRecord;
+    const exitChargesFinal = exitCharges ?? before.est_exit_charges ?? null;
+    const entryTotal = before.entry_charges?.total ?? null;
+    const exitTotal = exitChargesFinal?.total ?? null;
+    const totalCharges =
+      entryTotal !== null && exitTotal !== null ? round2(entryTotal + exitTotal) : null;
+    const closedAt = new Date();
+    const grossPnl = round2(pnl);
+    const netPnl = totalCharges !== null ? round2(pnl - totalCharges) : null;
+
     trade.status = "closed";
-    trade.closed_at = new Date();
-    trade.close_pnl = pnl;
+    trade.closed_at = closedAt;
+    trade.close_pnl = grossPnl;
     trade.buy_close = curBuy;
     trade.sell_close = curSell;
+    trade.exit_charges = exitChargesFinal;
+    trade.exit_value =
+      exitLegs.length > 0 ? round2(trade.lot_size * (curBuy + curSell)) : null;
+    trade.total_charges = totalCharges;
+    trade.net_pnl = netPnl;
     await trade.save();
+
+    // Append the exit (and the round-trip result) to the charges ledger.
+    void appendTradeLog({
+      trade_id: trade._id.toString(),
+      symbol: trade.symbol,
+      name: trade.name,
+      is_index: trade.is_index,
+      lot_size: trade.lot_size,
+      event: "exit",
+      at: closedAt,
+      legs: exitLogLegs,
+      value: trade.exit_value ?? 0,
+      charges: chargeTotals(exitChargesFinal),
+      source: exitCharges
+        ? "kite"
+        : exitChargesFinal
+          ? "kite_estimate"
+          : "unpriced",
+      margin: trade.margin,
+      gross_pnl: grossPnl,
+      total_charges: totalCharges,
+      net_pnl: netPnl,
+    });
 
     res.json({ trade: serializeTrade(trade.toObject() as TradeRecord) });
   } catch (err) {
@@ -4155,6 +4553,10 @@ app.listen(PORT, () => {
     // 1m/5m/15m/1h baseline at any time of day.
     startOptionOiCapture();
   });
+
+  // Open the dedicated trade/charges ledger connection (no-op when TRADE_LOG_URI
+  // is unset — the ledger then rides on the main connection).
+  void initTradeLogConnection();
 
   // Connect to the split nse_fno databases (archive, current, spread) and start EOD capture scheduler + backfill.
   void initNseFnoConnections().then(() => {

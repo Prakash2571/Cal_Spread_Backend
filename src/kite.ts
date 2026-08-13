@@ -125,6 +125,108 @@ export interface BasketOrder {
   price: number;
 }
 
+/**
+ * One order line for the virtual contract note (POST /charges/orders).
+ * Same shape as a basket order except the fill price is `average_price` (the
+ * charges are computed on the executed value, not on a limit price).
+ */
+export interface ChargeOrder {
+  order_id: string;
+  exchange: string;
+  tradingsymbol: string;
+  transaction_type: "BUY" | "SELL";
+  variety: string;
+  product: string;
+  order_type: string;
+  quantity: number;
+  average_price: number;
+}
+
+/**
+ * The charge heads Zerodha bills per order, exactly as the virtual contract
+ * note reports them. Every value is in rupees and already sided: Zerodha only
+ * levies STT on the SELL leg of a futures trade and stamp duty only on the BUY
+ * leg, so the zeroes in this breakdown are meaningful, not missing data.
+ */
+export interface OrderChargeBreakdown {
+  /** STT (equity/F&O) or CTT (commodities). */
+  transaction_tax: number;
+  /** Which of the two the above is, as reported by Kite ("stt" / "ctt"). */
+  transaction_tax_type: string;
+  exchange_turnover_charge: number;
+  sebi_turnover_charge: number;
+  brokerage: number;
+  stamp_duty: number;
+  /** GST is 18% of (brokerage + exchange + SEBI), split igst / cgst+sgst. */
+  gst: { igst: number; cgst: number; sgst: number; total: number };
+  total: number;
+}
+
+/** A single order's charges, tied back to the order line we asked about. */
+export interface OrderCharges {
+  order_id: string;
+  tradingsymbol: string;
+  transaction_type: "BUY" | "SELL";
+  quantity: number;
+  price: number;
+  charges: OrderChargeBreakdown;
+  /**
+   * The untouched `charges` object Kite returned. Persisted alongside the
+   * parsed numbers so a new charge head Zerodha introduces is still on record
+   * even though this parser doesn't know about it yet.
+   */
+  raw: unknown;
+}
+
+function num(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : 0;
+}
+
+/**
+ * Read Kite's per-order charge object defensively.
+ *
+ * Every head is optional as far as this parser is concerned: charges are money,
+ * so a shape change must degrade to "0 for that head" rather than NaN poisoning
+ * the trade's P&L. `total` is taken from the response when present (Zerodha's
+ * own rounding is the authority) and otherwise recomputed from the heads.
+ */
+function parseCharges(raw: unknown): OrderChargeBreakdown {
+  const c = (raw ?? {}) as Record<string, unknown>;
+  const gstRaw = (c.gst ?? {}) as Record<string, unknown>;
+
+  const igst = num(gstRaw.igst);
+  const cgst = num(gstRaw.cgst);
+  const sgst = num(gstRaw.sgst);
+  const gstTotal = num(gstRaw.total) || igst + cgst + sgst;
+
+  const transaction_tax = num(c.transaction_tax);
+  const exchange_turnover_charge = num(c.exchange_turnover_charge);
+  const sebi_turnover_charge = num(c.sebi_turnover_charge);
+  const brokerage = num(c.brokerage);
+  const stamp_duty = num(c.stamp_duty);
+
+  const total =
+    num(c.total) ||
+    transaction_tax +
+      exchange_turnover_charge +
+      sebi_turnover_charge +
+      brokerage +
+      stamp_duty +
+      gstTotal;
+
+  return {
+    transaction_tax,
+    transaction_tax_type:
+      typeof c.transaction_tax_type === "string" ? c.transaction_tax_type : "",
+    exchange_turnover_charge,
+    sebi_turnover_charge,
+    brokerage,
+    stamp_duty,
+    gst: { igst, cgst, sgst, total: gstTotal },
+    total,
+  };
+}
+
 export class KiteError extends Error {
   status: number;
   constructor(message: string, status = 500) {
@@ -480,6 +582,66 @@ export class KiteClient {
     const initial = json.data.initial?.total ?? 0;
     const final = json.data.final?.total ?? 0;
     return { initial, final, total: final || initial };
+  }
+
+  /**
+   * Virtual contract note (/charges/orders): the exact brokerage and statutory
+   * charges Zerodha would bill for a set of executed orders.
+   *
+   * This is the ONLY source of charge numbers in this app — we never reimplement
+   * Zerodha's rate card locally, because the rates change (STT, stamp duty and
+   * exchange slabs have all moved in recent years) and a stale local formula
+   * would silently misstate every trade's P&L.
+   *
+   * Results come back in request order; we still carry each request's order_id
+   * across so a caller can match a response to its leg without trusting order.
+   */
+  async getOrderCharges(orders: ChargeOrder[]): Promise<OrderCharges[]> {
+    if (orders.length === 0) return [];
+
+    const res = await fetch(`${KITE_API_ROOT}/charges/orders`, {
+      method: "POST",
+      headers: { ...this.authHeader(), "Content-Type": "application/json" },
+      body: JSON.stringify(orders),
+    });
+
+    const json = (await res.json()) as {
+      status: string;
+      data?: unknown;
+      message?: string;
+    };
+
+    if (!res.ok || json.status !== "success" || !Array.isArray(json.data)) {
+      if (res.status === 401 || res.status === 403) this.clearSession();
+      throw new KiteError(
+        json.message ?? `Failed to fetch order charges (HTTP ${res.status}).`,
+        res.status || 500,
+      );
+    }
+
+    const rows = json.data as Record<string, unknown>[];
+    return rows.map((row, i) => {
+      const req = orders[i];
+      const chargesRaw = row?.charges;
+      return {
+        order_id:
+          typeof row?.order_id === "string" && row.order_id
+            ? row.order_id
+            : (req?.order_id ?? String(i)),
+        tradingsymbol:
+          typeof row?.tradingsymbol === "string"
+            ? row.tradingsymbol
+            : (req?.tradingsymbol ?? ""),
+        transaction_type:
+          row?.transaction_type === "SELL" || row?.transaction_type === "BUY"
+            ? row.transaction_type
+            : (req?.transaction_type ?? "BUY"),
+        quantity: num(row?.quantity) || (req?.quantity ?? 0),
+        price: num(row?.price) || (req?.average_price ?? 0),
+        charges: parseCharges(chargesRaw),
+        raw: chargesRaw ?? null,
+      };
+    });
   }
 
   /**
