@@ -2859,8 +2859,43 @@ app.post("/api/trades/:id/close", requireAdmin, async (req: Request, res: Respon
     // Read the stored charges as plain objects (not live subdocuments) so the
     // fallback is copied into exit_charges rather than re-parented.
     const before = trade.toObject() as TradeRecord;
+
+    // Backfill missing ENTRY charges for trades taken before charges were
+    // tracked. Their entry fills are stored (trade.buy/sell.entry), so we can
+    // price them now and still net the close. It's an ESTIMATE — Kite's contract
+    // note only covers the current day, so an older fill is re-priced at today's
+    // rate card — hence source "kite_estimate". Without this a legacy open trade
+    // would close showing GROSS (entry side null ⇒ total null).
+    let entryChargesFinal: ITradeCharges | null = before.entry_charges ?? null;
+    if (!entryChargesFinal && longInst && shortInst) {
+      const entryLegs: ChargeLeg[] = [
+        {
+          side: "BUY",
+          token: trade.buy.token,
+          expiry: trade.buy.expiry,
+          tradingsymbol: longInst.tradingsymbol,
+          exchange: longInst.exchange,
+          quantity: trade.lot_size,
+          price: trade.buy.entry,
+        },
+        {
+          side: "SELL",
+          token: trade.sell.token,
+          expiry: trade.sell.expiry,
+          tradingsymbol: shortInst.tradingsymbol,
+          exchange: shortInst.exchange,
+          quantity: trade.lot_size,
+          price: trade.sell.entry,
+        },
+      ];
+      const pricedEntry = await priceChargeGroups([
+        { legs: entryLegs, source: "kite_estimate" },
+      ]);
+      if (pricedEntry) entryChargesFinal = pricedEntry[0]!.charges;
+    }
+
     const exitChargesFinal = exitCharges ?? before.est_exit_charges ?? null;
-    const entryTotal = before.entry_charges?.total ?? null;
+    const entryTotal = entryChargesFinal?.total ?? null;
     const exitTotal = exitChargesFinal?.total ?? null;
     const totalCharges =
       entryTotal !== null && exitTotal !== null ? round2(entryTotal + exitTotal) : null;
@@ -2875,6 +2910,13 @@ app.post("/api/trades/:id/close", requireAdmin, async (req: Request, res: Respon
     trade.close_pnl = grossPnl;
     trade.buy_close = curBuy;
     trade.sell_close = curSell;
+    // Persist a backfilled entry charge/value on legacy trades that never had one.
+    if (!before.entry_charges && entryChargesFinal) {
+      trade.entry_charges = entryChargesFinal;
+    }
+    if (before.entry_value == null) {
+      trade.entry_value = round2(trade.lot_size * (trade.buy.entry + trade.sell.entry));
+    }
     trade.exit_charges = exitChargesFinal;
     trade.exit_value =
       exitLegs.length > 0 ? round2(trade.lot_size * (curBuy + curSell)) : null;
