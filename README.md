@@ -127,8 +127,12 @@ backend restart.
 Fills and costs are modelled end to end, so a trade's P&L is what an account would actually
 keep:
 
-- **Slippage** — entry and exit walk the live 5-level order book for the full lot (buy into the
-  asks, sell into the bids), so the bid/ask spread is paid on both sides rather than assumed away.
+- **Slippage** — fills are taken at the touch of the live book: the long leg pays the best ask and
+  the short leg receives the best bid, mirrored on exit, so the round trip pays the spread exactly
+  twice. Touch quotes are real, tick-valid prices — a volume-weighted average across several
+  levels would produce a price that doesn't exist on the exchange and slippage that can't be
+  reconciled against the quotes. If a leg has no bid/ask, taking a trade is refused rather than
+  filled from a last traded price; on exit (which can't be refused) that fallback is logged.
 - **Charges** — brokerage and every statutory head (STT, exchange transaction charge, SEBI
   turnover charge, GST, stamp duty) come from Zerodha's virtual contract note API
   (`POST /charges/orders`) priced at those exact fills. They are never computed from a local

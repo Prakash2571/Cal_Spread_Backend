@@ -2196,10 +2196,18 @@ app.get("/api/spread-stats/:symbol", async (req: Request, res: Response) => {
 // ============================================================================
 
 /**
- * Volume-weighted fill price for a market order of `quantity`, walking the
- * given order-book side (best level first). This reproduces a real market
- * order: it fills at the touch when there's enough size, and slips into deeper
- * levels when the lot is larger than what's available — exactly like a broker.
+ * Fill price at the TOUCH: the best price on one side of the book (highest bid
+ * / lowest ask).
+ *
+ * This is deliberately not a volume-weighted walk down the book. A VWAP across
+ * several levels produces a price that DOES NOT EXIST on the exchange — it
+ * isn't a multiple of the instrument's tick size — so every P&L derived from it
+ * is subtly unreal and the slippage it implies can't be reconciled against the
+ * quotes. The touch is a real, tick-valid, executable price, which makes the
+ * slippage exactly the spread that was crossed: buy the ask, sell the bid.
+ *
+ * Returns null when that side of the book is empty, so callers can refuse the
+ * trade instead of inventing a fill from a last-traded price.
  */
 interface Ladder {
   last: number;
@@ -2235,29 +2243,20 @@ async function resolveLadder(tokens: number[]): Promise<Map<number, Ladder>> {
   return out;
 }
 
-function vwapFill(
+function bestPrice(
   levels: { price: number; qty: number }[],
-  quantity: number,
-  fallback: number,
-): number {
-  let remaining = quantity;
-  let cost = 0;
-  let filled = 0;
+  side: "bid" | "ask",
+): number | null {
+  let best: number | null = null;
   for (const lv of levels) {
-    if (remaining <= 0) break;
-    const take = Math.min(remaining, lv.qty);
-    if (take <= 0) continue;
-    cost += take * lv.price;
-    filled += take;
-    remaining -= take;
+    if (!(lv.price > 0)) continue;
+    if (best === null) best = lv.price;
+    // Highest bid / lowest ask. Computed rather than trusting the array order,
+    // so a reordered or padded depth payload can't hand back a worse level as
+    // if it were the touch.
+    else best = side === "bid" ? Math.max(best, lv.price) : Math.min(best, lv.price);
   }
-  if (remaining > 0) {
-    // Not enough visible depth — fill the remainder at the deepest known price.
-    const lastPx = levels.length > 0 ? levels[levels.length - 1]!.price : fallback;
-    cost += remaining * lastPx;
-    filled += remaining;
-  }
-  return filled > 0 ? cost / filled : fallback;
+  return best;
 }
 
 // ---------------------------------------------------------------------------
@@ -2269,9 +2268,9 @@ function vwapFill(
 // turnover slabs change, and a hardcoded formula would quietly misstate the
 // P&L of every trade after the next rate revision.
 //
-// The fills themselves already walk the order book (see vwapFill), so a trade's
-// net P&L is now "spread paid + charges paid" — the two real costs of the round
-// trip — rather than a mid-price fantasy.
+// The fills themselves are taken at the touch (see bestPrice), so the P&L
+// already carries the spread that was crossed; these charges are recorded
+// alongside it rather than deducted from it.
 // ---------------------------------------------------------------------------
 
 /** A leg to price charges for: the instrument plus the fill it executed at. */
@@ -2569,10 +2568,24 @@ app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
     const [buyLeg, sellLeg] =
       premCurrent <= premNext ? [currentLeg, nextLeg] : [nextLeg, currentLeg];
 
-    // Realistic market-order fills: BUY walks the ask side, SELL walks the bid
-    // side, for the full lot quantity (captures slippage/partial fills).
-    const buyEntry = vwapFill(buyLeg.ladder.asks, current.lot_size, buyLeg.ladder.last);
-    const sellEntry = vwapFill(sellLeg.ladder.bids, current.lot_size, sellLeg.ladder.last);
+    // Fills at the touch: the long leg pays the best ASK, the short leg receives
+    // the best BID. Both are real, tick-valid quotes, so the entry cost is
+    // exactly the spread that was crossed — no averaged, unexecutable price.
+    const buyEntry = bestPrice(buyLeg.ladder.asks, "ask");
+    const sellEntry = bestPrice(sellLeg.ladder.bids, "bid");
+
+    // No quote on the side we'd have to trade against means we cannot say what
+    // the fill would have been. Refuse rather than record a fabricated entry
+    // from the last traded price — a wrong entry silently poisons the P&L and
+    // the slippage for the life of the trade.
+    if (buyEntry === null || sellEntry === null) {
+      res.status(502).json({
+        error:
+          "No live bid/ask on one of the legs right now (illiquid or pre-open). " +
+          "Try again once both legs are quoted.",
+      });
+      return;
+    }
 
     // Look up tradingsymbol + exchange for each leg (needed by the margin API).
     const instByToken = new Map<number, { tradingsymbol: string; exchange: string }>();
@@ -2766,21 +2779,29 @@ app.post("/api/trades/:id/close", requireAdmin, async (req: Request, res: Respon
       return;
     }
 
-    // Realistic market-order exit walking the live book for the lot (WebSocket
-    // first, REST fallback): sell the long leg into the BIDS, buy back the
-    // short leg from the ASKS.
+    // Exit at the touch (WebSocket book first, REST fallback): the long leg is
+    // sold into the best BID, the short leg bought back at the best ASK — the
+    // mirror of the entry, so the round trip pays the spread exactly twice.
     const ladders = await resolveLadder([trade.buy.token, trade.sell.token]);
 
     const buyL = ladders.get(trade.buy.token);
     const sellL = ladders.get(trade.sell.token);
-    const curBuy = buyL
-      ? vwapFill(buyL.bids, trade.lot_size, buyL.last)
-      : trade.buy.entry;
-    const curSell = sellL
-      ? vwapFill(sellL.asks, trade.lot_size, sellL.last)
-      : trade.sell.entry;
+    const exitBid = buyL ? bestPrice(buyL.bids, "bid") : null;
+    const exitAsk = sellL ? bestPrice(sellL.asks, "ask") : null;
 
-    // GROSS P&L: the price move only. Charges come off it below.
+    // Unlike entry, a close can't simply be refused — that would trap the
+    // position. Fall back to the last traded price, then to the entry (a flat
+    // leg), and say so in the log, since those fills are not spread-accurate.
+    if (exitBid === null || exitAsk === null) {
+      console.warn(
+        `[Trade ${trade._id.toString()}] closing ${trade.symbol} without a full ` +
+          `bid/ask: falling back to last traded price — exit slippage is approximate.`,
+      );
+    }
+    const curBuy = exitBid ?? buyL?.last ?? trade.buy.entry;
+    const curSell = exitAsk ?? sellL?.last ?? trade.sell.entry;
+
+    // GROSS P&L: the price move only. Charges are reported separately.
     const pnl =
       trade.lot_size *
       ((curBuy - trade.buy.entry) + (trade.sell.entry - curSell));

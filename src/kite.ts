@@ -512,8 +512,9 @@ export class KiteClient {
   }
 
   /**
-   * Full 5-level order book per instrument, for realistic market-order fills
-   * (walking the book to compute a volume-weighted fill price for a lot size).
+   * Full 5-level order book per instrument. Fills are taken at the touch (best
+   * bid / best ask); the deeper levels are kept because they show the size
+   * behind the quote.
    */
   async getQuoteLadder(identifiers: string[]): Promise<Map<number, QuoteLadder>> {
     const out = new Map<number, QuoteLadder>();
