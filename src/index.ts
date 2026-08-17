@@ -215,7 +215,12 @@ const OI_FRAMES: Record<OiFrameKey, OiFrameCfg> = {
   "1m": { intervalMin: 1, retentionMs: 1 * 24 * 60 * 60 * 1000, kiteInterval: "minute" },
   "5m": { intervalMin: 5, retentionMs: 3 * 24 * 60 * 60 * 1000, kiteInterval: "5minute" },
   "15m": { intervalMin: 15, retentionMs: 7 * 24 * 60 * 60 * 1000, kiteInterval: "15minute" },
-  "1h": { intervalMin: 60, retentionMs: 4 * 24 * 60 * 60 * 1000, kiteInterval: "60minute" },
+  // A week, like 15m — NOT less. Retention is pruned against CALENDAR time, so a
+  // 4-day window was worth barely two sessions once a weekend fell inside it
+  // (on a Monday it reached back only to Thursday). The coarsest frame is the one
+  // a multi-session look-back is asked of, so it gets the longest window; 7 days
+  // of hourly buckets is ~35 points, which costs nothing to hold or persist.
+  "1h": { intervalMin: 60, retentionMs: 7 * 24 * 60 * 60 * 1000, kiteInterval: "60minute" },
 };
 /** Frame keys in display order. Prefer this over Object.keys for stable order. */
 const OI_FRAME_KEYS = Object.keys(OI_FRAMES) as OiFrameKey[];
@@ -274,7 +279,7 @@ function completedBuckets<T extends { t: number }>(points: T[]): T[] {
 
 // ---------------------------------------------------------------------------
 // Multi-timeframe NIFTY FUTURES open-interest history (current/next/far month).
-// Reuses the OI_FRAMES cadence + retention (1m→1 day, 5m→3 days, 15m→1 week).
+// Reuses the OI_FRAMES cadence + retention (1m→1 day, 5m→3 days, 15m/1h→1 week).
 // Only 3 tokens are involved, so the live snapshot is a single cheap /quote and
 // the Kite backfill is 3 historical calls. In-memory (rebuilt on restart).
 // ---------------------------------------------------------------------------
@@ -553,6 +558,11 @@ function requeueFailedWrites(
 /** TTL (seconds) for a frame's key: its retention plus a day of slack. */
 function frameTtlSec(cfg: OiFrameCfg): number {
   return Math.floor((cfg.retentionMs + REDIS_TTL_SLACK_MS) / 1000);
+}
+
+/** The longest retention any frame keeps — for caches shared across all frames. */
+function maxFrameRetentionMs(): number {
+  return Math.max(...OI_FRAME_KEYS.map((k) => OI_FRAMES[k].retentionMs));
 }
 
 // ---------------------------------------------------------------------------
@@ -835,6 +845,13 @@ async function warmLoadFromRedis(): Promise<void> {
       e instanceof Error ? e.message : e,
     );
   }
+
+  // Derive the coarse frames' older buckets from the finer ones we just loaded,
+  // BEFORE startOptionOiCapture() snapshots its backfill windows — otherwise the
+  // gap detector would see a short 1h frame and go asking Kite for a week of
+  // minute candles that the 15m frame already answers for free. Outside the
+  // try/catch on purpose: a PARTIAL warm load is the case that benefits most.
+  coarsenFrames();
 }
 
 // Dividend yields (%) from Yahoo, refreshed once a day.
@@ -2123,8 +2140,8 @@ app.get("/api/option-oi-series/:underlying", (_req: Request, res: Response) => {
 
 // --- Multi-timeframe Call/Put total-OI history for the analytics OI chart.
 // Returns the retained aggregate series for a frame: 1m (last 1 day), 5m (last
-// 3 days) or 15m (last 1 week). Points are { t, totalCe, totalPe } over the
-// 24↑/ATM/26↓ window. Filled live + backfilled from Kite on downtime. ---
+// 3 days), 15m or 1h (last 1 week each). Points are { t, totalCe, totalPe } over
+// the 24↑/ATM/26↓ window. Filled live + backfilled from Kite on downtime. ---
 app.get("/api/option-oi-frame/:underlying", (req: Request, res: Response) => {
   const frame = parseFrameKey(req.query.frame);
   res.json({
@@ -2136,8 +2153,8 @@ app.get("/api/option-oi-frame/:underlying", (req: Request, res: Response) => {
 });
 
 // --- Multi-timeframe NIFTY FUTURES open-interest history (3 monthly contracts).
-// Same frame contract as /api/option-oi-frame: 1m (last 1 day), 5m (last 3 days)
-// or 15m (last 1 week). Each point carries one leg per contract, keyed by expiry
+// Same frame contract as /api/option-oi-frame: 1m (last 1 day), 5m (last 3 days),
+// 15m or 1h (last 1 week). Each point carries one leg per contract, keyed by expiry
 // so the client can plot current/next/far month as three series. ---
 app.get("/api/futures-oi-frame/:underlying", (req: Request, res: Response) => {
   const frame = parseFrameKey(req.query.frame);
@@ -3854,6 +3871,177 @@ function mergeOiFrame(key: OiFrameKey, backfilled: OiAggPoint[]): void {
 }
 
 /**
+ * The frame a coarser one can be rebuilt from without touching Kite: one whose
+ * buckets tile ours exactly and whose retention reaches at least as far back.
+ *
+ * Why this exists at all. Raising a frame's `retentionMs` does NOT make the extra
+ * history appear. The gap detectors only ever look for a missing TAIL or a missing
+ * session HEAD (see oiBackfillFromMs / missingHeadMs), and neither fires for whole
+ * sessions that sit inside the newly-widened window — so extending 1h from 4 days
+ * to a week would have left those days blank until a week of live capture filled
+ * them in. Nor do they need fetching: the 15m frame ALREADY retains that week, and
+ * a coarse bucket's value is by definition the closing reading of the last fine
+ * bucket inside it — the very number the live 1h capture writes. The week is
+ * already on disk, one aggregation away, for zero Kite calls.
+ */
+function coarsenSourceFor(key: OiFrameKey): OiFrameKey | null {
+  const cfg = OI_FRAMES[key];
+  let best: OiFrameKey | null = null;
+  for (const k of OI_FRAME_KEYS) {
+    if (k === key) continue;
+    const c = OI_FRAMES[k];
+    if (c.intervalMin >= cfg.intervalMin) continue; // must be finer
+    if (cfg.intervalMin % c.intervalMin !== 0) continue; // must tile us exactly
+    if (c.retentionMs < cfg.retentionMs) continue; // must reach as far back as us
+    // Prefer the COARSEST valid source: identical answer, fewest points walked.
+    if (!best || c.intervalMin > OI_FRAMES[best].intervalMin) best = k;
+  }
+  return best;
+}
+
+/**
+ * Group a finer frame's points into `bsize` buckets, keeping the LAST one in each
+ * — that bucket's closing reading.
+ *
+ * No candle shift applies here: the source points are already stamped with their
+ * own bucket END (contrast downsampleAgg, which consumes Kite candles stamped with
+ * their START). A point landing exactly on a coarse boundary closes that bucket
+ * rather than opening the next, which is bucketEndMs's own rule, so the grouping
+ * agrees with the live path bar for bar.
+ */
+function collapseToBuckets<T extends { t: number }>(
+  points: T[],
+  bsize: number,
+  now: number,
+): Map<number, T> {
+  const out = new Map<number, T>();
+  for (const p of points) {
+    const bEnd = bucketEndMs(p.t, bsize);
+    if (isPreOpenBucket(bEnd)) continue;
+    // Never synthesise the still-FORMING bucket. It holds only the part of its
+    // interval that has elapsed, yet nothing in the stored shape says so — it would
+    // be persisted looking finished and then beat the real closing reading on the
+    // next warm load. Exactly why appendOiFrameLive withholds it too.
+    if (bEnd > now) continue;
+    out.set(bEnd, p); // input is ascending, so the last write is the bucket's close
+  }
+  return out;
+}
+
+/** Mirror a whole frame to Redis: write every kept bucket, drop what left. */
+function persistWholeFrame(
+  rk: string,
+  points: { t: number }[],
+  before: Set<number>,
+  ttl: number,
+): void {
+  const kept = new Set<number>();
+  for (const p of points) {
+    kept.add(p.t);
+    queueHashField(rk, p.t, p, ttl);
+  }
+  queueHashDrop(
+    rk,
+    Array.from(before).filter((t) => !kept.has(t)),
+    ttl,
+  );
+}
+
+/**
+ * Fill a coarse OPTION frame's missing buckets from a finer, longer-retained one.
+ *
+ * Only ADDS buckets, plus the one repair mergeOiFrame also allows: a bucket that
+ * admitted it was `partial` yields to a complete reading. A bucket measured live is
+ * otherwise never overwritten. Returns the number of buckets created, so a no-op
+ * costs no Redis writes at all.
+ */
+function coarsenOiFrame(key: OiFrameKey, srcKey: OiFrameKey): number {
+  const cfg = OI_FRAMES[key];
+  const store = oiFrameStores[key];
+  const now = Date.now();
+  const collapsed = collapseToBuckets(
+    oiFrameStores[srcKey].points,
+    cfg.intervalMin * 60 * 1000,
+    now,
+  );
+  if (collapsed.size === 0) return 0;
+
+  const byBucket = new Map<number, OiAggPoint>();
+  for (const p of store.points) byBucket.set(p.t, p);
+  let filled = 0;
+  for (const [bEnd, p] of collapsed) {
+    const cur = byBucket.get(bEnd);
+    if (cur && !(cur.partial && !p.partial)) continue;
+    // Copy rather than share: the live append path mutates stored points in place,
+    // and this one still belongs to the source frame.
+    byBucket.set(bEnd, { ...p, t: bEnd });
+    filled++;
+  }
+  if (filled === 0) return 0;
+
+  const cutoff = now - cfg.retentionMs;
+  const before = new Set(store.points.map((p) => p.t));
+  store.points = Array.from(byBucket.values())
+    .filter((p) => p.t >= cutoff)
+    .sort((a, b) => a.t - b.t);
+  persistWholeFrame(redisKeys.oiFrame(key), store.points, before, frameTtlSec(cfg));
+  return filled;
+}
+
+/** The same derivation for a coarse FUTURES frame. */
+function coarsenFutOiFrame(key: OiFrameKey, srcKey: OiFrameKey): number {
+  const cfg = OI_FRAMES[key];
+  const store = futOiFrameStores[key];
+  const now = Date.now();
+  const collapsed = collapseToBuckets(
+    futOiFrameStores[srcKey].points,
+    cfg.intervalMin * 60 * 1000,
+    now,
+  );
+  if (collapsed.size === 0) return 0;
+
+  const byBucket = new Map<number, FutOiPoint>();
+  for (const p of store.points) byBucket.set(p.t, p);
+  let filled = 0;
+  for (const [bEnd, p] of collapsed) {
+    if (byBucket.has(bEnd)) continue; // futures points carry no `partial` caveat
+    byBucket.set(bEnd, cloneFutOiPoint({ t: bEnd, legs: p.legs }));
+    filled++;
+  }
+  if (filled === 0) return 0;
+
+  const cutoff = now - cfg.retentionMs;
+  const before = new Set(store.points.map((p) => p.t));
+  store.points = Array.from(byBucket.values())
+    .filter((p) => p.t >= cutoff)
+    .sort((a, b) => a.t - b.t);
+  persistWholeFrame(redisKeys.futFrame(key), store.points, before, frameTtlSec(cfg));
+  return filled;
+}
+
+/**
+ * Rebuild every coarse frame's older buckets from the finer frames, both families.
+ *
+ * Pure in-memory work plus buffered writes (no I/O of its own) and idempotent, so
+ * it is safe to run on boot and after every backfill. Deliberately independent of
+ * a Kite session: the data it needs is already in the stores.
+ */
+function coarsenFrames(): void {
+  for (const key of OI_FRAME_KEYS) {
+    const src = coarsenSourceFor(key);
+    if (!src) continue;
+    const opt = coarsenOiFrame(key, src);
+    const fut = coarsenFutOiFrame(key, src);
+    if (opt || fut) {
+      console.log(
+        `[OptionOI] Derived ${opt} option and ${fut} futures ${key} bucket(s) from ` +
+          `the ${src} frame (no Kite calls).`,
+      );
+    }
+  }
+}
+
+/**
  * The earliest timestamp we still NEED for any frame. The overall backfill `from`
  * is the min across frames, so a warm cache only fetches the gap.
  *
@@ -4229,7 +4417,10 @@ function rememberFutContracts(contracts: FutContract[]): void {
   queuePlainWrite(
     redisKeys.futContracts,
     Array.from(futOiKnownContracts.values()),
-    Math.floor((OI_FRAMES["15m"].retentionMs + REDIS_TTL_SLACK_MS) / 1000),
+    // The LONGEST frame retention, not a hardcoded one: these labels have to
+    // outlive every frame that can still hold points for a rolled-over contract,
+    // or the endpoint falls back to a blank tradingsymbol for it.
+    Math.floor((maxFrameRetentionMs() + REDIS_TTL_SLACK_MS) / 1000),
   );
 }
 
@@ -4521,6 +4712,8 @@ function startOptionOiCapture(): void {
     await backfillOiFrames(coldOptFrom);
     await backfillFutOiFrames(coldFutFrom);
     await backfillPrevClose();
+    // Anything the backfill added to a fine frame can extend a coarse one too.
+    coarsenFrames();
     await flushRedisWrites();
   })();
   setInterval(() => {
@@ -4536,6 +4729,7 @@ function startOptionOiCapture(): void {
       await backfillFutOiFrames(futFrom);
       // Covers a process that started mid-session without a baseline.
       await backfillPrevClose();
+      coarsenFrames();
       await flushRedisWrites();
     })();
   }, 30 * 60 * 1000);
