@@ -3693,6 +3693,7 @@ async function backfillPrevClose(): Promise<void> {
           fromStr,
           toStr,
           "day",
+          "background",
         );
         ref = lastPrevSession(spotDaily)?.close ?? 0;
       } catch {
@@ -3734,7 +3735,13 @@ async function backfillPrevClose(): Promise<void> {
       // A previous close never changes, so a retry only fetches what's missing.
       if (tokens[token]) continue;
       try {
-        const candles = await kite.getHistoricalOiSeries(token, fromStr, toStr, "day");
+        const candles = await kite.getHistoricalOiSeries(
+          token,
+          fromStr,
+          toStr,
+          "day",
+          "background",
+        );
         const prev = lastPrevSession(candles);
         if (prev && prev.oi > 0) {
           tokens[token] = { oi: prev.oi, ltp: prev.close };
@@ -3748,7 +3755,7 @@ async function backfillPrevClose(): Promise<void> {
         // must stay retryable, but the rest of the band still gets a baseline.
         failed++;
       }
-      await delay(220); // stay within Kite historical rate limits
+      await delay(220); // courtesy pacing; the hard limit is kite.ts's HistoricalGate
     }
 
     if (Object.keys(tokens).length === 0) {
@@ -4429,6 +4436,7 @@ async function backfillOiFrames(fromMsOverride?: number): Promise<void> {
       fromStr,
       toStr,
       "minute",
+      "background",
     );
     if (spotCandles.length === 0) return;
     const minuteKey = (t: string) => t.slice(0, 16); // "YYYY-MM-DDTHH:MM"
@@ -4477,13 +4485,25 @@ async function backfillOiFrames(fromMsOverride?: number): Promise<void> {
       if (tok == null || oiByToken.has(tok)) return;
       let candles: { t: string; close: number; oi: number }[] = [];
       try {
-        candles = await kite.getHistoricalOiSeries(tok, fromStr, toStr, "minute");
+        candles = await kite.getHistoricalOiSeries(
+          tok,
+          fromStr,
+          toStr,
+          "minute",
+          "background",
+        );
       } catch {
         // A rate-limit blip is the likely cause and one absent strike skews every
         // minute of the window, so pay for a single retry before giving up on it.
         await delay(1200);
         try {
-          candles = await kite.getHistoricalOiSeries(tok, fromStr, toStr, "minute");
+          candles = await kite.getHistoricalOiSeries(
+          tok,
+          fromStr,
+          toStr,
+          "minute",
+          "background",
+        );
         } catch (e) {
           unfetched.add(tok);
           console.warn(
@@ -4501,7 +4521,7 @@ async function backfillOiFrames(fromMsOverride?: number): Promise<void> {
       }
       oiByToken.set(tok, mOi);
       closeByToken.set(tok, mClose);
-      await delay(220); // stay within Kite historical rate limits
+      await delay(220); // courtesy pacing; the hard limit is kite.ts's HistoricalGate
     };
     for (let k = bLo; k <= bHi; k++) {
       await fetchTok(ceByStrike.get(strikes[k]!));
@@ -4863,6 +4883,7 @@ async function backfillFutOiFrames(fromMsOverride?: number): Promise<void> {
         fromStr,
         toStr,
         "minute",
+        "background",
       );
       // Deliberately NOT caught per contract: merged buckets are never revisited,
       // so writing a zeroed leg here would hide that contract for the whole
@@ -4877,7 +4898,7 @@ async function backfillFutOiFrames(fromMsOverride?: number): Promise<void> {
         tsByMin.set(k, cd.t);
       }
       byExpiry.set(c.expiry, m);
-      await delay(220); // stay within Kite historical rate limits
+      await delay(220); // courtesy pacing; the hard limit is kite.ts's HistoricalGate
     }
 
     // Walk minutes in order, carrying forward each leg's last known values.

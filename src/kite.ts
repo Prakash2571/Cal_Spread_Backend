@@ -84,6 +84,129 @@ export interface HistoricalCandle {
   oi: number;
 }
 
+/**
+ * Who is asking for historical candles.
+ *
+ * `interactive` — a request a user is waiting on (a chart endpoint).
+ * `background`  — a scheduler or backfill. Yields to interactive work.
+ */
+export type HistoricalPriority = "interactive" | "background";
+
+/**
+ * Minimum spacing between historical requests. Kite allows ~3/second on that
+ * endpoint; 350ms is ~2.9/s, which leaves headroom without being wasteful.
+ */
+const HISTORICAL_MIN_GAP_MS = 350;
+
+/**
+ * A slot is handed back after this long no matter what the request is doing.
+ *
+ * `fetch` here has no timeout of its own, so without this one stalled connection
+ * would hold the gate and every other historical call in the process would queue
+ * behind it forever. Releasing early can briefly allow two in flight — which is a
+ * far better failure than a wedged queue.
+ */
+const HISTORICAL_SLOT_TIMEOUT_MS = 20_000;
+
+const sleepMs = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Serialises and paces every historical-candle request in the process.
+ *
+ * Why this exists rather than a `delay()` at each call site. The rate limit is a
+ * property of the ACCOUNT, not of any one loop, and this endpoint is used by two
+ * very different kinds of caller: the OI/prev-close/hourly/EOD backfills, which can
+ * issue hundreds of calls back to back, and the chart endpoints, which issue one or
+ * two while a user waits. Per-loop delays only worked because those loops happened
+ * to run sequentially; nothing enforced it, and a user opening a stock page during a
+ * backfill put both on the wire at once with no coordination — the classic route to
+ * a 429 that then poisons a whole reconstruction.
+ *
+ * Priority is what makes queueing safe here. A plain FIFO queue would fix the rate
+ * limit and introduce something worse: a cold-start option backfill is ~180 requests
+ * (a minute of wall clock), and a user request landing behind it would appear to
+ * hang. Interactive callers therefore jump ahead of every queued background one, so
+ * they wait for at most the request in flight plus one gap — well under a second.
+ *
+ * Background work can in principle be starved by a constant stream of interactive
+ * requests. That is the right trade for this app (interactive volume is a handful of
+ * page loads) and the backfills are gap-aware, so anything they miss is simply
+ * picked up on the next 30-minute pass.
+ */
+class HistoricalGate {
+  private busy = false;
+  private lastStartedAt = 0;
+  private waiting: { background: boolean; resume: () => void }[] = [];
+
+  /** Timings are constructor args purely so tests can run with short ones. */
+  constructor(
+    private readonly minGapMs = HISTORICAL_MIN_GAP_MS,
+    private readonly slotTimeoutMs = HISTORICAL_SLOT_TIMEOUT_MS,
+  ) {}
+
+  async run<T>(prio: HistoricalPriority, call: () => Promise<T>): Promise<T> {
+    await this.acquire(prio);
+    // Release exactly once, whichever of the watchdog or the finally gets there
+    // first, so a slot can never be handed out twice.
+    let released = false;
+    const releaseOnce = () => {
+      if (released) return;
+      released = true;
+      this.release();
+    };
+    const watchdog = setTimeout(releaseOnce, this.slotTimeoutMs);
+    try {
+      const gap = this.minGapMs - (Date.now() - this.lastStartedAt);
+      if (gap > 0) await sleepMs(gap);
+      // Stamped at START, so the gap paces request starts rather than adding to
+      // however long the previous response happened to take.
+      this.lastStartedAt = Date.now();
+      return await call();
+    } finally {
+      clearTimeout(watchdog);
+      releaseOnce();
+    }
+  }
+
+  private acquire(prio: HistoricalPriority): Promise<void> {
+    if (!this.busy) {
+      this.busy = true;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resume) => {
+      const entry = { background: prio === "background", resume };
+      if (entry.background) {
+        this.waiting.push(entry);
+        return;
+      }
+      // Ahead of every queued background call, behind interactive ones already
+      // waiting — FIFO within a priority class.
+      let i = 0;
+      while (i < this.waiting.length && !this.waiting[i]!.background) i++;
+      this.waiting.splice(i, 0, entry);
+    });
+  }
+
+  /** Hand the slot straight to the next waiter, or mark the gate free. */
+  private release(): void {
+    const next = this.waiting.shift();
+    if (next) next.resume();
+    else this.busy = false;
+  }
+
+  /** How many calls are queued behind the one in flight (for logging/tests). */
+  get queued(): number {
+    return this.waiting.length;
+  }
+}
+
+const historicalGate = new HistoricalGate();
+
+/** How many historical requests are currently queued. Exposed for logging. */
+export function historicalQueueDepth(): number {
+  return historicalGate.queued;
+}
+
 /** Raw shape of a /quote entry (only the fields we read). */
 interface RawFullQuote {
   instrument_token: number;
@@ -661,6 +784,35 @@ export class KiteClient {
   }
 
   /**
+   * Fetch + validate one historical-candle request, through the shared gate.
+   *
+   * All four historical methods differ only in how they MAP the candle rows, so the
+   * request, the error handling and the rate gate live here once. Returns raw Kite
+   * candle rows: [timestamp, open, high, low, close, volume, oi].
+   */
+  private async historicalCandles(
+    url: string,
+    prio: HistoricalPriority,
+  ): Promise<unknown[][]> {
+    return historicalGate.run(prio, async () => {
+      const res = await fetch(url, { headers: this.authHeader() });
+      const json = (await res.json()) as {
+        status: string;
+        data?: { candles?: unknown[][] };
+        message?: string;
+      };
+      if (!res.ok || json.status !== "success" || !json.data?.candles) {
+        if (res.status === 401 || res.status === 403) this.clearSession();
+        throw new KiteError(
+          json.message ?? `Failed to fetch historical data (HTTP ${res.status}).`,
+          res.status || 500,
+        );
+      }
+      return json.data.candles;
+    });
+  }
+
+  /**
    * Historical daily candles WITH open interest (oi=1) for one instrument.
    * Returns the day's close price and closing open interest per trading day.
    * `from`/`to` are "yyyy-mm-dd". Requires the historical-data subscription.
@@ -669,24 +821,13 @@ export class KiteClient {
     token: number,
     from: string,
     to: string,
+    prio: HistoricalPriority = "interactive",
   ): Promise<{ date: string; close: number; oi: number }[]> {
     const url =
       `${KITE_API_ROOT}/instruments/historical/${token}/day` +
       `?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&oi=1`;
-    const res = await fetch(url, { headers: this.authHeader() });
-    const json = (await res.json()) as {
-      status: string;
-      data?: { candles?: unknown[][] };
-      message?: string;
-    };
-    if (!res.ok || json.status !== "success" || !json.data?.candles) {
-      if (res.status === 401 || res.status === 403) this.clearSession();
-      throw new KiteError(
-        json.message ?? `Failed to fetch historical data (HTTP ${res.status}).`,
-        res.status || 500,
-      );
-    }
-    return json.data.candles.map((c) => ({
+    const candles = await this.historicalCandles(url, prio);
+    return candles.map((c) => ({
       date: String(c[0] ?? "").slice(0, 10),
       close: Number(c[4] ?? 0),
       oi: Number(c[6] ?? 0),
@@ -703,24 +844,13 @@ export class KiteClient {
     from: string,
     to: string,
     interval = "day",
+    prio: HistoricalPriority = "interactive",
   ): Promise<HistoricalCandle[]> {
     const url =
       `${KITE_API_ROOT}/instruments/historical/${token}/${interval}` +
       `?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&oi=1`;
-    const res = await fetch(url, { headers: this.authHeader() });
-    const json = (await res.json()) as {
-      status: string;
-      data?: { candles?: unknown[][] };
-      message?: string;
-    };
-    if (!res.ok || json.status !== "success" || !json.data?.candles) {
-      if (res.status === 401 || res.status === 403) this.clearSession();
-      throw new KiteError(
-        json.message ?? `Failed to fetch historical data (HTTP ${res.status}).`,
-        res.status || 500,
-      );
-    }
-    return json.data.candles.map((c) => ({
+    const candles = await this.historicalCandles(url, prio);
+    return candles.map((c) => ({
       date: String(c[0] ?? "").slice(0, 10),
       open: Number(c[1] ?? 0),
       high: Number(c[2] ?? 0),
@@ -740,24 +870,13 @@ export class KiteClient {
     from: string,
     to: string,
     interval: string,
+    prio: HistoricalPriority = "interactive",
   ): Promise<{ t: string; close: number }[]> {
     const url =
       `${KITE_API_ROOT}/instruments/historical/${token}/${interval}` +
       `?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
-    const res = await fetch(url, { headers: this.authHeader() });
-    const json = (await res.json()) as {
-      status: string;
-      data?: { candles?: unknown[][] };
-      message?: string;
-    };
-    if (!res.ok || json.status !== "success" || !json.data?.candles) {
-      if (res.status === 401 || res.status === 403) this.clearSession();
-      throw new KiteError(
-        json.message ?? `Failed to fetch historical data (HTTP ${res.status}).`,
-        res.status || 500,
-      );
-    }
-    return json.data.candles.map((c) => ({
+    const candles = await this.historicalCandles(url, prio);
+    return candles.map((c) => ({
       t: String(c[0] ?? ""),
       close: Number(c[4] ?? 0),
     }));
@@ -775,24 +894,13 @@ export class KiteClient {
     from: string,
     to: string,
     interval: string,
+    prio: HistoricalPriority = "interactive",
   ): Promise<{ t: string; close: number; oi: number }[]> {
     const url =
       `${KITE_API_ROOT}/instruments/historical/${token}/${interval}` +
       `?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&oi=1`;
-    const res = await fetch(url, { headers: this.authHeader() });
-    const json = (await res.json()) as {
-      status: string;
-      data?: { candles?: unknown[][] };
-      message?: string;
-    };
-    if (!res.ok || json.status !== "success" || !json.data?.candles) {
-      if (res.status === 401 || res.status === 403) this.clearSession();
-      throw new KiteError(
-        json.message ?? `Failed to fetch historical data (HTTP ${res.status}).`,
-        res.status || 500,
-      );
-    }
-    return json.data.candles.map((c) => ({
+    const candles = await this.historicalCandles(url, prio);
+    return candles.map((c) => ({
       t: String(c[0] ?? ""),
       close: Number(c[4] ?? 0),
       oi: Number(c[6] ?? 0),

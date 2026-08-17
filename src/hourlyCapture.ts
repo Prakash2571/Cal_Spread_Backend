@@ -409,6 +409,7 @@ export async function backfillMissedHours(deps: HourlySchedulerDeps): Promise<vo
         fromDate,
         toDate,
         "60minute",
+        "background",
       );
       await delay(300); // rate limit
       const midCandles = await kite.getHistorical(
@@ -416,6 +417,7 @@ export async function backfillMissedHours(deps: HourlySchedulerDeps): Promise<vo
         fromDate,
         toDate,
         "60minute",
+        "background",
       );
       await delay(300); // rate limit
 
@@ -427,6 +429,7 @@ export async function backfillMissedHours(deps: HourlySchedulerDeps): Promise<vo
           fromDate,
           toDate,
           "60minute",
+          "background",
         );
         await delay(300); // rate limit
       }

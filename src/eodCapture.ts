@@ -325,7 +325,13 @@ export async function backfillStockFutures(deps: EodSchedulerDeps): Promise<void
       if (!inst) continue;
 
       try {
-        const candles = await kite.getHistoricalFull(f.token, fromDate, toDate);
+        const candles = await kite.getHistoricalFull(
+          f.token,
+          fromDate,
+          toDate,
+          "day",
+          "background",
+        );
         await delay(300); // Rate limit
 
         for (const candle of candles) {
