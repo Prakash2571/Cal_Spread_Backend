@@ -846,11 +846,12 @@ async function warmLoadFromRedis(): Promise<void> {
     );
   }
 
-  // Derive the coarse frames' older buckets from the finer ones we just loaded,
-  // BEFORE startOptionOiCapture() snapshots its backfill windows — otherwise the
-  // gap detector would see a short 1h frame and go asking Kite for a week of
-  // minute candles that the 15m frame already answers for free. Outside the
-  // try/catch on purpose: a PARTIAL warm load is the case that benefits most.
+  // Derive the coarse frames' older buckets from the finer ones we just loaded, so
+  // /api/option-oi-frame serves a full week from the FIRST request rather than only
+  // after a backfill chain has run. (It does not save any Kite calls: the tail
+  // detector reads the newest point, so a short-but-current 1h frame was never
+  // going to trigger a fetch — see coarsenSourceFor.) Outside the try/catch on
+  // purpose: a PARTIAL warm load is the case that benefits most.
   coarsenFrames();
 }
 
@@ -3202,6 +3203,14 @@ function triggerPostLoginBackfill(): void {
     await backfillFutOiFrames(futFrom);
     // Baseline for the chain's "Day" column (no-op once today's is cached).
     await backfillPrevClose();
+    // Extend the coarse frames from whatever the fine ones just gained. This is
+    // the load-bearing coarsen site, not an afterthought: Kite tokens expire
+    // daily, so on the first boot of a new day backfillOiFrames() bails on the
+    // missing session and both coarsen calls in startOptionOiCapture() run
+    // against warm-load data only. The 15m frame's real reconstruction happens
+    // HERE, after login — and without this the 1h frame would stay short until
+    // the next in-hours 30-minute tick, i.e. tomorrow for an evening login.
+    coarsenFrames();
     // Persist everything the backfills reconstructed, so the next restart
     // warm-loads it instead of paying for the same Kite calls again.
     await flushRedisWrites();
@@ -3849,24 +3858,20 @@ function mergeOiFrame(key: OiFrameKey, backfilled: OiAggPoint[]): void {
     const cur = byBucket.get(p.t);
     if (!cur || (cur.partial && !p.partial)) byBucket.set(p.t, p);
   }
-  const cutoff = Date.now() - cfg.retentionMs;
+  const now = Date.now();
+  const cutoff = now - cfg.retentionMs;
   const before = new Set(store.points.map((p) => p.t));
   store.points = Array.from(byBucket.values())
     .filter((p) => p.t >= cutoff)
     .sort((a, b) => a.t - b.t);
   // Persist the whole merged frame: a backfill both ADDS buckets and prunes past
   // the retention edge, so field-by-field tracking would miss one or the other.
-  const ttl = frameTtlSec(cfg);
-  const rk = redisKeys.oiFrame(key);
-  const kept = new Set<number>();
-  for (const p of store.points) {
-    kept.add(p.t);
-    queueHashField(rk, p.t, p, ttl);
-  }
-  queueHashDrop(
-    rk,
-    Array.from(before).filter((t) => !kept.has(t)),
-    ttl,
+  persistWholeFrame(
+    redisKeys.oiFrame(key),
+    store.points,
+    before,
+    frameTtlSec(cfg),
+    now,
   );
 }
 
@@ -3900,14 +3905,25 @@ function coarsenSourceFor(key: OiFrameKey): OiFrameKey | null {
 }
 
 /**
- * Group a finer frame's points into `bsize` buckets, keeping the LAST one in each
- * — that bucket's closing reading.
+ * Group a finer frame's points into `bsize` buckets, keeping only the point that
+ * actually CLOSES each bucket.
  *
  * No candle shift applies here: the source points are already stamped with their
  * own bucket END (contrast downsampleAgg, which consumes Kite candles stamped with
  * their START). A point landing exactly on a coarse boundary closes that bucket
  * rather than opening the next, which is bucketEndMs's own rule, so the grouping
  * agrees with the live path bar for bar.
+ *
+ * `p.t === bEnd` is the load-bearing condition here, and it is not tidiness. Taking
+ * the LAST point inside a bucket instead would cheerfully build an 11:00 bar out of
+ * a 10:45 reading whenever the fine frame stops mid-hour — a restart, a failed
+ * capture, any gap edge. That bar is a quarter-hour short, carries no `partial`
+ * caveat to admit it, and since mergeOiFrame only replaces buckets that DO admit
+ * they are incomplete, the correct value the Kite backfill fetches minutes later
+ * would be discarded and the wrong bar frozen for the frame's whole retention.
+ * Requiring the closing point costs nothing: it exists in every covered bucket (the
+ * 15m point at 11:00, and the 15:30 clamp at the day's end), and where it is
+ * missing the live path or the backfill fills that bucket properly instead.
  */
 function collapseToBuckets<T extends { t: number }>(
   points: T[],
@@ -3918,27 +3934,37 @@ function collapseToBuckets<T extends { t: number }>(
   for (const p of points) {
     const bEnd = bucketEndMs(p.t, bsize);
     if (isPreOpenBucket(bEnd)) continue;
-    // Never synthesise the still-FORMING bucket. It holds only the part of its
-    // interval that has elapsed, yet nothing in the stored shape says so — it would
-    // be persisted looking finished and then beat the real closing reading on the
-    // next warm load. Exactly why appendOiFrameLive withholds it too.
+    // Never synthesise a bucket whose interval hasn't finished elapsing.
     if (bEnd > now) continue;
-    out.set(bEnd, p); // input is ascending, so the last write is the bucket's close
+    // Only the reading that CLOSES the bucket may represent it — see above.
+    if (p.t !== bEnd) continue;
+    out.set(bEnd, p);
   }
   return out;
 }
 
-/** Mirror a whole frame to Redis: write every kept bucket, drop what left. */
+/**
+ * Mirror a whole frame to Redis: write every CLOSED bucket, drop whatever left.
+ *
+ * The `p.t <= now` guard is the one appendOiFrameLive applies, for its reason: a
+ * forming bucket holds only the elapsed part of its interval, and nothing in the
+ * stored shape distinguishes it from a finished one (`partial` marks incomplete
+ * STRIKE COVERAGE, not an incomplete time span). Persisting it would warm-load
+ * looking authoritative and beat the backfill's correct version — up to 59 minutes
+ * of it on the 1h frame. It is excluded from the write while still counting as
+ * KEPT, so the HDEL below can never drop a bucket that is still live in memory.
+ */
 function persistWholeFrame(
   rk: string,
   points: { t: number }[],
   before: Set<number>,
   ttl: number,
+  now: number,
 ): void {
   const kept = new Set<number>();
   for (const p of points) {
     kept.add(p.t);
-    queueHashField(rk, p.t, p, ttl);
+    if (p.t <= now) queueHashField(rk, p.t, p, ttl);
   }
   queueHashDrop(
     rk,
@@ -3955,10 +3981,9 @@ function persistWholeFrame(
  * otherwise never overwritten. Returns the number of buckets created, so a no-op
  * costs no Redis writes at all.
  */
-function coarsenOiFrame(key: OiFrameKey, srcKey: OiFrameKey): number {
+function coarsenOiFrame(key: OiFrameKey, srcKey: OiFrameKey, now: number): number {
   const cfg = OI_FRAMES[key];
   const store = oiFrameStores[key];
-  const now = Date.now();
   const collapsed = collapseToBuckets(
     oiFrameStores[srcKey].points,
     cfg.intervalMin * 60 * 1000,
@@ -3966,12 +3991,24 @@ function coarsenOiFrame(key: OiFrameKey, srcKey: OiFrameKey): number {
   );
   if (collapsed.size === 0) return 0;
 
+  const cutoff = now - cfg.retentionMs;
   const byBucket = new Map<number, OiAggPoint>();
   for (const p of store.points) byBucket.set(p.t, p);
   let filled = 0;
   for (const [bEnd, p] of collapsed) {
+    // A source bucket that admits it understates its window is worth no more than
+    // the hole it would fill — and propagating the flag would hand the same
+    // unrepairable session a SECOND retry budget under partialRepairFromMs, whose
+    // rate-limit key is per-interval. Leave those to the live path and the backfill.
+    if (p.partial) continue;
+    // Count only buckets that will survive the retention filter below, so a
+    // derivation that is immediately discarded can't trigger a whole-frame rewrite
+    // and a log line claiming work that didn't happen.
+    if (bEnd < cutoff) continue;
     const cur = byBucket.get(bEnd);
-    if (cur && !(cur.partial && !p.partial)) continue;
+    // Derived points are never `partial` (filtered above), so the sole overwrite
+    // case is repairing a bucket that admitted it was incomplete.
+    if (cur && !cur.partial) continue;
     // Copy rather than share: the live append path mutates stored points in place,
     // and this one still belongs to the source frame.
     byBucket.set(bEnd, { ...p, t: bEnd });
@@ -3979,20 +4016,24 @@ function coarsenOiFrame(key: OiFrameKey, srcKey: OiFrameKey): number {
   }
   if (filled === 0) return 0;
 
-  const cutoff = now - cfg.retentionMs;
   const before = new Set(store.points.map((p) => p.t));
   store.points = Array.from(byBucket.values())
     .filter((p) => p.t >= cutoff)
     .sort((a, b) => a.t - b.t);
-  persistWholeFrame(redisKeys.oiFrame(key), store.points, before, frameTtlSec(cfg));
+  persistWholeFrame(
+    redisKeys.oiFrame(key),
+    store.points,
+    before,
+    frameTtlSec(cfg),
+    now,
+  );
   return filled;
 }
 
 /** The same derivation for a coarse FUTURES frame. */
-function coarsenFutOiFrame(key: OiFrameKey, srcKey: OiFrameKey): number {
+function coarsenFutOiFrame(key: OiFrameKey, srcKey: OiFrameKey, now: number): number {
   const cfg = OI_FRAMES[key];
   const store = futOiFrameStores[key];
-  const now = Date.now();
   const collapsed = collapseToBuckets(
     futOiFrameStores[srcKey].points,
     cfg.intervalMin * 60 * 1000,
@@ -4000,22 +4041,29 @@ function coarsenFutOiFrame(key: OiFrameKey, srcKey: OiFrameKey): number {
   );
   if (collapsed.size === 0) return 0;
 
+  const cutoff = now - cfg.retentionMs;
   const byBucket = new Map<number, FutOiPoint>();
   for (const p of store.points) byBucket.set(p.t, p);
   let filled = 0;
   for (const [bEnd, p] of collapsed) {
-    if (byBucket.has(bEnd)) continue; // futures points carry no `partial` caveat
+    if (bEnd < cutoff) continue;
+    if (byBucket.has(bEnd)) continue; // FutOiPoint carries no `partial` caveat
     byBucket.set(bEnd, cloneFutOiPoint({ t: bEnd, legs: p.legs }));
     filled++;
   }
   if (filled === 0) return 0;
 
-  const cutoff = now - cfg.retentionMs;
   const before = new Set(store.points.map((p) => p.t));
   store.points = Array.from(byBucket.values())
     .filter((p) => p.t >= cutoff)
     .sort((a, b) => a.t - b.t);
-  persistWholeFrame(redisKeys.futFrame(key), store.points, before, frameTtlSec(cfg));
+  persistWholeFrame(
+    redisKeys.futFrame(key),
+    store.points,
+    before,
+    frameTtlSec(cfg),
+    now,
+  );
   return filled;
 }
 
@@ -4027,11 +4075,15 @@ function coarsenFutOiFrame(key: OiFrameKey, srcKey: OiFrameKey): number {
  * a Kite session: the data it needs is already in the stores.
  */
 function coarsenFrames(): void {
+  // ONE `now` for every frame and both families. Two Date.now() calls either side
+  // of a bucket boundary would let the futures frame gain a bar the option frame
+  // skipped in the same pass, and hand the two different retention cutoffs.
+  const now = Date.now();
   for (const key of OI_FRAME_KEYS) {
     const src = coarsenSourceFor(key);
     if (!src) continue;
-    const opt = coarsenOiFrame(key, src);
-    const fut = coarsenFutOiFrame(key, src);
+    const opt = coarsenOiFrame(key, src, now);
+    const fut = coarsenFutOiFrame(key, src, now);
     if (opt || fut) {
       console.log(
         `[OptionOI] Derived ${opt} option and ${fut} futures ${key} bucket(s) from ` +
@@ -4417,9 +4469,10 @@ function rememberFutContracts(contracts: FutContract[]): void {
   queuePlainWrite(
     redisKeys.futContracts,
     Array.from(futOiKnownContracts.values()),
-    // The LONGEST frame retention, not a hardcoded one: these labels have to
-    // outlive every frame that can still hold points for a rolled-over contract,
-    // or the endpoint falls back to a blank tradingsymbol for it.
+    // The LONGEST frame retention rather than one frame's, so widening any frame
+    // can't silently outlive these labels. NOTE this is an upper bound, not a
+    // guarantee: the early return above means the TTL is only refreshed when the
+    // contract SET changes (monthly), so the key can still lapse before then.
     Math.floor((maxFrameRetentionMs() + REDIS_TTL_SLACK_MS) / 1000),
   );
 }
@@ -4487,22 +4540,18 @@ function mergeFutOiFrame(key: OiFrameKey, backfilled: FutOiPoint[]): void {
     // live append path mutates stored points in place.
     if (!byBucket.has(bEnd)) byBucket.set(bEnd, cloneFutOiPoint(p));
   }
-  const cutoff = Date.now() - cfg.retentionMs;
+  const now = Date.now();
+  const cutoff = now - cfg.retentionMs;
   const before = new Set(store.points.map((p) => p.t));
   store.points = Array.from(byBucket.values())
     .filter((p) => p.t >= cutoff)
     .sort((a, b) => a.t - b.t);
-  const ttl = frameTtlSec(cfg);
-  const rk = redisKeys.futFrame(key);
-  const kept = new Set<number>();
-  for (const p of store.points) {
-    kept.add(p.t);
-    queueHashField(rk, p.t, p, ttl);
-  }
-  queueHashDrop(
-    rk,
-    Array.from(before).filter((t) => !kept.has(t)),
-    ttl,
+  persistWholeFrame(
+    redisKeys.futFrame(key),
+    store.points,
+    before,
+    frameTtlSec(cfg),
+    now,
   );
 }
 
