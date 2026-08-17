@@ -51,6 +51,15 @@ export interface FullQuote {
   last_price: number;
   close: number;
   oi: number;
+  /**
+   * Exchange's own "when did this last trade" stamp, "YYYY-MM-DD HH:MM:SS" in IST,
+   * or "" when Kite didn't send one (it is absent for some instruments).
+   *
+   * This is the only field in a /quote response that reveals whether the market is
+   * actually OPEN. On an exchange holiday /quote answers with the previous session's
+   * prices and OI and looks entirely normal — see isQuoteFromToday.
+   */
+  last_trade_time: string;
 }
 
 /** Extended full quote that also includes OHLC for EOD capture. */
@@ -81,6 +90,9 @@ interface RawFullQuote {
   last_price?: number;
   ohlc?: { open?: number; high?: number; low?: number; close?: number };
   oi?: number;
+  last_trade_time?: string;
+  /** Indices carry no last_trade_time; this is the equivalent stamp for them. */
+  exchange_timestamp?: string;
 }
 
 /** Raw /quote entry including market depth (5 levels of bid/ask). */
@@ -426,6 +438,9 @@ export class KiteClient {
             last_price: v.last_price ?? 0,
             close: v.ohlc?.close ?? 0,
             oi: v.oi ?? 0,
+            // Prefer the trade stamp; fall back to the exchange stamp, which is
+            // what an INDEX carries (the NIFTY spot has no "last trade").
+            last_trade_time: v.last_trade_time ?? v.exchange_timestamp ?? "",
           });
         }
       }

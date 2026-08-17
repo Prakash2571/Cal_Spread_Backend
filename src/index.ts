@@ -174,6 +174,8 @@ interface OptionOiDay {
   meta: Map<number, { strike: number; type: "CE" | "PE" }>;
   series: Map<number, OiSample[]>; // option token -> per-minute samples
   spot: { t: number; ltp: number }[]; // index spot per-minute samples
+  /** Strike window these totals are summed over, pinned once — see pinStrikeWindow. */
+  window?: StrikeWindow;
 }
 let optionOiDay: OptionOiDay | null = null;
 
@@ -235,6 +237,25 @@ interface OiAggPoint {
   totalPe: number;
   straddle: number; // auto-ATM straddle premium (ATM CE LTP + ATM PE LTP)
   spot: number; // NIFTY index spot at this bucket
+  /**
+   * The strike window (inclusive, by STRIKE VALUE) these totals were summed over.
+   *
+   * Published because a total is only comparable with another total over the SAME
+   * strikes. The window used to be recomputed per sample around the live ATM, so it
+   * slid by a strike every time NIFTY crossed one — and first-differencing two
+   * totals across a slide yields `OI(strike that entered) - OI(strike that left)`,
+   * which on the asymmetric 26-down/24-up window is lakhs of "OI change" that never
+   * happened, biased in the direction of the trend. It is now pinned per session
+   * (see pinStrikeWindow), and shipping the bounds lets the client refuse to
+   * difference two buckets that don't share them instead of trusting that they do.
+   *
+   * Absent on buckets written before this existed. The client treats absent-vs-
+   * absent as comparable (that is the old behaviour, unchanged for old data) and
+   * absent-vs-present as not comparable, so warm-loaded history degrades to one
+   * dropped bar at the seam rather than a wrong one.
+   */
+  wLo?: number;
+  wHi?: number;
   /**
    * Set when this reading is KNOWN to understate the window: a quote response that
    * didn't cover every strike in it, or a reconstruction whose historical call for
@@ -346,7 +367,24 @@ const futOiKnownContracts = new Map<string, FutContract>();
 /** Keep a key a day past its data's retention, so a paused process can resume. */
 const REDIS_TTL_SLACK_MS = 24 * 60 * 60 * 1000;
 const redisKeys = {
-  oiFrame: (f: OiFrameKey) => `oiframe:${f}`,
+  /**
+   * `v2` because the totals changed MEANING, not shape.
+   *
+   * Buckets written before the strike window was pinned were summed over a window
+   * that followed the live ATM, so a v1 bucket and a v2 bucket are sums over
+   * different strikes and differencing them is exactly the artifact pinning exists
+   * to remove. A version bump is the only thing that reaches the HISTORY: the frames
+   * retain a week, `mergeOiFrame` deliberately prefers a bucket that already exists,
+   * and the gap detectors see no gap — so without this the fix would have applied
+   * only to buckets captured from the deploy onwards while the visible week kept
+   * showing the same false spikes.
+   *
+   * Starting empty makes the gap-aware backfill reconstruct the full retention
+   * window from Kite with the pinned window applied, which is the normal cold-start
+   * path and already paced for the rate limit. The v1 keys carry a TTL and age out
+   * on their own.
+   */
+  oiFrame: (f: OiFrameKey) => `oiframe:v2:${f}`,
   futFrame: (f: OiFrameKey) => `futoiframe:${f}`,
   futContracts: "futcontracts",
   prevClose: "prevclose",
@@ -2101,26 +2139,21 @@ app.get("/api/option-oi-series/:underlying", (_req: Request, res: Response) => {
     straddle: number;
   }[] = [];
   const n = store.spot.length;
+  // The session's pinned window, so this endpoint's totals are summed over the same
+  // strikes as the frame caches' — and are comparable minute to minute. It used to
+  // recompute the window around each minute's ATM, which made consecutive totals
+  // sums over different strikes (see pinStrikeWindow).
+  const win = store.window;
   for (let i = 0; i < n; i++) {
     const sp = store.spot[i];
     if (!sp) continue;
-    // ATM for this minute from the captured spot.
-    let atmIdx = 0;
-    let bestD = Infinity;
-    for (let k = 0; k < strikes.length; k++) {
-      const d = Math.abs(strikes[k]! - sp.ltp);
-      if (d < bestD) {
-        bestD = d;
-        atmIdx = k;
-      }
-    }
-    const lo = Math.max(0, atmIdx - 26);
-    const hi = Math.min(strikes.length - 1, atmIdx + 24);
+    const atmIdx = nearestStrikeIndex(strikes, sp.ltp);
     let totalCe = 0;
     let totalPe = 0;
-    for (let k = lo; k <= hi; k++) {
-      const ceTok = ceByStrike.get(strikes[k]!);
-      const peTok = peByStrike.get(strikes[k]!);
+    for (const strike of strikes) {
+      if (win && !inWindow(win, strike)) continue;
+      const ceTok = ceByStrike.get(strike);
+      const peTok = peByStrike.get(strike);
       if (ceTok != null) totalCe += store.series.get(ceTok)?.[i]?.oi ?? 0;
       if (peTok != null) totalPe += store.series.get(peTok)?.[i]?.oi ?? 0;
     }
@@ -3295,13 +3328,73 @@ function candleEndMs(candleStart: number, bsize: number): number {
   return bucketEndMs(candleStart + 60 * 1000, bsize);
 }
 
-/** Is it a weekday within (roughly) NSE market hours, in IST? */
+/**
+ * IST dates that ARE trading sessions despite falling on a weekend — NSE's muhurat
+ * and other special sessions. Comma-separated ISO dates, e.g.
+ * `EXTRA_SESSION_DAYS=2026-11-08`.
+ *
+ * Needed because the weekend test below would otherwise skip such a session
+ * entirely, leaving its buckets obtainable only from the Kite backfill. A list is
+ * unavoidable here: a special session has to be known BEFORE it starts, and no
+ * quote can tell us in advance.
+ */
+const EXTRA_SESSION_DAYS = new Set(
+  (process.env.EXTRA_SESSION_DAYS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
+
+/**
+ * Is it a weekday (or a configured special session) within NSE market hours, in IST?
+ *
+ * Deliberately does NOT know about exchange holidays — no reliable list is available
+ * to this process, and a hardcoded one silently rots into skipping real sessions.
+ * Holidays are caught after the fact by isQuoteFromToday, which asks the exchange
+ * itself whether anything has traded. This function is only the cheap first filter.
+ */
 function isIstMarketHours(): boolean {
   const ist = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
   const dow = ist.getUTCDay(); // 0 = Sun ... 6 = Sat
-  if (dow === 0 || dow === 6) return false;
+  if ((dow === 0 || dow === 6) && !EXTRA_SESSION_DAYS.has(istDayKey())) return false;
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
   return mins >= 9 * 60 + 10 && mins <= 15 * 60 + 35; // 09:10–15:35 IST
+}
+
+/**
+ * Did this quote trade TODAY? `true` yes, `false` demonstrably not, `null` no
+ * evidence either way.
+ *
+ * This is how an exchange HOLIDAY is detected. A mid-week holiday passes
+ * isIstMarketHours() happily, and /quote answers with the previous session's prices
+ * and open interest — nothing in the payload looks unusual. Capture therefore built
+ * a full day of buckets carrying last session's OI, unflagged, so the level charts
+ * showed a session that never traded and the chain's OI Δ% printed a confident 0.0%
+ * where a dash was the honest answer.
+ *
+ * Three-valued on purpose, and callers must FAIL OPEN on `null`: Kite omits the
+ * stamp for some instruments, and a missing field must never be read as "the market
+ * is shut". Only positive evidence — a well-formed stamp from an earlier day —
+ * suppresses capture.
+ */
+function isQuoteFromToday(stamp: string | undefined): boolean | null {
+  if (!stamp) return null;
+  const day = stamp.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
+  return day === istDayKey();
+}
+
+/** Log the "market is shut today" notice once per IST day, not once a minute. */
+let closedDayLogged = "";
+function noteMarketClosed(what: string, stamp: string): void {
+  const day = istDayKey();
+  if (closedDayLogged === day) return;
+  closedDayLogged = day;
+  console.log(
+    `[OptionOI] ${day} looks like an exchange holiday — ${what} last traded at ` +
+      `${stamp}. Skipping capture; the frames stay untouched rather than gaining a ` +
+      `day of carried-forward values. (Set EXTRA_SESSION_DAYS if this is wrong.)`,
+  );
 }
 
 /** Resolve the nearest NIFTY option expiry's tokens + strike/type metadata. */
@@ -3392,6 +3485,17 @@ async function captureOptionOi(): Promise<void> {
 
     const quotes = await kite.getQuoteFull([sel.spotId, ...sel.ids]);
     const qmap = new Map(quotes.map((q) => [q.instrument_token, q]));
+
+    // Exchange holiday check, BEFORE anything is recorded. The spot index carries
+    // an exchange_timestamp; if it is from an earlier day then nothing has traded
+    // today and every value in this response is last session's. Writing them would
+    // manufacture a whole flat session in the frames. Fails open when the stamp is
+    // missing (isQuoteFromToday returns null) so a real session is never skipped.
+    const spotStamp = qmap.get(store.spotToken)?.last_trade_time;
+    if (isQuoteFromToday(spotStamp) === false) {
+      noteMarketClosed(`${OPTION_OI_UNDERLYING} spot`, spotStamp!);
+      return;
+    }
 
     // Push one aligned sample for EVERY tracked token (carry forward if a
     // particular strike is missing from this response) so all series + spot
@@ -3684,6 +3788,66 @@ async function backfillPrevClose(): Promise<void> {
   }
 }
 
+/**
+ * The total-OI window: strikes below / above the ATM. Mirrored by the client's
+ * TOTAL_DOWN / TOTAL_UP, which is why the chain's own totals agree with the chart's.
+ */
+const WINDOW_DOWN = 26;
+const WINDOW_UP = 24;
+
+/** Inclusive strike bounds (by strike VALUE, not ladder index). */
+interface StrikeWindow {
+  lo: number;
+  hi: number;
+}
+
+/** Ladder index of the strike nearest `spot`. */
+function nearestStrikeIndex(strikes: number[], spot: number): number {
+  let best = 0;
+  let bestD = Infinity;
+  for (let k = 0; k < strikes.length; k++) {
+    const d = Math.abs(strikes[k]! - spot);
+    if (d < bestD) {
+      bestD = d;
+      best = k;
+    }
+  }
+  return best;
+}
+
+/**
+ * Pin the strike window a session's totals will be summed over, from its FIRST
+ * spot reading.
+ *
+ * Pinning is what makes a first difference meaningful. An ATM-following window
+ * changes membership whenever spot crosses a strike, and the totals then jump by
+ * the OI of the strikes swapped in and out — a move of lakhs, in the direction of
+ * the trend, indistinguishable from real buildup on the ΔOI histogram.
+ *
+ * Bounds are STRIKE VALUES rather than ladder indices on purpose: the ladder can
+ * gain or lose strikes intraday (a new far strike gets listed), which would silently
+ * shift an index-based window while leaving the recorded bounds looking identical.
+ *
+ * The width is generous enough that a pinned window stays around the money for a
+ * whole session — 26 strikes below and 24 above is roughly ±1250 NIFTY points — and
+ * a day that genuinely travels further is one where a fixed reference frame is the
+ * more honest way to read the change anyway. Every session re-pins, and the client
+ * never differences across an overnight gap, so drift cannot accumulate.
+ */
+function pinStrikeWindow(strikes: number[], spot: number): StrikeWindow | null {
+  if (strikes.length === 0 || !(spot > 0)) return null;
+  const atm = nearestStrikeIndex(strikes, spot);
+  return {
+    lo: strikes[Math.max(0, atm - WINDOW_DOWN)]!,
+    hi: strikes[Math.min(strikes.length - 1, atm + WINDOW_UP)]!,
+  };
+}
+
+/** Is `strike` inside a pinned window? */
+function inWindow(w: StrikeWindow, strike: number): boolean {
+  return strike >= w.lo && strike <= w.hi;
+}
+
 /** Sorted strike ladder + strike→token maps for a captured day. */
 function frameLadder(meta: OptionOiDay["meta"]): {
   strikes: number[];
@@ -3702,7 +3866,12 @@ function frameLadder(meta: OptionOiDay["meta"]): {
 }
 
 /**
- * Total CE/PE OI over the 26-below / ATM / 24-above window at the LATEST snapshot.
+ * Total CE/PE OI over this session's PINNED strike window, at the latest snapshot.
+ *
+ * The window is fixed for the session on the first reading (see pinStrikeWindow) so
+ * consecutive totals are sums over the same strikes and their difference is a real
+ * OI change. The straddle still tracks the LIVE ATM — that is a different quantity
+ * and is meant to follow spot.
  *
  * `unseeded` lists tokens this cycle has no reading for AT ALL (see captureOptionOi).
  * They contribute 0 to the totals, so if any of them falls inside the window the
@@ -3721,17 +3890,18 @@ function currentWindowAgg(
   const { strikes, ceByStrike, peByStrike } = frameLadder(store.meta);
   if (strikes.length === 0) return null;
 
-  let atmIdx = 0;
-  let bestD = Infinity;
-  for (let k = 0; k < strikes.length; k++) {
-    const d = Math.abs(strikes[k]! - spot);
-    if (d < bestD) {
-      bestD = d;
-      atmIdx = k;
-    }
+  if (!store.window) {
+    const pinned = pinStrikeWindow(strikes, spot);
+    if (!pinned) return null;
+    store.window = pinned;
+    console.log(
+      `[OptionOI] ${store.day} ${store.expiry}: totals window pinned to strikes ` +
+        `${pinned.lo}–${pinned.hi} (first spot ${spot}).`,
+    );
   }
-  const lo = Math.max(0, atmIdx - 26);
-  const hi = Math.min(strikes.length - 1, atmIdx + 24);
+  const win = store.window;
+  const atmIdx = nearestStrikeIndex(strikes, spot);
+
   let totalCe = 0;
   let totalPe = 0;
   const lastOf = (tok: number | undefined): { oi: number; ltp: number } => {
@@ -3741,9 +3911,10 @@ function currentWindowAgg(
     return { oi: s?.oi ?? 0, ltp: s?.ltp ?? 0 };
   };
   let missing = 0;
-  for (let k = lo; k <= hi; k++) {
-    const ce = ceByStrike.get(strikes[k]!);
-    const pe = peByStrike.get(strikes[k]!);
+  for (const strike of strikes) {
+    if (!inWindow(win, strike)) continue;
+    const ce = ceByStrike.get(strike);
+    const pe = peByStrike.get(strike);
     totalCe += lastOf(ce).oi;
     totalPe += lastOf(pe).oi;
     if (unseeded && ((ce != null && unseeded.has(ce)) || (pe != null && unseeded.has(pe)))) {
@@ -3754,7 +3925,15 @@ function currentWindowAgg(
   const ceAtm = lastOf(ceByStrike.get(strikes[atmIdx]!)).ltp;
   const peAtm = lastOf(peByStrike.get(strikes[atmIdx]!)).ltp;
   const straddle = ceAtm > 0 && peAtm > 0 ? ceAtm + peAtm : 0;
-  const point: OiAggPoint = { t: Date.now(), totalCe, totalPe, straddle, spot };
+  const point: OiAggPoint = {
+    t: Date.now(),
+    totalCe,
+    totalPe,
+    straddle,
+    spot,
+    wLo: win.lo,
+    wHi: win.hi,
+  };
   if (missing > 0) point.partial = 1;
   return point;
 }
@@ -4335,20 +4514,30 @@ async function backfillOiFrames(fromMsOverride?: number): Promise<void> {
     const lastOi = new Map<number, number>();
     const lastClose = new Map<number, number>();
     const perMinute: OiAggPoint[] = [];
+    /**
+     * Pinned strike window per IST day, exactly as the live path pins it — from that
+     * day's FIRST reading. Reconstructing with a per-minute ATM window would have
+     * re-introduced the sliding-window artifact on every backfilled bucket, and
+     * would also have disagreed with the live buckets either side of it.
+     *
+     * A run that starts mid-session pins from the first minute it HAS, which may
+     * differ from what the live path pinned that morning. That is fine and is why
+     * the bounds travel with each point: the client simply won't difference across
+     * the seam, so the worst case is one dropped bar rather than a wrong one.
+     */
+    const dayWindows = new Map<string, StrikeWindow>();
     for (const mk of sortedMins) {
       const spot = spotByMin.get(mk)!;
       if (!(spot > 0)) continue;
-      let atmIdx = 0;
-      let bd = Infinity;
-      for (let k = 0; k < strikes.length; k++) {
-        const d = Math.abs(strikes[k]! - spot);
-        if (d < bd) {
-          bd = d;
-          atmIdx = k;
-        }
+      const dayKey = mk.slice(0, 10); // "YYYY-MM-DD" out of "YYYY-MM-DDTHH:MM"
+      let win = dayWindows.get(dayKey);
+      if (!win) {
+        const pinned = pinStrikeWindow(strikes, spot);
+        if (!pinned) continue;
+        win = pinned;
+        dayWindows.set(dayKey, win);
       }
-      const lo = Math.max(0, atmIdx - 26);
-      const hi = Math.min(strikes.length - 1, atmIdx + 24);
+      const atmIdx = nearestStrikeIndex(strikes, spot);
       let totalCe = 0;
       let totalPe = 0;
       // Carry-forward OI for the window sum.
@@ -4372,9 +4561,10 @@ async function backfillOiFrames(fromMsOverride?: number): Promise<void> {
       const unknownTok = (tok: number | undefined): boolean =>
         tok != null && (!oiByToken.has(tok) || unfetched.has(tok));
       let missing = 0;
-      for (let k = lo; k <= hi; k++) {
-        const ce = ceByStrike.get(strikes[k]!);
-        const pe = peByStrike.get(strikes[k]!);
+      for (const strike of strikes) {
+        if (!inWindow(win, strike)) continue;
+        const ce = ceByStrike.get(strike);
+        const pe = peByStrike.get(strike);
         totalCe += sumOi(ce);
         totalPe += sumOi(pe);
         if (unknownTok(ce) || unknownTok(pe)) missing++;
@@ -4384,7 +4574,15 @@ async function backfillOiFrames(fromMsOverride?: number): Promise<void> {
       const straddle = ceAtm > 0 && peAtm > 0 ? ceAtm + peAtm : 0;
       const t = new Date(tsByMin.get(mk) ?? `${mk}:00`).getTime();
       if (Number.isFinite(t)) {
-        const point: OiAggPoint = { t, totalCe, totalPe, straddle, spot };
+        const point: OiAggPoint = {
+          t,
+          totalCe,
+          totalPe,
+          straddle,
+          spot,
+          wLo: win.lo,
+          wHi: win.hi,
+        };
         if (missing > 0) point.partial = 1;
         perMinute.push(point);
       }
@@ -4592,6 +4790,15 @@ async function captureFuturesOi(): Promise<void> {
 
     const quotes = await kite.getQuoteFull(sel.ids);
     const qmap = new Map(quotes.map((q) => [q.instrument_token, q]));
+
+    // Same holiday guard as captureOptionOi, read off the CURRENT-month contract —
+    // the one that always trades. Without it a holiday would still fill the futures
+    // frames with carried-forward OI even though the option side had bailed out.
+    const nearStamp = qmap.get(sel.contracts[0]!.token)?.last_trade_time;
+    if (isQuoteFromToday(nearStamp) === false) {
+      noteMarketClosed(`${FUT_OI_UNDERLYING} futures`, nearStamp!);
+      return;
+    }
 
     // Carry-forward source: the newest 1m point (finest cadence we keep).
     const finest = futOiFrameStores["1m"].points;
