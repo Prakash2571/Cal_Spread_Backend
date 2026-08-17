@@ -55,21 +55,54 @@ function monthFromDate(date: string): string {
   return date.slice(0, 7);
 }
 
-/** True during NSE market hours: Mon-Fri, 09:15-15:30 IST. */
+/** True during NSE equity-derivatives hours: Mon-Fri, 09:15-15:40 IST. */
 function isMarketOpen(): boolean {
   const ist = istNow();
   const day = ist.getUTCDay(); // 0 Sun ... 6 Sat
   if (day === 0 || day === 6) return false;
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-  return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 30;
+  return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 40;
 }
 
-/** Market slots we capture: 10:00 through 15:30.
- *  NSE market hours are 9:15 AM to 3:30 PM IST.
- *  The first full-hour boundary after market open (9:15) is 10:00, and the
- *  last capture is at market close (15:30).
+/**
+ * First IST date on which the equity-derivatives session ran to 15:40.
+ *
+ * SEBI's revised framework extended the F&O close by ten minutes with effect from
+ * 2026-08-03 (the cash market's own close is unchanged). Everything this file
+ * stores is an NFO futures price, so the derivatives close is the only one that
+ * matters here.
  */
-const MARKET_HOURS = ["10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "15:30"];
+const FNO_CLOSE_EXTENDED_FROM = "2026-08-03";
+
+/** Market slots we capture: 10:00 through the close.
+ *  The first full-hour boundary after market open (9:15) is 10:00, and the last
+ *  capture is at market close.
+ */
+const MARKET_HOURS_TO_1530 = ["10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "15:30"];
+const MARKET_HOURS_TO_1540 = ["10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "15:40"];
+
+/**
+ * The slot list that applies to an IST date.
+ *
+ * Date-gated rather than a single updated constant because `hourly_prices` holds
+ * months of history: sessions before the extension have a "15:30" closing record
+ * and can never grow a "15:40" one. Expecting the new label everywhere would leave
+ * every archived day permanently one slot short, so the nightly completeness check
+ * would report INCOMPLETE forever and re-backfill against candles that cannot
+ * satisfy it. Both lists are the same LENGTH, so per-day expected counts are
+ * unaffected.
+ */
+function marketHoursFor(date: string): string[] {
+  return date >= FNO_CLOSE_EXTENDED_FROM ? MARKET_HOURS_TO_1540 : MARKET_HOURS_TO_1530;
+}
+
+/** Slot list for the current IST day. */
+function marketHoursToday(): string[] {
+  return marketHoursFor(istDayKey());
+}
+
+/** Number of slots per session — identical across both eras. */
+const SLOTS_PER_DAY = MARKET_HOURS_TO_1540.length;
 
 /** Small delay utility. */
 function delay(ms: number): Promise<void> {
@@ -275,17 +308,17 @@ export interface HourlySchedulerDeps {
 let lastCapturedSlot = "";
 
 /**
- * Given the current IST time, determine which MARKET_HOURS slot (if any)
+ * Given the current IST time, determine which market slot (if any)
  * we are within a 2-minute capture window of.
  * - For ":00" slots: fires when minutes are 0-2.
- * - For "15:30": fires when hour is 15 and minutes are 30-32.
- * Returns the matched slot string (e.g. "10:00" or "15:30") or null.
+ * - For "15:40": fires when hour is 15 and minutes are 40-42.
+ * Returns the matched slot string (e.g. "10:00" or "15:40") or null.
  */
 function currentCaptureSlot(ist: Date): string | null {
   const hh = ist.getUTCHours();
   const mm = ist.getUTCMinutes();
 
-  for (const slot of MARKET_HOURS) {
+  for (const slot of marketHoursToday()) {
     const slotHour = parseInt(slot.slice(0, 2), 10);
     const slotMin = parseInt(slot.slice(3, 5), 10);
 
@@ -298,7 +331,7 @@ function currentCaptureSlot(ist: Date): string | null {
 
 /**
  * Sets up a setInterval (every 60s). On each tick, checks if we are within
- * a capture window of any MARKET_HOURS slot. If so, captures prices and
+ * a capture window of any market slot. If so, captures prices and
  * drains the cache.
  */
 export function startHourlyScheduler(deps: HourlySchedulerDeps): void {
@@ -341,7 +374,7 @@ let backfilling = false;
  * For each FNO stock, look back over a window and backfill EVERY missing market
  * slot ("holes") via the Kite historical API (60-minute candles) — not just
  * slots after the most recent record. This recovers gaps such as a missed 15:00
- * even when a later slot (15:30) was captured. Runs on startup AND after each
+ * even when a later slot (15:40) was captured. Runs on startup AND after each
  * login, so any window missed while the system was down is recovered.
  */
 export async function backfillMissedHours(deps: HourlySchedulerDeps): Promise<void> {
@@ -370,7 +403,7 @@ export async function backfillMissedHours(deps: HourlySchedulerDeps): Promise<vo
   const nowHour = istHourKey();
 
   // Look back over a window and fill ANY missing slot (holes), not just slots
-  // after the most recent record — so a missed 15:00 (with 15:30 present) is
+  // after the most recent record — so a missed 15:00 (with 15:40 present) is
   // still recovered. Configurable via HOURLY_BACKFILL_LOOKBACK_DAYS (default 7).
   const lookbackDays = Number(process.env.HOURLY_BACKFILL_LOOKBACK_DAYS ?? "7") || 7;
   const windowStart = new Date(istNow().getTime() - lookbackDays * 24 * 60 * 60 * 1000)
@@ -521,7 +554,7 @@ function allExpectedSlots(
   while (current <= end) {
     const dateStr = current.toISOString().slice(0, 10);
     if (isWeekday(dateStr)) {
-      for (const hour of MARKET_HOURS) {
+      for (const hour of marketHoursFor(dateStr)) {
         // On the end (today) day, don't expect slots that haven't happened yet.
         if (dateStr === endDate && hour > endTime) continue;
         slots.push({ date: dateStr, time: hour });
@@ -533,21 +566,23 @@ function allExpectedSlots(
 }
 
 /**
- * Convert a Kite candle timestamp to a MARKET_HOURS slot key.
+ * Convert a Kite candle timestamp to a market slot key.
  *
  * Kite 60-minute candles for NSE are timestamped at the candle START time,
  * which falls at :15 past the hour (e.g. "2025-07-08 09:15:00" covers
  * 09:15-10:15, "2025-07-08 10:15:00" covers 10:15-11:15, etc.).
  *
- * Our MARKET_HOURS slots represent capture points (10:00, 11:00, ..., 15:00,
- * 15:30). The top-of-hour slots correspond to candle END times rounded down.
+ * Our slots represent capture points (10:00, 11:00, ..., 15:00, close). The
+ * top-of-hour slots correspond to candle END times rounded down.
  * So we map: "09:15" -> "10:00", "10:15" -> "11:00", ..., "14:15" -> "15:00".
  *
- * Additionally, Kite produces a shorter candle from 15:15-15:30 (market close).
- * The "15:15" candle maps to our "15:30" slot since its close price is the
- * market closing price at 15:30.
+ * Additionally, Kite produces a shorter final candle from 15:15 to the close.
+ * The "15:15" candle maps to our closing slot since its close price is the
+ * market closing price — 15:30 for sessions before the F&O extension, 15:40 from
+ * 2026-08-03 onward. The label is taken from the date's own slot list so it can
+ * never drift out of step with what backfill expects to find.
  *
- * Only return a slot key if the result is a valid MARKET_HOURS entry.
+ * Only return a slot key if the result is a valid slot for that date.
  */
 function candleToSlotKey(timestamp: string): string | null {
   // The Kite API returns timestamps in IST.
@@ -561,19 +596,22 @@ function candleToSlotKey(timestamp: string): string | null {
   const hh = parseInt(timePart.slice(0, 2), 10);
   const mm = parseInt(timePart.slice(3, 5), 10);
 
+  const slots = marketHoursFor(datePart);
+  const closingSlot = slots[slots.length - 1]!;
+
   // Kite 60-min candles start at :15 past the hour. The candle ending at
   // the next top-of-hour is the slot we want.
   // e.g. candle starting at 09:15 ends at 10:15 -> slot "10:00"
   //      candle starting at 14:15 ends at 15:15 -> slot "15:00"
-  // Special case: candle starting at 15:15 ends at 15:30 -> slot "15:30"
+  // Special case: the 15:15 candle runs to the close -> closing slot
   if (mm === 15) {
-    // For the 15:15 candle, it covers 15:15-15:30 (market close).
+    // For the 15:15 candle, it covers 15:15 through market close.
     if (hh === 15) {
-      return `${datePart}_15:30`;
+      return `${datePart}_${closingSlot}`;
     }
     const slotHour = hh + 1;
     const slotKey = `${String(slotHour).padStart(2, "0")}:00`;
-    if (MARKET_HOURS.includes(slotKey)) {
+    if (slots.includes(slotKey)) {
       return `${datePart}_${slotKey}`;
     }
   }
@@ -583,12 +621,12 @@ function candleToSlotKey(timestamp: string): string | null {
   if (mm === 0) {
     const slotHour = hh + 1;
     const slotKey = `${String(slotHour).padStart(2, "0")}:00`;
-    if (MARKET_HOURS.includes(slotKey)) {
+    if (slots.includes(slotKey)) {
       return `${datePart}_${slotKey}`;
     }
     // Also check if the hour itself is a valid slot (direct match).
     const directKey = `${String(hh).padStart(2, "0")}:00`;
-    if (MARKET_HOURS.includes(directKey)) {
+    if (slots.includes(directKey)) {
       return `${datePart}_${directKey}`;
     }
   }
@@ -604,7 +642,7 @@ function candleToSlotKey(timestamp: string): string | null {
 
 /**
  * Runs once after market close. Counts how many of today's expected hourly
- * slot-records are stored (symbols x MARKET_HOURS). If the day is complete it
+ * slot-records are stored (symbols x slots-per-day). If the day is complete it
  * logs a CHECK PASS; if not, it backfills the missing slots and re-verifies.
  */
 export async function reviewDayCompleteness(deps: HourlySchedulerDeps): Promise<void> {
@@ -631,7 +669,7 @@ export async function reviewDayCompleteness(deps: HourlySchedulerDeps): Promise<
     console.log("[DayReview] No eligible symbols on the board — skipping.");
     return;
   }
-  const expectedTotal = symbols.length * MARKET_HOURS.length;
+  const expectedTotal = symbols.length * SLOTS_PER_DAY;
 
   const countToday = (): Promise<number> =>
     HourlyPrice.countDocuments({ date: today, symbol: { $in: symbols } });
@@ -639,7 +677,7 @@ export async function reviewDayCompleteness(deps: HourlySchedulerDeps): Promise<
   const before = await countToday();
   console.log(
     `[DayReview] Stored ${before}/${expectedTotal} slot-records for ${today} ` +
-      `(${symbols.length} symbols x ${MARKET_HOURS.length} slots).`,
+      `(${symbols.length} symbols x ${SLOTS_PER_DAY} slots).`,
   );
 
   if (before >= expectedTotal) {
@@ -676,7 +714,7 @@ let lastReviewDay = "";
 
 /**
  * Fires the end-of-day review once per weekday, within a 2-minute window of the
- * configured time (DAY_REVIEW_TIME, default "16:30" IST — an hour after close).
+ * configured time (DAY_REVIEW_TIME, default "16:30" IST — 50 minutes after close).
  */
 export function startDayReviewScheduler(deps: HourlySchedulerDeps): void {
   const parts = (process.env.DAY_REVIEW_TIME ?? "16:30").split(":");

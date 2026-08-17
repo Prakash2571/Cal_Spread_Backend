@@ -634,7 +634,7 @@ export async function recomputeSpreadSummary(): Promise<void> {
 }
 
 // ============================================================================
-//  Scheduler: checks at 15:35 IST for EOD capture and 16:00 IST for summary
+//  Scheduler: checks at 15:45 IST for EOD capture and 16:00 IST for summary
 // ============================================================================
 
 let schedulerInterval: ReturnType<typeof setInterval> | null = null;
@@ -642,7 +642,7 @@ let lastComputedDay = "";
 
 /**
  * Start the EOD scheduler. Checks every 60 seconds:
- *   - At 15:35-15:37 IST: triggers EOD data capture (closing data).
+ *   - At 15:45-15:47 IST: triggers EOD data capture (closing data).
  *   - At 16:00-16:02 IST: triggers spread summary recomputation (ensures
  *     today's data is included).
  */
@@ -662,11 +662,11 @@ export function startEodScheduler(deps: EodSchedulerDeps): void {
         const mm = ist.getUTCMinutes();
         const today = istDayKey();
 
-        // Trigger EOD capture at 15:35-15:37 IST (3-min window).
-        if (hh === 15 && mm >= 35 && mm <= 37) {
+        // Trigger EOD capture at 15:45-15:47 IST (3-min window).
+        if (hh === 15 && mm >= 45 && mm <= 47) {
           if (today !== lastCapturedDay) {
             lastCapturedDay = today;
-            console.log("[EODCapture] Triggering EOD capture at 15:35 IST...");
+            console.log("[EODCapture] Triggering EOD capture at 15:45 IST...");
             await captureEodData(deps);
           }
         }
@@ -685,7 +685,7 @@ export function startEodScheduler(deps: EodSchedulerDeps): void {
     })();
   }, 60_000);
 
-  console.log("[EODCapture] EOD scheduler started (checking every 60s for 15:35 & 16:00 IST).");
+  console.log("[EODCapture] EOD scheduler started (checking every 60s for 15:45 & 16:00 IST).");
 }
 
 // ============================================================================
@@ -697,7 +697,7 @@ export function startEodScheduler(deps: EodSchedulerDeps): void {
  * last_date in spread_summary. If spread_daily has newer data (or spread_summary
  * is empty), trigger a full recomputeSpreadSummary() to catch up.
  *
- * This covers the case where the process crashed between EOD capture (15:35)
+ * This covers the case where the process crashed between EOD capture (15:45)
  * and summary recomputation (16:00), leaving today's data captured but the
  * summary stale.
  */

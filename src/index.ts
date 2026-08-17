@@ -547,7 +547,7 @@ async function flushRedisWrites(): Promise<void> {
  *
  * Every other flush trigger sits behind `isIstMarketHours()`, so a failure on the
  * session's LAST tick — a 60s cooldown is more than enough to swallow it — parked
- * the day's 15:30 closing buckets in memory until the next trading morning, and an
+ * the day's 15:40 closing buckets in memory until the next trading morning, and an
  * overnight deploy dropped them. This timer is deliberately not market-hours gated.
  */
 function startRedisFlushRetry(): void {
@@ -1536,13 +1536,13 @@ function istDateTime(d: Date): string {
   return ist.toISOString().slice(0, 19).replace("T", " ");
 }
 
-/** True during NSE market hours: Mon-Fri, 09:15-15:30 IST. */
+/** True during NSE equity-derivatives hours: Mon-Fri, 09:15-15:40 IST. */
 function isMarketOpen(): boolean {
   const ist = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
   const day = ist.getUTCDay(); // 0 Sun ... 6 Sat (on the IST-shifted date)
   if (day === 0 || day === 6) return false;
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-  return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 30;
+  return mins >= 9 * 60 + 15 && mins <= 15 * 60 + 40;
 }
 
 /** Simple delay helper to avoid rate-limiting on consecutive Kite API calls. */
@@ -2559,7 +2559,7 @@ app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
   }
   if (!isMarketOpen()) {
     res.status(400).json({
-      error: "Trades can only be taken during market hours (Mon–Fri, 9:15–15:30 IST).",
+      error: "Trades can only be taken during market hours (Mon–Fri, 9:15–15:40 IST).",
     });
     return;
   }
@@ -3272,9 +3272,16 @@ function sessionOpenMs(t: number): number {
   return istTimeOnDayMs(t, 9 * 60 + 15);
 }
 
-/** Epoch ms of the 15:30 IST session close on the day containing `t`. */
+/**
+ * Epoch ms of the 15:40 IST session close on the day containing `t`.
+ *
+ * 15:40 is the equity-derivatives close from 2026-08-03 (SEBI's revised framework
+ * added ten minutes). Not date-gated on that changeover, unlike the hourly slot
+ * labels: the frames this clamps keep at most 7 days, so nothing predating the
+ * extension is still in retention.
+ */
 function sessionCloseMs(t: number): number {
-  return istTimeOnDayMs(t, 15 * 60 + 30);
+  return istTimeOnDayMs(t, 15 * 60 + 40);
 }
 
 /**
@@ -3296,8 +3303,8 @@ function isPreOpenBucket(bEnd: number): boolean {
  *
  * Frames used to be stamped with the LAST SAMPLE that landed in a bucket, which
  * is why the 5m axis read 15:29 and the 15m axis 15:29/15:14: the last
- * once-a-minute capture inside 15:25–15:30 is the 15:29 one. Stamping the
- * boundary instead makes every label a real interval edge (…15:20, 15:25, 15:30)
+ * once-a-minute capture inside 15:35–15:40 is the 15:39 one. Stamping the
+ * boundary instead makes every label a real interval edge (…15:30, 15:35, 15:40)
  * and matches the "bucket end" contract the client already assumes.
  *
  * Boundaries are aligned to the IST CALENDAR, not to the epoch. For 1m/5m/15m the
@@ -3308,7 +3315,7 @@ function isPreOpenBucket(bEnd: number): boolean {
  */
 function bucketEndMs(t: number, bsize: number): number {
   const close = sessionCloseMs(t);
-  // We keep sampling until 15:35, after the 15:30 close. Those readings belong to
+  // We keep sampling until 15:45, after the 15:40 close. Those readings belong to
   // the closing bucket — so the day's last bar carries the true closing value
   // instead of opening a bucket that never traded.
   if (t >= close) return close;
@@ -3358,7 +3365,7 @@ function isIstMarketHours(): boolean {
   const dow = ist.getUTCDay(); // 0 = Sun ... 6 = Sat
   if ((dow === 0 || dow === 6) && !EXTRA_SESSION_DAYS.has(istDayKey())) return false;
   const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-  return mins >= 9 * 60 + 10 && mins <= 15 * 60 + 35; // 09:10–15:35 IST
+  return mins >= 9 * 60 + 10 && mins <= 15 * 60 + 45; // 09:10–15:45 IST
 }
 
 /**
@@ -4108,7 +4115,7 @@ function coarsenSourceFor(key: OiFrameKey): OiFrameKey | null {
  * they are incomplete, the correct value the Kite backfill fetches minutes later
  * would be discarded and the wrong bar frozen for the frame's whole retention.
  * Requiring the closing point costs nothing: it exists in every covered bucket (the
- * 15m point at 11:00, and the 15:30 clamp at the day's end), and where it is
+ * 15m point at 11:00, and the 15:40 clamp at the day's end), and where it is
  * missing the live path or the backfill fills that bucket properly instead.
  */
 function collapseToBuckets<T extends { t: number }>(

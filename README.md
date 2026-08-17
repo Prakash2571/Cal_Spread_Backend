@@ -56,7 +56,7 @@ Kite daily candles on a cold start.
   epoch — otherwise every 1h boundary would land on the IST half-hour.
 - The still-forming bucket is never published, so every point on every chart is a finished
   interval.
-- The last bucket of a session is clamped to the 15:30 close, so the closing bar carries the
+- The last bucket of a session is clamped to the 15:40 close, so the closing bar carries the
   real closing value instead of opening one that never traded.
 - Purely pre-open buckets are dropped on both the live and backfill paths, so the day's first
   bar doesn't depend on whether the process happened to be up before the open.
