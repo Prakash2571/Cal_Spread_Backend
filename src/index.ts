@@ -2250,12 +2250,22 @@ app.get("/api/spread-stats/:symbol", async (req: Request, res: Response) => {
  * Fill price at the TOUCH: the best price on one side of the book (highest bid
  * / lowest ask).
  *
- * This is deliberately not a volume-weighted walk down the book. A VWAP across
- * several levels produces a price that DOES NOT EXIST on the exchange — it
- * isn't a multiple of the instrument's tick size — so every P&L derived from it
- * is subtly unreal and the slippage it implies can't be reconciled against the
- * quotes. The touch is a real, tick-valid, executable price, which makes the
- * slippage exactly the spread that was crossed: buy the ask, sell the bid.
+ * This is deliberately not a volume-weighted walk down the book, for two
+ * reasons.
+ *
+ * A VWAP across several levels produces a price that DOES NOT EXIST on the
+ * exchange — it isn't a multiple of the instrument's tick size — so every P&L
+ * derived from it is subtly unreal and the slippage it implies can't be
+ * reconciled against the quotes. The touch is a real, tick-valid, executable
+ * price, which makes the slippage exactly the spread that was crossed: buy the
+ * ask, sell the bid.
+ *
+ * And for the size actually traded here, a walk could never trigger anyway.
+ * These trades are exactly 1 lot, and an F&O order must be a whole multiple of
+ * the lot size — partial lots can't be traded — so every resting order, and
+ * therefore the aggregate quantity at any level, is at least one lot. One lot
+ * cannot exhaust the touch. Ignoring `qty` is exact at this size, not an
+ * approximation; it would only become one if multi-lot sizing were ever added.
  *
  * Returns null when that side of the book is empty, so callers can refuse the
  * trade instead of inventing a fill from a last-traded price.
