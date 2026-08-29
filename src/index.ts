@@ -51,6 +51,10 @@ import { initNseFnoConnections } from "./db.js";
 import { SpreadSummary } from "./db.js";
 import { startHourlyScheduler, backfillMissedHours, startDayReviewScheduler } from "./hourlyCapture.js";
 import { startEodScheduler, backfillStockFutures, checkAndRecomputeSummary } from "./eodCapture.js";
+// Box arbitrage (paper trading) — an independent module that reuses this file's
+// Kite session, ticker hub, instrument cache and charge estimator by injection.
+// It owns its own routes, models and collections; nothing here changes.
+import { registerBoxModule, type BoxModule } from "./box/index.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
@@ -72,6 +76,14 @@ const kite = new KiteClient({
 
 // One shared Kite WebSocket fanned out to all SSE clients (keeps us within
 // Zerodha's per-key connection limit no matter how many visitors watch).
+/**
+ * Set once the box module is registered (see the bottom of this file). Lets the
+ * feed's death notify the box engine without this line having to know about the
+ * module — the box engine then drops its cached books instead of trading a
+ * frozen order book.
+ */
+let onFeedSessionLost: (() => void) | null = null;
+
 const tickerHub = new TickerHub(
   () => ({ apiKey: kite.getApiKey(), accessToken: kite.getAccessToken() }),
   () => {
@@ -79,6 +91,7 @@ const tickerHub = new TickerHub(
     // so we don't restore a dead token on the next restart.
     kite.clearSession();
     void clearKiteSession();
+    onFeedSessionLost?.();
   },
 );
 
@@ -5072,6 +5085,25 @@ async function restoreSessionOnStartup(): Promise<void> {
   }
 }
 
+// ============================================================================
+//  Box arbitrage (paper trading) — registered LAST so it cannot affect the
+//  matching of any existing route. It mounts its own /api/box/* endpoints and
+//  reuses the shared Kite session, ticker hub, instrument cache and the very same
+//  Zerodha charge estimator the calendar trades use.
+// ============================================================================
+const boxModule: BoxModule = registerBoxModule(app, {
+  kite,
+  tickerHub,
+  getAllInstruments: getAllInstrumentsCached,
+  getBoard: async () => deriveFnoBoard(await getAllInstrumentsCached()),
+  priceChargeGroups,
+  istDayKey,
+  makeIdResolver,
+  requireAdmin,
+  getAdminRole,
+});
+onFeedSessionLost = () => boxModule.engine.onSessionLost();
+
 app.listen(PORT, () => {
   console.log(`Cal_Spread backend listening on http://localhost:${PORT}`);
   if (!process.env.KITE_API_KEY || !process.env.KITE_API_SECRET) {
@@ -5130,6 +5162,10 @@ app.listen(PORT, () => {
     // Intraday NIFTY option-OI capture so the Analytics page has a real
     // 1m/5m/15m/1h baseline at any time of day.
     startOptionOiCapture();
+    // Adopt any box paper position left open by the previous process and start
+    // its monitor. Discovery of NEW boxes stays off until an admin presses RUN,
+    // but an OPEN position must be managed from the moment the process is up.
+    void boxModule.boot().catch((e) => console.warn("[Box] boot failed:", e));
   });
 
   // Open the dedicated trade/charges ledger connection (no-op when TRADE_LOG_URI

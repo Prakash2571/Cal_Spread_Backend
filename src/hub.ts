@@ -27,6 +27,17 @@ export class TickerHub {
   private handle: TickerHandle | null = null;
   private clients = new Set<HubClient>();
   private subscribed = new Set<number>();
+  /**
+   * Headless consumers holding the upstream socket open.
+   *
+   * An SSE client is not the only legitimate reason to have a live feed: the box
+   * scanner has to keep managing open paper positions with no browser attached.
+   * A retainer keeps the connection (and therefore the cached books) alive while
+   * that is true, without pretending to be a client that wants SSE frames.
+   */
+  private retainers = new Set<object>();
+  /** Headless tick consumers (the box quote store). */
+  private tickListeners = new Set<(ticks: Tick[]) => void>();
   /** Last tick seen per token, so new clients get an instant snapshot. */
   private latest = new Map<number, Tick>();
   /** When each token's live tick was last received (for freshness checks). */
@@ -66,13 +77,81 @@ export class TickerHub {
     return () => {
       this.clients.delete(client);
       // No listeners left → drop the upstream connection to free the quota.
-      if (this.clients.size === 0) this.stop();
+      // A retainer (e.g. the box engine managing open positions) counts as a
+      // listener: when one is held the feed must survive the last SSE client.
+      if (this.clients.size === 0 && this.retainers.size === 0) this.stop();
     };
   }
 
   /** Seed the tick cache from a REST snapshot (so late joiners get data fast). */
   seed(ticks: Tick[]): void {
     for (const t of ticks) this.latest.set(t.token, t);
+  }
+
+  /**
+   * Hold the upstream connection open without being an SSE client.
+   *
+   * Returns a release function. While at least one retainer is held the socket
+   * (and the cached books) survive even with no browser connected — which is what
+   * lets a headless strategy keep monitoring its open positions.
+   */
+  retain(tokens: number[] = []): () => void {
+    const key = {};
+    this.retainers.add(key);
+    if (tokens.length > 0) this.ensureSocket(tokens);
+    else this.ensureSocket([]);
+    return () => {
+      this.retainers.delete(key);
+      if (this.clients.size === 0 && this.retainers.size === 0) this.stop();
+    };
+  }
+
+  /** Subscribe extra tokens for a headless consumer. */
+  subscribeTokens(tokens: number[]): void {
+    if (tokens.length === 0) return;
+    this.ensureSocket(tokens);
+  }
+
+  /**
+   * Stop streaming tokens no headless consumer needs any more.
+   *
+   * Tokens an SSE client still asks for are kept, so a scanner releasing a strike
+   * window can never blank a chart someone is watching.
+   */
+  unsubscribeTokens(tokens: number[]): void {
+    if (tokens.length === 0) return;
+    const stillWanted = new Set<number>();
+    for (const client of this.clients) {
+      for (const t of client.tokens) stillWanted.add(t);
+    }
+    const drop = tokens.filter((t) => this.subscribed.has(t) && !stillWanted.has(t));
+    if (drop.length === 0) return;
+    for (const t of drop) {
+      this.subscribed.delete(t);
+      this.latest.delete(t);
+      this.latestAt.delete(t);
+      this.latestLadder.delete(t);
+      this.latestLadderAt.delete(t);
+    }
+    this.handle?.unsubscribe(drop);
+  }
+
+  /** Register a headless tick consumer. Returns an unsubscribe function. */
+  addTickListener(fn: (ticks: Tick[]) => void): () => void {
+    this.tickListeners.add(fn);
+    return () => {
+      this.tickListeners.delete(fn);
+    };
+  }
+
+  /** True when the upstream socket is currently connected. */
+  isConnected(): boolean {
+    return this.handle !== null;
+  }
+
+  /** How many instrument tokens are currently subscribed upstream. */
+  subscribedCount(): number {
+    return this.subscribed.size;
   }
 
   private ensureSocket(tokens: number[]): void {
@@ -118,6 +197,20 @@ export class TickerHub {
     return this.latest.get(token);
   }
 
+  /**
+   * The latest full book for a token WITH the instant it was received, so a
+   * caller can apply its own freshness policy (the box engine's gate is much
+   * tighter than getFreshLadder's 5s default).
+   */
+  getLadderSnapshot(
+    token: number,
+  ): { last: number; bids: DepthLevel[]; asks: DepthLevel[]; at: number } | null {
+    const l = this.latestLadder.get(token);
+    const at = this.latestLadderAt.get(token);
+    if (!l || at === undefined) return null;
+    return { ...l, at };
+  }
+
   private broadcast(ticks: Tick[]): void {
     const now = Date.now();
     const slim: Tick[] = [];
@@ -143,6 +236,15 @@ export class TickerHub {
         this.latestLadderAt.set(t.token, now);
       }
       slim.push(s);
+    }
+    // Headless consumers first: a strategy's decision must not queue behind SSE
+    // writes. Isolated so a listener throwing can never break the fan-out.
+    for (const listener of this.tickListeners) {
+      try {
+        listener(slim);
+      } catch (err) {
+        console.warn("[Hub] tick listener failed:", err);
+      }
     }
     const payload = `data: ${JSON.stringify(slim)}\n\n`;
     for (const client of this.clients) {

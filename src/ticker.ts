@@ -31,6 +31,15 @@ export interface TickerHandle {
   close: () => void;
   /** Subscribe to additional instrument tokens on the existing socket. */
   subscribe: (tokens: number[]) => void;
+  /**
+   * Stop streaming the given tokens on the existing socket.
+   *
+   * Needed by consumers whose token set MOVES rather than only grows (the box
+   * scanner re-centres its strike windows as the underlying drifts). Without it
+   * every abandoned strike would stay subscribed for the life of the connection
+   * and eventually exhaust Zerodha's per-connection instrument limit.
+   */
+  unsubscribe: (tokens: number[]) => void;
 }
 
 interface ConnectOptions {
@@ -93,6 +102,21 @@ export function connectTicker(opts: ConnectOptions): TickerHandle {
         sendSubscribe(tokens);
       } else {
         pendingTokens.push(...tokens);
+      }
+    },
+    unsubscribe: (tokens: number[]) => {
+      if (tokens.length === 0) return;
+      if (isOpen) {
+        try {
+          ws.send(JSON.stringify({ a: "unsubscribe", v: tokens }));
+        } catch {
+          // Socket went away mid-send; the tokens die with the connection.
+        }
+      } else {
+        // Never opened (or already closed): just drop them from the queue so
+        // they are not subscribed once it does open.
+        const drop = new Set(tokens);
+        pendingTokens = pendingTokens.filter((t) => !drop.has(t));
       }
     },
   };
