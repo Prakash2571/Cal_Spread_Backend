@@ -255,6 +255,22 @@ price, so a box that was mispriced at the close is still visible:
 indicativeCostPerUnit = Last(K1 CE) - Last(K2 CE) + Last(K2 PE) - Last(K1 PE)
 ```
 
+Two guards keep that view honest, because **a last-traded price is not a closing
+price**: a strike that has not traded for days carries a price struck when the
+underlying was somewhere else, and four legs each stale from a different session
+produce an enormous fictional edge.
+
+1. **Session filter.** Only legs whose `last_trade_time` falls in the newest
+   session present in the data are used (derived from the quotes themselves, so no
+   holiday calendar is needed). Legs that last traded earlier are dropped and
+   counted in `indicative_stale_legs`.
+2. **Plausibility bound.** A long box always costs money and can never cost more
+   than it pays, so the implied cost must sit strictly inside `(0, width)`. A
+   negative cost would imply free money of unlimited size; a cost above the width
+   would mean paying more than the guaranteed payoff. Outside that range no cost
+   and no edge are reported at all — the row is simply absent rather than shown
+   with an impossible number.
+
 Those rows carry `price_source: "last_close"` and status `INDICATIVE`, are never
 `liquidity_ok`, and cannot reach the entry path — the market-open gate sits in
 front of it independently. Open positions are likewise **not** auto-exited while
@@ -366,7 +382,7 @@ seven-strike/21-pair limits, the long-box legs, ask-for-BUY and bid-for-SELL, bo
 payoff and gross edge, one-lot enforcement and touch-quantity validation, freshness and
 missing-bid/missing-ask rejection, fee and safety-buffer reporting, ₹1,199 vs ₹1,200 of spread,
 duplicate rejection, token-dependent recalculation, reversed exit sides, the convergence
-threshold, the market-closed gate and the indicative last-close view, the refusal to exit at a loss or under ₹600, the 75% capture rule, insufficient exit
+threshold, the market-closed gate, the indicative last-close view and its plausibility bound, the refusal to exit at a loss or under ₹600, the 75% capture rule, insufficient exit
 liquidity leaving a position open, manual close (including its refusal), serialization, and that
 STOP blocks new entries while still managing open positions.
 

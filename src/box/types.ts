@@ -176,7 +176,12 @@ export type BoxRejectReason =
   | "duplicate_open"
   | "stale_underlying"
   /** The market is shut, so these figures are indicative and not executable. */
-  | "market_closed";
+  | "market_closed"
+  /**
+   * The last-close prices do not form a coherent box (cost outside 0..width),
+   * which means at least one leg has not traded recently enough to be comparable.
+   */
+  | "implausible_close";
 
 /** Per-leg liquidity/freshness detail for an evaluation. */
 export interface BoxLegEvaluation {

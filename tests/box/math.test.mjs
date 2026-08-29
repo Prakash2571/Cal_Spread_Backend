@@ -625,3 +625,88 @@ test("a missing closing price yields no indicative edge rather than a guess", ()
   assert.equal(ev.tradable, false);
   assert.equal(ev.reject, "no_quote");
 });
+
+
+test("a last-close set that cannot be a real box reports NO edge", () => {
+  const { candidate } = goodCandidate();
+  const width = candidate.box_width; // 200
+
+  // The exact shape seen in production: one leg's "last price" came from a
+  // session when the underlying was far away, so the implied cost is NEGATIVE and
+  // the arithmetic claims an edge many times the box's maximum payoff.
+  const stale = new Map([
+    [candidate.legs.k1_ce.token, 40],
+    [candidate.legs.k2_ce.token, 30],
+    [candidate.legs.k2_pe.token, 40],
+    [candidate.legs.k1_pe.token, 475], // stale: struck weeks ago
+  ]);
+  const ev = evaluateCandidateIndicative({ candidate, lastPrices: stale, now: NOW });
+  // Raw arithmetic would have said cost -425 → edge (200+425) x 75 = ₹46,875,
+  // against a box that can never pay more than 200 x 75 = ₹15,000.
+  assert.equal(ev.entry_box_cost_per_unit, null, "an impossible cost must not be shown");
+  assert.equal(ev.gross_edge, null, "and no edge may be derived from it");
+  assert.equal(ev.reject, "implausible_close");
+  assert.equal(ev.tradable, false);
+
+  // A cost above the width is equally impossible (paying more than the payoff).
+  const overpriced = new Map([
+    [candidate.legs.k1_ce.token, 500],
+    [candidate.legs.k2_ce.token, 30],
+    [candidate.legs.k2_pe.token, 40],
+    [candidate.legs.k1_pe.token, 20],
+  ]);
+  const over = evaluateCandidateIndicative({
+    candidate,
+    lastPrices: overpriced,
+    now: NOW,
+  });
+  assert.equal(over.gross_edge, null);
+  assert.equal(over.reject, "implausible_close");
+
+  // The boundaries themselves are excluded: a box costing exactly its width has
+  // no edge, and one costing exactly 0 is the free-money case.
+  for (const cost of [0, width]) {
+    const atBound = new Map([
+      [candidate.legs.k1_ce.token, 100 + cost],
+      [candidate.legs.k2_ce.token, 100],
+      [candidate.legs.k2_pe.token, 50],
+      [candidate.legs.k1_pe.token, 50],
+    ]);
+    const ev2 = evaluateCandidateIndicative({ candidate, lastPrices: atBound, now: NOW });
+    assert.equal(ev2.gross_edge, null, `cost ${cost} must be rejected`);
+  }
+
+  // …while a coherent close is reported normally.
+  const sane = new Map([
+    [candidate.legs.k1_ce.token, 300],
+    [candidate.legs.k2_ce.token, 220],
+    [candidate.legs.k2_pe.token, 200],
+    [candidate.legs.k1_pe.token, 105],
+  ]);
+  const ok = evaluateCandidateIndicative({ candidate, lastPrices: sane, now: NOW });
+  assert.equal(ok.entry_box_cost_per_unit, 175);
+  assert.equal(ok.gross_edge, GOOD_BOX.grossEdge);
+  assert.equal(ok.reject, "market_closed");
+});
+
+test("an indicative edge can never exceed the box's maximum payoff", () => {
+  const { candidate } = goodCandidate();
+  const maxPayoff = candidate.box_width * candidate.lot_size; // ₹15,000
+  // Sweep a wide range of last-price sets; anything reported must be bounded.
+  for (const k1pe of [0.5, 5, 50, 105, 300, 900]) {
+    const prices = new Map([
+      [candidate.legs.k1_ce.token, 300],
+      [candidate.legs.k2_ce.token, 220],
+      [candidate.legs.k2_pe.token, 200],
+      [candidate.legs.k1_pe.token, k1pe],
+    ]);
+    const ev = evaluateCandidateIndicative({ candidate, lastPrices: prices, now: NOW });
+    if (ev.gross_edge !== null) {
+      assert.ok(ev.gross_edge > 0, `k1pe=${k1pe} gave a non-positive edge`);
+      assert.ok(
+        ev.gross_edge < maxPayoff,
+        `k1pe=${k1pe} gave ₹${ev.gross_edge}, above the ₹${maxPayoff} maximum payoff`,
+      );
+    }
+  }
+});

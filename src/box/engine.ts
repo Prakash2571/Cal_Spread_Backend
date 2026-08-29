@@ -125,6 +125,10 @@ export class BoxEngine {
   private indicativeTimer: NodeJS.Timeout | null = null;
   private indicativeAt: number | null = null;
   private indicativePriced = 0;
+  /** The trading day the last-close view was built from. */
+  private indicativeSessionDay: string | null = null;
+  /** Legs discarded because they last traded in an EARLIER session. */
+  private indicativeStaleLegs = 0;
 
   constructor(private deps: BoxEngineDeps) {
     this.cfg = loadBoxConfig();
@@ -397,13 +401,40 @@ export class BoxEngine {
         .filter((s): s is string => typeof s === "string");
       if (ids.length === 0) return;
       const quotes = await this.deps.kite.getQuoteFull(ids);
+
+      // Only legs that traded in the LATEST session may be compared.
+      //
+      // `last_price` is the price of the last trade, not "the close": a strike
+      // that has not traded for days carries a price struck when the underlying
+      // was somewhere else, and four legs each stale from a different session
+      // produce a fictional edge. The session is derived from the data itself —
+      // the newest trade date across the whole universe — so no holiday calendar
+      // is needed and a long weekend resolves correctly.
+      const sessionDay = quotes.reduce((latest, q) => {
+        const day = q.last_trade_time.slice(0, 10);
+        return day > latest ? day : latest;
+      }, "");
+
       const lastPrices = new Map<number, number>();
+      let stale = 0;
       for (const q of quotes) {
-        // After the close, last_price IS the day's closing price.
-        if (q.last_price > 0) lastPrices.set(q.instrument_token, q.last_price);
+        if (!(q.last_price > 0)) continue;
+        if (sessionDay && q.last_trade_time.slice(0, 10) !== sessionDay) {
+          stale++;
+          continue; // last traded in an earlier session — not comparable
+        }
+        lastPrices.set(q.instrument_token, q.last_price);
       }
+
+      this.indicativeSessionDay = sessionDay || null;
+      this.indicativeStaleLegs = stale;
       this.indicativePriced = this.scanner.publishIndicative(lastPrices);
       this.indicativeAt = Date.now();
+      console.log(
+        `[Box] last-close view: session ${sessionDay || "unknown"}, ` +
+          `${lastPrices.size}/${quotes.length} legs traded in it (${stale} stale), ` +
+          `${this.indicativePriced} box(es) with a coherent close.`,
+      );
     } catch (err) {
       console.warn("[Box] indicative (last-close) refresh failed:", err);
     }
@@ -1056,6 +1087,9 @@ export class BoxEngine {
       /** When the last-close view was last rebuilt, and how many boxes it priced. */
       indicative_at: this.indicativeAt,
       indicative_priced: this.indicativePriced,
+      /** The session the last-close prices come from, and legs dropped as stale. */
+      indicative_session_day: this.indicativeSessionDay,
+      indicative_stale_legs: this.indicativeStaleLegs,
       execution_mode: "paper_touch" as const,
       authenticated: this.deps.kite.getAccessToken() !== null,
       db_enabled: isBoxDbEnabled(),

@@ -476,7 +476,7 @@ export function evaluateCandidateIndicative(args: {
 
   const havePrices = legs.every((l) => l.price !== null);
   const byRole = new Map(legs.map((l) => [l.role, l]));
-  const costPerUnit = havePrices
+  const rawCost = havePrices
     ? round2(
         byRole.get("k1_ce")!.price! -
           byRole.get("k2_ce")!.price! +
@@ -484,20 +484,46 @@ export function evaluateCandidateIndicative(args: {
           byRole.get("k1_pe")!.price!,
       )
     : null;
+
+  // PLAUSIBILITY BOUND — the reason this function cannot simply do the arithmetic
+  // and publish it.
+  //
+  // A long box always costs money and can never cost more than it pays, so its
+  // cost per unit must sit strictly inside (0, width). Outside that range the
+  // inputs are not a coherent snapshot: a NEGATIVE cost implies free money of
+  // unlimited size, which no exchange offers, and a cost above the width implies
+  // paying more than the guaranteed payoff.
+  //
+  // It happens because a last-traded price is NOT a closing price for an illiquid
+  // option: a strike that has not traded for days carries a price struck when the
+  // underlying was somewhere else entirely, and combining four legs each stale
+  // from a different session produces an enormous fictional edge. Reporting no
+  // edge is the honest answer.
+  const plausible =
+    rawCost !== null && rawCost > 0 && rawCost < candidate.box_width;
+
+  const costPerUnit = plausible ? rawCost : null;
   const grossPerUnit = costPerUnit === null ? null : round2(candidate.box_width - costPerUnit);
   const grossEdge = grossPerUnit === null ? null : round2(grossPerUnit * lotSize);
+
+  let reject: BoxRejectReason;
+  if (!havePrices) reject = "no_quote";
+  else if (!plausible) reject = "implausible_close";
+  else reject = "market_closed";
 
   return {
     candidate,
     at: now,
     legs,
+    // Deliberately null rather than the raw figure when implausible: a number
+    // that cannot be true must not be displayed as though it were.
     entry_box_cost_per_unit: costPerUnit,
     gross_edge_per_unit: grossPerUnit,
     gross_edge: grossEdge,
     // Never tradable: there is no executable book behind these numbers.
     tradable: false,
     worst_age_ms: null,
-    reject: havePrices ? "market_closed" : "no_quote",
+    reject,
   };
 }
 
