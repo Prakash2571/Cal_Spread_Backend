@@ -32,6 +32,7 @@ import { buildCandidates, round2 } from "./math.js";
 import { BoxPositionBook, type BoxOpenPosition } from "./positions.js";
 import { BoxPositionMonitor } from "./positionMonitor.js";
 import { BoxQuoteStore, SpotStore } from "./quotes.js";
+import { initBoxConnection } from "../db.js";
 import {
   appendBoxEvent,
   closeBoxTrade,
@@ -71,6 +72,8 @@ export interface BoxEngineDeps {
   priceChargeGroups: PriceChargeGroupsFn;
   istDayKey: (at?: number) => string;
   makeIdResolver: (all: Instrument[]) => (token: number) => string | null;
+  /** NSE equity-derivatives hours, reused from the calendar engine. */
+  isMarketOpen: () => boolean;
 }
 
 /** Minutes past IST midnight, right now. */
@@ -115,6 +118,13 @@ export class BoxEngine {
   private lastError: string | null = null;
   private universeBuiltAt: number | null = null;
   private sseClients = new Set<SseClient>();
+
+  /** Cached exchange-hours state, refreshed on the market timer. */
+  private marketOpen = false;
+  private marketTimer: NodeJS.Timeout | null = null;
+  private indicativeTimer: NodeJS.Timeout | null = null;
+  private indicativeAt: number | null = null;
+  private indicativePriced = 0;
 
   constructor(private deps: BoxEngineDeps) {
     this.cfg = loadBoxConfig();
@@ -190,7 +200,11 @@ export class BoxEngine {
       },
       istDayKey: () => this.deps.istDayKey(),
       istMinutesOfDay: () => istMinutesOfDay(),
+      isMarketOpen: () => this.marketOpen,
     });
+
+    this.marketOpen = this.deps.isMarketOpen();
+    this.scanner.setMarketOpen(this.marketOpen);
   }
 
   /* ------------------------------- lifecycle ------------------------------ */
@@ -205,6 +219,11 @@ export class BoxEngine {
   async boot(): Promise<void> {
     if (this.started) return;
     this.started = true;
+    // Open the box database first (BOX_MONGODB_URI when set, otherwise the main
+    // one) so the positions below are read from the right place.
+    await initBoxConnection();
+    this.marketOpen = this.deps.isMarketOpen();
+    this.scanner.setMarketOpen(this.marketOpen);
     try {
       await this.adoptOpenPositions();
     } catch (err) {
@@ -220,8 +239,11 @@ export class BoxEngine {
     }
     console.log(
       `[Box] engine ready — ${this.positions.size} open paper box position(s), ` +
-        `min net edge ₹${this.cfg.minNetEdge}, safety ₹${this.cfg.safetyBuffer}, ` +
-        `freshness ${this.cfg.quoteMaxAgeMs}ms, ATM±${this.cfg.strikesEachSide}.`,
+        `entry gate ₹${this.cfg.minGrossEdge} GROSS from the spread` +
+        (this.cfg.minNetEdge > 0 ? ` (plus a ₹${this.cfg.minNetEdge} net floor)` : "") +
+        `, safety ₹${this.cfg.safetyBuffer} (reported, not gated), ` +
+        `freshness ${this.cfg.quoteMaxAgeMs}ms, ATM±${this.cfg.strikesEachSide}, ` +
+        `market ${this.marketOpen ? "OPEN" : "CLOSED"}.`,
     );
   }
 
@@ -243,11 +265,18 @@ export class BoxEngine {
     this.lastError = null;
     this.scanner.setDiscovering(true);
     this.ensureFeed();
+    this.startMarketWatch();
 
     try {
       await this.refreshUniverse();
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
+    }
+
+    // Shut market: populate the last-close view straight away so pressing RUN
+    // after hours still shows whatever opportunities existed at the close.
+    if (!this.marketOpen) {
+      await this.refreshIndicative().catch(() => {});
     }
 
     if (!this.universeTimer) {
@@ -306,6 +335,78 @@ export class BoxEngine {
       detail: `open_positions=${this.positions.size} (still monitored)`,
     });
     this.publish();
+  }
+
+  /**
+   * Keep the cached market-hours state current, and drive the last-close view
+   * while the exchange is shut.
+   *
+   * The transition matters: on close the live books stop arriving, so the
+   * indicative refresh takes over; on open it is dropped and the tick path
+   * resumes as the only source of truth.
+   */
+  private startMarketWatch(): void {
+    const sync = () => {
+      const open = this.deps.isMarketOpen();
+      if (open !== this.marketOpen) {
+        this.marketOpen = open;
+        this.scanner.setMarketOpen(open);
+        console.log(
+          `[Box] market ${open ? "OPEN — live executable prices" : "CLOSED — last-close view only, no entries"}.`,
+        );
+        if (open) {
+          // Live books supersede the closing snapshot immediately.
+          this.scanner.clearOpportunities();
+          this.scanner.refreshAll();
+        } else {
+          void this.refreshIndicative();
+        }
+      }
+    };
+    if (!this.marketTimer) {
+      this.marketTimer = setInterval(sync, 15_000);
+      this.marketTimer.unref?.();
+    }
+    if (!this.indicativeTimer) {
+      this.indicativeTimer = setInterval(() => {
+        if (!this.running || this.marketOpen) return;
+        void this.refreshIndicative();
+      }, this.cfg.indicativeRefreshMs);
+      this.indicativeTimer.unref?.();
+    }
+    sync();
+  }
+
+  /**
+   * Rebuild the opportunity list from LAST TRADED / CLOSING prices.
+   *
+   * Only ever runs while the market is shut. One REST /quote call per 500
+   * instruments, so the whole monitored universe costs a handful of requests a
+   * minute — and the result is explicitly marked `last_close`, so it can be read
+   * but never traded.
+   */
+  async refreshIndicative(): Promise<void> {
+    if (!this.deps.kite.getAccessToken()) return;
+    const tokens = [...this.subscribedOptionTokens];
+    if (tokens.length === 0) return;
+    try {
+      const all = await this.deps.getAllInstruments();
+      const resolve = this.deps.makeIdResolver(all);
+      const ids = tokens
+        .map(resolve)
+        .filter((s): s is string => typeof s === "string");
+      if (ids.length === 0) return;
+      const quotes = await this.deps.kite.getQuoteFull(ids);
+      const lastPrices = new Map<number, number>();
+      for (const q of quotes) {
+        // After the close, last_price IS the day's closing price.
+        if (q.last_price > 0) lastPrices.set(q.instrument_token, q.last_price);
+      }
+      this.indicativePriced = this.scanner.publishIndicative(lastPrices);
+      this.indicativeAt = Date.now();
+    } catch (err) {
+      console.warn("[Box] indicative (last-close) refresh failed:", err);
+    }
   }
 
   /** Attach to the shared feed (tick listener + retainer + publish loop). */
@@ -610,12 +711,12 @@ export class BoxEngine {
   private async openPaperTrade(args: {
     candidate: BoxCandidate;
     evaluation: BoxEvaluation;
-    entryChargesTotal: number;
-    estimatedExitChargesTotal: number;
-    netEdge: number;
-    charges: { entry: BoxCharges; estimated_exit: BoxCharges };
+    entryChargesTotal: number | null;
+    estimatedExitChargesTotal: number | null;
+    netEdge: number | null;
+    charges: { entry: BoxCharges; estimated_exit: BoxCharges } | null;
   }): Promise<string | null> {
-    const { candidate, evaluation, netEdge } = args;
+    const { candidate, evaluation } = args;
     const byRole = new Map(evaluation.legs.map((l) => [l.role, l]));
 
     const legs: IBoxLeg[] = [];
@@ -649,6 +750,11 @@ export class BoxEngine {
     }
 
     const costPerUnit = evaluation.entry_box_cost_per_unit!;
+    // The net edge is the after-cost figure for the record. With charges
+    // unavailable it falls back to gross minus the buffer, so the exit rules
+    // still have a sane reference point to measure convergence against.
+    const recordedNetEdge =
+      args.netEdge ?? round2(evaluation.gross_edge! - this.cfg.safetyBuffer);
     const payload: IBoxTrade = {
       execution_mode: "paper_touch",
       underlying: candidate.underlying,
@@ -664,10 +770,10 @@ export class BoxEngine {
       box_width: candidate.box_width,
       entry_box_cost: round2(costPerUnit * candidate.lot_size),
       entry_gross_edge: evaluation.gross_edge!,
-      entry_charges: args.charges.entry,
-      estimated_exit_charges: args.charges.estimated_exit,
+      entry_charges: args.charges ? args.charges.entry : null,
+      estimated_exit_charges: args.charges ? args.charges.estimated_exit : null,
       safety_buffer: this.cfg.safetyBuffer,
-      entry_net_edge: netEdge,
+      entry_net_edge: recordedNetEdge,
       opened_at: new Date(),
       current_remaining_edge: evaluation.gross_edge,
       exit_box_value: null,
@@ -707,7 +813,7 @@ export class BoxEngine {
       quantity: candidate.lot_size,
       entry_box_cost_per_unit: costPerUnit,
       entry_gross_edge: evaluation.gross_edge!,
-      entry_net_edge: netEdge,
+      entry_net_edge: recordedNetEdge,
       entry_charges_total: args.entryChargesTotal,
       estimated_exit_charges_total: args.estimatedExitChargesTotal,
       safety_buffer: this.cfg.safetyBuffer,
@@ -739,7 +845,7 @@ export class BoxEngine {
       entry_charges_total: args.entryChargesTotal,
       exit_charges_total: args.estimatedExitChargesTotal,
       safety_buffer: this.cfg.safetyBuffer,
-      net_edge: netEdge,
+      net_edge: recordedNetEdge,
       legs: toEventLegs(evaluation.legs),
       reason: "paper_touch fills at the revalidated executable touch",
       detail: `1 lot (${candidate.lot_size} qty)`,
@@ -747,7 +853,7 @@ export class BoxEngine {
 
     console.log(
       `[Box] PAPER ENTRY ${candidate.underlying} ${candidate.lower_strike}→${candidate.upper_strike} ` +
-        `${candidate.expiry} net edge ₹${netEdge} (gross ₹${evaluation.gross_edge})`,
+        `${candidate.expiry} gross ₹${evaluation.gross_edge} (net after fees ₹${recordedNetEdge})`,
     );
     this.broadcast("entry", { trade: serializeBoxTrade(doc) });
     return id;
@@ -911,7 +1017,11 @@ export class BoxEngine {
 
   getConfig() {
     return {
+      /** THE ENTRY GATE — ₹ from the spread alone. */
+      min_gross_edge: this.cfg.minGrossEdge,
+      /** Optional extra net floor; 0 means fees do not gate entry. */
       min_net_edge: this.cfg.minNetEdge,
+      require_priced_charges: this.cfg.requirePricedCharges,
       safety_buffer: this.cfg.safetyBuffer,
       quote_max_age_ms: this.cfg.quoteMaxAgeMs,
       underlying_max_age_ms: this.cfg.underlyingMaxAgeMs,
@@ -927,7 +1037,7 @@ export class BoxEngine {
       max_subscribed_tokens: this.cfg.maxSubscribedTokens,
       lots: 1,
       execution_mode: "paper_touch" as const,
-      universe: "NSE F&O (stocks + supported indices)",
+      universe: "NSE F&O options only — F&O stocks + supported indices",
     };
   }
 
@@ -935,8 +1045,17 @@ export class BoxEngine {
     const scanner = this.scanner.getStats();
     return {
       running: this.running,
-      state: this.running ? ("SCANNING" as const) : ("STOPPED" as const),
+      state: this.running
+        ? this.marketOpen
+          ? ("SCANNING" as const)
+          : ("MARKET_CLOSED" as const)
+        : ("STOPPED" as const),
       monitoring: true,
+      /** False → prices shown are last-close and NOTHING can be entered. */
+      market_open: this.marketOpen,
+      /** When the last-close view was last rebuilt, and how many boxes it priced. */
+      indicative_at: this.indicativeAt,
+      indicative_priced: this.indicativePriced,
       execution_mode: "paper_touch" as const,
       authenticated: this.deps.kite.getAccessToken() !== null,
       db_enabled: isBoxDbEnabled(),

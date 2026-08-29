@@ -50,6 +50,14 @@ export interface BoxMonitorDeps {
   istDayKey: () => string;
   /** Minutes past midnight IST, for the expiry-safety window. */
   istMinutesOfDay: () => number;
+  /**
+   * Whether the exchange is open.
+   *
+   * Metrics keep being refreshed when it is shut (so the UI stays informative),
+   * but no exit is attempted: there is no executable book to close into, and
+   * repeatedly "discovering" that would only spam the ledger.
+   */
+  isMarketOpen: () => boolean;
 }
 
 /** Market close in IST minutes-of-day (15:30). */
@@ -59,6 +67,8 @@ export class BoxPositionMonitor {
   private timer: NodeJS.Timeout | null = null;
   private ticking = false;
   private closingIds = new Set<string>();
+  /** position id → the last liquidity-gap SHAPE written to the ledger. */
+  private lastBlockedKey = new Map<string, string>();
   private stats = {
     cycles: 0,
     exitsTriggered: 0,
@@ -168,6 +178,11 @@ export class BoxPositionMonitor {
 
     if (pos.closing || this.closingIds.has(pos.id)) return;
 
+    // Outside market hours there is nothing to close into. The position stays
+    // open with its metrics refreshed, and no exit — or exit-refusal — is
+    // recorded, because "the market is shut" is not a liquidity event.
+    if (!this.deps.isMarketOpen()) return;
+
     const expirySafety = this.isInExpirySafetyWindow(pos);
     if (expirySafety && !pos.expiry_safety) {
       pos.expiry_safety = true;
@@ -226,9 +241,17 @@ export class BoxPositionMonitor {
     if (!exitLiquidityOk(metrics.legs)) {
       this.stats.exitsSkippedLiquidity++;
       const detail = describeLiquidityGap(metrics.legs, pos.lot_size);
-      if (pos.exit_blocked_reason !== detail) {
+      // Deduped on a STABLE key rather than the message: the human-readable
+      // detail embeds the current age and size, which change every cycle, so
+      // comparing messages would append a near-identical ledger row every second.
+      const key = liquidityGapKey(metrics.legs, pos.lot_size);
+      if (this.lastBlockedKey.get(pos.id) !== key) {
+        this.lastBlockedKey.set(pos.id, key);
         pos.exit_blocked_reason = detail;
         this.deps.onEvent("EXIT_SKIPPED_LIQUIDITY", pos, metrics, detail);
+      } else {
+        // Keep the displayed reason current without writing to the ledger again.
+        pos.exit_blocked_reason = detail;
       }
       return;
     }
@@ -243,6 +266,7 @@ export class BoxPositionMonitor {
     }
     // Clear any earlier blockage now that the exit is actually going through.
     pos.exit_blocked_reason = null;
+    this.lastBlockedKey.delete(pos.id);
 
     await this.executeExit(pos, metrics, reason);
   }
@@ -339,6 +363,26 @@ export class BoxPositionMonitor {
     const minutes = this.deps.istMinutesOfDay();
     return minutes >= IST_CLOSE_MINUTES - this.deps.cfg.expirySafetyMinutesBeforeClose;
   }
+}
+
+/**
+ * A STABLE identity for the shape of a liquidity gap: which legs are blocked and
+ * why, with no volatile numbers in it.
+ *
+ * Used to decide whether a blockage is genuinely new and worth another ledger
+ * row, as opposed to the same problem reported a second later.
+ */
+export function liquidityGapKey(legs: BoxLegEvaluation[], lotSize: number): string {
+  const parts: string[] = [];
+  for (const l of legs) {
+    let cause: string | null = null;
+    if (l.quote_at === null) cause = "no_book";
+    else if (!l.fresh) cause = "stale";
+    else if (l.price === null || !(l.price > 0)) cause = l.side === "BUY" ? "no_ask" : "no_bid";
+    else if (l.qty_at_touch < lotSize) cause = "thin";
+    if (cause) parts.push(`${l.role}:${cause}`);
+  }
+  return parts.join("|") || "ok";
 }
 
 /** A human-readable description of which legs cannot fill one lot. */

@@ -5099,6 +5099,7 @@ const boxModule: BoxModule = registerBoxModule(app, {
   priceChargeGroups,
   istDayKey,
   makeIdResolver,
+  isMarketOpen,
   requireAdmin,
   getAdminRole,
 });

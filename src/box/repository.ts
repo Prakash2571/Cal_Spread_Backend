@@ -8,7 +8,7 @@
  */
 
 import mongoose from "mongoose";
-import { isDbEnabled } from "../db.js";
+import { isBoxConnectionReady } from "../db.js";
 import {
   BoxTrade,
   BoxTradeEvent,
@@ -33,9 +33,12 @@ export function isDuplicateKeyError(err: unknown): boolean {
   );
 }
 
-/** True when box persistence is available (shares MONGODB_URI). */
+/**
+ * True when box persistence is available — the dedicated BOX_MONGODB_URI
+ * connection when one is configured, otherwise the main MONGODB_URI one.
+ */
 export function isBoxDbEnabled(): boolean {
-  return isDbEnabled();
+  return isBoxConnectionReady();
 }
 
 export function isValidBoxId(id: string): boolean {

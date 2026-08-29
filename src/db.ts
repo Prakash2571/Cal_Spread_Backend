@@ -5,6 +5,12 @@ const NSE_FNO_ARCHIVE_URI = process.env.NSE_FNO_ARCHIVE_URI ?? "";
 const NSE_FNO_CURRENT_URI = process.env.NSE_FNO_CURRENT_URI ?? "";
 const NSE_FNO_SPREAD_URI = process.env.NSE_FNO_SPREAD_URI ?? "";
 const TRADE_LOG_URI = process.env.TRADE_LOG_URI ?? "";
+/**
+ * Dedicated database for the BOX arbitrage module (box_trades,
+ * box_trade_events). Optional: with it unset the box collections live in the
+ * MONGODB_URI database instead, so the feature works out of the box.
+ */
+const BOX_MONGODB_URI = process.env.BOX_MONGODB_URI ?? "";
 
 // ============================================================================
 //  Three separate Mongoose connections for the split nse_fno databases
@@ -333,6 +339,51 @@ export async function appendTradeLog(entry: ITradeLog): Promise<void> {
     await TradeLog.create(entry);
   } catch (err) {
     console.warn("[TradeLog] failed to append", entry.event, "event:", err);
+  }
+}
+
+// ============================================================================
+//  Box arbitrage storage (box_trades, box_trade_events)
+//
+//  Box positions are a different strategy with a four-leg shape, so they get
+//  their own collections — and optionally their own DATABASE via BOX_MONGODB_URI,
+//  which keeps the paper-trading book completely separate from the live calendar
+//  trade book. With the variable unset everything falls back to MONGODB_URI.
+// ============================================================================
+
+/** Dedicated box connection, or null when BOX_MONGODB_URI is unset. */
+export const boxConnection = BOX_MONGODB_URI
+  ? mongoose.createConnection(BOX_MONGODB_URI)
+  : null;
+
+/** True once the box collections have a live connection to read/write. */
+export function isBoxConnectionReady(): boolean {
+  return boxConnection
+    ? boxConnection.readyState === 1
+    : mongoose.connection.readyState === 1;
+}
+
+/** Open the dedicated box connection, if one is configured. */
+export async function initBoxConnection(): Promise<void> {
+  if (!boxConnection) {
+    if (!MONGODB_URI) {
+      console.warn(
+        "BOX_MONGODB_URI and MONGODB_URI are both unset — box paper trades cannot be stored, so the box scanner will refuse to start.",
+      );
+      return;
+    }
+    console.log(
+      "BOX_MONGODB_URI is not set — box_trades / box_trade_events fall back to the main MONGODB_URI database.",
+    );
+    return;
+  }
+  try {
+    await boxConnection.asPromise();
+    console.log(
+      `Connected to box MongoDB (database "${boxConnection.name}") — box_trades + box_trade_events.`,
+    );
+  } catch (err) {
+    console.error("Failed to connect to the box MongoDB:", err);
   }
 }
 

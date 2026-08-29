@@ -13,7 +13,7 @@
 
 import mongoose from "mongoose";
 import type { ILegCharges, ITradeCharges } from "../db.js";
-import { tradeLogConnection } from "../db.js";
+import { boxConnection } from "../db.js";
 import type {
   BoxCharges,
   BoxDepthLevel,
@@ -138,6 +138,7 @@ const boxLegSchema = new mongoose.Schema<IBoxLeg>(
 
 const scannerConfigSchema = new mongoose.Schema(
   {
+    min_gross_edge: { type: Number, default: 0 },
     min_net_edge: { type: Number, default: 0 },
     safety_buffer: { type: Number, default: 0 },
     quote_max_age_ms: { type: Number, default: 0 },
@@ -239,8 +240,17 @@ export interface BoxTradeRecord extends IBoxTrade {
   _id: mongoose.Types.ObjectId;
 }
 
+/**
+ * Bind a box model to the dedicated box connection when BOX_MONGODB_URI is
+ * configured, and to the main connection otherwise — but always in its own
+ * collection, so the calendar trade book is never touched either way.
+ */
+function boxModel<T>(name: string, schema: mongoose.Schema<T>): mongoose.Model<T> {
+  return boxConnection ? boxConnection.model<T>(name, schema) : mongoose.model<T>(name, schema);
+}
+
 /** The box position model (collection: "box_trades"). */
-export const BoxTrade = mongoose.model<IBoxTrade>("BoxTrade", boxTradeSchema);
+export const BoxTrade = boxModel<IBoxTrade>("BoxTrade", boxTradeSchema);
 
 /* ------------------------------ event ledger ------------------------------ */
 
@@ -294,18 +304,14 @@ const boxTradeEventSchema = new mongoose.Schema<IBoxTradeEvent>(
 );
 
 /**
- * The box ledger rides on the dedicated ledger connection when TRADE_LOG_URI is
- * configured (same policy as the calendar ledger) and on the main connection
- * otherwise — but always in its OWN collection.
+ * The append-only box ledger, alongside the positions it describes (so a box
+ * database is self-contained and can be exported on its own).
  */
-export const BoxTradeEvent = (tradeLogConnection ?? mongoose.connection).model<IBoxTradeEvent>(
-  "BoxTradeEvent",
-  boxTradeEventSchema,
-);
+export const BoxTradeEvent = boxModel<IBoxTradeEvent>("BoxTradeEvent", boxTradeEventSchema);
 
 /** True once the box event ledger has a live connection to write to. */
 export function isBoxEventLedgerEnabled(): boolean {
-  return tradeLogConnection
-    ? tradeLogConnection.readyState === 1
+  return boxConnection
+    ? boxConnection.readyState === 1
     : mongoose.connection.readyState === 1;
 }

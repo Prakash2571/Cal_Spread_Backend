@@ -217,15 +217,98 @@ test("charges are requested once and then served from cache", async () => {
   for (const g of groups) for (const l of g.legs) assert.equal(l.quantity, LOT);
 });
 
-test("the ₹1,200 rule is applied to the REVALIDATED book, not the first snapshot", async () => {
-  // Charges are ₹600 a side, so the ₹1,875 gross box nets 1875-600-600-150 = ₹525.
+test("heavy fees do NOT block a box whose spread clears the gate", async () => {
+  // Charges of ₹600 a side leave only 1875-600-600-150 = ₹525 net, but the gate
+  // is the ₹1,875 GROSS spread, so this trades.
   const h = harness({ entryTotal: 600, exitTotal: 600 });
   const tokens = h.seedGood();
   h.scanner.setDiscovering(true);
   h.scanner.onTokensUpdated(tokens);
   await settle();
-  assert.equal(h.stub.calls.length, 1, "it was worth pricing…");
-  assert.equal(h.opened.length, 0, "…but ₹525 net does not qualify");
+  assert.equal(h.stub.calls.length, 1, "charges are still priced for the record");
+  assert.equal(h.opened.length, 1, "and the spread alone decides the entry");
+  assert.equal(h.opened[0].netEdge, 1875 - 600 - 600 - 150);
+  assert.equal(h.opened[0].evaluation.gross_edge, GOOD_BOX.grossEdge);
+});
+
+test("with an optional net floor configured, the same box is refused", async () => {
+  const h = harness({ entryTotal: 600, exitTotal: 600, config: { minNetEdge: 1200 } });
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+  await settle();
+  assert.equal(h.opened.length, 0, "₹525 net is below the configured floor");
+});
+
+test("a spread under ₹1,200 never enters, however small the fees", async () => {
+  const h = harness({ entryTotal: 1, exitTotal: 1 });
+  // cost 195 → gross (200-195) x 75 = ₹375.
+  const tokens = h.seedGood({ k1_ce: { ask: 320 } });
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+  await settle();
+  assert.equal(h.opened.length, 0);
+  assert.equal(h.stub.calls.length, 0, "it never even reached the charge call");
+});
+
+test("market CLOSED: no entry, whatever the numbers look like", async () => {
+  const h = harness();
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.setMarketOpen(false);
+
+  for (let i = 0; i < 3; i++) {
+    h.scanner.onTokensUpdated(tokens);
+    await settle();
+  }
+  assert.equal(h.opened.length, 0, "a paper fill needs a live executable book");
+  assert.equal(h.stub.calls.length, 0, "and no charge call is wasted either");
+  assert.equal(h.scanner.isMarketOpen(), false);
+
+  // Re-opening the market resumes entries immediately.
+  h.scanner.setMarketOpen(true);
+  h.scanner.onTokensUpdated(tokens);
+  await settle();
+  assert.equal(h.opened.length, 1);
+});
+
+test("the last-close view is published as INDICATIVE and cannot be entered", async () => {
+  const h = harness();
+  h.scanner.setDiscovering(true);
+  h.scanner.setMarketOpen(false);
+
+  // A self-consistent set of closing prices for the whole window: one price per
+  // TOKEN (a strike's CE is the same contract whether it is a box's K1 or its K2),
+  // with calls falling and puts rising across strikes. Calibrated so the
+  // 19900/20100 box closed at a cost of 300-220+200-105 = 175 against a width of
+  // 200, i.e. the same ₹1,875 gross edge used elsewhere in these tests.
+  const lastPrices = new Map();
+  const ce = (strike) => 300 - (strike - GOOD_BOX.k1) * 0.4;
+  const pe = (strike) => 105 + (strike - GOOD_BOX.k1) * 0.475;
+  for (const cand of h.all) {
+    for (const role of ["k1_ce", "k2_ce", "k2_pe", "k1_pe"]) {
+      const leg = cand.legs[role];
+      const price = leg.instrument_type === "CE" ? ce(leg.strike) : pe(leg.strike);
+      lastPrices.set(leg.token, price);
+    }
+  }
+  const priced = h.scanner.publishIndicative(lastPrices);
+  await settle();
+
+  assert.ok(priced > 0, "boxes were priced from the close");
+  assert.equal(h.opened.length, 0, "publishing a view must never open a trade");
+
+  const rows = h.scanner.listOpportunities(100);
+  assert.ok(rows.length > 0, "the operator can still see what existed at the close");
+  for (const r of rows) {
+    assert.equal(r.status, "INDICATIVE");
+    assert.equal(r.price_source, "last_close");
+    assert.equal(r.liquidity_ok, false);
+    assert.equal(r.reject, "market_closed");
+  }
+  const best = rows.find((r) => r.key === h.candidate.key);
+  assert.ok(best, "the qualifying box is in the list");
+  assert.equal(best.gross_edge, GOOD_BOX.grossEdge);
 });
 
 test("the book is re-checked after the charge call, and a decayed book is refused", async () => {

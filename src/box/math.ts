@@ -373,12 +373,14 @@ export function evaluateCandidate(args: {
 }
 
 /**
- * The ₹1,200 qualification.
+ * The after-cost picture, reported on every opportunity and stored on every
+ * trade:
  *
  *   projectedNetEdge = grossEdge - entryFees - estimatedExitFees - safetyBuffer
- *   qualifies        = projectedNetEdge >= minNetEdge
  *
- * Note the comparison is `>=`: exactly ₹1,200 qualifies, ₹1,199.99 does not.
+ * This is INFORMATIONAL by default. The entry gate is the gross spread (see
+ * qualifiesForEntry) — fees are shown so they can be managed, not deducted
+ * before deciding to trade, unless an explicit net floor is configured.
  */
 export function projectedNetEdge(args: {
   grossEdge: number;
@@ -391,13 +393,112 @@ export function projectedNetEdge(args: {
   );
 }
 
-export function qualifiesForEntry(netEdge: number, minNetEdge: number): boolean {
-  return netEdge >= minNetEdge;
+/**
+ * THE ENTRY GATE: ₹1,200 from the SPREAD alone.
+ *
+ *   qualifies = grossEdge >= minGrossEdge
+ *               AND (minNetEdge <= 0 OR projectedNetEdge >= minNetEdge)
+ *
+ * The comparison is `>=`, so exactly ₹1,200 gross qualifies and ₹1,199.99 does
+ * not. The net floor is OPTIONAL and disabled by default (minNetEdge = 0): the
+ * charges are still estimated, stored and displayed, they simply do not raise the
+ * bar the spread has to clear.
+ *
+ * `netEdge` may be null (charges unavailable); that only matters when a net floor
+ * is actually configured.
+ */
+export function qualifiesForEntry(
+  grossEdge: number | null,
+  netEdge: number | null,
+  cfg: Pick<BoxConfig, "minGrossEdge" | "minNetEdge">,
+): boolean {
+  if (grossEdge === null) return false;
+  if (grossEdge < cfg.minGrossEdge) return false;
+  if (cfg.minNetEdge > 0) {
+    if (netEdge === null) return false;
+    if (netEdge < cfg.minNetEdge) return false;
+  }
+  return true;
 }
 
 /** Whether a candidate's gross edge justifies a (slow) charge estimation. */
 export function passesGrossPrefilter(grossEdge: number | null, threshold: number): boolean {
   return grossEdge !== null && grossEdge >= threshold;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Indicative evaluation (market closed)                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Evaluate a box from LAST TRADED / CLOSING prices instead of the touch.
+ *
+ * Used only while the market is shut, so an opportunity that existed at the close
+ * can still be inspected. This is deliberately a SEPARATE function from
+ * evaluateCandidate: there is no bid/ask and therefore no executable price, so
+ * the result is always marked `tradable: false` and can never reach the entry
+ * path. It is a read-only view, not a trading signal.
+ *
+ *   indicativeCostPerUnit = Last(K1 CE) - Last(K2 CE) + Last(K2 PE) - Last(K1 PE)
+ */
+export function evaluateCandidateIndicative(args: {
+  candidate: BoxCandidate;
+  /** token → last traded / closing price. */
+  lastPrices: Map<number, number>;
+  now: number;
+}): BoxEvaluation {
+  const { candidate, lastPrices, now } = args;
+  const lotSize = candidate.lot_size;
+
+  const legs: BoxLegEvaluation[] = BOX_LEG_ROLES.map((role) => {
+    const inst = candidate.legs[role];
+    const last = lastPrices.get(inst.token) ?? 0;
+    return {
+      role,
+      side: BOX_ENTRY_SIDES[role],
+      token: inst.token,
+      tradingsymbol: inst.tradingsymbol,
+      strike: inst.strike,
+      instrument_type: inst.instrument_type,
+      // The closing price, NOT an executable touch — hence executable: false.
+      price: last > 0 ? last : null,
+      qty_at_touch: 0,
+      bid: 0,
+      bid_qty: 0,
+      ask: 0,
+      ask_qty: 0,
+      quote_at: null,
+      age_ms: null,
+      fresh: false,
+      executable: false,
+    };
+  });
+
+  const havePrices = legs.every((l) => l.price !== null);
+  const byRole = new Map(legs.map((l) => [l.role, l]));
+  const costPerUnit = havePrices
+    ? round2(
+        byRole.get("k1_ce")!.price! -
+          byRole.get("k2_ce")!.price! +
+          byRole.get("k2_pe")!.price! -
+          byRole.get("k1_pe")!.price!,
+      )
+    : null;
+  const grossPerUnit = costPerUnit === null ? null : round2(candidate.box_width - costPerUnit);
+  const grossEdge = grossPerUnit === null ? null : round2(grossPerUnit * lotSize);
+
+  return {
+    candidate,
+    at: now,
+    legs,
+    entry_box_cost_per_unit: costPerUnit,
+    gross_edge_per_unit: grossPerUnit,
+    gross_edge: grossEdge,
+    // Never tradable: there is no executable book behind these numbers.
+    tradable: false,
+    worst_age_ms: null,
+    reject: havePrices ? "market_closed" : "no_quote",
+  };
 }
 
 /* -------------------------------------------------------------------------- */

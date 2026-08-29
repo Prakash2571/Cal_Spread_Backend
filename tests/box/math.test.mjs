@@ -16,6 +16,7 @@ import {
   computeExitMetrics,
   convergenceThreshold,
   evaluateCandidate,
+  evaluateCandidateIndicative,
   evaluateExitLegs,
   exitLiquidityOk,
   exitSideFor,
@@ -329,47 +330,84 @@ test("15/16. the projected net edge subtracts entry fees, exit fees AND the safe
   );
 });
 
-test("17/18. ₹1,199 does not qualify and ₹1,200 does — the threshold is NET, not gross", () => {
-  const min = cfg().minNetEdge;
-  assert.equal(min, 1200, "the shipped default must be ₹1,200");
+test("17/18. ₹1,199 does not qualify and ₹1,200 does — measured on the GROSS spread", () => {
+  const c = cfg();
+  assert.equal(c.minGrossEdge, 1200, "the shipped gate must be ₹1,200 gross");
+  assert.equal(c.minNetEdge, 0, "and no net floor by default — fees are managed by hand");
 
-  assert.equal(qualifiesForEntry(1199, min), false);
-  assert.equal(qualifiesForEntry(1199.99, min), false);
-  assert.equal(qualifiesForEntry(1200, min), true);
-  assert.equal(qualifiesForEntry(1200.01, min), true);
+  assert.equal(qualifiesForEntry(1199, null, c), false);
+  assert.equal(qualifiesForEntry(1199.99, null, c), false);
+  assert.equal(qualifiesForEntry(1200, null, c), true);
+  assert.equal(qualifiesForEntry(1200.01, null, c), true);
+  assert.equal(qualifiesForEntry(null, null, c), false, "no edge, no trade");
+});
 
-  // And end to end: a ₹1,650 GROSS edge is not enough once ₹300 of charges and
-  // the ₹150 buffer come off (₹1,200 net exactly qualifies; a rupee less does not).
-  const netAt1650 = projectedNetEdge({
+test("fees do NOT raise the bar the spread has to clear", () => {
+  const c = cfg();
+  // ₹1,200 gross with ₹300 of charges and the ₹150 buffer nets only ₹750 — and
+  // that is fine: the gate is the spread, the net figure is for the record.
+  const net = projectedNetEdge({
+    grossEdge: 1200,
+    entryCharges: 150,
+    estimatedExitCharges: 150,
+    safetyBuffer: 150,
+  });
+  assert.equal(net, 750);
+  assert.equal(qualifiesForEntry(1200, net, c), true, "₹1,200 of spread qualifies");
+
+  // Even a box whose net edge is NEGATIVE still qualifies on the spread alone,
+  // because the operator has said they will manage the fees themselves.
+  const negative = projectedNetEdge({
+    grossEdge: 1250,
+    entryCharges: 800,
+    estimatedExitCharges: 800,
+    safetyBuffer: 150,
+  });
+  assert.ok(negative < 0);
+  assert.equal(qualifiesForEntry(1250, negative, c), true);
+});
+
+test("an OPTIONAL net floor can be switched on, and then it does bind", () => {
+  const floored = cfg({ minNetEdge: 1200 });
+  // ₹1,650 gross - ₹300 charges - ₹150 buffer = exactly ₹1,200 net.
+  const ok = projectedNetEdge({
     grossEdge: 1650,
     entryCharges: 150,
     estimatedExitCharges: 150,
     safetyBuffer: 150,
   });
-  assert.equal(netAt1650, 1200);
-  assert.equal(qualifiesForEntry(netAt1650, min), true);
+  assert.equal(ok, 1200);
+  assert.equal(qualifiesForEntry(1650, ok, floored), true);
 
-  const netAt1649 = projectedNetEdge({
+  const short = projectedNetEdge({
     grossEdge: 1649,
     entryCharges: 150,
     estimatedExitCharges: 150,
     safetyBuffer: 150,
   });
-  assert.equal(netAt1649, 1199);
-  assert.equal(qualifiesForEntry(netAt1649, min), false);
+  assert.equal(short, 1199);
+  assert.equal(qualifiesForEntry(1649, short, floored), false);
+  // With a floor configured, an unpriced box cannot satisfy it.
+  assert.equal(qualifiesForEntry(5000, null, floored), false);
+  // …whereas with the default (no floor) an unpriced box still clears the gate.
+  assert.equal(qualifiesForEntry(5000, null, cfg()), true);
 });
 
 test("the local prefilter never discards a box that could still qualify", () => {
   const c = cfg();
   const threshold = prefilterGrossThreshold(c);
-  // ₹1,200 + ₹150 safety + a deliberate LOWER bound on charges (₹160).
-  assert.equal(threshold, 1200 + 150 + 160);
+  // Gross-only gate → the prefilter IS the gross requirement.
+  assert.equal(threshold, 1200);
   assert.equal(passesGrossPrefilter(threshold, threshold), true);
   assert.equal(passesGrossPrefilter(threshold - 1, threshold), false);
   assert.equal(passesGrossPrefilter(null, threshold), false);
-  // The allowance must UNDER-state real charges, or a qualifying box could be
-  // filtered out before it was ever priced.
-  assert.ok(c.prefilterChargeAllowance <= 8 * 20 * 1.18 + 1);
+
+  // With a net floor configured the prefilter has to reach further, using a
+  // deliberate LOWER bound on charges so it cannot filter out a box that would
+  // have qualified once real charges came back.
+  const floored = cfg({ minNetEdge: 1200 });
+  assert.equal(prefilterGrossThreshold(floored), 1200 + 150 + 160);
+  assert.ok(floored.prefilterChargeAllowance <= 8 * 20 * 1.18 + 1);
 });
 
 /* -------------------------------------------------------------------- 21 --- */
@@ -537,4 +575,53 @@ test("exit arithmetic is unavailable, not guessed, when charges cannot be priced
   assert.equal(m.total_round_trip_charges, null);
   assert.equal(m.current_net_pnl, null);
   assert.equal(m.exit_eligible, false, "an unpriced round trip can never auto-exit");
+});
+
+
+/* --------------------------- market-closed view --------------------------- */
+
+test("the last-close view reports the spread but is never tradable", () => {
+  const { candidate } = goodCandidate();
+  // Closing prices only — no bid, no ask, no depth anywhere.
+  const lastPrices = new Map([
+    [candidate.legs.k1_ce.token, 300],
+    [candidate.legs.k2_ce.token, 220],
+    [candidate.legs.k2_pe.token, 200],
+    [candidate.legs.k1_pe.token, 105],
+  ]);
+  const ev = evaluateCandidateIndicative({ candidate, lastPrices, now: NOW });
+
+  // The economics are computed the same way, so a box that was mispriced at the
+  // close is visible.
+  assert.equal(ev.entry_box_cost_per_unit, 175);
+  assert.equal(ev.gross_edge, GOOD_BOX.grossEdge);
+  assert.equal(ev.gross_edge_per_unit, 25);
+
+  // …but nothing about it is executable.
+  assert.equal(ev.tradable, false, "a closing price is not an executable touch");
+  assert.equal(ev.reject, "market_closed");
+  assert.equal(ev.worst_age_ms, null);
+  for (const leg of ev.legs) {
+    assert.equal(leg.executable, false);
+    assert.equal(leg.fresh, false);
+    assert.equal(leg.qty_at_touch, 0);
+    assert.equal(leg.bid, 0);
+    assert.equal(leg.ask, 0);
+    assert.equal(leg.quote_at, null);
+  }
+});
+
+test("a missing closing price yields no indicative edge rather than a guess", () => {
+  const { candidate } = goodCandidate();
+  const lastPrices = new Map([
+    [candidate.legs.k1_ce.token, 300],
+    [candidate.legs.k2_ce.token, 220],
+    // K2 PE never traded — no close to use.
+    [candidate.legs.k1_pe.token, 105],
+  ]);
+  const ev = evaluateCandidateIndicative({ candidate, lastPrices, now: NOW });
+  assert.equal(ev.entry_box_cost_per_unit, null);
+  assert.equal(ev.gross_edge, null);
+  assert.equal(ev.tradable, false);
+  assert.equal(ev.reject, "no_quote");
 });

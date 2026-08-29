@@ -31,6 +31,8 @@ export interface BoxModuleDeps {
   priceChargeGroups: PriceChargeGroupsFn;
   istDayKey: (at?: number) => string;
   makeIdResolver: (all: Instrument[]) => (token: number) => string | null;
+  /** NSE equity-derivatives hours, reused from the calendar engine. */
+  isMarketOpen: () => boolean;
   requireAdmin: RequestHandler;
   getAdminRole: (token: string | undefined) => "full" | "trade" | null;
 }
@@ -57,6 +59,7 @@ export function registerBoxModule(app: Express, deps: BoxModuleDeps): BoxModule 
     priceChargeGroups: deps.priceChargeGroups,
     istDayKey: deps.istDayKey,
     makeIdResolver: deps.makeIdResolver,
+    isMarketOpen: deps.isMarketOpen,
   });
 
   registerBoxRoutes(app, {

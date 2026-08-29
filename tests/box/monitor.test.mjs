@@ -7,7 +7,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { BoxPositionMonitor, describeLiquidityGap } from "../../dist/box/positionMonitor.js";
+import {
+  BoxPositionMonitor,
+  describeLiquidityGap,
+  liquidityGapKey,
+} from "../../dist/box/positionMonitor.js";
 import { BoxChargeEstimator } from "../../dist/box/charges.js";
 import { BoxPositionBook } from "../../dist/box/positions.js";
 import { BoxScanner } from "../../dist/box/scanner.js";
@@ -37,6 +41,7 @@ function harness({
   istDay = "2026-08-29",
   istMinutes = 11 * 60,
   chargesFail = false,
+  marketOpen = true,
 } = {}) {
   const { candidate } = goodCandidate();
   const conf = cfg();
@@ -95,6 +100,7 @@ function harness({
     onEvent: (event, pos, metrics, detail) => events.push({ event, detail, metrics }),
     istDayKey: () => istDay,
     istMinutesOfDay: () => istMinutes,
+    isMarketOpen: () => marketOpen,
   });
 
   return { monitor, positions, position, candidate, closes, events, persisted, conf, quotes };
@@ -313,4 +319,78 @@ test("a box expiring later is not in the expiry-safety window", async () => {
   await h.monitor.cycle();
   assert.equal(h.position.expiry_safety, false);
   assert.equal(h.closes.length, 0);
+});
+
+
+/* ---------------------------- market closed ------------------------------- */
+
+test("market CLOSED: metrics keep refreshing but no exit is attempted", async () => {
+  // A box that WOULD auto-exit during market hours.
+  const h = harness({ exitValuePerUnit: 198, marketOpen: false });
+  await h.monitor.cycle();
+
+  assert.equal(h.closes.length, 0, "there is nothing to close into after hours");
+  assert.equal(h.positions.size, 1);
+  // The position is still measured, so the UI stays informative overnight.
+  assert.ok(h.position.metrics, "metrics are still refreshed");
+  assert.equal(h.position.metrics.remaining_edge, (200 - 198) * LOT);
+  // "The market is shut" is not a liquidity event, so nothing is logged.
+  assert.equal(h.events.length, 0);
+  assert.equal(h.position.exit_blocked_reason, null);
+});
+
+test("market CLOSED does not fabricate an expiry-safety close either", async () => {
+  const h = harness({
+    exitValuePerUnit: 180,
+    expiry: "2026-08-29",
+    istDay: "2026-08-29",
+    istMinutes: 16 * 60, // past the close
+    marketOpen: false,
+  });
+  await h.monitor.cycle();
+  assert.equal(h.closes.length, 0);
+  assert.equal(h.positions.size, 1);
+});
+
+/* --------------------------- ledger de-duplication ------------------------ */
+
+test("a persistent liquidity gap is logged once, not once per cycle", async () => {
+  const h = harness({ exitValuePerUnit: 198, qty: 40 });
+
+  for (let i = 0; i < 5; i++) await h.monitor.cycle();
+
+  const skipped = h.events.filter((e) => e.event === "EXIT_SKIPPED_LIQUIDITY");
+  assert.equal(skipped.length, 1, "the same blockage must not spam the ledger");
+  assert.equal(h.positions.size, 1);
+  // The displayed reason is still kept current for the operator.
+  assert.match(h.position.exit_blocked_reason, /needs 75/);
+});
+
+test("liquidityGapKey is stable across cycles but changes when the cause does", () => {
+  const base = (over = {}) => ({
+    role: "k1_ce",
+    side: "SELL",
+    tradingsymbol: "A",
+    price: 10,
+    qty_at_touch: 40,
+    fresh: true,
+    quote_at: 1,
+    age_ms: 5,
+    ...over,
+  });
+  const ok = { role: "k2_ce", side: "BUY", tradingsymbol: "B", price: 10, qty_at_touch: 200, fresh: true, quote_at: 1, age_ms: 5 };
+
+  // Same cause, different volatile numbers → same key (so no repeat ledger row).
+  const a = liquidityGapKey([base({ age_ms: 5 }), ok], 75);
+  const b = liquidityGapKey([base({ age_ms: 900, qty_at_touch: 41 }), ok], 75);
+  assert.equal(a, b);
+  assert.equal(a, "k1_ce:thin");
+
+  // A different cause → a different key, so it IS reported.
+  const stale = liquidityGapKey([base({ fresh: false }), ok], 75);
+  assert.notEqual(stale, a);
+  assert.equal(stale, "k1_ce:stale");
+
+  // Everything fillable → no gap at all.
+  assert.equal(liquidityGapKey([base({ qty_at_touch: 200 }), ok], 75), "ok");
 });

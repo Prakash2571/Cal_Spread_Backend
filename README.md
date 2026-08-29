@@ -154,7 +154,7 @@ the charge fields left null and the UI saying so rather than implying a free tra
 An **independent** module in `src/box/`. It shares this app's Kite session, WebSocket, instrument
 cache and charge estimator, and shares nothing else: the calendar engine's calculations, captures,
 analytics, schema and collections are untouched, and box positions live in their own collections
-(`box_trades`, `box_trade_events`).
+(`box_trades`, `box_trade_events`) — optionally in their own **database** via `BOX_MONGODB_URI`.
 
 > ### Paper execution — read this before trusting a number
 >
@@ -196,40 +196,78 @@ grossEdgePerUnit    = (K2 - K1) - entryBoxCostPerUnit
 grossEdge           = grossEdgePerUnit x lotSize
 ```
 
-### Entry: ₹1,200 of NET expected profit
+### Entry: ₹1,200 from the SPREAD
 
-The threshold is **net**, not a gross arbitrage difference:
+The gate is the **gross** arbitrage the executable prices actually show:
+
+```
+grossEdge = ((K2 - K1) - entryBoxCostPerUnit) x lotSize
+enter if    grossEdge >= MIN_BOX_GROSS_EDGE          (default ₹1,200)
+```
+
+Charges are **still** estimated, stored and displayed — they are simply not
+deducted before deciding to enter, because fees are managed by hand. The
+after-cost figure is reported alongside every opportunity and frozen onto every
+trade:
 
 ```
 projectedNetEdge = grossEdge - entryCharges - estimatedExitCharges - safetyBuffer
-enter if           projectedNetEdge >= MIN_BOX_NET_EDGE      (default ₹1,200)
 ```
 
-so a qualifying box has already survived the bid/ask spread, the entry fees, the projected exit
-fees and the safety buffer. Charges are the **same Zerodha virtual contract note** the calendar
-trades use (`POST /charges/orders`), wrapped for a box: four entry orders and four reversed exit
-orders priced in **one** request, with a per-leg breakdown and totals stored on the trade. If
-Zerodha cannot price them the box is displayed as `UNPRICED` and is **never** auto-traded.
+If you later want a net cushion as well, set `MIN_BOX_NET_EDGE` to a positive
+number and it becomes an **additional** floor. It is `0` (off) by default.
+
+Charges come from the **same Zerodha virtual contract note** the calendar trades
+use (`POST /charges/orders`), wrapped for a box: four entry orders and four
+reversed exit orders priced in **one** request, with a per-leg breakdown and
+totals stored on the trade. A box whose charges cannot be priced is shown
+`UNPRICED` and skipped — not because of the threshold, but because the exit rules
+are evaluated net of charges, so such a position could never have its net P&L
+computed and would never auto-exit. Set `BOX_REQUIRE_PRICED_CHARGES=false` to
+allow it anyway and manage those by hand.
 
 Guards on every automatic entry:
 
-- **One lot, always.** `quantity` is the contract's current `lot_size` from instrument metadata.
-  There is no multiplier and no custom size.
-- **One-lot touch liquidity.** Each leg needs `ask > 0 && askQty >= lotSize` (BUY) or
-  `bid > 0 && bidQty >= lotSize` (SELL), counting only what rests at that **exact** best price.
-  V1 does not walk deeper levels.
-- **Freshness.** All four books must be no older than `BOX_QUOTE_MAX_AGE_MS` (default 1,500 ms),
-  measured from when each book was received.
-- **Revalidation.** Charge estimation is asynchronous, so after it returns the four quotes are
-  re-read and the freshness, liquidity and ₹1,200 tests are re-applied to the **current** book. A
-  decision is never executed on a pre-API-call snapshot.
-- **One open box per exact strike pair**, enforced by a synchronous in-memory reservation *and* a
-  unique partial index on `{underlying, expiry, lower_strike, upper_strike}` where `status: "open"`.
+- **Market open.** Outside NSE equity-derivatives hours nothing is entered at
+  all: there is no executable book, so a paper fill would be a fiction.
+- **One lot, always.** `quantity` is the contract's current `lot_size` from
+  instrument metadata. There is no multiplier and no custom size.
+- **One-lot touch liquidity.** Each leg needs `ask > 0 && askQty >= lotSize`
+  (BUY) or `bid > 0 && bidQty >= lotSize` (SELL), counting only what rests at
+  that **exact** best price. V1 does not walk deeper levels.
+- **Freshness.** All four books must be no older than `BOX_QUOTE_MAX_AGE_MS`
+  (default 1,500 ms), measured from when each book was received.
+- **Revalidation.** Charge estimation is asynchronous, so after it returns the
+  four quotes are re-read and the freshness, liquidity and ₹1,200 spread tests
+  are re-applied to the **current** book. A decision is never executed on a
+  pre-API-call snapshot.
+- **One open box per exact strike pair**, enforced by a synchronous in-memory
+  reservation *and* a unique partial index on
+  `{underlying, expiry, lower_strike, upper_strike}` where `status: "open"`.
+
+### When the market is closed
+
+Pressing RUN outside market hours does not trade. Instead the scanner publishes
+an **indicative** view built from each contract's **last traded / closing**
+price, so a box that was mispriced at the close is still visible:
+
+```
+indicativeCostPerUnit = Last(K1 CE) - Last(K2 CE) + Last(K2 PE) - Last(K1 PE)
+```
+
+Those rows carry `price_source: "last_close"` and status `INDICATIVE`, are never
+`liquidity_ok`, and cannot reach the entry path — the market-open gate sits in
+front of it independently. Open positions are likewise **not** auto-exited while
+the exchange is shut (their metrics keep refreshing, but "the market is shut" is
+not a liquidity event and is not written to the ledger). The view refreshes every
+`BOX_INDICATIVE_REFRESH_MS` (default 60s) via one REST `/quote` call per 500
+instruments.
 
 ### Universe: ATM ±3 only
 
-All NSE F&O underlyings (stocks and supported indices) with valid contracts, each on its nearest
-non-expired expiry, and for each one **at most seven strikes**: `ATM-3 … ATM … ATM+3`. That gives
+NSE **F&O stock and index OPTIONS only** — every F&O underlying that has listed option
+contracts and a resolvable spot (an NSE equity, or one of the supported indices), each on its
+nearest non-expired expiry, and for each one **at most seven strikes**: `ATM-3 … ATM … ATM+3`. That gives
 at most `C(7,2) = 21` strike pairs per underlying, which is the entire V1 search space. The ATM
 window re-centres when the underlying drifts past a hysteresis band (and no more often than
 `BOX_WINDOW_MIN_INTERVAL_MS`), so a price sitting on a strike boundary cannot cause continuous
@@ -303,8 +341,12 @@ Every threshold is env-overridable; the defaults are the shipped specification.
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
-| `MIN_BOX_NET_EDGE` | `1200` | Minimum projected **net** profit (₹) to auto-open |
-| `BOX_SAFETY_BUFFER` | `150` | Conservative slippage allowance (₹) per round trip |
+| `BOX_MONGODB_URI` | *(unset)* | Dedicated database for `box_trades` + `box_trade_events`; falls back to `MONGODB_URI` |
+| `MIN_BOX_GROSS_EDGE` | `1200` | **The entry gate**: minimum GROSS edge (₹) from the spread alone |
+| `MIN_BOX_NET_EDGE` | `0` | Optional *additional* net floor (₹). `0` = fees do not gate entry |
+| `BOX_REQUIRE_PRICED_CHARGES` | `true` | Skip a box whose charges Kite could not price (so exits stay manageable) |
+| `BOX_SAFETY_BUFFER` | `150` | Slippage allowance (₹) reported in the net figure, **not** part of the gate |
+| `BOX_INDICATIVE_REFRESH_MS` | `60000` | How often the last-close view is rebuilt while the market is shut |
 | `BOX_QUOTE_MAX_AGE_MS` | `1500` | Maximum age of each of the four books at a decision |
 | `BOX_PREFILTER_CHARGE_ALLOWANCE` | `160` | Lower bound on round-trip charges, prefilter only |
 | `BOX_CONVERGENCE_FLOOR` / `BOX_CONVERGENCE_PCT` | `200` / `0.2` | Convergence threshold |
@@ -322,9 +364,9 @@ Strikes are fixed at **ATM ±3** in V1 and deliberately not configurable.
 dependency). It covers the trading core deterministically: strike-window selection and the
 seven-strike/21-pair limits, the long-box legs, ask-for-BUY and bid-for-SELL, box cost, expiry
 payoff and gross edge, one-lot enforcement and touch-quantity validation, freshness and
-missing-bid/missing-ask rejection, fee and safety-buffer subtraction, ₹1,199 vs ₹1,200,
+missing-bid/missing-ask rejection, fee and safety-buffer reporting, ₹1,199 vs ₹1,200 of spread,
 duplicate rejection, token-dependent recalculation, reversed exit sides, the convergence
-threshold, the refusal to exit at a loss or under ₹600, the 75% capture rule, insufficient exit
+threshold, the market-closed gate and the indicative last-close view, the refusal to exit at a loss or under ₹600, the 75% capture rule, insufficient exit
 liquidity leaving a position open, manual close (including its refusal), serialization, and that
 STOP blocks new entries while still managing open positions.
 
@@ -362,8 +404,8 @@ Box arbitrage (paper, admin-only — full admin or trade access):
 
 | Endpoint | Purpose |
 | -------- | ------- |
-| `GET /api/box/status` | Scanner state, universe/candidate counts, monitor + charge stats |
-| `GET /api/box/config` | Active thresholds (₹1,200 net, ₹150 safety, 1,500 ms, ATM ±3, 1 lot) |
+| `GET /api/box/status` | Scanner state, `market_open`, universe/candidate counts, monitor + charge stats |
+| `GET /api/box/config` | Active thresholds (₹1,200 spread, ₹150 safety, 1,500 ms, ATM ±3, 1 lot) |
 | `POST /api/box/start` | RUN — begin discovering and auto-opening paper boxes |
 | `POST /api/box/stop` | STOP — stop opening NEW boxes (open ones stay monitored) |
 | `GET /api/box/opportunities` | Current opportunities, best net edge first |

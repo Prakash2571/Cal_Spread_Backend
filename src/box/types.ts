@@ -174,7 +174,9 @@ export type BoxRejectReason =
   | "below_net_edge"
   | "unpriced_charges"
   | "duplicate_open"
-  | "stale_underlying";
+  | "stale_underlying"
+  /** The market is shut, so these figures are indicative and not executable. */
+  | "market_closed";
 
 /** Per-leg liquidity/freshness detail for an evaluation. */
 export interface BoxLegEvaluation {
@@ -254,9 +256,21 @@ export interface BoxOpportunity {
   /** True when every leg is fresh and one-lot executable at the touch. */
   liquidity_ok: boolean;
   worst_age_ms: number | null;
-  /** "UNPRICED" when charges could not be determined — never auto-traded. */
+  /**
+   * Where the prices behind this row came from.
+   *
+   * "touch"     — executable best bid/ask. The only source that can be traded.
+   * "last_close"— last traded / closing prices, shown while the market is shut.
+   */
+  price_source: "touch" | "last_close";
+  /**
+   * "INDICATIVE" — the market is closed, so this is a last-close view only.
+   * "UNPRICED"   — charges could not be determined.
+   * Neither is ever auto-traded.
+   */
   status:
     | "WATCHING"
+    | "INDICATIVE"
     | "UNPRICED"
     | "ELIGIBLE"
     | "PAPER_OPENED"
@@ -310,6 +324,9 @@ export type BoxExitReason =
 
 /** The scanner settings a trade was taken under (frozen onto the document). */
 export interface BoxScannerConfigSnapshot {
+  /** The gross-spread entry gate (₹) this trade qualified under. */
+  min_gross_edge: number;
+  /** Optional additional net floor (0 = none). */
   min_net_edge: number;
   safety_buffer: number;
   quote_max_age_ms: number;

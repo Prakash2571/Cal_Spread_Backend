@@ -104,7 +104,8 @@ test("28. a box document serializes to a stable API shape with ISO dates", () =>
   assert.equal(s.legs[0].exit_price, 350);
 
   // The settings the trade was taken under are frozen onto it.
-  assert.equal(s.scanner_config_snapshot.min_net_edge, 1200);
+  assert.equal(s.scanner_config_snapshot.min_gross_edge, 1200);
+  assert.equal(s.scanner_config_snapshot.min_net_edge, 0);
   assert.equal(s.scanner_config_snapshot.safety_buffer, 150);
   assert.equal(s.scanner_config_snapshot.strikes_each_side, 3);
   assert.equal(s.scanner_config_snapshot.execution_mode, "paper_touch");
@@ -176,7 +177,9 @@ test("ledger rows preserve the exact book each decision was taken on", () => {
 
 test("the shipped configuration is the documented V1 specification", () => {
   const c = loadBoxConfig();
-  assert.equal(c.minNetEdge, 1200);
+  // The entry gate is ₹1,200 from the SPREAD; fees are reported, not gated.
+  assert.equal(c.minGrossEdge, 1200);
+  assert.equal(c.minNetEdge, 0);
   assert.equal(c.safetyBuffer, 150);
   assert.equal(c.quoteMaxAgeMs, 1500);
   assert.equal(c.strikesEachSide, 3);
@@ -184,8 +187,9 @@ test("the shipped configuration is the documented V1 specification", () => {
   assert.equal(c.convergencePct, 0.2);
   assert.equal(c.minExitNetPnl, 600);
   assert.equal(c.profitCapturePct, 0.75);
-  assert.equal(prefilterGrossThreshold(c), 1510);
+  assert.equal(prefilterGrossThreshold(c), 1200);
   assert.equal(configSnapshot(c).execution_mode, "paper_touch");
+  assert.equal(configSnapshot(c).min_gross_edge, 1200);
 });
 
 test("the quote store stamps books with their receive time and ages them out", () => {

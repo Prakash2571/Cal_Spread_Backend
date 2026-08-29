@@ -18,6 +18,7 @@ import { configSnapshot, prefilterGrossThreshold } from "./config.js";
 import { BoxChargeEstimator, buildEntryChargeLegs, type BoxChargeLeg } from "./charges.js";
 import {
   evaluateCandidate,
+  evaluateCandidateIndicative,
   passesGrossPrefilter,
   projectedNetEdge,
   qualifiesForEntry,
@@ -43,10 +44,11 @@ export interface BoxScannerDeps {
     candidate: BoxCandidate;
     evaluation: BoxEvaluation;
     entryLegs: BoxChargeLeg[];
-    entryChargesTotal: number;
-    estimatedExitChargesTotal: number;
-    netEdge: number;
-    charges: NonNullable<Awaited<ReturnType<BoxChargeEstimator["estimate"]>>>;
+    /** null only when charges were unavailable and the requirement is disabled. */
+    entryChargesTotal: number | null;
+    estimatedExitChargesTotal: number | null;
+    netEdge: number | null;
+    charges: Awaited<ReturnType<BoxChargeEstimator["estimate"]>>;
   }) => Promise<string | null>;
   /** Ledger hook for rejections and detections. */
   onEvent: (
@@ -94,6 +96,14 @@ export class BoxScanner {
 
   /** Discovery of NEW boxes. Monitoring of open boxes never depends on this. */
   private discovering = false;
+  /**
+   * Whether the exchange is open.
+   *
+   * A hard gate on entry: outside market hours there is no executable book, so a
+   * paper fill would be a fiction. Opportunities are still PUBLISHED (from last
+   * close) so a box that existed at the close can be inspected.
+   */
+  private marketOpen = true;
 
   private stats: BoxScannerStats = {
     ticksApplied: 0,
@@ -125,6 +135,15 @@ export class BoxScanner {
 
   isDiscovering(): boolean {
     return this.discovering;
+  }
+
+  /** Tell the scanner whether the exchange is currently open. */
+  setMarketOpen(open: boolean): void {
+    this.marketOpen = open;
+  }
+
+  isMarketOpen(): boolean {
+    return this.marketOpen;
   }
 
   getStats(): BoxScannerStats {
@@ -253,6 +272,8 @@ export class BoxScanner {
     });
 
     if (!this.discovering) return;
+    // No entry outside market hours — a fill needs a live executable book.
+    if (!this.marketOpen) return;
     if (openKeyTaken) return;
     if (!evaluation.tradable) {
       this.noteRejection(cand, evaluation);
@@ -319,16 +340,19 @@ export class BoxScanner {
       this.stats.chargeAttempts++;
       const estimate = await this.deps.charges.estimate(cand.key, entryLegs);
 
-      // Charges could not be determined → the opportunity stays visible as
-      // UNPRICED but is NOT eligible for an automatic paper entry.
-      if (!estimate) {
+      // Charges could not be determined. This does NOT change the threshold (the
+      // gate is the gross spread) — but the exit rules are evaluated net of
+      // charges, so a position with no charge figures could never have its net
+      // P&L computed and would never auto-exit. It is therefore skipped unless
+      // BOX_REQUIRE_PRICED_CHARGES is turned off.
+      if (!estimate && this.deps.cfg.requirePricedCharges) {
         this.stats.rejectedFees++;
         this.markStatus(cand.key, "UNPRICED");
         this.logRejection(
           "ENTRY_REJECTED_FEES",
           cand,
           first,
-          "Zerodha could not price the eight box orders",
+          "Zerodha could not price the eight box orders, so the exit could not be managed net of charges",
         );
         this.deps.positions.release(cand.key);
         return;
@@ -352,14 +376,18 @@ export class BoxScanner {
       // Re-price the net edge on the CURRENT touch. The charge estimate is reused
       // (it is a function of turnover, which barely moves for a tick-sized price
       // change) but the EDGE is always recomputed from the live book.
-      const netEdge = projectedNetEdge({
-        grossEdge: second.gross_edge,
-        entryCharges: estimate.entry_total,
-        estimatedExitCharges: estimate.estimated_exit_total,
-        safetyBuffer: this.deps.cfg.safetyBuffer,
-      });
+      const netEdge = estimate
+        ? projectedNetEdge({
+            grossEdge: second.gross_edge,
+            entryCharges: estimate.entry_total,
+            estimatedExitCharges: estimate.estimated_exit_total,
+            safetyBuffer: this.deps.cfg.safetyBuffer,
+          })
+        : null;
 
-      if (!qualifiesForEntry(netEdge, this.deps.cfg.minNetEdge)) {
+      // The gate is the GROSS spread; the net figure is carried for the record
+      // and only binds when an explicit net floor is configured.
+      if (!qualifiesForEntry(second.gross_edge, netEdge, this.deps.cfg)) {
         this.markStatus(cand.key, "WATCHING");
         this.deps.positions.release(cand.key);
         return;
@@ -376,8 +404,8 @@ export class BoxScanner {
         candidate: cand,
         evaluation: second,
         entryLegs: revalidatedLegs,
-        entryChargesTotal: estimate.entry_total,
-        estimatedExitChargesTotal: estimate.estimated_exit_total,
+        entryChargesTotal: estimate ? estimate.entry_total : null,
+        estimatedExitChargesTotal: estimate ? estimate.estimated_exit_total : null,
         netEdge,
         charges: estimate,
       });
@@ -462,19 +490,24 @@ export class BoxScanner {
       openKeyTaken: boolean;
       passedPrefilter: boolean;
       cachedNetEdge: { entry: number; exit: number; net: number } | null;
+      priceSource?: "touch" | "last_close";
     },
   ): void {
     const cand = evaluation.candidate;
     const previous = this.opportunities.get(cand.key);
     const cfg = this.deps.cfg;
 
+    const indicative = ctx.priceSource === "last_close";
+    const cachedNet = ctx.cachedNetEdge ? ctx.cachedNetEdge.net : null;
+
     let status: BoxOpportunity["status"];
     if (ctx.openKeyTaken) status = "OPEN";
     else if (previous?.status === "PAPER_OPENED" && !ctx.openKeyTaken) status = "PAPER_OPENED";
+    // A last-close view is never eligible, however good the number looks.
+    else if (indicative) status = "INDICATIVE";
     else if (!evaluation.tradable) status = ctx.passedPrefilter ? "REJECTED" : "WATCHING";
-    else if (ctx.cachedNetEdge && qualifiesForEntry(ctx.cachedNetEdge.net, cfg.minNetEdge)) {
-      status = "ELIGIBLE";
-    } else if (previous?.status === "UNPRICED" && ctx.passedPrefilter) status = "UNPRICED";
+    else if (previous?.status === "UNPRICED" && ctx.passedPrefilter) status = "UNPRICED";
+    else if (qualifiesForEntry(evaluation.gross_edge, cachedNet, cfg)) status = "ELIGIBLE";
     else status = "WATCHING";
 
     this.opportunities.set(cand.key, {
@@ -499,11 +532,42 @@ export class BoxScanner {
       projected_net_edge: ctx.cachedNetEdge ? ctx.cachedNetEdge.net : null,
       liquidity_ok: evaluation.tradable,
       worst_age_ms: evaluation.worst_age_ms,
+      price_source: ctx.priceSource ?? "touch",
       status,
       reject: evaluation.reject,
       legs: evaluation.legs,
       updated_at: evaluation.at,
     });
+  }
+
+  /**
+   * Publish an INDICATIVE view of every candidate from last traded / closing
+   * prices, for when the market is shut.
+   *
+   * These rows exist so an operator can see that a box was mispriced at the
+   * close. They carry `price_source: "last_close"`, are never `tradable`, and the
+   * entry path is separately gated on the market being open — so nothing here can
+   * become a paper fill.
+   */
+  publishIndicative(lastPrices: Map<number, number>): number {
+    const now = Date.now();
+    const openKeys = this.deps.positions.openKeys();
+    let priced = 0;
+    for (const cand of this.candidates.values()) {
+      const evaluation = evaluateCandidateIndicative({ candidate: cand, lastPrices, now });
+      if (evaluation.gross_edge !== null) priced++;
+      this.publish(evaluation, {
+        openKeyTaken: openKeys.has(cand.key),
+        passedPrefilter: passesGrossPrefilter(
+          evaluation.gross_edge,
+          prefilterGrossThreshold(this.deps.cfg),
+        ),
+        cachedNetEdge: null,
+        priceSource: "last_close",
+      });
+    }
+    this.stats.lastEvaluationAt = now;
+    return priced;
   }
 
   /**
@@ -524,6 +588,7 @@ export class BoxScanner {
         opp.status === "PAPER_OPENED" ||
         opp.status === "ELIGIBLE" ||
         opp.status === "UNPRICED" ||
+        opp.status === "INDICATIVE" ||
         (opp.gross_edge !== null && opp.gross_edge >= Math.min(threshold, 0)) ||
         (opp.projected_net_edge !== null && opp.projected_net_edge >= visibilityFloor);
       if (!interesting) continue;
