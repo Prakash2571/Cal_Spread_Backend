@@ -63,6 +63,8 @@ interface QueueItem {
   label: string;
   /** The local charge heads, for a head-by-head comparison against Zerodha. */
   localCharges: BoxChargesWithOrigin | null;
+  /** How many times this verification has already been tried (0 on first pass). */
+  attempt: number;
 }
 
 /** local − Zerodha per head, so a persistent bias points at one rate/rounding rule. */
@@ -92,6 +94,7 @@ export class BoxChargeReconciler {
     failed: 0,
     skipped: 0,
     warnings: 0,
+    retries: 0,
     max_abs_diff: 0,
     last_abs_diff: null as number | null,
     last_pct_diff: null as number | null,
@@ -138,6 +141,7 @@ export class BoxChargeReconciler {
       legs: args.legs,
       label: args.label ?? args.tradeId,
       localCharges: args.localCharges ?? null,
+      attempt: 0,
     });
     this.pump();
   }
@@ -179,17 +183,7 @@ export class BoxChargeReconciler {
         item.legs,
       );
       if (!priced) {
-        this.stats.failed++;
-        this.deps.metrics?.recordReconciliationFailure();
-        await this.safePersist(item, {
-          status: "failed",
-          local_total: item.localTotal,
-          reconciled_total: null,
-          abs_diff: null,
-          pct_diff: null,
-          at: new Date(),
-          error: "Zerodha could not price the box orders",
-        });
+        await this.retryOrFail(item, "Zerodha could not price the box orders");
         return;
       }
 
@@ -228,18 +222,50 @@ export class BoxChargeReconciler {
       await this.safePersist(item, verdict);
       this.deps.onReconciled?.(item.tradeId, item.phase, verdict, warned);
     } catch (err) {
-      this.stats.failed++;
-      this.deps.metrics?.recordReconciliationFailure();
-      await this.safePersist(item, {
-        status: "failed",
-        local_total: item.localTotal,
-        reconciled_total: null,
-        abs_diff: null,
-        pct_diff: null,
-        at: new Date(),
-        error: err instanceof Error ? err.message : String(err),
-      });
+      await this.retryOrFail(item, err instanceof Error ? err.message : String(err));
     }
+  }
+
+  /**
+   * A transient verification failure: retry with bounded backoff, or give up and
+   * record the charges as unverified.
+   *
+   * Why retry at all: the Zerodha charge API can rate-limit or 5xx briefly, and a
+   * single blip used to mark a trade's charges permanently unverified — which
+   * matters now that head_diffs is the tool for spotting a drifted statutory rate.
+   *
+   * Why BOUNDED: this must never become a hot loop against the broker. Attempts
+   * are capped and spaced linearly, and the trade is already open either way —
+   * reconciliation is an audit, never a precondition for execution.
+   */
+  private async retryOrFail(item: QueueItem, error: string): Promise<void> {
+    const maxAttempts = Math.max(1, this.deps.cfg.chargeReconcileMaxAttempts);
+    const next = item.attempt + 1;
+    if (next < maxAttempts) {
+      this.stats.retries++;
+      const delay = Math.max(0, this.deps.cfg.chargeReconcileRetryBaseMs) * next;
+      console.warn(
+        `[Box] charge reconciliation for ${item.label} (${item.phase}) failed ` +
+          `(attempt ${next}/${maxAttempts}: ${error}) — retrying in ${Math.round(delay / 1000)}s.`,
+      );
+      const timer = setTimeout(() => {
+        this.queue.push({ ...item, attempt: next });
+        this.pump();
+      }, delay);
+      timer.unref?.();
+      return;
+    }
+    this.stats.failed++;
+    this.deps.metrics?.recordReconciliationFailure();
+    await this.safePersist(item, {
+      status: "failed",
+      local_total: item.localTotal,
+      reconciled_total: null,
+      abs_diff: null,
+      pct_diff: null,
+      at: new Date(),
+      error: `${error} (gave up after ${maxAttempts} attempt(s))`,
+    });
   }
 
   private async safePersist(

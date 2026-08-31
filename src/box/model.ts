@@ -114,6 +114,14 @@ const chargeReconciliationSchema = new mongoose.Schema(
     reconciled_total: { type: Number, default: null },
     abs_diff: { type: Number, default: null },
     pct_diff: { type: Number, default: null },
+    // PER-HEAD differences (brokerage, STT, exchange, IPFT, SEBI, GST, stamp).
+    //
+    // This field was previously MISSING from the schema, so every head_diffs
+    // object the reconciler computed was silently dropped by Mongoose on write —
+    // leaving only an opaque total and no way to see WHICH statutory rate had
+    // drifted. Mixed rather than a strict subdoc so a future head can be added
+    // without a migration.
+    head_diffs: { type: mongoose.Schema.Types.Mixed, default: null },
     at: { type: Date, default: null },
     error: { type: String, default: null },
   },
@@ -414,6 +422,10 @@ const boxExecutionAttemptSchema = new mongoose.Schema(
     failed_legs: { type: [String], default: [] },
     failure_reason: { type: String, default: null },
     failure_detail: { type: String, default: null },
+    // EXECUTION_ABORT_AFTER_FILL: 4/4 filled, executed economics failed the gate,
+    // whole box reversed immediately. Stored flat so it can be queried directly.
+    abort_after_fill: { type: Boolean, default: false },
+    required_expected_net_profit: { type: Number, default: null },
     // The full per-leg legging record: an append-only audit blob.
     legging: { type: mongoose.Schema.Types.Mixed, default: null },
     partial_entry_charges: { type: Number, default: null },

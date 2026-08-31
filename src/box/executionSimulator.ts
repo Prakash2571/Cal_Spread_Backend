@@ -325,6 +325,9 @@ export class BoxExecutionSimulator {
       unwind_charges: null,
       legging_gross_loss: null,
       legging_net_loss: null,
+      abort_after_fill: false,
+      final_expected_net_profit: null,
+      required_expected_net_profit: null,
       failure_reason: null,
       failure_detail: null,
     });
@@ -431,7 +434,7 @@ export class BoxExecutionSimulator {
         total_entry_slippage: totalEntrySlippage,
       };
 
-      // ---- All four filled: a real box was opened. ----
+      // ---- All four filled. Re-qualify on the EXECUTED prices. ----
       if (filledCount === 4) {
         const execution = this.evaluateFromCaptured(
           candidate,
@@ -439,6 +442,47 @@ export class BoxExecutionSimulator {
           filledAt,
         );
         const decision = args.qualify(execution, totalEntrySlippage);
+        record.final_expected_net_profit = decision.expected_net_profit;
+        record.required_expected_net_profit = decision.min_expected_net_profit;
+
+        /**
+         * ABORT AFTER FILL.
+         *
+         * The four orders have ALREADY filled, so we cannot pretend nothing
+         * happened and simply refuse the entry — that would silently discard a
+         * position the simulated market really gave us, and flatter the strategy
+         * by hiding the cost of a dislocation that decayed in flight.
+         *
+         * Instead: reverse all four legs immediately at the current opposite
+         * touch, book the true round-trip cost (adverse spread + charges both
+         * ways), and open NO box.
+         */
+        if (!decision.qualifies) {
+          record.abort_after_fill = true;
+          record.emergency_unwind = true;
+          await this.wait(Math.max(0, this.deps.cfg.legUnwindLatencyMs));
+          const unwind = this.unwindFilledLegs(candidate, legs, lotSize);
+          record.partial_entry_charges = unwind.partial_entry_charges;
+          record.unwind_charges = unwind.unwind_charges;
+          record.legging_gross_loss = unwind.legging_gross_loss;
+          record.legging_net_loss = unwind.legging_net_loss;
+          record.decision_to_complete_ms = round2(this.now() - detection.at);
+          // A failed unwind is the more serious condition, so it wins the label.
+          record.failure_reason = unwind.unwindFailed ? "unwind_failed" : "abort_after_fill";
+          record.failure_detail =
+            `4/4 filled, but the executed economics no longer qualify: expected net ` +
+            `₹${decision.expected_net_profit ?? "?"} < required ₹${decision.min_expected_net_profit}` +
+            (unwind.unwindFailed ? " (one or more legs could not be unwound)" : "");
+          // Counted as an ABORT, never as a 4/4 fill — no box was opened.
+          this.deps.metrics?.recordLeggingAbortAfterFill();
+          this.deps.metrics?.recordExecutionFailed(record.failure_reason);
+          this.deps.metrics?.recordLeggingLoss(unwind.legging_net_loss);
+          if (record.first_to_last_fill_ms !== null) {
+            this.deps.metrics?.recordFirstToLastFill(record.first_to_last_fill_ms);
+          }
+          return { ok: false, legging: record, reason: record.failure_reason, detail: record.failure_detail };
+        }
+
         record.opened = true;
         this.deps.metrics?.recordLeggingOutcome(4, 0);
         this.deps.metrics?.recordExecutionFilled(totalEntrySlippage, round2(filledAt - detection.at));
@@ -462,61 +506,107 @@ export class BoxExecutionSimulator {
 
       // Emergency unwind the filled legs at the current opposite touch.
       await this.wait(Math.max(0, this.deps.cfg.legUnwindLatencyMs));
-      const unwindAt = this.now();
       record.emergency_unwind = true;
-      let unwindFailed = false;
-      let grossLoss = 0;
-      const filledEntryOrders: { side: OrderSide; tradingsymbol: string; quantity: number; price: number }[] = [];
-      const unwindOrders: { side: OrderSide; tradingsymbol: string; quantity: number; price: number }[] = [];
-
-      for (const legExec of legs) {
-        if (legExec.status !== "FILLED" || legExec.fill_price === null) continue;
-        filledEntryOrders.push({ side: legExec.side, tradingsymbol: legExec.tradingsymbol, quantity: lotSize, price: legExec.fill_price });
-        const inst = candidate.legs[legExec.role];
-        const unwindSide: OrderSide = legExec.side === "BUY" ? "SELL" : "BUY";
-        const q = this.deps.quotes.get(inst.token);
-        const uEval = q
-          ? this.legFromQuote({ role: legExec.role, side: unwindSide, inst, quote: q, lotSize, now: unwindAt, maxAgeMs: this.deps.cfg.quoteMaxAgeMs })
-          : null;
-        if (!uEval || !uEval.executable || !uEval.fresh || uEval.price === null) {
-          unwindFailed = true;
-          legExec.fail_reason = "could not unwind — no opposite touch";
-          continue;
-        }
-        legExec.status = "UNWOUND";
-        legExec.unwind_price = uEval.price;
-        // Round-trip loss for this leg (positive = money lost).
-        const roundTripCost =
-          legExec.side === "BUY"
-            ? round2((legExec.fill_price - uEval.price) * lotSize) // paid ask, sold bid
-            : round2((uEval.price - legExec.fill_price) * lotSize); // sold bid, bought ask
-        legExec.unwind_slippage = roundTripCost;
-        grossLoss += roundTripCost;
-        unwindOrders.push({ side: unwindSide, tradingsymbol: legExec.tradingsymbol, quantity: lotSize, price: uEval.price });
-      }
-
-      const charge = this.deps.chargeTotal ?? (() => 0);
-      const partialEntryCharges = round2(charge(filledEntryOrders));
-      const unwindCharges = round2(charge(unwindOrders));
-      const leggingGrossLoss = round2(-grossLoss); // as a P&L (≤ 0)
-      const leggingNetLoss = round2(leggingGrossLoss - partialEntryCharges - unwindCharges);
-
-      record.partial_entry_charges = partialEntryCharges;
-      record.unwind_charges = unwindCharges;
-      record.legging_gross_loss = leggingGrossLoss;
-      record.legging_net_loss = leggingNetLoss;
+      const unwind = this.unwindFilledLegs(candidate, legs, lotSize);
+      record.partial_entry_charges = unwind.partial_entry_charges;
+      record.unwind_charges = unwind.unwind_charges;
+      record.legging_gross_loss = unwind.legging_gross_loss;
+      record.legging_net_loss = unwind.legging_net_loss;
       record.decision_to_complete_ms = round2(this.now() - detection.at);
-      record.failure_reason = unwindFailed ? "unwind_failed" : "legging_incomplete";
-      record.failure_detail = `${filledCount}/4 filled, failed legs: ${failedLegs.join(", ")}${unwindFailed ? " (one or more could not be unwound)" : ""}`;
+      record.failure_reason = unwind.unwindFailed ? "unwind_failed" : "legging_incomplete";
+      record.failure_detail = `${filledCount}/4 filled, failed legs: ${failedLegs.join(", ")}${unwind.unwindFailed ? " (one or more could not be unwound)" : ""}`;
 
       this.deps.metrics?.recordExecutionFailed(record.failure_reason);
-      this.deps.metrics?.recordLeggingLoss(leggingNetLoss);
+      this.deps.metrics?.recordLeggingLoss(unwind.legging_net_loss);
 
       return { ok: false, legging: record, reason: record.failure_reason, detail: record.failure_detail };
     } finally {
       this.active--;
       this.inFlight.delete(key);
     }
+  }
+
+  /**
+   * Emergency-reverse every FILLED leg at the CURRENT opposite touch, and price
+   * the whole episode.
+   *
+   * Shared by both abort paths — a partial fill (1-3 legs, real directional
+   * exposure) and an abort after a complete 4/4 fill (economics failed). In both
+   * cases the money already spent is real, so the cost is computed from observed
+   * touches only: never an invented price, never a random slippage figure.
+   *
+   * Mutates each leg's status/unwind fields so the per-leg audit trail shows what
+   * happened, and marks a leg UNWIND_FAILED when no opposite touch existed — that
+   * leaves simulated exposure outstanding, which must stay visible.
+   */
+  private unwindFilledLegs(
+    candidate: BoxCandidate,
+    legs: PaperLegExecution[],
+    lotSize: number,
+  ): {
+    unwindFailed: boolean;
+    partial_entry_charges: number;
+    unwind_charges: number;
+    legging_gross_loss: number;
+    legging_net_loss: number;
+  } {
+    const unwindAt = this.now();
+    let unwindFailed = false;
+    let grossLoss = 0;
+    const filledEntryOrders: { side: OrderSide; tradingsymbol: string; quantity: number; price: number }[] = [];
+    const unwindOrders: { side: OrderSide; tradingsymbol: string; quantity: number; price: number }[] = [];
+
+    for (const legExec of legs) {
+      if (legExec.status !== "FILLED" || legExec.fill_price === null) continue;
+      filledEntryOrders.push({
+        side: legExec.side,
+        tradingsymbol: legExec.tradingsymbol,
+        quantity: lotSize,
+        price: legExec.fill_price,
+      });
+      const inst = candidate.legs[legExec.role];
+      const unwindSide: OrderSide = legExec.side === "BUY" ? "SELL" : "BUY";
+      const q = this.deps.quotes.get(inst.token);
+      const uEval = q
+        ? this.legFromQuote({
+            role: legExec.role,
+            side: unwindSide,
+            inst,
+            quote: q,
+            lotSize,
+            now: unwindAt,
+            maxAgeMs: this.deps.cfg.quoteMaxAgeMs,
+          })
+        : null;
+      if (!uEval || !uEval.executable || !uEval.fresh || uEval.price === null) {
+        unwindFailed = true;
+        legExec.status = "UNWIND_FAILED";
+        legExec.fail_reason = "could not unwind — no opposite touch";
+        continue;
+      }
+      legExec.status = "UNWOUND";
+      legExec.unwind_price = uEval.price;
+      // Round-trip loss for this leg (positive = money lost).
+      const roundTripCost =
+        legExec.side === "BUY"
+          ? round2((legExec.fill_price - uEval.price) * lotSize) // paid ask, sold bid
+          : round2((uEval.price - legExec.fill_price) * lotSize); // sold bid, bought ask
+      legExec.unwind_slippage = roundTripCost;
+      grossLoss += roundTripCost;
+      unwindOrders.push({
+        side: unwindSide,
+        tradingsymbol: legExec.tradingsymbol,
+        quantity: lotSize,
+        price: uEval.price,
+      });
+    }
+
+    const charge = this.deps.chargeTotal ?? (() => 0);
+    const partial_entry_charges = round2(charge(filledEntryOrders));
+    const unwind_charges = round2(charge(unwindOrders));
+    const legging_gross_loss = round2(-grossLoss); // as a P&L (≤ 0)
+    const legging_net_loss = round2(legging_gross_loss - partial_entry_charges - unwind_charges);
+    return { unwindFailed, partial_entry_charges, unwind_charges, legging_gross_loss, legging_net_loss };
   }
 
   private leggingRefuse(

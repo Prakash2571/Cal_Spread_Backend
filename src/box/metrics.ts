@@ -233,6 +233,7 @@ export class BoxMetrics {
     legging_1_of_4: 0,
     legging_0_of_4: 0,
     legging_aborts: 0,
+    legging_abort_after_fill: 0,
   };
   /** Failure reason → count. A small, fixed key space, so this cannot grow. */
   private failures = new Map<string, number>();
@@ -301,6 +302,19 @@ export class BoxMetrics {
     if (filledCount > 0 && filledCount < 4) this.counters.legging_aborts++;
   }
 
+  /**
+   * A 4/4 fill that was immediately reversed because the executed economics no
+   * longer qualified.
+   *
+   * Deliberately NOT counted as `legging_4_of_4`: that counter feeds
+   * `fill_rate_4_of_4`, which must mean "a box was actually opened". An aborted
+   * 4/4 is an abort, and is counted as one.
+   */
+  recordLeggingAbortAfterFill(): void {
+    this.counters.legging_abort_after_fill++;
+    this.counters.legging_aborts++;
+  }
+
   recordLeggingFailedRole(role: string): void {
     this.leggingFailedRoles.set(role, (this.leggingFailedRoles.get(role) ?? 0) + 1);
   }
@@ -358,6 +372,8 @@ export class BoxMetrics {
           "0_of_4": c.legging_0_of_4,
           total: leggingTotal,
           aborts: c.legging_aborts,
+          /** 4/4 filled but reversed immediately on failed executed economics. */
+          abort_after_fill: c.legging_abort_after_fill,
         },
         fill_rate_4_of_4: rate(c.legging_4_of_4),
         failure_rate_3_of_4: rate(c.legging_3_of_4),

@@ -1034,7 +1034,11 @@ export class BoxEngine {
       detected_at: new Date(legging.detected_at),
       resolved_at: new Date(),
       detected_gross_edge: null,
-      expected_net_profit: null,
+      // The economics recomputed on the EXECUTED prices, and the gate they were
+      // tested against — so an abort can be sized rather than guessed at.
+      expected_net_profit: legging.final_expected_net_profit,
+      required_expected_net_profit: legging.required_expected_net_profit,
+      abort_after_fill: legging.abort_after_fill,
       filled_leg_count: legging.filled_leg_count,
       failed_legs: legging.failed_legs,
       failure_reason: reason,
@@ -1065,9 +1069,13 @@ export class BoxEngine {
     });
 
     console.log(
-      `[Box] LEGGING ABORT ${directionLabel(direction)} ${candidate.underlying} ` +
+      `[Box] ${legging.abort_after_fill ? "ABORT AFTER FILL" : "LEGGING ABORT"} ` +
+        `${directionLabel(direction)} ${candidate.underlying} ` +
         `${candidate.lower_strike}→${candidate.upper_strike}: ${legging.filled_leg_count}/4 filled, ` +
-        `net loss ₹${netAbort ?? 0} (${reason})`,
+        `net loss ₹${netAbort ?? 0} (${reason})` +
+        (legging.abort_after_fill
+          ? ` — executed net ₹${legging.final_expected_net_profit ?? "?"} < required ₹${legging.required_expected_net_profit ?? "?"}`
+          : ""),
     );
     this.broadcast("execution_attempt", { attempt });
   }

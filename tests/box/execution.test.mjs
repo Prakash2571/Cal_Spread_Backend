@@ -17,6 +17,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { BoxExecutionSimulator } from "../../dist/box/executionSimulator.js";
+import { BoxMetrics } from "../../dist/box/metrics.js";
 import { BoxQuoteStore } from "../../dist/box/quotes.js";
 import { evaluateCandidate, evaluateEntryDecision } from "../../dist/box/math.js";
 import { GOOD_BOX, LOT, cfg, goodCandidate, quote, quotesFor, seedStore } from "./helpers.mjs";
@@ -58,6 +59,9 @@ function build({ config = {}, marketOpen = true, feedHealthy = true, chargeTotal
   const clock = fakeClock();
   const quotes = new BoxQuoteStore();
   const flags = { market: marketOpen, feed: feedHealthy };
+  // A real metrics instance so execution/legging counters can be asserted. Not
+  // sampling (no timers) — snapshot() is read directly.
+  const metrics = new BoxMetrics(conf.metricsWindow);
   const sim = new BoxExecutionSimulator({
     cfg: conf,
     quotes,
@@ -66,8 +70,9 @@ function build({ config = {}, marketOpen = true, feedHealthy = true, chargeTotal
     now: clock.now,
     wait: clock.wait,
     chargeTotal: chargeTotal ?? (() => 0),
+    metrics,
   });
-  return { candidate, conf, clock, quotes, sim, flags };
+  return { candidate, conf, clock, quotes, sim, flags, metrics };
 }
 
 function detect(b, overrides = {}, at = b.clock.base) {
@@ -344,4 +349,154 @@ test("REPLAY: a 3/4 abort is reproduced deterministically with the same loss", a
   assert.equal(a.legging.filled_leg_count, c.legging.filled_leg_count);
   assert.equal(a.legging.legging_net_loss, c.legging.legging_net_loss);
   assert.deepEqual(a.legging.failed_legs, c.legging.failed_legs);
+});
+
+
+/* -------------------- paper_legging: ABORT AFTER A 4/4 FILL ----------------- */
+
+/**
+ * The dangerous edge case: all four orders FILL, but the economics computed on
+ * the executed prices no longer clear the gate.
+ *
+ * We cannot pretend the entry was simply refused — the orders really filled, so a
+ * complete box briefly existed. It must be reversed immediately and the true cost
+ * of that round trip booked, with NO box opened.
+ */
+
+/** A qualifier whose gate/charges can be tuned to force a specific verdict. */
+function qualifyWith(cfgObj, { entryCharges = 150, exitCharges = 150, min = 1200 } = {}) {
+  return (execution, measuredSlippage) =>
+    evaluateEntryDecision({
+      grossEdge: execution.gross_edge,
+      entryCharges,
+      estimatedExitCharges: exitCharges,
+      entrySlippageAllowance: 0,
+      futureExitSlippageAllowance: 0,
+      measuredEntrySlippage: measuredSlippage,
+      cfg: { ...cfgObj, safetyBuffer: 150, minExpectedNetProfit: min, minGrossEdge: 1200, minNetEdge: 0 },
+    });
+}
+
+test("4/4 filled + still qualifies: the box opens and nothing is unwound", async () => {
+  const b = leggingBuild();
+  const detection = detect(b);
+  const res = await b.sim.simulateLeggingEntry({
+    candidate: b.candidate,
+    detection,
+    qualify: qualifyWith(b.conf), // net 1425 >= 1200
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.legging.opened, true);
+  assert.equal(res.legging.abort_after_fill, false);
+  assert.equal(res.legging.emergency_unwind, false);
+  // The executed economics are recorded even on a clean open, for analytics.
+  assert.equal(res.legging.final_expected_net_profit, 1425);
+  assert.equal(res.legging.required_expected_net_profit, 1200);
+});
+
+test("4/4 filled but the executed net falls below the gate: abort after fill, all four reversed, no box", async () => {
+  const b = leggingBuild();
+  const detection = detect(b);
+  // Charges make the executed net ₹675 — a real fill that no longer qualifies.
+  const res = await b.sim.simulateLeggingEntry({
+    candidate: b.candidate,
+    detection,
+    qualify: qualifyWith(b.conf, { entryCharges: 900 }),
+  });
+
+  assert.equal(res.ok, false, "no box may be opened");
+  assert.equal(res.reason, "abort_after_fill");
+  assert.equal(res.legging.abort_after_fill, true);
+  assert.equal(res.legging.opened, false);
+  assert.equal(res.legging.filled_leg_count, 4, "all four really did fill");
+  assert.deepEqual(res.legging.failed_legs, [], "no leg failed — the economics did");
+  assert.equal(res.legging.final_expected_net_profit, 675);
+  assert.equal(res.legging.required_expected_net_profit, 1200);
+
+  // The whole box was reversed, and that cost real money.
+  assert.equal(res.legging.emergency_unwind, true);
+  assert.equal(res.legging.legs.filter((l) => l.status === "UNWOUND").length, 4);
+  assert.ok(res.legging.partial_entry_charges > 0, "the four entry fills were charged");
+  assert.ok(res.legging.unwind_charges > 0, "the four reversals were charged");
+  assert.ok(res.legging.legging_gross_loss <= 0, "crossing the spread both ways loses money");
+  assert.ok(
+    res.legging.legging_net_loss < res.legging.legging_gross_loss,
+    "charges deepen the abort loss",
+  );
+});
+
+test("4/4 filled but the executed net is NEGATIVE: still aborts, and the loss is booked", async () => {
+  const b = leggingBuild();
+  const detection = detect(b);
+  const res = await b.sim.simulateLeggingEntry({
+    candidate: b.candidate,
+    detection,
+    qualify: qualifyWith(b.conf, { entryCharges: 2000 }), // net = -425
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.legging.abort_after_fill, true);
+  assert.equal(res.legging.final_expected_net_profit, -425);
+  assert.ok(res.legging.legging_net_loss < 0, "an abort always costs money");
+});
+
+test("4/4 filled, edge destroyed in flight: the executed prices are what qualification sees", async () => {
+  const b = leggingBuild();
+  const detection = detect(b);
+  // During the latency the box gets much more expensive to buy, but every leg is
+  // still executable — so all four fill and the GROSS edge itself is gone.
+  b.clock.at(100, () => {
+    pushLeg(b, "k1_ce", { bid: 399, bidQty: 150, ask: 400, askQty: 150 }, b.clock.now());
+  });
+  const res = await b.sim.simulateLeggingEntry({
+    candidate: b.candidate,
+    detection,
+    qualify: qualifyWith(b.conf),
+  });
+  assert.equal(res.ok, false, "a decayed dislocation must not open a box");
+  assert.equal(res.legging.filled_leg_count, 4);
+  assert.equal(res.legging.abort_after_fill, true);
+  assert.ok(
+    res.legging.final_expected_net_profit < 1200,
+    `executed net should have collapsed (got ${res.legging.final_expected_net_profit})`,
+  );
+});
+
+test("abort-after-fill whose unwind partially fails is reported as unwind_failed, not a clean abort", async () => {
+  const b = leggingBuild();
+  const detection = detect(b);
+  // All four fill at arrival (base + 220). Then K1 CE loses its BID, so the leg
+  // that must be SOLD to reverse the position has no opposite touch at unwind.
+  b.clock.at(300, () => {
+    pushLeg(b, "k1_ce", { bid: 0, bidQty: 0, ask: 300, askQty: 150 }, b.clock.now());
+  });
+  const res = await b.sim.simulateLeggingEntry({
+    candidate: b.candidate,
+    detection,
+    qualify: qualifyWith(b.conf, { entryCharges: 900 }),
+  });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.legging.abort_after_fill, true, "it is still an abort-after-fill");
+  assert.equal(res.reason, "unwind_failed", "a stranded leg is the more serious condition");
+  const stranded = res.legging.legs.filter((l) => l.status === "UNWIND_FAILED");
+  assert.equal(stranded.length, 1, "the un-reversible leg must stay visible");
+  assert.equal(stranded[0].role, "k1_ce");
+  assert.ok(stranded[0].fail_reason.includes("unwind"));
+  // The legs that could be reversed still were.
+  assert.equal(res.legging.legs.filter((l) => l.status === "UNWOUND").length, 3);
+});
+
+test("an aborted 4/4 is counted as an abort, never as a successful fill", async () => {
+  const b = leggingBuild();
+  const detection = detect(b);
+  await b.sim.simulateLeggingEntry({
+    candidate: b.candidate,
+    detection,
+    qualify: qualifyWith(b.conf, { entryCharges: 900 }),
+  });
+  const snap = b.metrics.snapshot();
+  assert.equal(snap.legging.outcomes["4_of_4"], 0, "must NOT inflate the 4/4 fill rate");
+  assert.equal(snap.legging.outcomes.abort_after_fill, 1);
+  assert.ok(snap.legging.outcomes.aborts >= 1);
+  assert.equal(snap.execution.filled, 0, "no fill was achieved");
 });

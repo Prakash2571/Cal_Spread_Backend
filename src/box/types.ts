@@ -532,7 +532,16 @@ export type BoxExecutionFailureReason =
   /** paper_legging: at least one leg did not fill before the timeout. */
   | "legging_incomplete"
   /** paper_legging: a filled leg could not be unwound (no opposite liquidity). */
-  | "unwind_failed";
+  | "unwind_failed"
+  /**
+   * paper_legging: ALL FOUR legs filled, but the final economics computed on the
+   * EXECUTED prices no longer clear the required expected net profit.
+   *
+   * This is not a refusal — the orders really filled, so a real position existed.
+   * The box is never opened; instead all four legs are immediately reversed and
+   * the true cost of that round trip is booked as the abort P&L.
+   */
+  | "abort_after_fill";
 
 /** One leg's detection → execution comparison. */
 export interface BoxExecutionLeg {
@@ -601,8 +610,19 @@ export interface BoxExecutionRecord {
 /** How the four legs are submitted in paper_legging. */
 export type BoxLegExecutionMode = "parallel" | "sequential";
 
-/** The lifecycle state of one simulated leg order. */
-export type PaperLegStatus = "PENDING" | "FILLED" | "FAILED" | "UNWOUND";
+/**
+ * The lifecycle state of one simulated leg order.
+ *
+ * UNWIND_FAILED is distinct from FAILED: the leg DID fill, and the attempt to
+ * reverse it found no opposite touch — so simulated exposure is still outstanding
+ * and must be visible rather than folded into a generic failure.
+ */
+export type PaperLegStatus =
+  | "PENDING"
+  | "FILLED"
+  | "FAILED"
+  | "UNWOUND"
+  | "UNWIND_FAILED";
 
 /**
  * One leg's independent execution attempt under paper_legging.
@@ -670,6 +690,19 @@ export interface PaperLeggingExecutionRecord {
   legging_gross_loss: number | null;
   /** legging_gross_loss − partial_entry_charges − unwind_charges (₹, ≤ 0). */
   legging_net_loss: number | null;
+  /**
+   * True when all four legs FILLED but the final qualification on the executed
+   * prices failed, so the complete box had to be reversed straight away.
+   *
+   * Distinct from a partial-fill abort: there was no legging *risk* here (the box
+   * was briefly complete and hedged), only an economics failure — the cost is the
+   * round-trip spread and charges on all four legs.
+   */
+  abort_after_fill: boolean;
+  /** Expected net profit recomputed on the EXECUTED prices (₹). */
+  final_expected_net_profit: number | null;
+  /** The gate that figure was tested against (₹). */
+  required_expected_net_profit: number | null;
   failure_reason: BoxExecutionFailureReason | null;
   failure_detail: string | null;
 }
@@ -694,6 +727,13 @@ export interface IBoxExecutionAttempt {
   detected_gross_edge: number | null;
   /** The expected net profit the entry was chasing. */
   expected_net_profit: number | null;
+  /** The gate the attempt had to clear (₹) — so a miss can be sized, not guessed. */
+  required_expected_net_profit?: number | null;
+  /**
+   * True for the EXECUTION_ABORT_AFTER_FILL case: 4/4 filled, economics failed on
+   * the executed prices, whole box reversed immediately.
+   */
+  abort_after_fill?: boolean;
   filled_leg_count: number;
   failed_legs: BoxLegRole[];
   failure_reason: BoxExecutionFailureReason | null;

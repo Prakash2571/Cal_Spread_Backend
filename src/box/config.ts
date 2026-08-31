@@ -66,6 +66,10 @@ function executionMode(name: string, fallback: ExecutionMode): ExecutionMode {
   const v = raw.trim().toLowerCase();
   if (v === "paper_touch") return "paper_touch";
   if (v === "paper_latency") return "paper_latency";
+  // paper_legging MUST be accepted here: it is a first-class execution model, and
+  // silently falling back to paper_latency made the whole four-independent-order
+  // simulation unreachable from configuration (and reported the wrong mode).
+  if (v === "paper_legging") return "paper_legging";
   console.warn(`[Box] ignoring unknown ${name}="${raw}" — using ${fallback}.`);
   return fallback;
 }
@@ -168,6 +172,13 @@ export interface BoxConfig {
   chargeReconcileWarnPct: number;
   /** Max concurrent reconciliation calls (Zerodha must not be hammered). */
   chargeReconcileConcurrency: number;
+  /**
+   * How many times one verification may be tried before the charges are recorded
+   * as unverified. Bounded so a broker outage can never become a hot retry loop.
+   */
+  chargeReconcileMaxAttempts: number;
+  /** Linear backoff base (ms): attempt N waits N × this. */
+  chargeReconcileRetryBaseMs: number;
 
   // ---- Market-data quality ----
   /**
@@ -316,6 +327,8 @@ export function loadBoxConfig(): BoxConfig {
     reconcileCharges: bool("BOX_RECONCILE_CHARGES", true),
     chargeReconcileWarnPct: num("BOX_CHARGE_RECONCILE_WARN_PCT", 5),
     chargeReconcileConcurrency: num("BOX_CHARGE_RECONCILE_CONCURRENCY", 2),
+    chargeReconcileMaxAttempts: num("BOX_CHARGE_RECONCILE_MAX_ATTEMPTS", 3),
+    chargeReconcileRetryBaseMs: num("BOX_CHARGE_RECONCILE_RETRY_BASE_MS", 5_000),
 
     quoteMaxAgeMs: num("BOX_QUOTE_MAX_AGE_MS", 15_000),
     feedMaxAgeMs: num("BOX_FEED_MAX_AGE_MS", 5_000),

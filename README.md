@@ -175,6 +175,15 @@ analytics, schema and collections are untouched, and box positions live in their
 >   entry charges + unwind charges + adverse round-trip) is booked to a separate
 >   `box_execution_attempts` collection so failed executions never vanish from the strategy P&L.
 >
+> **Abort after a 4/4 fill.** A dislocation can decay *while the orders are in flight*. If all four
+> legs fill but the economics recomputed on the **executed** prices no longer clear the gate (say
+> ₹1,700 at detection became ₹800 against a ₹1,200 requirement), the entry is **not** quietly
+> refused — the orders really filled, so a complete box briefly existed. All four legs are reversed
+> immediately, the true round-trip cost (adverse spread + charges both ways) is booked as
+> `abort_after_fill`, and **no box is opened**. Such an attempt is counted as an **abort**, never as
+> a 4/4 fill, so `fill_rate_4_of_4` keeps meaning "a box was actually opened". A leg that cannot be
+> reversed is marked `UNWIND_FAILED` and reported as `unwind_failed` rather than a clean abort.
+>
 > **Slippage accounting.** The measured entry slippage is an ANALYTICS figure, never a second
 > deduction: the executed gross edge already contains any adverse entry move, so final
 > qualification is `executedGross − entryCharges − projectedExitCharges − futureExitSlippage
@@ -459,6 +468,8 @@ Every threshold is env-overridable; the defaults are the shipped specification.
 | `BOX_EXPECTED_ENTRY_SLIPPAGE` / `BOX_EXPECTED_EXIT_SLIPPAGE` | `250` / `250` | Slippage allowances (₹) used before/for the un-measured side |
 | `BOX_RECONCILE_CHARGES` | `true` | Verify local charge maths against Zerodha asynchronously after a fill |
 | `BOX_CHARGE_RECONCILE_WARN_PCT` | `5` | Warn when local vs Zerodha charges differ by more than this % |
+| `BOX_CHARGE_RECONCILE_MAX_ATTEMPTS` | `3` | Bounded retries before charges are recorded unverified (never a hot loop) |
+| `BOX_CHARGE_RECONCILE_RETRY_BASE_MS` | `5000` | Linear backoff base: attempt N waits N × this |
 | `BOX_BROKERAGE_PER_ORDER` / `BOX_STT_SELL_PCT` / `BOX_EXCHANGE_TXN_PCT` / `BOX_SEBI_PCT` / `BOX_STAMP_DUTY_BUY_PCT` / `BOX_GST_PCT` | `20` / `0.15` / `0.03553` / `0.0001` / `0.003` / `18` | The centralised local charge rate card (percentages as PERCENT) |
 | `BOX_REQUIRE_PRICED_CHARGES` | `true` | Skip a box whose charges could not be determined |
 | `BOX_SAFETY_BUFFER` | `150` | Risk allowance (₹) deducted inside the expected-net figure |
