@@ -140,6 +140,10 @@ export class BoxEngine {
   private indicativeTimer: NodeJS.Timeout | null = null;
   private indicativeAt: number | null = null;
   private indicativePriced = 0;
+  /** Rolling ring of (receive time − exchange timestamp) samples, in ms. */
+  private exchangeLagSamples: number[] = [];
+  private exchangeLagCursor = 0;
+  private static readonly EXCHANGE_LAG_WINDOW = 500;
   /** The trading day the last-close view was built from. */
   private indicativeSessionDay: string | null = null;
   /** Legs discarded because they last traded in an EARLIER session. */
@@ -517,6 +521,11 @@ export class BoxEngine {
       if (this.subscribedSpotTokens.has(t.token) && t.last_price > 0) {
         this.spots.set(t.token, t.last_price, now);
       }
+      // Sample how far behind the exchange we are, when a packet carries an
+      // exchange timestamp. It is a Unix SECOND, so the estimate is coarse (and
+      // sensitive to any skew between our clock and the exchange's), hence it is
+      // kept as a rolling distribution and clearly labelled approximate.
+      if (t.exchange_ts && t.exchange_ts > 0) this.sampleExchangeLag(now - t.exchange_ts);
     }
     const changed = this.quotes.applyTicks(ticks, now);
     if (changed.length > 0) {
@@ -549,6 +558,53 @@ export class BoxEngine {
   private feedAgeMs(): number | null {
     const at = this.quotes.lastUpdateAt;
     return at === null ? null : Date.now() - at;
+  }
+
+  /** Record one exchange-lag sample into the ring, clamping clock-skew negatives. */
+  private sampleExchangeLag(lagMs: number): void {
+    // A negative lag means our clock is behind the exchange's — clock skew, not a
+    // real "arrived before it was sent". Clamp so it never flatters the figure.
+    const v = lagMs < 0 ? 0 : lagMs;
+    if (this.exchangeLagSamples.length < BoxEngine.EXCHANGE_LAG_WINDOW) {
+      this.exchangeLagSamples.push(v);
+    } else {
+      this.exchangeLagSamples[this.exchangeLagCursor] = v;
+      this.exchangeLagCursor = (this.exchangeLagCursor + 1) % BoxEngine.EXCHANGE_LAG_WINDOW;
+    }
+  }
+
+  /**
+   * The exchange-lag distribution, or null when no timestamped packet has been
+   * seen yet.
+   *
+   * APPROXIMATE by construction: the exchange stamp is second-resolution and the
+   * figure includes any skew between our clock and the exchange's. It answers
+   * "roughly how far behind NSE is the book we are acting on", not a precise
+   * network latency.
+   */
+  private exchangeLag(): {
+    median_ms: number;
+    p95_ms: number;
+    last_ms: number;
+    samples: number;
+  } | null {
+    const n = this.exchangeLagSamples.length;
+    if (n === 0) return null;
+    const sorted = [...this.exchangeLagSamples].sort((a, b) => a - b);
+    const at = (frac: number) => sorted[Math.min(n - 1, Math.floor(frac * n))]!;
+    return {
+      median_ms: at(0.5),
+      p95_ms: at(0.95),
+      // Newest sample: the most recently written ring slot.
+      last_ms:
+        n < BoxEngine.EXCHANGE_LAG_WINDOW
+          ? this.exchangeLagSamples[n - 1]!
+          : this.exchangeLagSamples[
+              (this.exchangeLagCursor - 1 + BoxEngine.EXCHANGE_LAG_WINDOW) %
+                BoxEngine.EXCHANGE_LAG_WINDOW
+            ]!,
+      samples: n,
+    };
   }
 
   /* ------------------------------- universe ------------------------------- */
@@ -1050,25 +1106,50 @@ export class BoxEngine {
    * leaves margin null, exactly like the calendar trade.
    */
   private async captureMargin(id: string, candidate: BoxCandidate): Promise<void> {
-    try {
-      const res = await this.deps.getBasketMargin(
-        BOX_LEG_ROLES.map((role) => ({
-          exchange: candidate.legs[role].exchange,
-          tradingsymbol: candidate.legs[role].tradingsymbol,
-          transaction_type: BOX_ENTRY_SIDES[role],
-          variety: "regular",
-          product: "NRML",
-          order_type: "MARKET",
-          quantity: candidate.lot_size,
-          price: 0,
-        })),
-      );
-      const margin = Math.round(res.total);
-      const pos = this.positions.get(id);
-      if (pos) pos.margin = margin;
-      await setBoxTradeMargin(id, margin);
-    } catch (err) {
-      console.warn("[Box] basket margin fetch failed:", err);
+    const orders = BOX_LEG_ROLES.map((role) => ({
+      exchange: candidate.legs[role].exchange,
+      tradingsymbol: candidate.legs[role].tradingsymbol,
+      transaction_type: BOX_ENTRY_SIDES[role],
+      variety: "regular",
+      product: "NRML",
+      order_type: "MARKET",
+      quantity: candidate.lot_size,
+      price: 0,
+    }));
+
+    // Retry a few times: the margin API can transiently 5xx or rate-limit right
+    // at entry, and a single failure used to leave margin permanently blank. The
+    // trade already exists, so this is pure enrichment — retrying is safe.
+    const MAX_ATTEMPTS = 4;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      // Stop if the position closed and its doc no longer needs enriching.
+      if (attempt > 1 && !this.positions.get(id)) {
+        // It may have closed; still try ONCE more so the closed doc gets margin.
+      }
+      try {
+        const res = await this.deps.getBasketMargin(orders);
+        const margin = Math.round(res.total);
+        if (!(margin > 0)) {
+          // A zero/blank margin is not useful; treat it as a miss and retry.
+          throw new Error(`basket margin returned ${res.total}`);
+        }
+        const pos = this.positions.get(id);
+        if (pos) pos.margin = margin;
+        await setBoxTradeMargin(id, margin);
+        if (attempt > 1) {
+          console.log(`[Box] margin for ${candidate.key} captured on attempt ${attempt}: ₹${margin}`);
+        }
+        return;
+      } catch (err) {
+        const last = attempt === MAX_ATTEMPTS;
+        console.warn(
+          `[Box] basket margin fetch failed for ${candidate.key} (attempt ${attempt}/${MAX_ATTEMPTS})${last ? " — giving up, margin stays unpriced" : ", retrying"}:`,
+          err instanceof Error ? err.message : err,
+        );
+        if (last) return;
+        // Back off: 1.5s, 3s, 4.5s — clear of a transient rate-limit window.
+        await new Promise((r) => setTimeout(r, 1500 * attempt));
+      }
     }
   }
 
@@ -1211,6 +1292,13 @@ export class BoxEngine {
       /** Feed liveness: age of the newest tick anywhere, and the verdict. */
       feed_age_ms: this.feedAgeMs(),
       feed_healthy: this.isFeedHealthy(),
+      /**
+       * APPROXIMATE lag behind the exchange, from Kite's second-resolution
+       * exchange_timestamp. Distinct from feed_age_ms (a liveness heartbeat):
+       * this estimates how stale the data itself is versus NSE. null until a
+       * timestamped packet has been seen.
+       */
+      exchange_lag_ms: this.exchangeLag(),
       open_positions: this.positions.size,
       skipped_for_budget: this.skippedForBudget.length,
       skipped_symbols: this.skippedForBudget.slice(0, 25),

@@ -25,6 +25,15 @@ export interface Tick {
   ask: number; // best ask (0 if unavailable)
   bids?: DepthLevel[]; // up to 5 levels (full mode only)
   asks?: DepthLevel[];
+  /**
+   * Exchange timestamp in epoch MILLISECONDS, present on "full" packets only.
+   *
+   * Kite sends it as a 32-bit Unix SECOND, so the resolution is one second — it
+   * is enough to estimate how far behind the exchange we are, but never
+   * millisecond-accurate. 0/absent when the packet did not carry one (e.g. LTP
+   * packets, or an index's shorter layout).
+   */
+  exchange_ts?: number;
 }
 
 export interface TickerHandle {
@@ -161,10 +170,16 @@ export function parseBinary(buf: ArrayBuffer): Tick[] {
     let oi = 0;
     let bid = 0;
     let ask = 0;
+    let exchangeTs = 0;
     const bids: DepthLevel[] = [];
     const asks: DepthLevel[] = [];
     if (len >= 184) {
       oi = dv.getUint32(offset + 48, false);
+      // Exchange timestamp at offset 60: a Unix SECOND, so second-resolution.
+      // Multiplied to ms here so consumers work in one unit; 0 is treated as
+      // "absent" by everything downstream.
+      const exSec = dv.getUint32(offset + 60, false);
+      if (exSec > 0) exchangeTs = exSec * 1000;
       // Market depth: 5 bid packets (offset 64), then 5 ask packets (offset
       // 124). Each is 12 bytes: qty(4), price(4), orders(2), padding(2).
       for (let i = 0; i < 5; i++) {
@@ -188,6 +203,7 @@ export function parseBinary(buf: ArrayBuffer): Tick[] {
       ask,
       bids,
       asks,
+      exchange_ts: exchangeTs,
     });
     offset += len;
   }

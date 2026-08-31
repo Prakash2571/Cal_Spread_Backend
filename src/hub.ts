@@ -224,6 +224,7 @@ export class TickerHub {
         ask: t.ask,
         ...(t.bids ? { bids: t.bids } : {}),
         ...(t.asks ? { asks: t.asks } : {}),
+        ...(t.exchange_ts ? { exchange_ts: t.exchange_ts } : {}),
       };
       this.latest.set(t.token, s);
       this.latestAt.set(t.token, now);
