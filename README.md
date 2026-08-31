@@ -169,8 +169,18 @@ analytics, schema and collections are untouched, and box positions live in their
 >   not tick is still valid; an in-flight move during the latency is used automatically; a book that
 >   has aged past the trust window, or is missing, is rejected. There is **no invented slippage
 >   percentage** — slippage is measured against the detection touch.
-> - **`paper_legging`** models **four independent orders**: each leg fills or fails from its own
->   book at arrival. If all four fill a box is opened; if some fill and others do not, the filled
+> - **`paper_legging`** models **four genuinely independent orders**, each with its own lifecycle
+>   (`CREATED → SUBMITTED → IN_FLIGHT → PENDING → FILLED / TIMED_OUT / FAILED`) and its own
+>   timestamps. There is **no common snapshot**: each order arrives, tries the latest valid resting
+>   book, and if it cannot fill the whole lot it **rests as `PENDING`** until a later depth update
+>   fills it — or until `arrival_at + BOX_LEG_TIMEOUT_MS`, which is an **arrival-relative** deadline,
+>   not a detection-relative one. Pending orders are woken by the quote store's subscription, so a
+>   fill is stamped with the **tick's own timestamp**. Legs therefore land at different instants,
+>   which is what makes legging risk measurable: `first_to_last_fill_ms` is literally
+>   `max(fill_at) − min(fill_at)` (0 when they fill together), reported alongside
+>   `decision_to_first_fill_ms` / `decision_to_last_fill_ms`, and `exposure_duration_ms` measures how
+>   long the position was one-sided (first fill → complete box, or → unwind). If all four fill a box
+>   is opened; if some fill and others do not, the filled
 >   legs are **emergency-unwound** at the current opposite touch and the **legging loss** (partial
 >   entry charges + unwind charges + adverse round-trip) is booked to a separate
 >   `box_execution_attempts` collection so failed executions never vanish from the strategy P&L.

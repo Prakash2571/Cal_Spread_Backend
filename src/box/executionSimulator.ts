@@ -40,7 +40,16 @@
 
 import type { BoxConfig } from "./config.js";
 import type { BoxMetrics } from "./metrics.js";
-import { cloneDepth, entrySideFor, evaluateCandidate, evaluateExitLegs, exitSideFor, round2 } from "./math.js";
+import { LegExecutor, fillTiming } from "./legExecutor.js";
+import {
+  cloneDepth,
+  entrySideFor,
+  evaluateCandidate,
+  evaluateExitLegs,
+  exitSideFor,
+  round2,
+  slippagePerUnit,
+} from "./math.js";
 import type { BoxOpenPosition } from "./positions.js";
 import type { BoxQuoteStore } from "./quotes.js";
 import {
@@ -128,17 +137,6 @@ const sleep = (ms: number): Promise<void> =>
     (t as { unref?: () => void }).unref?.();
   });
 
-/** Cost of a price move, per unit: positive always means "worse for us". */
-function slippagePerUnit(
-  side: OrderSide,
-  detected: number | null,
-  executed: number | null,
-): number | null {
-  if (detected === null || executed === null) return null;
-  // Paying more on a BUY and receiving less on a SELL are both adverse.
-  return round2(side === "BUY" ? executed - detected : detected - executed);
-}
-
 export class BoxExecutionSimulator {
   private readonly now: () => number;
   private readonly wait: (ms: number) => Promise<void>;
@@ -146,9 +144,44 @@ export class BoxExecutionSimulator {
   private inFlight = new Set<string>();
   private active = 0;
 
+  /** Independent per-leg order lifecycles (paper_legging). */
+  private readonly legExecutor: LegExecutor;
+
   constructor(private deps: BoxExecutionSimulatorDeps) {
     this.now = deps.now ?? Date.now;
     this.wait = deps.wait ?? sleep;
+    this.legExecutor = new LegExecutor({
+      cfg: deps.cfg,
+      quotes: deps.quotes,
+      now: this.now,
+      wait: this.wait,
+      // One definition of the touch/liquidity rules, shared with every other path.
+      evaluate: (a) => this.legFromQuote(a),
+      // Orders still working are abandoned if the world changes underneath them.
+      abortReason: () => {
+        if (!this.deps.isMarketOpen()) {
+          return { reason: "market_closed" as const, detail: "the market closed while orders were working" };
+        }
+        if (!this.deps.isFeedHealthy()) {
+          return { reason: "feed_unhealthy" as const, detail: "the WebSocket feed went unhealthy while orders were working" };
+        }
+        if (this.leggingStillWanted && !this.leggingStillWanted()) {
+          return { reason: "discovery_stopped" as const, detail: "the candidate was no longer wanted while orders were working" };
+        }
+        return null;
+      },
+    });
+  }
+
+  /** `stillWanted` for the legging run in flight, consulted by the executor. */
+  private leggingStillWanted: (() => boolean) | null = null;
+
+  /** Close the unhedged-exposure window and derive its duration. */
+  private closeExposure(record: PaperLeggingExecutionRecord, at: number): void {
+    if (record.exposure_started_at === null) return;
+    record.exposure_ended_at = at;
+    record.exposure_duration_ms = round2(at - record.exposure_started_at);
+    this.deps.metrics?.recordExposureDuration(record.exposure_duration_ms);
   }
 
   get mode(): ExecutionMode {
@@ -318,6 +351,12 @@ export class BoxExecutionSimulator {
       failed_legs: [],
       legs: [],
       first_to_last_fill_ms: null,
+      decision_to_first_fill_ms: null,
+      decision_to_last_fill_ms: null,
+      timed_out_legs: [],
+      exposure_started_at: null,
+      exposure_ended_at: null,
+      exposure_duration_ms: null,
       decision_to_complete_ms: null,
       total_entry_slippage: 0,
       emergency_unwind: false,
@@ -338,109 +377,89 @@ export class BoxExecutionSimulator {
     this.inFlight.add(key);
     this.active++;
     this.deps.metrics?.recordExecutionAttempt();
+    this.deps.metrics?.recordLeggingAttempt();
+    this.leggingStillWanted = args.stillWanted ?? null;
 
     try {
       const sentAt = detection.at + Math.max(0, this.deps.cfg.simulatedDecisionMs);
-      const arrivalAt = sentAt + Math.max(0, this.deps.cfg.simulatedLatencyMs);
       const tokens = BOX_LEG_ROLES.map((role) => candidate.legs[role].token);
 
-      // Wait to arrival, reading the latest book at that instant (Task 2 model).
-      await this.awaitBooks(tokens, arrivalAt);
-      if (args.stillWanted && !args.stillWanted()) {
-        return this.leggingRefuse(baseRecord(), "discovery_stopped", "the candidate was no longer wanted");
-      }
-      if (!this.deps.isMarketOpen()) return this.leggingRefuse(baseRecord(), "market_closed", "market closed during the delay");
-      if (!this.deps.isFeedHealthy()) return this.leggingRefuse(baseRecord(), "feed_unhealthy", "feed unhealthy during the delay");
+      /**
+       * FOUR INDEPENDENT ORDERS.
+       *
+       * Each one travels, arrives, and then either fills from the latest valid
+       * resting book or rests as PENDING until a later depth update fills it — or
+       * until its own arrival-relative deadline expires. No common snapshot, so
+       * legs genuinely land at different instants (or not at all).
+       */
+      const run = await this.legExecutor.run({
+        requests: BOX_LEG_ROLES.map((role) => {
+          const det = detByRole.get(role);
+          return {
+            role,
+            side: entrySideFor(role, direction),
+            inst: candidate.legs[role],
+            detected_price: det?.price ?? null,
+            detected_qty: det?.qty_at_touch ?? 0,
+            quantity: lotSize,
+          };
+        }),
+        submitAt: sentAt,
+        lotSize,
+      });
 
-      const filledAt = Math.max(arrivalAt, this.now());
-      const legs: PaperLegExecution[] = [];
-      const filledRoles: BoxLegRole[] = [];
-      let sequentialAborted = false;
-
-      for (const role of BOX_LEG_ROLES) {
-        const inst = candidate.legs[role];
-        const side = entrySideFor(role, direction);
-        const det = detByRole.get(role);
-        const submit = sentAt;
-        const legExec: PaperLegExecution = {
-          role,
-          side,
-          token: inst.token,
-          tradingsymbol: inst.tradingsymbol,
-          detected_price: det?.price ?? null,
-          detected_qty: det?.qty_at_touch ?? 0,
-          submit_at: submit,
-          arrival_at: arrivalAt,
-          resolved_at: null,
-          fill_price: null,
-          quantity: lotSize,
-          quote_version: null,
-          book_age_ms: null,
-          slippage: null,
-          status: "PENDING",
-          unwind_price: null,
-          unwind_slippage: null,
-          fail_reason: null,
-        };
-
-        // Sequential mode stops submitting once a leg has failed.
-        if (sequentialAborted) {
-          legExec.status = "FAILED";
-          legExec.fail_reason = "not submitted (earlier leg failed, sequential mode)";
-          legs.push(legExec);
-          continue;
-        }
-
-        const q = this.deps.quotes.get(inst.token);
-        const evalLeg = q
-          ? this.legFromQuote({ role, side, inst, quote: q, lotSize, now: filledAt, maxAgeMs: this.deps.cfg.quoteMaxAgeMs })
-          : null;
-
-        if (evalLeg && evalLeg.executable && evalLeg.fresh) {
-          legExec.status = "FILLED";
-          legExec.resolved_at = filledAt;
-          legExec.fill_price = evalLeg.price;
-          legExec.quote_version = evalLeg.quote_version ?? null;
-          legExec.book_age_ms = evalLeg.age_ms;
-          legExec.slippage = slippagePerUnit(side, det?.price ?? null, evalLeg.price);
-          if (legExec.slippage !== null) legExec.slippage = round2(legExec.slippage * lotSize);
-          filledRoles.push(role);
-        } else {
-          legExec.status = "FAILED";
-          legExec.resolved_at = filledAt;
-          legExec.fail_reason = !q
-            ? "no book at arrival"
-            : evalLeg && !evalLeg.fresh
-              ? "book too stale at arrival"
-              : "insufficient touch liquidity at arrival";
-          if (legMode === "sequential") sequentialAborted = true;
-        }
-        legs.push(legExec);
-      }
-
+      const legs = run.legs;
+      const filledRoles = legs.filter((l) => l.status === "FILLED").map((l) => l.role);
       const filledCount = filledRoles.length;
       const failedLegs = BOX_LEG_ROLES.filter((r) => !filledRoles.includes(r));
+      const timedOutLegs = legs.filter((l) => l.status === "TIMED_OUT").map((l) => l.role);
       const totalEntrySlippage = round2(
         legs.reduce((s, l) => s + (l.status === "FILLED" && l.slippage !== null ? l.slippage : 0), 0),
       );
+      const timing = fillTiming(legs, detection.at);
+      for (const _ of timedOutLegs) this.deps.metrics?.recordLegTimeout();
 
       const record: PaperLeggingExecutionRecord = {
         ...baseRecord(),
         filled_leg_count: filledCount,
         failed_legs: failedLegs,
+        timed_out_legs: timedOutLegs,
         legs,
-        first_to_last_fill_ms: filledCount > 0 ? round2(filledAt - detection.at) : null,
+        first_to_last_fill_ms: timing.first_to_last_fill_ms,
+        decision_to_first_fill_ms: timing.decision_to_first_fill_ms,
+        decision_to_last_fill_ms: timing.decision_to_last_fill_ms,
+        // Exposure starts the moment the FIRST leg fills. It ends when the box is
+        // complete (4/4) or when the unwind finishes — set on those paths below.
+        exposure_started_at: timing.first_fill_at,
+        exposure_ended_at: filledCount === 4 ? timing.last_fill_at : null,
+        exposure_duration_ms:
+          filledCount === 4 && timing.first_fill_at !== null && timing.last_fill_at !== null
+            ? round2(timing.last_fill_at - timing.first_fill_at)
+            : null,
         decision_to_complete_ms: round2(this.now() - detection.at),
         total_entry_slippage: totalEntrySlippage,
       };
 
-      // ---- All four filled. Re-qualify on the EXECUTED prices. ----
+      // The run was cut short (feed died / market shut / discovery stopped). Legs
+      // that had already filled are still real, so fall through to the abort
+      // accounting below rather than pretending nothing happened.
+      if (run.aborted && filledCount === 0) {
+        return this.leggingRefuse(record, run.aborted.reason, run.aborted.detail);
+      }
+
+      if (timing.first_fill_at !== null) {
+        this.deps.metrics?.recordFirstFillLatency(timing.decision_to_first_fill_ms ?? 0);
+        this.deps.metrics?.recordLastFillLatency(timing.decision_to_last_fill_ms ?? 0);
+      }
+
+      // ---- All four filled. Re-qualify on the ACTUAL FILL PRICES. ----
       if (filledCount === 4) {
-        const execution = this.evaluateFromCaptured(
-          candidate,
-          new Map(tokens.map((t) => [t, this.deps.quotes.get(t)!])),
-          filledAt,
-        );
+        // The four legs filled at four different instants, so the store's CURRENT
+        // books are not what we traded. Qualification must price the books each leg
+        // actually filled from — otherwise a box could be accepted or rejected on
+        // prices that never touched this position.
+        const completedAt = timing.last_fill_at ?? this.now();
+        const execution = this.evaluateFromCaptured(candidate, run.booksAtFill, completedAt);
         const decision = args.qualify(execution, totalEntrySlippage);
         record.final_expected_net_profit = decision.expected_net_profit;
         record.required_expected_net_profit = decision.min_expected_net_profit;
@@ -466,6 +485,9 @@ export class BoxExecutionSimulator {
           record.unwind_charges = unwind.unwind_charges;
           record.legging_gross_loss = unwind.legging_gross_loss;
           record.legging_net_loss = unwind.legging_net_loss;
+          // The box was complete and hedged, then reversed: exposure ends with the
+          // unwind, not with the fourth fill.
+          this.closeExposure(record, this.now());
           record.decision_to_complete_ms = round2(this.now() - detection.at);
           // A failed unwind is the more serious condition, so it wins the label.
           record.failure_reason = unwind.unwindFailed ? "unwind_failed" : "abort_after_fill";
@@ -485,7 +507,8 @@ export class BoxExecutionSimulator {
 
         record.opened = true;
         this.deps.metrics?.recordLeggingOutcome(4, 0);
-        this.deps.metrics?.recordExecutionFilled(totalEntrySlippage, round2(filledAt - detection.at));
+        // Detection → the box actually being complete (the LAST leg's fill).
+        this.deps.metrics?.recordExecutionFilled(totalEntrySlippage, round2(completedAt - detection.at));
         if (record.first_to_last_fill_ms !== null) {
           this.deps.metrics?.recordFirstToLastFill(record.first_to_last_fill_ms);
         }
@@ -512,6 +535,8 @@ export class BoxExecutionSimulator {
       record.unwind_charges = unwind.unwind_charges;
       record.legging_gross_loss = unwind.legging_gross_loss;
       record.legging_net_loss = unwind.legging_net_loss;
+      // Directional exposure ran from the first fill until the unwind completed.
+      this.closeExposure(record, this.now());
       record.decision_to_complete_ms = round2(this.now() - detection.at);
       record.failure_reason = unwind.unwindFailed ? "unwind_failed" : "legging_incomplete";
       record.failure_detail = `${filledCount}/4 filled, failed legs: ${failedLegs.join(", ")}${unwind.unwindFailed ? " (one or more could not be unwound)" : ""}`;

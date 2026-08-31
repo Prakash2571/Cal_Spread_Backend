@@ -60,6 +60,22 @@ export function round2(v: number): number {
   return Math.round(v * 100) / 100;
 }
 
+/**
+ * Cost of a price move, per unit: POSITIVE always means "worse for us".
+ *
+ * Paying more on a BUY and receiving less on a SELL are both adverse, so the sign
+ * is normalised here rather than at each call site — a leg's slippage is then
+ * directly comparable and summable regardless of side.
+ */
+export function slippagePerUnit(
+  side: OrderSide,
+  detected: number | null,
+  executed: number | null,
+): number | null {
+  if (detected === null || executed === null) return null;
+  return round2(side === "BUY" ? executed - detected : detected - executed);
+}
+
 /** The side a leg trades on ENTRY for a given direction. */
 export function entrySideFor(role: BoxLegRole, direction: BoxDirection = "LONG_BOX"): OrderSide {
   return BOX_ENTRY_SIDES_BY_DIRECTION[direction][role];

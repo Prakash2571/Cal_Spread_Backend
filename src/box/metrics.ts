@@ -212,6 +212,10 @@ export class BoxMetrics {
   readonly leggingLoss: RingBuffer;
   /** paper_legging: detection → last leg resolution (ms). */
   readonly firstToLastFill: RingBuffer;
+  /** Detection → first / last leg fill, and the unhedged exposure window. */
+  readonly firstFillLatency: RingBuffer;
+  readonly lastFillLatency: RingBuffer;
+  readonly exposureDuration: RingBuffer;
   /** Expected net at entry minus the eventual realised net of the closed trade (₹). */
   readonly expectedVsRealised: RingBuffer;
 
@@ -234,6 +238,8 @@ export class BoxMetrics {
     legging_0_of_4: 0,
     legging_aborts: 0,
     legging_abort_after_fill: 0,
+    legging_attempts: 0,
+    legging_leg_timeouts: 0,
   };
   /** Failure reason → count. A small, fixed key space, so this cannot grow. */
   private failures = new Map<string, number>();
@@ -251,6 +257,9 @@ export class BoxMetrics {
     this.eventLoopLag = new EventLoopLagMonitor(window);
     this.leggingLoss = new RingBuffer(window);
     this.firstToLastFill = new RingBuffer(window);
+    this.firstFillLatency = new RingBuffer(window);
+    this.lastFillLatency = new RingBuffer(window);
+    this.exposureDuration = new RingBuffer(window);
     this.expectedVsRealised = new RingBuffer(window);
   }
 
@@ -327,6 +336,29 @@ export class BoxMetrics {
     this.firstToLastFill.push(ms);
   }
 
+  /** One paper_legging attempt began (its own denominator, not the entry one). */
+  recordLeggingAttempt(): void {
+    this.counters.legging_attempts++;
+  }
+
+  /** One order arrived and was still unfilled at its deadline. */
+  recordLegTimeout(): void {
+    this.counters.legging_leg_timeouts++;
+  }
+
+  recordFirstFillLatency(ms: number): void {
+    this.firstFillLatency.push(ms);
+  }
+
+  recordLastFillLatency(ms: number): void {
+    this.lastFillLatency.push(ms);
+  }
+
+  /** How long the position was one-sided (first fill → complete box or unwind). */
+  recordExposureDuration(ms: number): void {
+    this.exposureDuration.push(ms);
+  }
+
   /** Expected net at entry minus the realised net of the closed trade (₹). */
   recordRealisedVsExpected(diff: number): void {
     this.expectedVsRealised.push(diff);
@@ -380,7 +412,17 @@ export class BoxMetrics {
         failure_rate_2_of_4: rate(c.legging_2_of_4),
         failure_rate_1_of_4: rate(c.legging_1_of_4),
         legging_net_loss: this.leggingLoss.summary(),
+        /** Attempts, with their OWN denominator — never the entry attempt count. */
+        attempts: c.legging_attempts,
+        /** Orders that arrived and expired unfilled at BOX_LEG_TIMEOUT_MS. */
+        leg_timeouts: c.legging_leg_timeouts,
+        /** Dispersion of the fills: max(fill_at) − min(fill_at). */
         first_to_last_fill_ms: this.firstToLastFill.summary(),
+        /** Detection → first fill, and detection → last fill. */
+        first_fill_latency_ms: this.firstFillLatency.summary(),
+        last_fill_latency_ms: this.lastFillLatency.summary(),
+        /** How long the position was one-sided. */
+        exposure_duration_ms: this.exposureDuration.summary(),
         most_failing_role: this.mostFrequentFailingRole(),
         failing_roles: Object.fromEntries(this.leggingFailedRoles),
         expected_vs_realised_net: this.expectedVsRealised.summary(),

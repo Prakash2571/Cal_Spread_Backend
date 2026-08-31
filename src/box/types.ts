@@ -613,13 +613,27 @@ export type BoxLegExecutionMode = "parallel" | "sequential";
 /**
  * The lifecycle state of one simulated leg order.
  *
- * UNWIND_FAILED is distinct from FAILED: the leg DID fill, and the attempt to
- * reverse it found no opposite touch — so simulated exposure is still outstanding
- * and must be visible rather than folded into a generic failure.
+ *   CREATED          built, not yet submitted (sequential mode: waiting its turn)
+ *   SUBMITTED        released to the simulated broker at submit_at
+ *   IN_FLIGHT        travelling; cannot fill before arrival_at
+ *   PENDING          arrived and resting — the book could not fill it yet
+ *   FILLED           the full lot filled at an observed executable touch
+ *   PARTIALLY_FILLED reserved for depth walking (Phase 3); unreachable while the
+ *                    order style is touch-only, which fills one lot or nothing
+ *   TIMED_OUT        still unfilled at arrival_at + BOX_LEG_TIMEOUT_MS
+ *   FAILED           could not be worked at all (never submitted, feed died, …)
+ *   UNWOUND          filled, then successfully reversed
+ *   UNWIND_FAILED    filled, and the reversal found no opposite touch — so
+ *                    simulated exposure is STILL OUTSTANDING and must stay visible
  */
 export type PaperLegStatus =
+  | "CREATED"
+  | "SUBMITTED"
+  | "IN_FLIGHT"
   | "PENDING"
   | "FILLED"
+  | "PARTIALLY_FILLED"
+  | "TIMED_OUT"
   | "FAILED"
   | "UNWOUND"
   | "UNWIND_FAILED";
@@ -641,11 +655,22 @@ export interface PaperLegExecution {
   submit_at: number;
   /** submit + per-leg network/broker latency. */
   arrival_at: number;
+  /** When the order arrived and began RESTING unfilled (null if it never did). */
+  pending_since: number | null;
+  /** arrival_at + BOX_LEG_TIMEOUT_MS — the instant this order gives up. */
+  timeout_at: number | null;
+  /** When the fill happened (distinct from resolved_at, which any end-state sets). */
+  fill_at: number | null;
   /** When the fill (or failure) resolved. */
   resolved_at: number | null;
   fill_price: number | null;
   quantity: number;
+  /** Quantity actually filled, and what was left unfilled. */
+  fill_qty: number;
+  remaining_qty: number;
   quote_version: number | null;
+  /** RECEIVE timestamp of the book the fill was taken from. */
+  book_at: number | null;
   /** Book age at the leg's arrival (ms). */
   book_age_ms: number | null;
   /** fill − detected, signed so positive is always worse (₹, whole lot). */
@@ -677,8 +702,28 @@ export interface PaperLeggingExecutionRecord {
   /** Roles that failed to fill (empty on a clean 4/4). */
   failed_legs: BoxLegRole[];
   legs: PaperLegExecution[];
-  /** Detection → last leg resolution (ms). */
+  /**
+   * LEG DISPERSION: max(fill_at) − min(fill_at) across FILLED legs.
+   *
+   * Literally how far apart the fills landed — the measure of legging risk. This
+   * is NOT "detection → last fill" (that is decision_to_last_fill_ms below); a
+   * single-leg fill therefore gives 0, not the latency.
+   */
   first_to_last_fill_ms: number | null;
+  /** Detection → the FIRST leg's fill (ms). */
+  decision_to_first_fill_ms: number | null;
+  /** Detection → the LAST leg's fill (ms). */
+  decision_to_last_fill_ms: number | null;
+  /** Roles that arrived but were still unfilled at their timeout. */
+  timed_out_legs: BoxLegRole[];
+  /**
+   * UNHEDGED EXPOSURE WINDOW: when the first leg filled, and when the position
+   * stopped being one-sided — either the fourth leg completed the box, or the
+   * emergency unwind finished.
+   */
+  exposure_started_at: number | null;
+  exposure_ended_at: number | null;
+  exposure_duration_ms: number | null;
   decision_to_complete_ms: number | null;
   /** Sum of per-leg entry slippage across FILLED legs (₹). */
   total_entry_slippage: number;
