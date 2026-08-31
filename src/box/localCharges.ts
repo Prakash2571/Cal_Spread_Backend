@@ -85,9 +85,27 @@ export interface BoxChargeRates {
   brokerageMaxPct: number;
   /** STT on option SALES, percent of premium. */
   sttSellPct: number;
+  /**
+   * How STT is rounded. Zerodha's contract note rounds the STT head to the
+   * NEAREST RUPEE, not to paise — so ₹33.75 of computed STT is billed as ₹34.
+   * Modelled explicitly here (via `roundStt`) rather than assuming every head
+   * rounds to paise identically. Set false to round to paise instead.
+   */
+  sttRoundNearestRupee: boolean;
   /** Exchange transaction charge, percent of premium, both sides. */
   exchangeTxnPct: number;
-  /** NSE IPFT contribution, percent of premium. 0 = not modelled. */
+  /**
+   * NSE IPFT (Investor Protection Fund Trust), expressed as ₹ PER CRORE of
+   * premium turnover — the unit the exchange circular actually uses, so no
+   * percentage conversion is needed. It is folded into the exchange head, which
+   * is where a contract note shows it. 0 = not modelled.
+   */
+  ipftPerCrore: number;
+  /**
+   * @deprecated Legacy IPFT expressed as a PERCENT of premium. Kept so an
+   * existing `BOX_IPFT_PCT` deployment still works; prefer `ipftPerCrore`. Both
+   * are added if set.
+   */
   ipftPct: number;
   /** SEBI turnover fee, percent of premium, both sides. */
   sebiPct: number;
@@ -104,14 +122,45 @@ export function loadBoxChargeRates(): BoxChargeRates {
   return {
     brokeragePerOrder: num("BOX_BROKERAGE_PER_ORDER", 20),
     brokerageMaxPct: num("BOX_BROKERAGE_MAX_PCT", 0),
-    sttSellPct: num("BOX_STT_SELL_PCT", 0.15),
-    exchangeTxnPct: num("BOX_EXCHANGE_TXN_PCT", 0.03553),
+    sttSellPct: num("BOX_STT_SELL_PCT", 0.1),
+    sttRoundNearestRupee: bool("BOX_STT_ROUND_NEAREST_RUPEE", true),
+    exchangeTxnPct: num("BOX_EXCHANGE_TXN_PCT", 0.03503),
+    // ₹ per crore of premium. NSE equity-options IPFT is ₹50 per crore of
+    // premium; default 0 keeps the historical behaviour until deliberately set.
+    ipftPerCrore: num("BOX_IPFT_PER_CRORE", 0),
     ipftPct: num("BOX_IPFT_PCT", 0),
     sebiPct: num("BOX_SEBI_PCT", 0.0001),
     stampDutyBuyPct: num("BOX_STAMP_DUTY_BUY_PCT", 0.003),
     gstPct: num("BOX_GST_PCT", 18),
     sttType: process.env.BOX_STT_TYPE?.trim() || "stt",
   };
+}
+
+function bool(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const v = raw.trim().toLowerCase();
+  if (v === "1" || v === "true" || v === "yes") return true;
+  if (v === "0" || v === "false" || v === "no") return false;
+  return fallback;
+}
+
+/**
+ * Statutory rounding of the STT head.
+ *
+ * The one place this rule lives, so a contract note reads like Zerodha's. STT is
+ * rounded to the nearest rupee by default (their documented behaviour); the other
+ * heads keep paise. Centralised so it can never be applied to the wrong head.
+ */
+export function roundStt(value: number, rates: Pick<BoxChargeRates, "sttRoundNearestRupee">): number {
+  return rates.sttRoundNearestRupee ? Math.round(value) : round2(value);
+}
+
+/** IPFT for one leg (₹), from the ₹/crore rate plus any legacy percentage. */
+export function ipftFor(value: number, rates: BoxChargeRates): number {
+  const perCrore = (value * rates.ipftPerCrore) / 10_000_000;
+  const legacyPct = pct(value, rates.ipftPct);
+  return round2(perCrore + legacyPct);
 }
 
 /** One order to charge: the instrument, the size and the fill price. */
@@ -142,10 +191,12 @@ export function calculateLegCharges(
   const cap = rates.brokerageMaxPct > 0 ? pct(value, rates.brokerageMaxPct) : Infinity;
   const brokerage = round2(Math.min(rates.brokeragePerOrder, cap));
 
-  // STT is a SELL-side tax on the premium; a purchase pays none.
-  const stt = order.side === "SELL" ? round2(pct(value, rates.sttSellPct)) : 0;
-  // IPFT rides in the exchange head, which is where a contract note shows it.
-  const exchange_txn = round2(pct(value, rates.exchangeTxnPct + rates.ipftPct));
+  // STT is a SELL-side tax on the premium; a purchase pays none. Rounded by the
+  // statutory rule (nearest rupee by default), NOT to paise like the other heads.
+  const stt = order.side === "SELL" ? roundStt(pct(value, rates.sttSellPct), rates) : 0;
+  // Exchange transaction charge + IPFT (₹/crore) ride in the exchange head, which
+  // is where a contract note shows them.
+  const exchange_txn = round2(pct(value, rates.exchangeTxnPct) + ipftFor(value, rates));
   const sebi = round2(pct(value, rates.sebiPct));
   // Stamp duty is a BUY-side duty.
   const stamp_duty = order.side === "BUY" ? round2(pct(value, rates.stampDutyBuyPct)) : 0;

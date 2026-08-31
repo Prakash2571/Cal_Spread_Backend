@@ -159,16 +159,27 @@ analytics, schema and collections are untouched, and box positions live in their
 > ### Paper execution — read this before trusting a number
 >
 > **This module never places a real order.** No Zerodha order-placement API is called anywhere in
-> it. Every fill is simulated and stored with an `execution_mode` of `paper_latency` (default) or
-> `paper_touch`.
+> it. Every fill is simulated and stored with an `execution_mode` of `paper_latency` (default),
+> `paper_touch`, or `paper_legging`.
 >
 > - **`paper_touch`** assumes all four one-lot legs were simultaneously executable at the touch in
 >   the detection snapshot. Optimistic, kept for comparison.
-> - **`paper_latency`** (default) is more realistic: it waits a simulated decision + order-send
->   delay and then fills from the **first WebSocket book each leg publishes at or after that
->   moment**, so every recorded price is one the exchange actually showed *after* the order could
->   have arrived. There is **no invented slippage percentage** — slippage is measured against the
->   detection touch. If a leg publishes no post-arrival book, nothing is filled.
+> - **`paper_latency`** (default) waits a simulated decision + order-send delay and then fills from
+>   the **latest valid WebSocket book at the simulated arrival instant** — a resting book that did
+>   not tick is still valid; an in-flight move during the latency is used automatically; a book that
+>   has aged past the trust window, or is missing, is rejected. There is **no invented slippage
+>   percentage** — slippage is measured against the detection touch.
+> - **`paper_legging`** models **four independent orders**: each leg fills or fails from its own
+>   book at arrival. If all four fill a box is opened; if some fill and others do not, the filled
+>   legs are **emergency-unwound** at the current opposite touch and the **legging loss** (partial
+>   entry charges + unwind charges + adverse round-trip) is booked to a separate
+>   `box_execution_attempts` collection so failed executions never vanish from the strategy P&L.
+>
+> **Slippage accounting.** The measured entry slippage is an ANALYTICS figure, never a second
+> deduction: the executed gross edge already contains any adverse entry move, so final
+> qualification is `executedGross − entryCharges − projectedExitCharges − futureExitSlippage
+> allowance − buffer`. Likewise, once an exit actually executes the expected exit-slippage allowance
+> is dropped (realisable → realised).
 >
 > Either way these are **simulated fills at observed quotes**, not exchange fills, and do not
 > guarantee the same result live, which can also experience:
@@ -406,10 +417,16 @@ Every threshold is env-overridable; the defaults are the shipped specification.
 | `BOX_MIN_EXPECTED_NET_PROFIT` | `1200` | **The entry gate**: minimum expected NET profit (₹) after every cost |
 | `MIN_BOX_GROSS_EDGE` | `1200` | Cheap gross prefilter (₹) — never the decision |
 | `MIN_BOX_NET_EDGE` | `0` | Legacy *additional* net floor (₹). `>0` raises the effective gate |
-| `BOX_EXECUTION_MODE` | `paper_latency` | `paper_latency` (realistic) or `paper_touch` (optimistic, for comparison) |
+| `BOX_EXECUTION_MODE` | `paper_latency` | `paper_latency`, `paper_touch`, or `paper_legging` (four independent orders) |
 | `BOX_SIMULATED_LATENCY_MS` | `250` | Simulated order-send → exchange arrival delay |
 | `BOX_SIMULATED_DECISION_MS` | `40` | Simulated internal decision time before an order is "sent" |
-| `BOX_EXECUTION_MAX_WAIT_MS` | `1500` | How long the simulator waits for a post-arrival book per leg |
+| `BOX_EXECUTION_MAX_WAIT_MS` | `1500` | Bound on how long the simulator waits to reach the arrival instant |
+| `BOX_LEG_EXECUTION_MODE` | `parallel` | `paper_legging` leg submission: `parallel` or `sequential` |
+| `BOX_LEG_TIMEOUT_MS` | `500` | `paper_legging` per-leg rest time before it is deemed unfilled |
+| `BOX_LEG_UNWIND_LATENCY_MS` | `150` | Simulated latency of the emergency unwind of partial fills |
+| `BOX_EXIT_USE_REALISABLE` | `true` | Judge the auto-exit profit floor on realisable net (touch net − exit-slippage allowance) pre-execution; the final check uses the actual executed price |
+| `BOX_STT_ROUND_NEAREST_RUPEE` | `true` | Round the STT head to the nearest rupee, as the contract note does |
+| `BOX_IPFT_PER_CRORE` | `0` | NSE IPFT expressed as ₹ per crore of premium (folded into the exchange head) |
 | `BOX_ENABLE_SHORT_BOX` | `true` | Evaluate SHORT/reverse boxes as well as long boxes |
 | `BOX_EXPECTED_ENTRY_SLIPPAGE` / `BOX_EXPECTED_EXIT_SLIPPAGE` | `250` / `250` | Slippage allowances (₹) used before/for the un-measured side |
 | `BOX_RECONCILE_CHARGES` | `true` | Verify local charge maths against Zerodha asynchronously after a fill |

@@ -79,6 +79,14 @@ export interface BoxConfig {
   /** Cap on simultaneous simulated execution pipelines. */
   maxConcurrentExecutions: number;
 
+  // ---- paper_legging: four independent orders ----
+  /** How the four legs are submitted: "parallel" (default) or "sequential". */
+  legExecutionMode: "parallel" | "sequential";
+  /** How long a leg may rest before it is deemed unfilled and the box aborts (ms). */
+  legTimeoutMs: number;
+  /** Simulated latency for the emergency unwind of partial fills (ms). */
+  legUnwindLatencyMs: number;
+
   // ---- Entry qualification ----
   /**
    * THE ENTRY GATE: minimum EXPECTED NET PROFIT (₹).
@@ -192,6 +200,13 @@ export interface BoxConfig {
   convergencePct: number;
   /** Minimum realisable NET profit (₹) for any normal (non-emergency) exit. */
   minExitNetPnl: number;
+  /**
+   * Whether a normal auto-exit's profit floor is judged on REALISABLE net
+   * (touch net − expected exit-slippage allowance) rather than raw touch net.
+   * Once the exit actually executes, the check re-runs on the actual price with
+   * no allowance. Default true.
+   */
+  exitUseRealisableNet: boolean;
   /** Net profit that alone justifies taking profit, as a fraction of net edge. */
   profitCapturePct: number;
   /** Fraction of the ORIGINAL edge captured that alone justifies an exit. */
@@ -235,6 +250,13 @@ export function loadBoxConfig(): BoxConfig {
     executionPollMs: num("BOX_EXECUTION_POLL_MS", 20),
     maxConcurrentExecutions: num("BOX_MAX_CONCURRENT_EXECUTIONS", 8),
 
+    legExecutionMode:
+      (process.env.BOX_LEG_EXECUTION_MODE?.trim().toLowerCase() === "sequential"
+        ? "sequential"
+        : "parallel"),
+    legTimeoutMs: num("BOX_LEG_TIMEOUT_MS", 500),
+    legUnwindLatencyMs: num("BOX_LEG_UNWIND_LATENCY_MS", 150),
+
     // THE gate: ₹1,200 of expected net profit after every cost.
     minExpectedNetProfit: num("BOX_MIN_EXPECTED_NET_PROFIT", 1200),
     // Prefilter only.
@@ -263,6 +285,7 @@ export function loadBoxConfig(): BoxConfig {
     convergenceFloor: num("BOX_CONVERGENCE_FLOOR", 200),
     convergencePct: num("BOX_CONVERGENCE_PCT", 0.2),
     minExitNetPnl: num("BOX_MIN_EXIT_NET_PNL", 600),
+    exitUseRealisableNet: bool("BOX_EXIT_USE_REALISABLE", true),
     profitCapturePct: num("BOX_PROFIT_CAPTURE_PCT", 0.75),
     minCapturedPct: num("BOX_MIN_CAPTURED_PCT", 0.75),
 

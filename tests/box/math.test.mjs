@@ -718,3 +718,70 @@ test("an indicative edge can never exceed the box's maximum payoff", () => {
     }
   }
 });
+
+
+/* -------------------- Task 6/7: realisable-net exit gating ----------------- */
+
+/** Exit metrics with an explicit exit-slippage allowance and the realisable flag. */
+function metricsWithAllowance(exitValuePerUnit, { allowance, useRealisable, entryCost = GOOD_BOX.costPerUnit, entryNetEdge = 1425 } = {}) {
+  const { candidate } = goodCandidate();
+  const quotes = exitQuotes(candidate, exitValuePerUnit, { at: NOW, qty: 150 });
+  const legs = evaluateExitLegs({
+    legs: BOX_LEG_ROLES.map((role) => ({ role, inst: candidate.legs[role] })),
+    quotes,
+    lotSize: LOT,
+    now: NOW,
+    maxAgeMs: 1500,
+  });
+  return computeExitMetrics({
+    boxWidth: GOOD_BOX.width,
+    lotSize: LOT,
+    entryBoxCostPerUnit: entryCost,
+    entryNetEdge,
+    entryChargesTotal: 150,
+    currentExitChargesTotal: 150,
+    legs,
+    now: NOW,
+    executionCost: allowance,
+    useRealisableForFloor: useRealisable,
+    cfg: cfg(),
+  });
+}
+
+test("a current touch that passes but whose REALISABLE net fails does not trigger a normal exit", () => {
+  // Converged (remaining ₹150 <= ₹285). Touch net ₹650, exit-slippage allowance
+  // ₹150 → realisable ₹500 < the ₹600 floor. With the realisable check on, hold.
+  // exitValue 198 → gross (198-cost)*75. Pick cost so touch net = 650.
+  // gross = (198-cost)*75; net = gross - 300 = 650 → gross 950 → cost = 198 - 950/75 = 185.33…
+  // Use cost 185 → gross (198-185)*75 = 975; net 675; realisable 675-150=525 < 600.
+  const held = metricsWithAllowance(198, { allowance: 150, useRealisable: true, entryCost: 185 });
+  assert.equal(held.current_net_pnl, 675);
+  assert.equal(held.realisable_net_pnl, 525);
+  assert.equal(held.exit_eligible, false, "realisable net below the floor holds the trade");
+  assert.equal(held.rule_reason, null);
+  assert.equal(held.blocked_reason, "net_below_floor");
+
+  // The SAME touch, judged on raw touch net (realisable check off), WOULD exit.
+  const touch = metricsWithAllowance(198, { allowance: 150, useRealisable: false, entryCost: 185 });
+  assert.equal(touch.current_net_pnl, 675);
+  assert.equal(touch.exit_eligible, true);
+  assert.equal(touch.rule_reason, "EDGE_CONVERGED");
+});
+
+test("once the ACTUAL exit price is known, no allowance is subtracted (realisable == realised)", () => {
+  // Post-execution the caller passes allowance 0: the floor is the real net.
+  const m = metricsWithAllowance(198, { allowance: 0, useRealisable: false, entryCost: 185 });
+  assert.equal(m.current_net_pnl, 675);
+  assert.equal(m.realisable_net_pnl, 675, "no forward allowance once the price is real");
+  assert.equal(m.exit_eligible, true);
+  assert.equal(m.exit_reason, "EDGE_CONVERGED");
+});
+
+test("a comfortably profitable box still exits with the realisable check on", () => {
+  // Touch net well above floor even after the allowance.
+  const m = metricsWithAllowance(198, { allowance: 150, useRealisable: true, entryCost: 175 });
+  assert.equal(m.current_net_pnl, 1425);
+  assert.equal(m.realisable_net_pnl, 1275);
+  assert.equal(m.exit_eligible, true);
+  assert.equal(m.exit_reason, "EDGE_CONVERGED");
+});

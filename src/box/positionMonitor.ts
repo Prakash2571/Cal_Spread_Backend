@@ -214,7 +214,11 @@ export class BoxPositionMonitor {
       now,
       direction,
       entryEdge: pos.entry_gross_edge,
+      // PRE-EXECUTION: judge the profit floor on realisable net (touch net minus
+      // the expected exit-slippage allowance) so a marginal touch does not trigger
+      // an exit that would not realistically net enough.
       executionCost: this.deps.cfg.expectedExitSlippage,
+      useRealisableForFloor: this.deps.cfg.exitUseRealisableNet,
       openedAt: pos.opened_at,
       expirySafety: this.isInExpirySafetyWindow(pos),
       cfg: this.deps.cfg,
@@ -308,6 +312,9 @@ export class BoxPositionMonitor {
           this.deps.isFeedHealthy(),
         validate: (legs) => {
           // Re-derive the decision on the EXECUTED prices with local charges.
+          // POST-EXECUTION: the actual exit price is now known, so no expected
+          // exit-slippage allowance is subtracted (Task 6/7) — the floor is the
+          // real net.
           const exitTotal = this.localExitChargesTotal(pos, legs);
           const m = computeExitMetrics({
             boxWidth: pos.box_width,
@@ -320,7 +327,8 @@ export class BoxPositionMonitor {
             now: Date.now(),
             direction: pos.direction ?? "LONG_BOX",
             entryEdge: pos.entry_gross_edge,
-            executionCost: this.deps.cfg.expectedExitSlippage,
+            executionCost: 0,
+            useRealisableForFloor: false,
             openedAt: pos.opened_at,
             expirySafety,
             cfg: this.deps.cfg,
@@ -366,7 +374,10 @@ export class BoxPositionMonitor {
         now: Date.now(),
         direction: pos.direction ?? "LONG_BOX",
         entryEdge: pos.entry_gross_edge,
-        executionCost: this.deps.cfg.expectedExitSlippage,
+        // The exit has executed at a known price: no forward allowance is
+        // subtracted, so realisable == realised net here.
+        executionCost: 0,
+        useRealisableForFloor: false,
         openedAt: pos.opened_at,
         expirySafety,
         cfg: this.deps.cfg,

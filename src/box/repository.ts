@@ -10,9 +10,11 @@
 import mongoose from "mongoose";
 import { isBoxConnectionReady } from "../db.js";
 import {
+  BoxExecutionAttempt,
   BoxTrade,
   BoxTradeEvent,
   isBoxEventLedgerEnabled,
+  type BoxExecutionAttemptRecord,
   type BoxTradeRecord,
 } from "./model.js";
 import type {
@@ -22,6 +24,7 @@ import type {
   BoxEventType,
   BoxExecutionRecord,
   ExecutionMode,
+  IBoxExecutionAttempt,
   IBoxTrade,
   IBoxTradeEvent,
 } from "./types.js";
@@ -276,6 +279,40 @@ export async function appendBoxEvent(input: BoxEventInput): Promise<void> {
     await BoxTradeEvent.create(entry);
   } catch (err) {
     console.warn("[Box] failed to append", input.event, "event:", err);
+  }
+}
+
+/* --------------------------- execution attempts --------------------------- */
+
+/**
+ * Persist a paper_legging execution attempt that did not open a box.
+ *
+ * Best-effort like the ledger: a failed write is logged, never thrown, because
+ * the attempt has already resolved in memory and this is a record of it.
+ */
+export async function insertBoxExecutionAttempt(
+  attempt: IBoxExecutionAttempt,
+): Promise<void> {
+  if (!isBoxDbEnabled()) return;
+  try {
+    await BoxExecutionAttempt.create(attempt);
+  } catch (err) {
+    console.warn("[Box] failed to persist execution attempt:", err);
+  }
+}
+
+/** Recent aborted-execution attempts, newest first. */
+export async function loadBoxExecutionAttempts(
+  limit = 200,
+): Promise<BoxExecutionAttemptRecord[]> {
+  if (!isBoxDbEnabled()) return [];
+  try {
+    return await BoxExecutionAttempt.find()
+      .sort({ resolved_at: -1 })
+      .limit(limit)
+      .lean<BoxExecutionAttemptRecord[]>();
+  } catch {
+    return [];
   }
 }
 

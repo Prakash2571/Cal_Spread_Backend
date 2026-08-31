@@ -498,30 +498,67 @@ export function projectedNetEdge(args: {
 /**
  * THE ENTRY DECISION — expected NET profit, with every term visible.
  *
- *   expectedNet = gross - entryFees - estExitFees - executionCost - safetyBuffer
+ *   expectedNet = grossEdge
+ *               - entryCharges
+ *               - estimatedExitCharges
+ *               - (entrySlippageAllowance + futureExitSlippageAllowance)
+ *               - safetyBuffer
  *   qualifies   = expectedNet >= requiredNetProfit(cfg)
  *
- * The gross figure is only a prefilter: it decides whether a candidate is worth
- * costing out at all. Nothing is entered on gross alone.
+ * TWO DISTINCT CONTEXTS, ONE FUNCTION — and the difference is the whole point of
+ * TASK 1 (fixing entry-slippage double counting):
  *
- * `executionCost` is the honest part. Before the execution simulator has run it
- * is the configured allowance; afterwards the caller passes the MEASURED entry
- * slippage plus the exit allowance, and the same function is applied to the
- * execution snapshot. That is what makes the final qualification a statement
- * about a fill rather than about a sighting.
+ *   PRE-EXECUTION PROJECTION (deciding whether to start the pipeline)
+ *     grossEdge                    = the DETECTION gross edge
+ *     entrySlippageAllowance       = cfg.expectedEntrySlippage   (a guess, deducted)
+ *     futureExitSlippageAllowance  = cfg.expectedExitSlippage    (a guess, deducted)
+ *     measuredEntrySlippage        = null
+ *
+ *   FINAL EXECUTION QUALIFICATION (deciding whether the fill is worth keeping)
+ *     grossEdge                    = the EXECUTED gross edge — adverse entry
+ *                                    movement is ALREADY inside this number
+ *     entrySlippageAllowance       = 0   ← never deduct entry slippage again
+ *     futureExitSlippageAllowance  = cfg.expectedExitSlippage    (still a future cost)
+ *     measuredEntrySlippage        = the measured entry slippage — RECORDED as an
+ *                                    analytics figure, NOT deducted
+ *
+ * The legacy single `executionCost` argument is still accepted (treated as the
+ * whole deducted allowance) so existing callers/tests keep working.
  */
 export function evaluateEntryDecision(args: {
   grossEdge: number | null;
   entryCharges: number | null;
   estimatedExitCharges: number | null;
-  executionCost: number;
+  /** @deprecated Prefer the explicit allowances below. The whole deducted cost. */
+  executionCost?: number;
+  /** Expected entry-slippage allowance to deduct (pre-execution only; 0 at final). */
+  entrySlippageAllowance?: number;
+  /** Expected future exit-slippage allowance to deduct (always a forward cost). */
+  futureExitSlippageAllowance?: number;
+  /** Measured entry slippage for the record — NEVER deducted (analytics only). */
+  measuredEntrySlippage?: number | null;
   cfg: Pick<
     BoxConfig,
     "minExpectedNetProfit" | "minNetEdge" | "minGrossEdge" | "safetyBuffer"
   >;
 }): BoxEntryDecision {
   const { grossEdge, entryCharges, estimatedExitCharges, cfg } = args;
-  const executionCost = round2(args.executionCost);
+
+  // Resolve the two named allowances. When the explicit fields are supplied they
+  // win; otherwise fall back to the legacy lumped `executionCost` (attributed to
+  // the entry allowance, with no future-exit split — legacy callers never cared).
+  const usingExplicit =
+    args.entrySlippageAllowance !== undefined || args.futureExitSlippageAllowance !== undefined;
+  const entryAllowance = usingExplicit
+    ? round2(args.entrySlippageAllowance ?? 0)
+    : round2(args.executionCost ?? 0);
+  const futureExitAllowance = usingExplicit ? round2(args.futureExitSlippageAllowance ?? 0) : 0;
+  const executionCost = round2(entryAllowance + futureExitAllowance);
+  const measuredEntrySlippage =
+    args.measuredEntrySlippage === undefined || args.measuredEntrySlippage === null
+      ? null
+      : round2(args.measuredEntrySlippage);
+
   const minNet = requiredNetProfit(cfg);
   const passesPrefilter = grossEdge !== null && grossEdge >= cfg.minGrossEdge;
 
@@ -530,6 +567,9 @@ export function evaluateEntryDecision(args: {
     entry_charges: entryCharges,
     estimated_exit_charges: estimatedExitCharges,
     execution_cost: executionCost,
+    entry_slippage_allowance: entryAllowance,
+    future_exit_slippage_allowance: futureExitAllowance,
+    measured_entry_slippage: measuredEntrySlippage,
     safety_buffer: cfg.safetyBuffer,
     min_expected_net_profit: minNet,
     passes_gross_prefilter: passesPrefilter,
@@ -813,6 +853,14 @@ export function evaluateExitDecision(args: {
   currentExitChargesTotal: number | null;
   legs: BoxLegEvaluation[];
   expirySafety?: boolean;
+  /**
+   * The expected FUTURE exit-slippage allowance (₹). PRE-execution the floor is
+   * measured against `netPnl - executionAllowance` (the realistically realisable
+   * figure); once the ACTUAL exit price is known the caller passes 0.
+   */
+  executionAllowance?: number;
+  /** When true, the profit floor/capture use realisable net rather than touch net. */
+  useRealisableForFloor?: boolean;
   cfg: Pick<
     BoxConfig,
     | "convergenceFloor"
@@ -833,6 +881,13 @@ export function evaluateExitDecision(args: {
       : round2(args.entryChargesTotal + args.currentExitChargesTotal);
   const netPnl = grossPnl === null || roundTrip === null ? null : round2(grossPnl - roundTrip);
 
+  // The figure the PROFIT rules judge against. Pre-execution (useRealisableForFloor)
+  // it is net minus the expected exit-slippage allowance — a conservative estimate
+  // of what an exit would realistically net. Post-execution the caller sets the
+  // allowance to 0, so this equals the actual net at the executed price.
+  const allowance = args.useRealisableForFloor === true ? round2(args.executionAllowance ?? 0) : 0;
+  const floorNet = netPnl === null ? null : round2(netPnl - allowance);
+
   const remainingEdge =
     exitCredit === null
       ? null
@@ -848,17 +903,19 @@ export function evaluateExitDecision(args: {
   const executable = exitLiquidityOk(legs);
   const expirySafety = args.expirySafety === true;
 
-  // What the ARITHMETIC concludes, before asking whether it can be done.
+  // What the ARITHMETIC concludes, before asking whether it can be done. The
+  // profit tests use `floorNet` (realisable pre-execution, actual post-execution);
+  // the "in profit at all" guard stays on the touch net.
   let ruleReason: BoxExitReason | null = null;
   let blocked: BoxExitBlockedReason = null;
 
-  if (netPnl === null) {
+  if (netPnl === null || floorNet === null) {
     blocked = "unpriced_charges";
   } else if (netPnl > 0 && remainingEdge !== null) {
-    const clearsFloor = netPnl >= cfg.minExitNetPnl;
+    const clearsFloor = floorNet >= cfg.minExitNetPnl;
     const converged = remainingEdge <= threshold;
     const capturedEnough =
-      netPnl >= captureTarget || (capturedPct !== null && capturedPct >= cfg.minCapturedPct);
+      floorNet >= captureTarget || (capturedPct !== null && capturedPct >= cfg.minCapturedPct);
 
     if (converged && clearsFloor) ruleReason = "EDGE_CONVERGED";
     else if (clearsFloor && capturedEnough) ruleReason = "PROFIT_CAPTURE";
@@ -923,6 +980,8 @@ export function computeExitMetrics(args: {
   entryEdge?: number;
   /** Execution/slippage allowance reported for the unwind (₹). */
   executionCost?: number;
+  /** Use realisable net (touch net − executionCost) for the profit floor/capture. */
+  useRealisableForFloor?: boolean;
   openedAt?: number;
   expirySafety?: boolean;
   cfg: Pick<
@@ -939,6 +998,7 @@ export function computeExitMetrics(args: {
   const entryEdge =
     args.entryEdge ??
     round2((directionSign(direction) * boxWidth - entryBoxCostPerUnit) * lotSize);
+  const executionCost = round2(args.executionCost ?? 0);
 
   const decision = evaluateExitDecision({
     direction,
@@ -951,6 +1011,8 @@ export function computeExitMetrics(args: {
     currentExitChargesTotal: args.currentExitChargesTotal,
     legs,
     expirySafety: args.expirySafety === true,
+    executionAllowance: executionCost,
+    useRealisableForFloor: args.useRealisableForFloor === true,
     cfg,
   });
 
@@ -961,7 +1023,6 @@ export function computeExitMetrics(args: {
       ? null
       : round2(args.entryChargesTotal + args.currentExitChargesTotal);
 
-  const executionCost = round2(args.executionCost ?? 0);
   const realisable =
     decision.net_pnl === null ? null : round2(decision.net_pnl - executionCost);
 

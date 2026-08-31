@@ -95,6 +95,19 @@ export interface BoxChargeReconciliation {
   abs_diff: number | null;
   /** abs_diff / zerodha_total, as a percentage. */
   pct_diff: number | null;
+  /**
+   * Per-head local-minus-Zerodha differences (₹). When a discrepancy clusters on
+   * one head this points straight at the wrong rate or rounding rule (e.g. STT),
+   * instead of leaving a single opaque total to guess about.
+   */
+  head_diffs?: {
+    brokerage: number;
+    stt: number;
+    exchange_txn: number;
+    sebi: number;
+    stamp_duty: number;
+    gst: number;
+  } | null;
   at: Date | null;
   error: string | null;
 }
@@ -111,8 +124,12 @@ export interface BoxChargeReconciliation {
  *                     price the simulator records is one the market actually
  *                     published after the order could have arrived.
  */
-export type ExecutionMode = "paper_touch" | "paper_latency";
-export const EXECUTION_MODES: readonly ExecutionMode[] = ["paper_touch", "paper_latency"] as const;
+export type ExecutionMode = "paper_touch" | "paper_latency" | "paper_legging";
+export const EXECUTION_MODES: readonly ExecutionMode[] = [
+  "paper_touch",
+  "paper_latency",
+  "paper_legging",
+] as const;
 /** @deprecated Retained so older imports keep compiling. */
 export const EXECUTION_MODE = "paper_touch" as const;
 
@@ -404,8 +421,30 @@ export interface BoxEntryDecision {
   gross_edge: number | null;
   entry_charges: number | null;
   estimated_exit_charges: number | null;
-  /** Simulated execution/slippage cost carried into the decision (₹). */
+  /**
+   * The total execution/slippage cost actually DEDUCTED from expected net (₹) —
+   * `entry_slippage_allowance + future_exit_slippage_allowance`.
+   *
+   * DELIBERATELY the sum of the two named allowances below, never the measured
+   * entry slippage: at the FINAL qualification `gross_edge` is already the
+   * executed gross edge (adverse entry movement is baked into it), so deducting
+   * the measured entry slippage again would double-count it.
+   */
   execution_cost: number;
+  /**
+   * PRE-EXECUTION only: the expected entry-slippage allowance deducted while
+   * merely projecting whether an opportunity is worth starting. Zero at the final
+   * qualification, where the executed gross edge already reflects real movement.
+   */
+  entry_slippage_allowance: number;
+  /** The expected FUTURE exit-slippage allowance (₹) — always a forward cost. */
+  future_exit_slippage_allowance: number;
+  /**
+   * ANALYTICS ONLY: the entry slippage actually measured against the detection
+   * touch (₹, positive = worse). Recorded and exposed, but NOT subtracted from
+   * expected net — the executed gross edge already contains it.
+   */
+  measured_entry_slippage: number | null;
   safety_buffer: number;
   expected_net_profit: number | null;
   min_expected_net_profit: number;
@@ -489,7 +528,11 @@ export type BoxExecutionFailureReason =
   | "edge_disappeared"
   | "below_expected_net_profit"
   | "discovery_stopped"
-  | "duplicate";
+  | "duplicate"
+  /** paper_legging: at least one leg did not fill before the timeout. */
+  | "legging_incomplete"
+  /** paper_legging: a filled leg could not be unwound (no opposite liquidity). */
+  | "unwind_failed";
 
 /** One leg's detection → execution comparison. */
 export interface BoxExecutionLeg {
@@ -514,6 +557,10 @@ export interface BoxExecutionLeg {
   slippage_per_unit: number | null;
   /** slippage_per_unit x lot size. */
   slippage: number | null;
+  /** Age (ms) of the book used, measured at the simulated arrival/fill instant. */
+  executed_book_age_ms?: number | null;
+  /** True when a newer book arrived during the latency (version changed). */
+  book_changed?: boolean;
   /** Five-level book at execution — the audit record of the fill. */
   executed_depth: BoxDepthSnapshot | null;
 }
@@ -545,6 +592,118 @@ export interface BoxExecutionRecord {
   filled: boolean;
   failure_reason: BoxExecutionFailureReason | null;
   failure_detail: string | null;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  paper_legging — four independent orders, not one atomic box                */
+/* -------------------------------------------------------------------------- */
+
+/** How the four legs are submitted in paper_legging. */
+export type BoxLegExecutionMode = "parallel" | "sequential";
+
+/** The lifecycle state of one simulated leg order. */
+export type PaperLegStatus = "PENDING" | "FILLED" | "FAILED" | "UNWOUND";
+
+/**
+ * One leg's independent execution attempt under paper_legging.
+ *
+ * Every price here is an observed executable touch from a real WebSocket book at
+ * the leg's own simulated arrival time — never invented.
+ */
+export interface PaperLegExecution {
+  role: BoxLegRole;
+  side: OrderSide;
+  token: number;
+  tradingsymbol: string;
+  /** The touch visible when the box was detected. */
+  detected_price: number | null;
+  detected_qty: number;
+  submit_at: number;
+  /** submit + per-leg network/broker latency. */
+  arrival_at: number;
+  /** When the fill (or failure) resolved. */
+  resolved_at: number | null;
+  fill_price: number | null;
+  quantity: number;
+  quote_version: number | null;
+  /** Book age at the leg's arrival (ms). */
+  book_age_ms: number | null;
+  /** fill − detected, signed so positive is always worse (₹, whole lot). */
+  slippage: number | null;
+  status: PaperLegStatus;
+  /** If the leg had to be unwound, the opposite-touch price it was closed at. */
+  unwind_price: number | null;
+  unwind_slippage: number | null;
+  fail_reason: string | null;
+}
+
+/**
+ * The complete record of one paper_legging execution — whether it opened a box
+ * (4/4 filled) or aborted (some legs filled, others failed → emergency unwind).
+ *
+ * When it aborts it still costs money: partial-entry charges on the filled legs
+ * plus the charges and adverse touch of unwinding them. That legging loss is the
+ * whole reason this model exists.
+ */
+export interface PaperLeggingExecutionRecord {
+  mode: "paper_legging";
+  leg_execution_mode: BoxLegExecutionMode;
+  detected_at: number;
+  order_sent_at: number;
+  /** 0..4 */
+  filled_leg_count: number;
+  /** True only when all four legs filled and a box position was opened. */
+  opened: boolean;
+  /** Roles that failed to fill (empty on a clean 4/4). */
+  failed_legs: BoxLegRole[];
+  legs: PaperLegExecution[];
+  /** Detection → last leg resolution (ms). */
+  first_to_last_fill_ms: number | null;
+  decision_to_complete_ms: number | null;
+  /** Sum of per-leg entry slippage across FILLED legs (₹). */
+  total_entry_slippage: number;
+  /** ABORT accounting (all null / 0 on a clean open). */
+  emergency_unwind: boolean;
+  partial_entry_charges: number | null;
+  unwind_charges: number | null;
+  /** Gross loss from the round-trip of the partially-filled legs (₹, ≤ 0). */
+  legging_gross_loss: number | null;
+  /** legging_gross_loss − partial_entry_charges − unwind_charges (₹, ≤ 0). */
+  legging_net_loss: number | null;
+  failure_reason: BoxExecutionFailureReason | null;
+  failure_detail: string | null;
+}
+
+/** A persisted record of an execution ATTEMPT that did not open a box. */
+export interface IBoxExecutionAttempt {
+  candidate_key: string;
+  direction: BoxDirection;
+  underlying: string;
+  name: string;
+  is_index: boolean;
+  expiry: string;
+  lower_strike: number;
+  upper_strike: number;
+  lot_size: number;
+  quantity: number;
+  execution_mode: ExecutionMode;
+  leg_execution_mode: BoxLegExecutionMode | null;
+  detected_at: Date;
+  resolved_at: Date;
+  /** The gross edge that was detected. */
+  detected_gross_edge: number | null;
+  /** The expected net profit the entry was chasing. */
+  expected_net_profit: number | null;
+  filled_leg_count: number;
+  failed_legs: BoxLegRole[];
+  failure_reason: BoxExecutionFailureReason | null;
+  failure_detail: string | null;
+  legging: PaperLeggingExecutionRecord | null;
+  /** ABORT accounting, hoisted for easy querying. */
+  partial_entry_charges: number | null;
+  unwind_charges: number | null;
+  gross_abort_pnl: number | null;
+  net_abort_pnl: number | null;
 }
 
 /** One leg of a persisted box trade. */
@@ -686,6 +845,8 @@ export interface IBoxTrade {
 
   /** The full detection → execution audit record for the entry. */
   entry_execution?: BoxExecutionRecord | null;
+  /** The per-leg legging record when the entry used paper_legging (4/4 fill). */
+  entry_legging?: PaperLeggingExecutionRecord | null;
   /** The same for the exit. */
   exit_execution?: BoxExecutionRecord | null;
 
@@ -703,6 +864,14 @@ export interface IBoxTrade {
   gross_pnl: number | null;
   total_charges: number | null;
   net_pnl: number | null;
+  /**
+   * The REALISED net P&L of a closed trade: actual simulated gross from the
+   * recorded fills, minus actual entry and exit charges. No expected-slippage
+   * allowance — that forward estimate disappears once the real exit price is
+   * known. On an OPEN trade this is null. Mirrors `net_pnl` for closed trades,
+   * named explicitly so "expected / current / realisable / realised" never blur.
+   */
+  realised_net_pnl?: number | null;
 
   closed_at: Date | null;
   exit_reason: BoxExitReason | null;
@@ -734,6 +903,8 @@ export type BoxEventType =
   | "EXIT_SKIPPED_LIQUIDITY"
   | "EXPIRY_SAFETY"
   | "CHARGES_RECONCILED"
+  /** paper_legging: some legs filled, the box aborted and was unwound. */
+  | "EXECUTION_ABORTED"
   | "SCANNER_STARTED"
   | "SCANNER_STOPPED"
   | "ERROR";

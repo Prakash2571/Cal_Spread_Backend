@@ -40,8 +40,10 @@ import {
   type BoxChargeOrigin,
   type BoxEntryDecision,
   type BoxEvaluation,
+  type BoxExecutionFailureReason,
   type BoxExecutionRecord,
   type BoxOpportunity,
+  type PaperLeggingExecutionRecord,
 } from "./types.js";
 
 /** What the scanner needs from the outside world. */
@@ -66,8 +68,21 @@ export interface BoxScannerDeps {
     estimatedExitChargesTotal: number | null;
     chargeOrigin: BoxChargeOrigin;
     decision: BoxEntryDecision;
-    execution: BoxExecutionRecord;
+    execution: BoxExecutionRecord | null;
+    /** Present when the fill came from the paper_legging model (4/4 filled). */
+    legging?: PaperLeggingExecutionRecord | null;
   }) => Promise<string | null>;
+  /**
+   * paper_legging only: a fill attempt that did NOT open a box (some legs filled
+   * and were unwound, or none filled). Persisted so failed-execution losses are
+   * not invisible in the strategy's analytics.
+   */
+  onExecutionAttempt?: (
+    candidate: BoxCandidate,
+    legging: PaperLeggingExecutionRecord,
+    reason: BoxExecutionFailureReason,
+    detail: string,
+  ) => void;
   /** Ledger hook for rejections and detections. */
   onEvent: (
     event:
@@ -314,7 +329,7 @@ export class BoxScanner {
    */
   private localDecisionFor(
     evaluation: BoxEvaluation,
-    executionCost: number,
+    entrySlippageAllowance: number,
   ): BoxEntryDecision | null {
     if (evaluation.gross_edge === null) return null;
     const legs = buildEntryChargeLegs(evaluation.candidate, evaluation.legs);
@@ -331,9 +346,10 @@ export class BoxScanner {
       grossEdge: evaluation.gross_edge,
       entryCharges: totals.entry,
       estimatedExitCharges: totals.exit,
-      // Entry slippage allowance + the exit-side allowance: the round-trip
-      // execution cost the net figure must survive.
-      executionCost: executionCost + this.deps.cfg.expectedExitSlippage,
+      // PRE-EXECUTION PROJECTION: this is the DETECTION gross edge, so an expected
+      // entry-slippage allowance is deducted alongside the future exit allowance.
+      entrySlippageAllowance,
+      futureExitSlippageAllowance: this.deps.cfg.expectedExitSlippage,
       cfg: this.deps.cfg,
     });
   }
@@ -363,50 +379,46 @@ export class BoxScanner {
     this.stats.qualifyAttempts++;
     this.stats.executionsAttempted++;
 
+    const stillWanted = () =>
+      this.discovering &&
+      this.marketOpen &&
+      this.feedHealthy &&
+      this.deps.positions.getByKey(cand.key) === undefined;
+
     try {
+      // paper_legging: four independent orders, which may partially fill and abort.
+      if (this.deps.cfg.executionMode === "paper_legging") {
+        const legging = await this.deps.executionSim.simulateLeggingEntry({
+          candidate: cand,
+          detection,
+          stillWanted,
+          qualify: (execution, measuredSlippage) => this.finalQualify(execution, measuredSlippage),
+        });
+        if (!legging.ok) {
+          // Some legs may have filled and been unwound: persist the attempt so the
+          // legging loss is not invisible, then release.
+          if (legging.legging.filled_leg_count > 0 || legging.legging.emergency_unwind) {
+            this.deps.onExecutionAttempt?.(cand, legging.legging, legging.reason, legging.detail);
+          }
+          this.recordExecutionFailure(cand, detection, legging.reason, legging.detail);
+          this.deps.positions.release(cand.key);
+          return;
+        }
+        if (!this.discovering || !this.marketOpen || !this.feedHealthy) {
+          this.deps.positions.release(cand.key);
+          return;
+        }
+        await this.finalizeOpen(cand, legging.evaluation, legging.decision, null, legging.legging);
+        return;
+      }
+
       const result = await this.deps.executionSim.simulateEntry({
         candidate: cand,
         detection,
-        stillWanted: () =>
-          this.discovering &&
-          this.marketOpen &&
-          this.feedHealthy &&
-          this.deps.positions.getByKey(cand.key) === undefined,
+        stillWanted,
         // The final gate: expected NET profit on the EXECUTED snapshot, with the
-        // measured entry slippage folded into the execution cost.
-        qualify: (execution, measuredSlippage) => {
-          const legs = buildEntryChargeLegs(execution.candidate, execution.legs);
-          if (!legs) {
-            return {
-              gross_edge: execution.gross_edge,
-              entry_charges: null,
-              estimated_exit_charges: null,
-              execution_cost: 0,
-              safety_buffer: this.deps.cfg.safetyBuffer,
-              expected_net_profit: null,
-              min_expected_net_profit: requiredNetProfit(this.deps.cfg),
-              passes_gross_prefilter: false,
-              qualifies: false,
-              reject: "unpriced_charges",
-            };
-          }
-          const totals = this.deps.localCharges.totals(
-            legs.map((l) => ({
-              side: l.side,
-              tradingsymbol: l.tradingsymbol,
-              quantity: l.quantity,
-              price: l.price,
-            })),
-          );
-          return evaluateEntryDecision({
-            grossEdge: execution.gross_edge,
-            entryCharges: totals.entry,
-            estimatedExitCharges: totals.exit,
-            // Measured entry slippage (₹, positive = worse) + the exit allowance.
-            executionCost: Math.max(0, measuredSlippage) + this.deps.cfg.expectedExitSlippage,
-            cfg: this.deps.cfg,
-          });
-        },
+        // measured entry slippage RECORDED but never deducted again.
+        qualify: (execution, measuredSlippage) => this.finalQualify(execution, measuredSlippage),
       });
 
       if (!result.ok) {
@@ -422,37 +434,99 @@ export class BoxScanner {
         return;
       }
 
-      const legs = buildEntryChargeLegs(result.evaluation.candidate, result.evaluation.legs)!;
-      const orders = legs.map((l) => ({
-        side: l.side,
-        tradingsymbol: l.tradingsymbol,
-        quantity: l.quantity,
-        price: l.price,
-      }));
-      const local = this.deps.localCharges.roundTrip(orders);
-
-      const id = await this.deps.openPaperTrade({
-        candidate: cand,
-        evaluation: result.evaluation,
-        entryLegs: legs,
-        entryChargesTotal: local.entry_total,
-        estimatedExitChargesTotal: local.estimated_exit_total,
-        chargeOrigin: "local",
-        decision: result.decision,
-        execution: result.record,
-      });
-
-      if (id) {
-        this.stats.entriesOpened++;
-        this.markStatus(cand.key, "PAPER_OPENED");
-      } else {
-        this.deps.positions.release(cand.key);
-      }
+      await this.finalizeOpen(cand, result.evaluation, result.decision, result.record, null);
     } catch (err) {
       console.warn("[Box] entry attempt failed for", cand.key, err);
       this.deps.positions.release(cand.key);
     } finally {
       this.entryInFlight.delete(cand.key);
+    }
+  }
+
+  /**
+   * THE FINAL entry qualification on an EXECUTED snapshot.
+   *
+   * `execution.gross_edge` already reflects any adverse entry movement, so the
+   * measured entry slippage is RECORDED (analytics) but never deducted again —
+   * only the future exit-slippage allowance is a forward cost here. This is the
+   * fix for entry-slippage double counting (Task 1), shared by every mode.
+   */
+  private finalQualify(execution: BoxEvaluation, measuredSlippage: number): BoxEntryDecision {
+    const legs = buildEntryChargeLegs(execution.candidate, execution.legs);
+    if (!legs) {
+      return {
+        gross_edge: execution.gross_edge,
+        entry_charges: null,
+        estimated_exit_charges: null,
+        execution_cost: 0,
+        entry_slippage_allowance: 0,
+        future_exit_slippage_allowance: 0,
+        measured_entry_slippage: null,
+        safety_buffer: this.deps.cfg.safetyBuffer,
+        expected_net_profit: null,
+        min_expected_net_profit: requiredNetProfit(this.deps.cfg),
+        passes_gross_prefilter: false,
+        qualifies: false,
+        reject: "unpriced_charges",
+      };
+    }
+    const totals = this.deps.localCharges.totals(
+      legs.map((l) => ({
+        side: l.side,
+        tradingsymbol: l.tradingsymbol,
+        quantity: l.quantity,
+        price: l.price,
+      })),
+    );
+    return evaluateEntryDecision({
+      grossEdge: execution.gross_edge,
+      entryCharges: totals.entry,
+      estimatedExitCharges: totals.exit,
+      entrySlippageAllowance: 0,
+      futureExitSlippageAllowance: this.deps.cfg.expectedExitSlippage,
+      measuredEntrySlippage: measuredSlippage,
+      cfg: this.deps.cfg,
+    });
+  }
+
+  /** Build the final charge legs and hand the fill to the engine to persist. */
+  private async finalizeOpen(
+    cand: BoxCandidate,
+    evaluation: BoxEvaluation,
+    decision: BoxEntryDecision,
+    execution: BoxExecutionRecord | null,
+    legging: PaperLeggingExecutionRecord | null,
+  ): Promise<void> {
+    const legs = buildEntryChargeLegs(evaluation.candidate, evaluation.legs);
+    if (!legs) {
+      this.deps.positions.release(cand.key);
+      return;
+    }
+    const orders = legs.map((l) => ({
+      side: l.side,
+      tradingsymbol: l.tradingsymbol,
+      quantity: l.quantity,
+      price: l.price,
+    }));
+    const local = this.deps.localCharges.roundTrip(orders);
+
+    const id = await this.deps.openPaperTrade({
+      candidate: cand,
+      evaluation,
+      entryLegs: legs,
+      entryChargesTotal: local.entry_total,
+      estimatedExitChargesTotal: local.estimated_exit_total,
+      chargeOrigin: "local",
+      decision,
+      execution,
+      legging,
+    });
+
+    if (id) {
+      this.stats.entriesOpened++;
+      this.markStatus(cand.key, "PAPER_OPENED");
+    } else {
+      this.deps.positions.release(cand.key);
     }
   }
 

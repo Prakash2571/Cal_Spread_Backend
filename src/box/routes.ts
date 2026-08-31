@@ -158,6 +158,17 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
     }
   });
 
+  /** paper_legging execution attempts that aborted (partial fill + unwind). */
+  app.get("/api/box/execution-attempts", requireAdmin, async (req: Request, res: Response) => {
+    try {
+      const raw = Number(req.query.limit ?? 0);
+      const limit = Number.isFinite(raw) && raw > 0 ? Math.min(500, Math.round(raw)) : 100;
+      res.json({ dbEnabled: isBoxDbEnabled(), attempts: await engine.listExecutionAttempts(limit) });
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
   /** The append-only decision ledger. */
   app.get("/api/box/events", requireAdmin, async (req: Request, res: Response) => {
     try {

@@ -98,3 +98,65 @@ test("the legacy MIN_BOX_NET_EDGE floor raises the effective gate", () => {
 test("the default shipped gate is ₹1,200 of expected net profit", () => {
   assert.equal(requiredNetProfit(cfg()), 1200);
 });
+
+
+/* ------------------- Task 1: entry-slippage double counting ---------------- */
+
+test("FINAL qualification does not deduct measured entry slippage a second time", () => {
+  // Detection gross ₹2,500; latency cost ₹300 → executed gross ₹2,200. The final
+  // expected net must start from ₹2,200 ONCE — the ₹300 is already inside it.
+  const c = gate({ safetyBuffer: 150, minExpectedNetProfit: 1200, minGrossEdge: 1200 });
+  const d = evaluateEntryDecision({
+    grossEdge: 2200, // executed gross (already reflects the ₹300 adverse move)
+    entryCharges: 150,
+    estimatedExitCharges: 150,
+    entrySlippageAllowance: 0, // never deduct entry slippage at the final gate
+    futureExitSlippageAllowance: 0,
+    measuredEntrySlippage: 300, // recorded as analytics, NOT deducted
+    cfg: c,
+  });
+  // 2200 - 150 - 150 - 0 - 150 = 1750 (the ₹300 is NOT subtracted again).
+  assert.equal(d.expected_net_profit, 1750);
+  assert.equal(d.measured_entry_slippage, 300, "measured slippage is recorded");
+  assert.equal(d.entry_slippage_allowance, 0);
+  assert.equal(d.execution_cost, 0, "no allowance was deducted at the final gate");
+  // The buggy double-count would have produced 1750 - 300 = 1450.
+  assert.notEqual(d.expected_net_profit, 1450, "must not double-count the ₹300");
+});
+
+test("favourable entry movement improves executed gross naturally, with no artificial bonus", () => {
+  const c = gate({ safetyBuffer: 150, minExpectedNetProfit: 1200, minGrossEdge: 1200 });
+  // Detection gross ₹2,200; a favourable move improves executed gross to ₹2,400.
+  const d = evaluateEntryDecision({
+    grossEdge: 2400,
+    entryCharges: 150,
+    estimatedExitCharges: 150,
+    entrySlippageAllowance: 0,
+    futureExitSlippageAllowance: 0,
+    measuredEntrySlippage: -200, // favourable (negative), analytics only
+    cfg: c,
+  });
+  // 2400 - 150 - 150 - 150 = 1950. The favourable move helped ONLY via the higher
+  // executed gross — no extra bonus is added for the negative slippage.
+  assert.equal(d.expected_net_profit, 1950);
+  assert.equal(d.measured_entry_slippage, -200);
+});
+
+test("the PRE-EXECUTION projection DOES deduct the expected entry-slippage allowance", () => {
+  const c = gate({ safetyBuffer: 150, minExpectedNetProfit: 1200, minGrossEdge: 1200 });
+  // On the DETECTION edge, a forward entry-slippage allowance is a real cost.
+  const d = evaluateEntryDecision({
+    grossEdge: 2500,
+    entryCharges: 150,
+    estimatedExitCharges: 150,
+    entrySlippageAllowance: 250,
+    futureExitSlippageAllowance: 250,
+    cfg: c,
+  });
+  // 2500 - 150 - 150 - (250 + 250) - 150 = 1550.
+  assert.equal(d.expected_net_profit, 1550);
+  assert.equal(d.entry_slippage_allowance, 250);
+  assert.equal(d.future_exit_slippage_allowance, 250);
+  assert.equal(d.execution_cost, 500, "both allowances are deducted pre-execution");
+  assert.equal(d.measured_entry_slippage, null, "nothing is measured yet");
+});

@@ -47,8 +47,10 @@ import { initBoxConnection } from "../db.js";
 import {
   appendBoxEvent,
   closeBoxTrade,
+  insertBoxExecutionAttempt,
   insertBoxTrade,
   isBoxDbEnabled,
+  loadBoxExecutionAttempts,
   loadOpenBoxTrades,
   serializeBoxTrade,
   setBoxChargeReconciliation,
@@ -76,9 +78,12 @@ import {
   type BoxOpportunity,
   type BoxOptionInstrument,
   type BoxUnderlyingState,
+  type IBoxExecutionAttempt,
   type IBoxLeg,
   type IBoxTrade,
+  type PaperLeggingExecutionRecord,
 } from "./types.js";
+import type { BoxExecutionFailureReason } from "./types.js";
 import { entrySideFor } from "./math.js";
 
 export interface BoxEngineDeps {
@@ -197,6 +202,9 @@ export class BoxEngine {
       metrics: this.metrics,
       isMarketOpen: () => this.marketOpen,
       isFeedHealthy: () => this.isFeedHealthy(),
+      // The local charge calculator prices paper_legging partial-entry and unwind
+      // charges synchronously — never a network call inside the fill.
+      chargeTotal: (orders) => this.localCharges.legs(orders).total,
     });
 
     this.reconciler = new BoxChargeReconciler({
@@ -235,6 +243,8 @@ export class BoxEngine {
       metrics: this.metrics,
       positions: this.positions,
       openPaperTrade: (args) => this.openPaperTrade(args),
+      onExecutionAttempt: (candidate, legging, reason, detail) =>
+        void this.persistExecutionAttempt(candidate, legging, reason, detail),
       onEvent: (event, candidate, evaluation, detail) => {
         void appendBoxEvent({
           event,
@@ -951,6 +961,77 @@ export class BoxEngine {
    * The fills recorded are the executable touch prices that were visible in the
    * revalidated snapshot.
    */
+  /**
+   * Persist a paper_legging execution ATTEMPT that did not open a box.
+   *
+   * A failed four-leg execution can itself cost money (partial fill + emergency
+   * unwind), so it must not vanish as though nothing happened. Stored in its own
+   * `box_execution_attempts` collection — never mixed into `box_trades` — so the
+   * strategy's true P&L can later net successful boxes against abort losses.
+   */
+  private async persistExecutionAttempt(
+    candidate: BoxCandidate,
+    legging: PaperLeggingExecutionRecord,
+    reason: BoxExecutionFailureReason,
+    detail: string,
+  ): Promise<void> {
+    const direction = candidate.direction ?? "LONG_BOX";
+    const grossAbort = legging.legging_gross_loss ?? null;
+    const netAbort = legging.legging_net_loss ?? null;
+    const attempt: IBoxExecutionAttempt = {
+      candidate_key: candidate.key,
+      direction,
+      underlying: candidate.underlying,
+      name: candidate.name,
+      is_index: candidate.is_index,
+      expiry: candidate.expiry,
+      lower_strike: candidate.lower_strike,
+      upper_strike: candidate.upper_strike,
+      lot_size: candidate.lot_size,
+      quantity: candidate.lot_size,
+      execution_mode: "paper_legging",
+      leg_execution_mode: legging.leg_execution_mode,
+      detected_at: new Date(legging.detected_at),
+      resolved_at: new Date(),
+      detected_gross_edge: null,
+      expected_net_profit: null,
+      filled_leg_count: legging.filled_leg_count,
+      failed_legs: legging.failed_legs,
+      failure_reason: reason,
+      failure_detail: detail,
+      legging,
+      partial_entry_charges: legging.partial_entry_charges,
+      unwind_charges: legging.unwind_charges,
+      gross_abort_pnl: grossAbort,
+      net_abort_pnl: netAbort,
+    };
+    await insertBoxExecutionAttempt(attempt);
+
+    void appendBoxEvent({
+      event: "EXECUTION_ABORTED",
+      candidate_key: candidate.key,
+      underlying: candidate.underlying,
+      expiry: candidate.expiry,
+      direction,
+      lower_strike: candidate.lower_strike,
+      upper_strike: candidate.upper_strike,
+      lot_size: candidate.lot_size,
+      quantity: candidate.lot_size,
+      execution_mode: "paper_legging",
+      net_pnl: netAbort,
+      gross_pnl: grossAbort,
+      reason,
+      detail: `${detail} — legging net loss ₹${netAbort ?? 0}`,
+    });
+
+    console.log(
+      `[Box] LEGGING ABORT ${directionLabel(direction)} ${candidate.underlying} ` +
+        `${candidate.lower_strike}→${candidate.upper_strike}: ${legging.filled_leg_count}/4 filled, ` +
+        `net loss ₹${netAbort ?? 0} (${reason})`,
+    );
+    this.broadcast("execution_attempt", { attempt });
+  }
+
   private async openPaperTrade(args: {
     candidate: BoxCandidate;
     evaluation: BoxEvaluation;
@@ -959,12 +1040,16 @@ export class BoxEngine {
     estimatedExitChargesTotal: number | null;
     chargeOrigin: BoxChargesWithOrigin["computed_by"];
     decision: BoxEntryDecision;
-    execution: BoxExecutionRecord;
+    execution: BoxExecutionRecord | null;
+    legging?: PaperLeggingExecutionRecord | null;
   }): Promise<string | null> {
     const { candidate, evaluation, decision, execution } = args;
     const direction = candidate.direction ?? "LONG_BOX";
     const byRole = new Map(evaluation.legs.map((l) => [l.role, l]));
-    const execByRole = new Map(execution.legs.map((l) => [l.role, l]));
+    const execByRole = new Map((execution?.legs ?? []).map((l) => [l.role, l]));
+    // Total measured entry slippage for the log/ledger — from the latency record
+    // or the legging record, whichever produced this fill.
+    const entrySlippageForLog = execution?.total_slippage ?? args.legging?.total_entry_slippage ?? 0;
 
     // The local contract note for the executed fills, and its reversed projection.
     const orders = args.entryLegs.map((l) => ({
@@ -1049,6 +1134,7 @@ export class BoxEngine {
       },
       exit_charge_reconciliation: null,
       entry_execution: execution,
+      entry_legging: args.legging ?? null,
       exit_execution: null,
       opened_at: new Date(),
       current_remaining_edge: evaluation.gross_edge,
@@ -1123,6 +1209,7 @@ export class BoxEngine {
       phase: "entry",
       localTotal: localRoundTrip.entry_total,
       legs: args.entryLegs,
+      localCharges: localRoundTrip.entry,
       label: `${candidate.underlying} ${candidate.lower_strike}→${candidate.upper_strike} ${direction}`,
     });
 
@@ -1150,14 +1237,14 @@ export class BoxEngine {
       execution,
       legs: toEventLegs(evaluation.legs),
       reason: `${this.cfg.executionMode} fill; expected net ₹${decision.expected_net_profit}`,
-      detail: `1 lot (${candidate.lot_size} qty), slippage ₹${execution.total_slippage}`,
+      detail: `1 lot (${candidate.lot_size} qty), slippage ₹${entrySlippageForLog}`,
     });
 
     console.log(
       `[Box] PAPER ENTRY ${directionLabel(direction)} ${candidate.underlying} ` +
         `${candidate.lower_strike}→${candidate.upper_strike} ${candidate.expiry} ` +
         `gross ₹${evaluation.gross_edge} expected-net ₹${decision.expected_net_profit} ` +
-        `(slippage ₹${execution.total_slippage})`,
+        `(slippage ₹${entrySlippageForLog})`,
     );
     this.broadcast("entry", { trade: serializeBoxTrade(doc) });
     return id;
@@ -1207,11 +1294,20 @@ export class BoxEngine {
       gross_pnl: grossPnl,
       total_charges: totalCharges,
       net_pnl: netPnl,
+      // The REALISED net: actual simulated gross from the recorded fills minus
+      // actual charges. No expected-slippage allowance — that forward estimate
+      // is gone now the real exit price is known (Task 6).
+      realised_net_pnl: netPnl,
       current_remaining_edge: metrics.remaining_edge,
       current_captured_edge: metrics.captured_edge,
       current_captured_pct: metrics.captured_pct,
       exit_blocked_reason: null,
     };
+    // Track how far the eventual realised net landed from the expected net at
+    // entry — the honest measure of the projection's quality.
+    if (netPnl !== null && position.expected_net_profit !== null && position.expected_net_profit !== undefined) {
+      this.metrics.recordRealisedVsExpected(round2(position.expected_net_profit - netPnl));
+    }
     for (const [i, role] of BOX_LEG_ROLES.entries()) {
       const ev = byRole.get(role);
       const execLeg = execByRole.get(role);
@@ -1250,6 +1346,7 @@ export class BoxEngine {
           phase: "exit",
           localTotal: round2(exitCharges.total),
           legs: exitOrders,
+          localCharges: exitCharges,
           label: `${position.underlying} ${position.lower_strike}→${position.upper_strike}`,
         });
       }
@@ -1572,6 +1669,11 @@ export class BoxEngine {
 
   getOpportunities(limit?: number): BoxOpportunity[] {
     return this.scanner.listOpportunities(limit ?? this.cfg.maxPublishedOpportunities);
+  }
+
+  /** Recent paper_legging execution attempts that did not open a box. */
+  async listExecutionAttempts(limit = 100) {
+    return loadBoxExecutionAttempts(limit);
   }
 
   /**

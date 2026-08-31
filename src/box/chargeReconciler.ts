@@ -30,7 +30,7 @@ import type { BoxChargeEstimator, BoxChargeLeg } from "./charges.js";
 import type { BoxConfig } from "./config.js";
 import type { BoxMetrics } from "./metrics.js";
 import { round2 } from "./math.js";
-import type { BoxChargeReconciliation } from "./types.js";
+import type { BoxCharges, BoxChargeReconciliation, BoxChargesWithOrigin } from "./types.js";
 
 export type BoxChargePhase = "entry" | "exit";
 
@@ -61,6 +61,24 @@ interface QueueItem {
   localTotal: number;
   legs: BoxChargeLeg[];
   label: string;
+  /** The local charge heads, for a head-by-head comparison against Zerodha. */
+  localCharges: BoxChargesWithOrigin | null;
+}
+
+/** local − Zerodha per head, so a persistent bias points at one rate/rounding rule. */
+export function headDiffs(
+  local: BoxCharges | null,
+  zerodha: BoxCharges | null,
+): NonNullable<BoxChargeReconciliation["head_diffs"]> | null {
+  if (!local || !zerodha) return null;
+  return {
+    brokerage: round2(local.brokerage - zerodha.brokerage),
+    stt: round2(local.stt - zerodha.stt),
+    exchange_txn: round2(local.exchange_txn - zerodha.exchange_txn),
+    sebi: round2(local.sebi - zerodha.sebi),
+    stamp_duty: round2(local.stamp_duty - zerodha.stamp_duty),
+    gst: round2(local.gst - zerodha.gst),
+  };
 }
 
 export class BoxChargeReconciler {
@@ -104,6 +122,8 @@ export class BoxChargeReconciler {
     localTotal: number;
     legs: BoxChargeLeg[];
     label?: string;
+    /** The local charge heads, for a head-by-head comparison. */
+    localCharges?: BoxChargesWithOrigin | null;
   }): void {
     if (!this.deps.cfg.reconcileCharges) return;
     if (args.legs.length === 0) return;
@@ -117,6 +137,7 @@ export class BoxChargeReconciler {
       localTotal: round2(args.localTotal),
       legs: args.legs,
       label: args.label ?? args.tradeId,
+      localCharges: args.localCharges ?? null,
     });
     this.pump();
   }
@@ -200,6 +221,7 @@ export class BoxChargeReconciler {
         reconciled_total: reconciled,
         abs_diff: absDiff,
         pct_diff: pctDiff,
+        head_diffs: headDiffs(item.localCharges, priced as BoxCharges),
         at: new Date(),
         error: null,
       };

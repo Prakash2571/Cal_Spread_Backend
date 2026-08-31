@@ -19,6 +19,7 @@ import type {
   BoxChargesWithOrigin,
   BoxDepthLevel,
   BoxDepthSnapshot,
+  IBoxExecutionAttempt,
   BoxEventLeg,
   BoxLegCharges,
   IBoxLeg,
@@ -186,7 +187,11 @@ const scannerConfigSchema = new mongoose.Schema(
 const boxTradeSchema = new mongoose.Schema<IBoxTrade>(
   {
     // Never "live" — this module never places an exchange order.
-    execution_mode: { type: String, enum: ["paper_touch", "paper_latency"], default: "paper_touch" },
+    execution_mode: {
+      type: String,
+      enum: ["paper_touch", "paper_latency", "paper_legging"],
+      default: "paper_touch",
+    },
 
     underlying: { type: String, required: true, index: true },
     name: { type: String, default: "" },
@@ -233,6 +238,7 @@ const boxTradeSchema = new mongoose.Schema<IBoxTrade>(
     // (per-leg slippage, both depth snapshots, quote versions) without a schema
     // the size of the type — it is an append-only audit blob, never queried on.
     entry_execution: { type: mongoose.Schema.Types.Mixed, default: null },
+    entry_legging: { type: mongoose.Schema.Types.Mixed, default: null },
     exit_execution: { type: mongoose.Schema.Types.Mixed, default: null },
 
     opened_at: { type: Date, default: () => new Date() },
@@ -247,6 +253,7 @@ const boxTradeSchema = new mongoose.Schema<IBoxTrade>(
     gross_pnl: { type: Number, default: null },
     total_charges: { type: Number, default: null },
     net_pnl: { type: Number, default: null },
+    realised_net_pnl: { type: Number, default: null },
 
     closed_at: { type: Date, default: null },
     exit_reason: {
@@ -375,3 +382,55 @@ export function isBoxEventLedgerEnabled(): boolean {
     ? boxConnection.readyState === 1
     : mongoose.connection.readyState === 1;
 }
+
+/* -------------------------- execution attempts ---------------------------- */
+
+/**
+ * A paper_legging execution ATTEMPT that did not open a box (some legs filled and
+ * were emergency-unwound, incurring a legging loss). Its own collection — never
+ * mixed into `box_trades` — so aborted-execution losses can be netted against
+ * successful-box P&L in the strategy's analytics without polluting the trade book.
+ */
+const boxExecutionAttemptSchema = new mongoose.Schema(
+  {
+    candidate_key: { type: String, default: "", index: true },
+    direction: { type: String, enum: ["LONG_BOX", "SHORT_BOX"], default: "LONG_BOX" },
+    underlying: { type: String, default: "", index: true },
+    name: { type: String, default: "" },
+    is_index: { type: Boolean, default: false },
+    expiry: { type: String, default: "" },
+    lower_strike: { type: Number, default: 0 },
+    upper_strike: { type: Number, default: 0 },
+    lot_size: { type: Number, default: 0 },
+    quantity: { type: Number, default: 0 },
+    execution_mode: { type: String, default: "paper_legging" },
+    leg_execution_mode: { type: String, default: null },
+    detected_at: { type: Date, default: () => new Date() },
+    resolved_at: { type: Date, default: () => new Date(), index: true },
+    detected_gross_edge: { type: Number, default: null },
+    expected_net_profit: { type: Number, default: null },
+    filled_leg_count: { type: Number, default: 0 },
+    failed_legs: { type: [String], default: [] },
+    failure_reason: { type: String, default: null },
+    failure_detail: { type: String, default: null },
+    // The full per-leg legging record: an append-only audit blob.
+    legging: { type: mongoose.Schema.Types.Mixed, default: null },
+    partial_entry_charges: { type: Number, default: null },
+    unwind_charges: { type: Number, default: null },
+    gross_abort_pnl: { type: Number, default: null },
+    net_abort_pnl: { type: Number, default: null },
+  },
+  { collection: "box_execution_attempts" },
+);
+
+boxExecutionAttemptSchema.index({ resolved_at: -1 });
+
+export interface BoxExecutionAttemptRecord extends IBoxExecutionAttempt {
+  _id: mongoose.Types.ObjectId;
+}
+
+/** The aborted-execution ledger (collection: "box_execution_attempts"). */
+export const BoxExecutionAttempt = boxModel<IBoxExecutionAttempt>(
+  "BoxExecutionAttempt",
+  boxExecutionAttemptSchema as unknown as mongoose.Schema<IBoxExecutionAttempt>,
+);

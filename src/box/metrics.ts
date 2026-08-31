@@ -208,6 +208,12 @@ export class BoxMetrics {
   readonly chargeDiscrepancyPct: RingBuffer;
   /** Event-loop lag (ms). */
   readonly eventLoopLag: EventLoopLagMonitor;
+  /** paper_legging: net loss (₹, ≤ 0) of an aborted, partially-filled box. */
+  readonly leggingLoss: RingBuffer;
+  /** paper_legging: detection → last leg resolution (ms). */
+  readonly firstToLastFill: RingBuffer;
+  /** Expected net at entry minus the eventual realised net of the closed trade (₹). */
+  readonly expectedVsRealised: RingBuffer;
 
   readonly evaluations = new RateMeter(60);
   readonly wsUpdates = new RateMeter(60);
@@ -220,9 +226,18 @@ export class BoxMetrics {
     reconciliations: 0,
     reconciliation_failures: 0,
     reconciliation_warnings: 0,
+    // paper_legging fill-count histogram.
+    legging_4_of_4: 0,
+    legging_3_of_4: 0,
+    legging_2_of_4: 0,
+    legging_1_of_4: 0,
+    legging_0_of_4: 0,
+    legging_aborts: 0,
   };
   /** Failure reason → count. A small, fixed key space, so this cannot grow. */
   private failures = new Map<string, number>();
+  /** Which leg role most often fails to fill under legging. Fixed 4-key space. */
+  private leggingFailedRoles = new Map<string, number>();
 
   constructor(window = 500) {
     this.receiveToEvaluation = new RingBuffer(window);
@@ -233,6 +248,9 @@ export class BoxMetrics {
     this.chargeDiscrepancy = new RingBuffer(window);
     this.chargeDiscrepancyPct = new RingBuffer(window);
     this.eventLoopLag = new EventLoopLagMonitor(window);
+    this.leggingLoss = new RingBuffer(window);
+    this.firstToLastFill = new RingBuffer(window);
+    this.expectedVsRealised = new RingBuffer(window);
   }
 
   startSampling(): void {
@@ -273,10 +291,50 @@ export class BoxMetrics {
     this.counters.reconciliation_failures++;
   }
 
+  /** Record a paper_legging outcome by how many of the four legs filled. */
+  recordLeggingOutcome(filledCount: number, _failedCount: number): void {
+    if (filledCount >= 4) this.counters.legging_4_of_4++;
+    else if (filledCount === 3) this.counters.legging_3_of_4++;
+    else if (filledCount === 2) this.counters.legging_2_of_4++;
+    else if (filledCount === 1) this.counters.legging_1_of_4++;
+    else this.counters.legging_0_of_4++;
+    if (filledCount > 0 && filledCount < 4) this.counters.legging_aborts++;
+  }
+
+  recordLeggingFailedRole(role: string): void {
+    this.leggingFailedRoles.set(role, (this.leggingFailedRoles.get(role) ?? 0) + 1);
+  }
+
+  recordLeggingLoss(netLoss: number): void {
+    this.leggingLoss.push(netLoss);
+  }
+
+  recordFirstToLastFill(ms: number): void {
+    this.firstToLastFill.push(ms);
+  }
+
+  /** Expected net at entry minus the realised net of the closed trade (₹). */
+  recordRealisedVsExpected(diff: number): void {
+    this.expectedVsRealised.push(diff);
+  }
+
+  /** The role that fails to fill most often under legging, for the health panel. */
+  private mostFrequentFailingRole(): { role: string; count: number } | null {
+    let best: { role: string; count: number } | null = null;
+    for (const [role, count] of this.leggingFailedRoles) {
+      if (!best || count > best.count) best = { role, count };
+    }
+    return best;
+  }
+
   /** The whole published view. Cold path: percentiles are computed here. */
   snapshot(at = Date.now()) {
     const attempted = this.counters.executions_attempted;
     const failed = this.counters.executions_failed;
+    const c = this.counters;
+    const leggingTotal =
+      c.legging_4_of_4 + c.legging_3_of_4 + c.legging_2_of_4 + c.legging_1_of_4 + c.legging_0_of_4;
+    const rate = (n: number) => (leggingTotal > 0 ? Math.round((n / leggingTotal) * 10000) / 10000 : 0);
     return {
       execution: {
         attempted,
@@ -290,6 +348,26 @@ export class BoxMetrics {
         /** Detection → simulated fill, in ms. */
         decision_to_fill_ms: this.decisionToFill.summary(),
         qualification_to_fill_ms: this.qualificationToFill.summary(),
+      },
+      legging: {
+        outcomes: {
+          "4_of_4": c.legging_4_of_4,
+          "3_of_4": c.legging_3_of_4,
+          "2_of_4": c.legging_2_of_4,
+          "1_of_4": c.legging_1_of_4,
+          "0_of_4": c.legging_0_of_4,
+          total: leggingTotal,
+          aborts: c.legging_aborts,
+        },
+        fill_rate_4_of_4: rate(c.legging_4_of_4),
+        failure_rate_3_of_4: rate(c.legging_3_of_4),
+        failure_rate_2_of_4: rate(c.legging_2_of_4),
+        failure_rate_1_of_4: rate(c.legging_1_of_4),
+        legging_net_loss: this.leggingLoss.summary(),
+        first_to_last_fill_ms: this.firstToLastFill.summary(),
+        most_failing_role: this.mostFrequentFailingRole(),
+        failing_roles: Object.fromEntries(this.leggingFailedRoles),
+        expected_vs_realised_net: this.expectedVsRealised.summary(),
       },
       latency: {
         receive_to_evaluation_ms: this.receiveToEvaluation.summary(),

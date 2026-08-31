@@ -359,27 +359,25 @@ test("the last-close view is published as INDICATIVE and cannot be entered", asy
 /* ------------------------- execution simulation --------------------------- */
 
 test("an adverse post-latency move that removes the net edge is not filled", async () => {
-  // paper_latency: after the delay the K1 CE ask jumps so the box no longer nets
-  // ₹1,200. The execution simulator must refuse to fill.
+  // paper_latency: an adverse move lands DURING the latency window, so it is the
+  // current book at arrival and the box no longer nets ₹1,200 — refuse to fill.
   const h = harness({
-    config: { executionMode: "paper_latency", simulatedDecisionMs: 0, simulatedLatencyMs: 10, executionMaxWaitMs: 200, executionPollMs: 5 },
+    config: { executionMode: "paper_latency", simulatedDecisionMs: 0, simulatedLatencyMs: 60, executionMaxWaitMs: 200, executionPollMs: 5 },
   });
   const tokens = h.seedGood();
   h.scanner.setDiscovering(true);
   h.scanner.onTokensUpdated(tokens);
 
-  // AFTER arrival, publish a worse book for every leg (K1 CE ask +60), so the box
-  // no longer nets ₹1,200 at the executed touch.
-  setTimeout(() => {
-    const at = Date.now();
-    const worse = quotesFor(h.candidate, { k1_ce: { ask: 360, askQty: 150 } }, { at });
-    for (const [token, q] of worse) {
-      h.quotes.applyTicks([{ token, last_price: q.last, bid: q.bid, ask: q.ask, bids: q.bids, asks: q.asks }], at);
-    }
-  }, 30);
+  // Overwrite K1 CE with a much worse ask straight away (well before the 60ms
+  // arrival), so the latest book at arrival is the adverse one.
+  const at = Date.now();
+  const worse = quotesFor(h.candidate, { k1_ce: { ask: 360, askQty: 150 } }, { at });
+  for (const [token, q] of worse) {
+    h.quotes.applyTicks([{ token, last_price: q.last, bid: q.bid, ask: q.ask, bids: q.bids, asks: q.asks }], at);
+  }
 
-  await new Promise((r) => setTimeout(r, 320));
-  assert.equal(h.opened.length, 0, "the box stopped being worth ₹1,200 net by fill time");
+  await new Promise((r) => setTimeout(r, 220));
+  assert.equal(h.opened.length, 0, "the box stopped being worth ₹1,200 net by arrival");
   assert.equal(h.positions.isTaken(h.candidate.key), false, "the reservation is released");
 });
 
@@ -391,16 +389,9 @@ test("a favourable/flat post-latency book fills and records the slippage", async
   h.scanner.setDiscovering(true);
   h.scanner.onTokensUpdated(tokens);
 
-  // Re-publish the SAME good book AFTER arrival (latency 10ms), so a post-arrival
-  // book exists for every leg.
-  setTimeout(() => {
-    const at = Date.now();
-    for (const [token, q] of quotesFor(h.candidate, {}, { at })) {
-      h.quotes.applyTicks([{ token, last_price: q.last, bid: q.bid, ask: q.ask, bids: q.bids, asks: q.asks }], at);
-    }
-  }, 30);
-
-  await new Promise((r) => setTimeout(r, 320));
+  // No further ticks: the resting book from detection is still valid at arrival
+  // (Task 2 — a quiet book does not need a fresh post-arrival tick) and fills.
+  await new Promise((r) => setTimeout(r, 220));
   assert.equal(h.opened.length, 1);
   const o = h.opened[0];
   assert.equal(o.execution.mode, "paper_latency");
@@ -409,16 +400,17 @@ test("a favourable/flat post-latency book fills and records the slippage", async
   assert.ok(o.execution.decision_to_fill_ms >= 10, "the simulated latency is recorded");
 });
 
-test("no post-latency book for a leg means no invented fill", async () => {
+test("a resting book that is STALE by arrival is not filled", async () => {
+  // Trust window (30ms) shorter than the latency (60ms): the resting detection
+  // book has aged past the trust limit by the time the order arrives → reject.
   const h = harness({
-    config: { executionMode: "paper_latency", simulatedDecisionMs: 0, simulatedLatencyMs: 10, executionMaxWaitMs: 80, executionPollMs: 5 },
+    config: { executionMode: "paper_latency", simulatedDecisionMs: 0, simulatedLatencyMs: 60, executionMaxWaitMs: 100, executionPollMs: 5, quoteMaxAgeMs: 30 },
   });
   const tokens = h.seedGood();
   h.scanner.setDiscovering(true);
   h.scanner.onTokensUpdated(tokens);
-  // Publish nothing after arrival: the detection books are all stale-by-arrival.
-  await new Promise((r) => setTimeout(r, 140));
-  assert.equal(h.opened.length, 0, "a missing post-arrival book is never faked into a fill");
+  await new Promise((r) => setTimeout(r, 160));
+  assert.equal(h.opened.length, 0, "a book stale by arrival is never faked into a fill");
   assert.equal(h.positions.isTaken(h.candidate.key), false);
 });
 
