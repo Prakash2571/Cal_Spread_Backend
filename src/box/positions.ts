@@ -43,6 +43,8 @@ export interface BoxOpenPosition {
   entry_charges_total: number | null;
   estimated_exit_charges_total: number | null;
   safety_buffer: number;
+  /** Net basket margin the four legs block, captured at entry (₹), or null. */
+  margin: number | null;
 
   opened_at: number;
 

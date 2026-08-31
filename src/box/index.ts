@@ -33,6 +33,19 @@ export interface BoxModuleDeps {
   makeIdResolver: (all: Instrument[]) => (token: number) => string | null;
   /** NSE equity-derivatives hours, reused from the calendar engine. */
   isMarketOpen: () => boolean;
+  /** Zerodha basket-margin API, reused unchanged from the calendar engine. */
+  getBasketMargin: (
+    orders: {
+      exchange: string;
+      tradingsymbol: string;
+      transaction_type: "BUY" | "SELL";
+      variety: string;
+      product: string;
+      order_type: string;
+      quantity: number;
+      price: number;
+    }[],
+  ) => Promise<{ initial: number; final: number; total: number }>;
   requireAdmin: RequestHandler;
   getAdminRole: (token: string | undefined) => "full" | "trade" | null;
 }
@@ -60,6 +73,7 @@ export function registerBoxModule(app: Express, deps: BoxModuleDeps): BoxModule 
     istDayKey: deps.istDayKey,
     makeIdResolver: deps.makeIdResolver,
     isMarketOpen: deps.isMarketOpen,
+    getBasketMargin: deps.getBasketMargin,
   });
 
   registerBoxRoutes(app, {

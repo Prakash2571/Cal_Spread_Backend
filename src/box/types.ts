@@ -375,6 +375,15 @@ export interface IBoxTrade {
 
   box_width: number;
 
+  /**
+   * Net span (SPAN + exposure) margin the four legs block together, from
+   * Zerodha's basket-margin API priced for all four one-lot orders at once.
+   *
+   * `null` when it could not be fetched — it is captured best-effort at entry,
+   * exactly like the calendar trade's margin, and never gates a trade.
+   */
+  margin: number | null;
+
   entry_box_cost: number;
   entry_gross_edge: number;
 

@@ -5100,6 +5100,7 @@ const boxModule: BoxModule = registerBoxModule(app, {
   istDayKey,
   makeIdResolver,
   isMarketOpen,
+  getBasketMargin: (orders) => kite.getBasketMargin(orders),
   requireAdmin,
   getAdminRole,
 });

@@ -52,6 +52,7 @@ export function serializeBoxTrade(doc: BoxTradeDocLike) {
       exit_depth: l.exit_depth ?? null,
     })),
     box_width: doc.box_width,
+    margin: doc.margin ?? null,
     entry_box_cost: doc.entry_box_cost,
     entry_gross_edge: doc.entry_gross_edge,
     entry_charges: doc.entry_charges ?? null,

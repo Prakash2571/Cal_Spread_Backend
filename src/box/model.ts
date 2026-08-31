@@ -181,6 +181,8 @@ const boxTradeSchema = new mongoose.Schema<IBoxTrade>(
 
     box_width: { type: Number, required: true },
 
+    margin: { type: Number, default: null },
+
     entry_box_cost: { type: Number, required: true },
     entry_gross_edge: { type: Number, required: true },
 

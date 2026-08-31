@@ -74,6 +74,19 @@ export interface BoxEngineDeps {
   makeIdResolver: (all: Instrument[]) => (token: number) => string | null;
   /** NSE equity-derivatives hours, reused from the calendar engine. */
   isMarketOpen: () => boolean;
+  /** Zerodha basket-margin API, reused unchanged from the calendar engine. */
+  getBasketMargin: (
+    orders: {
+      exchange: string;
+      tradingsymbol: string;
+      transaction_type: "BUY" | "SELL";
+      variety: string;
+      product: string;
+      order_type: string;
+      quantity: number;
+      price: number;
+    }[],
+  ) => Promise<{ initial: number; final: number; total: number }>;
 }
 
 /** Minutes past IST midnight, right now. */
@@ -824,6 +837,28 @@ export class BoxEngine {
       });
     }
 
+    // Net basket margin for all four one-lot legs, priced in one request. Best
+    // effort and non-blocking of the fill, exactly like the calendar trade: the
+    // margin is a fact ABOUT the position, never a precondition for taking it.
+    let margin: number | null = null;
+    try {
+      const res = await this.deps.getBasketMargin(
+        BOX_LEG_ROLES.map((role) => ({
+          exchange: candidate.legs[role].exchange,
+          tradingsymbol: candidate.legs[role].tradingsymbol,
+          transaction_type: BOX_ENTRY_SIDES[role],
+          variety: "regular",
+          product: "NRML",
+          order_type: "MARKET",
+          quantity: candidate.lot_size,
+          price: 0,
+        })),
+      );
+      margin = Math.round(res.total);
+    } catch (marginErr) {
+      console.warn("[Box] basket margin fetch failed:", marginErr);
+    }
+
     const costPerUnit = evaluation.entry_box_cost_per_unit!;
     // The net edge is the after-cost figure for the record. With charges
     // unavailable it falls back to gross minus the buffer, so the exit rules
@@ -843,6 +878,7 @@ export class BoxEngine {
       status: "open",
       legs,
       box_width: candidate.box_width,
+      margin,
       entry_box_cost: round2(costPerUnit * candidate.lot_size),
       entry_gross_edge: evaluation.gross_edge!,
       entry_charges: args.charges ? args.charges.entry : null,
@@ -892,6 +928,7 @@ export class BoxEngine {
       entry_charges_total: args.entryChargesTotal,
       estimated_exit_charges_total: args.estimatedExitChargesTotal,
       safety_buffer: this.cfg.safetyBuffer,
+      margin,
       opened_at: Date.now(),
       legs: candidate.legs,
       entry_prices: entryPrices,
@@ -1074,6 +1111,7 @@ export class BoxEngine {
           ? doc.estimated_exit_charges.total
           : null,
         safety_buffer: doc.safety_buffer,
+        margin: doc.margin ?? null,
         opened_at: doc.opened_at.getTime(),
         legs,
         entry_prices: entryPrices,
@@ -1280,6 +1318,7 @@ export class BoxEngine {
         lot_size: pos.lot_size,
         quantity: pos.quantity,
         opened_at: new Date(pos.opened_at).toISOString(),
+        margin: pos.margin,
         entry_box_cost: round2(pos.entry_box_cost_per_unit * pos.lot_size),
         entry_gross_edge: pos.entry_gross_edge,
         entry_charges: pos.entry_charges_total,
