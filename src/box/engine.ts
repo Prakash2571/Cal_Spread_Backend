@@ -40,6 +40,7 @@ import {
   isBoxDbEnabled,
   loadOpenBoxTrades,
   serializeBoxTrade,
+  setBoxTradeMargin,
   toEventLegs,
   tradeKey,
   updateBoxTradeLive,
@@ -838,27 +839,6 @@ export class BoxEngine {
     }
 
     // Net basket margin for all four one-lot legs, priced in one request. Best
-    // effort and non-blocking of the fill, exactly like the calendar trade: the
-    // margin is a fact ABOUT the position, never a precondition for taking it.
-    let margin: number | null = null;
-    try {
-      const res = await this.deps.getBasketMargin(
-        BOX_LEG_ROLES.map((role) => ({
-          exchange: candidate.legs[role].exchange,
-          tradingsymbol: candidate.legs[role].tradingsymbol,
-          transaction_type: BOX_ENTRY_SIDES[role],
-          variety: "regular",
-          product: "NRML",
-          order_type: "MARKET",
-          quantity: candidate.lot_size,
-          price: 0,
-        })),
-      );
-      margin = Math.round(res.total);
-    } catch (marginErr) {
-      console.warn("[Box] basket margin fetch failed:", marginErr);
-    }
-
     const costPerUnit = evaluation.entry_box_cost_per_unit!;
     // The net edge is the after-cost figure for the record. With charges
     // unavailable it falls back to gross minus the buffer, so the exit rules
@@ -878,7 +858,9 @@ export class BoxEngine {
       status: "open",
       legs,
       box_width: candidate.box_width,
-      margin,
+      // Fetched right AFTER the fill, off the critical path (see below), so the
+      // margin round trip never sits between revalidation and creating the trade.
+      margin: null,
       entry_box_cost: round2(costPerUnit * candidate.lot_size),
       entry_gross_edge: evaluation.gross_edge!,
       entry_charges: args.charges ? args.charges.entry : null,
@@ -928,7 +910,7 @@ export class BoxEngine {
       entry_charges_total: args.entryChargesTotal,
       estimated_exit_charges_total: args.estimatedExitChargesTotal,
       safety_buffer: this.cfg.safetyBuffer,
-      margin,
+      margin: null,
       opened_at: Date.now(),
       legs: candidate.legs,
       entry_prices: entryPrices,
@@ -940,6 +922,11 @@ export class BoxEngine {
       config: configSnapshot(this.cfg),
     };
     this.positions.add(position);
+
+    // Margin is captured AFTER the fill is recorded, so a slow /margins/basket
+    // call can never delay the trade or widen the gap after revalidation. It
+    // patches the live position and the stored doc when it returns.
+    void this.captureMargin(id, candidate);
 
     void appendBoxEvent({
       event: "ENTRY",
@@ -1052,6 +1039,37 @@ export class BoxEngine {
     this.broadcast("exit", { trade: serializeBoxTrade(closed) });
     this.maybeReleaseFeed();
     return true;
+  }
+
+  /**
+   * Fetch the net basket margin for the four legs and patch it onto the live
+   * position and the stored document.
+   *
+   * Deliberately off the entry critical path: it runs after the trade exists, so
+   * its network latency never delays the fill. Best-effort — a failure just
+   * leaves margin null, exactly like the calendar trade.
+   */
+  private async captureMargin(id: string, candidate: BoxCandidate): Promise<void> {
+    try {
+      const res = await this.deps.getBasketMargin(
+        BOX_LEG_ROLES.map((role) => ({
+          exchange: candidate.legs[role].exchange,
+          tradingsymbol: candidate.legs[role].tradingsymbol,
+          transaction_type: BOX_ENTRY_SIDES[role],
+          variety: "regular",
+          product: "NRML",
+          order_type: "MARKET",
+          quantity: candidate.lot_size,
+          price: 0,
+        })),
+      );
+      const margin = Math.round(res.total);
+      const pos = this.positions.get(id);
+      if (pos) pos.margin = margin;
+      await setBoxTradeMargin(id, margin);
+    } catch (err) {
+      console.warn("[Box] basket margin fetch failed:", err);
+    }
   }
 
   /** Manual close from the API. */

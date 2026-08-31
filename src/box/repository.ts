@@ -105,6 +105,16 @@ export async function insertBoxTrade(
   }
 }
 
+/** Patch the basket margin onto a trade once it has been fetched off the hot path. */
+export async function setBoxTradeMargin(id: string, margin: number): Promise<void> {
+  if (!isBoxDbEnabled() || !isValidBoxId(id)) return;
+  try {
+    await BoxTrade.updateOne({ _id: id }, { $set: { margin } });
+  } catch (err) {
+    console.warn("[Box] margin update failed for", id, err);
+  }
+}
+
 /** Persist the live convergence figure for an open trade (periodic, not hot). */
 export async function updateBoxTradeLive(
   id: string,
