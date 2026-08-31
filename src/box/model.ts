@@ -16,6 +16,7 @@ import type { ILegCharges, ITradeCharges } from "../db.js";
 import { boxConnection } from "../db.js";
 import type {
   BoxCharges,
+  BoxChargesWithOrigin,
   BoxDepthLevel,
   BoxDepthSnapshot,
   BoxEventLeg,
@@ -83,7 +84,7 @@ const boxLegChargesSchema = new mongoose.Schema<BoxLegCharges>(
   { _id: false },
 );
 
-const boxChargesSchema = new mongoose.Schema<BoxCharges>(
+const boxChargesSchema = new mongoose.Schema<BoxChargesWithOrigin>(
   {
     legs: { type: [boxLegChargesSchema], default: [] },
     value: { type: Number, default: 0 },
