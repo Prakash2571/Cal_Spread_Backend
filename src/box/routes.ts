@@ -51,6 +51,29 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
     res.json(engine.getConfig());
   });
 
+  /**
+   * ADMIN control: how many strikes each side of ATM are monitored/traded (1, 2
+   * or 3). Guarded by the same admin auth as every other box route.
+   *
+   * From the moment it is set, only boxes within ATM ±level are discovered and
+   * entered. Positions ALREADY OPEN are never affected — they keep being
+   * monitored and exit on their own rules regardless of the new width.
+   */
+  app.post("/api/box/strike-level", requireAdmin, async (req: Request, res: Response) => {
+    try {
+      const raw = (req.body ?? {}) as { level?: unknown };
+      const level = Number(raw.level);
+      if (!Number.isFinite(level) || ![1, 2, 3].includes(Math.round(level))) {
+        res.status(400).json({ error: "level must be 1, 2 or 3." });
+        return;
+      }
+      const result = await engine.setStrikeLevel(level);
+      res.json({ ok: true, strike_level: result.level, status: engine.getStatus() });
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
   /** RUN — begin discovering and auto-opening paper boxes. */
   app.post("/api/box/start", requireAdmin, async (_req: Request, res: Response) => {
     try {

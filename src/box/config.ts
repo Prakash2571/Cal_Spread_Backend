@@ -32,6 +32,14 @@ function bool(name: string, fallback: boolean): boolean {
   return fallback;
 }
 
+/** Clamp any input to a valid strikes-each-side level: 1, 2 or 3. */
+export function clampStrikeLevel(v: number): 1 | 2 | 3 {
+  const n = Math.round(v);
+  if (n <= 1) return 1;
+  if (n >= 3) return 3;
+  return 2;
+}
+
 function executionMode(name: string, fallback: ExecutionMode): ExecutionMode {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
@@ -152,8 +160,21 @@ export interface BoxConfig {
   underlyingMaxAgeMs: number;
 
   // ---- Strike window ----
-  /** Strikes each side of ATM. Fixed at 3 and NOT env-tunable in this version. */
+  /**
+   * The MAXIMUM strikes each side of ATM the module ever builds. Fixed at 3.
+   *
+   * The ACTIVE level (1, 2 or 3) is a separate runtime control the admin sets —
+   * see `defaultStrikeLevel` and BoxEngine.setStrikeLevel. This cap never rises,
+   * so an admin can only ever narrow the window, never widen it past ATM ±3.
+   */
   readonly strikesEachSide: 3;
+  /**
+   * The active strikes-each-side level at boot: 1, 2 or 3 (default 3).
+   *
+   * Admin-adjustable at runtime. Narrowing it only affects which NEW boxes are
+   * discovered; positions already open are never touched by a change.
+   */
+  defaultStrikeLevel: 1 | 2 | 3;
   /**
    * Extra fraction of a strike step the spot must travel PAST the midpoint
    * before the ATM is re-centred.
@@ -234,6 +255,7 @@ export function loadBoxConfig(): BoxConfig {
     underlyingMaxAgeMs: num("BOX_UNDERLYING_MAX_AGE_MS", 10_000),
 
     strikesEachSide: 3,
+    defaultStrikeLevel: clampStrikeLevel(num("BOX_STRIKE_LEVEL", 3)),
     atmHysteresis: num("BOX_ATM_HYSTERESIS", 0.15),
     windowMinIntervalMs: num("BOX_WINDOW_MIN_INTERVAL_MS", 15_000),
     enableShortBox: bool("BOX_ENABLE_SHORT_BOX", true),

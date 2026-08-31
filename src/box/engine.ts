@@ -18,6 +18,7 @@ import type { Instrument, KiteClient } from "../kite.js";
 import type { TickerHub } from "../hub.js";
 import type { Tick } from "../ticker.js";
 import {
+  clampStrikeLevel,
   configSnapshot,
   loadBoxConfig,
   prefilterGrossThreshold,
@@ -130,6 +131,16 @@ export class BoxEngine {
   private monitor: BoxPositionMonitor;
   /** The directions the scanner builds candidates for. */
   private directions: readonly BoxDirection[];
+  /**
+   * The ACTIVE strikes-each-side level (1, 2 or 3), admin-adjustable at runtime.
+   *
+   * Never above the config cap (ATM ±3). Narrowing it changes only which NEW
+   * boxes are discovered — open positions keep their own legs and are managed
+   * independently, so a level change can never affect a trade already on.
+   */
+  private strikeLevel: 1 | 2 | 3;
+  /** Forces every window to rebuild on the next refresh (set by setStrikeLevel). */
+  private forceWindowRebuild = false;
 
   /** Underlying → its current seven-strike window. */
   private windows = new Map<string, BoxUnderlyingState>();
@@ -178,6 +189,7 @@ export class BoxEngine {
     this.localCharges = new LocalChargeCalculator();
     this.metrics = new BoxMetrics(this.cfg.metricsWindow);
     this.directions = this.cfg.enableShortBox ? BOX_DIRECTIONS : (["LONG_BOX"] as const);
+    this.strikeLevel = this.cfg.defaultStrikeLevel;
 
     this.executionSim = new BoxExecutionSimulator({
       cfg: this.cfg,
@@ -343,6 +355,42 @@ export class BoxEngine {
         `freshness ${this.cfg.quoteMaxAgeMs}ms, ATM±${this.cfg.strikesEachSide}, ` +
         `market ${this.marketOpen ? "OPEN" : "CLOSED"}.`,
     );
+  }
+
+  /** The active strikes-each-side level (1, 2 or 3). */
+  getStrikeLevel(): 1 | 2 | 3 {
+    return this.strikeLevel;
+  }
+
+  /**
+   * Admin control: set how many strikes each side of ATM are monitored/traded.
+   *
+   * Only 1, 2 or 3 (never wider than the ATM ±3 cap). The change rebuilds every
+   * strike window at the new width and re-derives the candidate set, so from this
+   * point only boxes within ATM ±level are discovered and entered.
+   *
+   * OPEN POSITIONS ARE UNTOUCHED. They hold their own legs, their tokens stay
+   * subscribed unconditionally, and the monitor manages and exits them exactly as
+   * before — a leg now outside the narrower window keeps streaming and the trade
+   * is unaffected. Only NEW discovery is constrained.
+   */
+  async setStrikeLevel(level: number): Promise<{ ok: boolean; level: 1 | 2 | 3; error?: string }> {
+    const next = clampStrikeLevel(level);
+    if (next === this.strikeLevel) return { ok: true, level: next };
+    this.strikeLevel = next;
+    this.forceWindowRebuild = true;
+    console.log(`[Box] strike level set to ATM ±${next} — new discovery is limited to this window; open positions are unaffected.`);
+    // Rebuild windows now if the feed is up; otherwise the next scheduled refresh
+    // (or the next RUN) picks up the flag.
+    if (this.deps.kite.getAccessToken()) {
+      try {
+        await this.refreshUniverse();
+      } catch (err) {
+        this.lastError = err instanceof Error ? err.message : String(err);
+      }
+    }
+    this.publish();
+    return { ok: true, level: next };
   }
 
   /** RUN: start discovering and opening new paper boxes. */
@@ -748,6 +796,8 @@ export class BoxEngine {
 
       let state = existing;
       const needsBuild =
+        // A strike-level change forces every window to rebuild at the new width.
+        this.forceWindowRebuild ||
         !state ||
         state.expiry !== chain.expiry ||
         (spot !== undefined &&
@@ -765,7 +815,8 @@ export class BoxEngine {
           chain,
           spot: spot.value,
           spotAt: spot.at,
-          eachSide: this.cfg.strikesEachSide,
+          // The ACTIVE admin-selected level, never above the ATM ±3 cap.
+          eachSide: this.strikeLevel,
           now,
         });
         if (built) state = built;
@@ -806,6 +857,8 @@ export class BoxEngine {
     // Open positions' legs are subscribed unconditionally.
     for (const t of this.positions.tokens()) wantOption.add(t);
 
+    // The forced rebuild (from a strike-level change) has now been applied.
+    this.forceWindowRebuild = false;
     this.skippedForBudget = skipped;
     this.universeBuiltAt = now;
     this.applySubscriptions(wantOption, wantSpot);
@@ -1432,8 +1485,11 @@ export class BoxEngine {
       /** Feed-liveness limit: newest tick across the whole universe. */
       feed_max_age_ms: this.cfg.feedMaxAgeMs,
       underlying_max_age_ms: this.cfg.underlyingMaxAgeMs,
+      /** The MAXIMUM strikes each side (the cap). */
       strikes_each_side: this.cfg.strikesEachSide,
-      max_strikes: this.cfg.strikesEachSide * 2 + 1,
+      /** The ACTIVE admin-selected level (1, 2 or 3), never above the cap. */
+      strike_level: this.strikeLevel,
+      max_strikes: this.strikeLevel * 2 + 1,
       max_candidates_per_underlying: 21,
       prefilter_gross_threshold: prefilterGrossThreshold(this.cfg),
       convergence_floor: this.cfg.convergenceFloor,
@@ -1471,6 +1527,8 @@ export class BoxEngine {
       started_at: this.startedAt,
       stopped_at: this.stoppedAt,
       universe_built_at: this.universeBuiltAt,
+      /** The active strikes-each-side level (1, 2 or 3). */
+      strike_level: this.strikeLevel,
       underlyings: this.windows.size,
       candidates: this.scanner.candidateCount,
       monitored_tokens: this.scanner.monitoredTokenCount,

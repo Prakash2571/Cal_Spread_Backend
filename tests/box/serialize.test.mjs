@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 
 import { serializeBoxTrade, toEventLegs, tradeKey } from "../../dist/box/serialize.js";
 import { BoxQuoteStore, SpotStore } from "../../dist/box/quotes.js";
-import { configSnapshot, loadBoxConfig, prefilterGrossThreshold } from "../../dist/box/config.js";
+import { clampStrikeLevel, configSnapshot, loadBoxConfig, prefilterGrossThreshold } from "../../dist/box/config.js";
 import { evaluateCandidate } from "../../dist/box/math.js";
 import { GOOD_BOX, LOT, goodCandidate, quotesFor } from "./helpers.mjs";
 
@@ -209,6 +209,22 @@ test("the shipped configuration is the documented V1 specification", () => {
   assert.equal(configSnapshot(c).execution_mode, "paper_latency");
   assert.equal(configSnapshot(c).min_expected_net_profit, 1200);
   assert.equal(configSnapshot(c).min_gross_edge, 1200);
+});
+
+test("the admin strike level is clamped to 1, 2 or 3 and never wider", () => {
+  // The default and the cap are both ATM ±3.
+  const c = loadBoxConfig();
+  assert.equal(c.strikesEachSide, 3);
+  assert.equal(c.defaultStrikeLevel, 3);
+  // Anything an admin sends is clamped into {1,2,3} — the window can only narrow.
+  assert.equal(clampStrikeLevel(1), 1);
+  assert.equal(clampStrikeLevel(2), 2);
+  assert.equal(clampStrikeLevel(3), 3);
+  assert.equal(clampStrikeLevel(0), 1);
+  assert.equal(clampStrikeLevel(-5), 1);
+  assert.equal(clampStrikeLevel(4), 3, "cannot widen past the ATM ±3 cap");
+  assert.equal(clampStrikeLevel(99), 3);
+  assert.equal(clampStrikeLevel(2.4), 2, "rounded to the nearest level");
 });
 
 test("the quote store stamps books with their receive time and ages them out", () => {

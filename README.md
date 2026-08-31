@@ -443,7 +443,15 @@ store exposes a `replay()` + `subscribe()` seam so recorded tick batches can be 
 exact live code path (store → scanner → execution simulator → monitor) without a Zerodha
 connection — the basis of a deterministic replay harness.
 
-Strikes are fixed at **ATM ±3** in V1 and deliberately not configurable.
+| `BOX_STRIKE_LEVEL` | `3` | Boot value of the active strikes-each-side level (1, 2 or 3), admin-adjustable at runtime |
+
+**ATM ±3 is the hard maximum.** The admin can *narrow* the monitored window to ATM ±1 or ±2 at
+runtime via `POST /api/box/strike-level` (admin-guarded, `{ "level": 1|2|3 }`); it can never be
+widened past ±3. Narrowing takes effect immediately for **new** discovery — the windows rebuild at
+the chosen width and only boxes within ATM ±level are entered from that point. **Positions already
+open are never affected**: they keep their own legs, stay subscribed unconditionally, and are
+managed and exited on their own rules regardless of the new width. The active level is reported as
+`strike_level` on `/api/box/status` and `/api/box/config`.
 
 ### Tests
 
@@ -507,6 +515,7 @@ Box arbitrage (paper, admin-only — full admin or trade access):
 | `GET /api/box/config` | Active thresholds (₹1,200 expected net, execution mode + latency, long/short, ATM ±3, 1 lot) |
 | `POST /api/box/start` | RUN — begin discovering and auto-opening paper boxes |
 | `POST /api/box/stop` | STOP — stop opening NEW boxes (open ones stay monitored) |
+| `POST /api/box/strike-level` | ADMIN — set monitored/traded window to ATM ±1, ±2 or ±3 (open positions unaffected) |
 | `GET /api/box/opportunities` | Current opportunities, best net edge first |
 | `GET /api/box/chains` | Monitored underlyings; `?underlying=` for its ATM ±3 chain with legs marked |
 | `GET /api/box/trades` | Open positions + persisted box trades |
