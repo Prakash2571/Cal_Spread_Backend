@@ -232,13 +232,17 @@ test("a depthless tick must not refresh a good book's timestamp", () => {
   assert.equal(store.isFresh(7, 1500, 9_000), false);
 });
 
-test("a REST ladder seeds a book that is treated as fresh at fetch time", () => {
+test("executable books can only enter the store through WebSocket ticks", () => {
   const store = new BoxQuoteStore();
-  store.applyLadder(11, { last: 50, bids: [{ price: 49, qty: 100 }], asks: [{ price: 51, qty: 100 }] }, 2_000);
+  assert.equal(store.applyLadder, undefined, "REST ladders must not be an execution source");
+
+  store.applyTicks(
+    [{ token: 11, last_price: 50, bid: 49, ask: 51, bids: [{ price: 49, qty: 100, orders: 1 }], asks: [{ price: 51, qty: 100, orders: 1 }] }],
+    2_000,
+  );
   const q = store.get(11);
-  assert.equal(q.source, "rest");
-  assert.equal(q.bid, 49);
-  assert.equal(q.ask_qty, 100);
+  assert.equal(q.source, "ws");
+  assert.ok(q.version > 0);
   assert.equal(store.isFresh(11, 1500, 3_000), true);
 
   store.forget([11]);

@@ -15,7 +15,12 @@
 
 import type { BoxConfig } from "./config.js";
 import { configSnapshot, prefilterGrossThreshold } from "./config.js";
-import { BoxChargeEstimator, buildEntryChargeLegs, type BoxChargeLeg } from "./charges.js";
+import {
+  BoxChargeEstimator,
+  buildEntryChargeLegs,
+  sameChargeLegs,
+  type BoxChargeLeg,
+} from "./charges.js";
 import {
   evaluateCandidate,
   evaluateCandidateIndicative,
@@ -351,92 +356,103 @@ export class BoxScanner {
     }
     this.entryInFlight.add(cand.key);
     try {
-      const entryLegs = buildEntryChargeLegs(cand, first.legs);
-      if (!entryLegs) {
+      let chargeInput = buildEntryChargeLegs(cand, first.legs);
+      if (!chargeInput) {
         this.deps.positions.release(cand.key);
         return;
       }
 
-      this.stats.chargeAttempts++;
-      const estimate = await this.deps.charges.estimate(cand.key, entryLegs);
+      // A moving touch invalidates the virtual contract note's order prices.
+      // Retry a bounded number of times; if the market never settles, skip this
+      // tick rather than combining stale charges with newer paper fills.
+      const MAX_PRICE_ATTEMPTS = 3;
+      for (let attempt = 1; attempt <= MAX_PRICE_ATTEMPTS; attempt++) {
+        this.stats.chargeAttempts++;
+        const estimate = await this.deps.charges.estimate(cand.key, chargeInput);
 
-      // Charges could not be determined. This does NOT change the threshold (the
-      // gate is the gross spread) — but the exit rules are evaluated net of
-      // charges, so a position with no charge figures could never have its net
-      // P&L computed and would never auto-exit. It is therefore skipped unless
-      // BOX_REQUIRE_PRICED_CHARGES is turned off.
-      if (!estimate && this.deps.cfg.requirePricedCharges) {
-        this.stats.rejectedFees++;
-        this.markStatus(cand.key, "UNPRICED");
-        this.logRejection(
-          "ENTRY_REJECTED_FEES",
-          cand,
-          first,
-          "Zerodha could not price the eight box orders, so the exit could not be managed net of charges",
-        );
-        this.deps.positions.release(cand.key);
+        if (!estimate && this.deps.cfg.requirePricedCharges) {
+          this.stats.rejectedFees++;
+          this.markStatus(cand.key, "UNPRICED");
+          this.logRejection(
+            "ENTRY_REJECTED_FEES",
+            cand,
+            first,
+            "Zerodha could not price the eight box orders, so the exit could not be managed net of charges",
+          );
+          this.deps.positions.release(cand.key);
+          return;
+        }
+
+        // The charge request is network I/O. Discovery, market hours, or WS feed
+        // health may have changed while it was in flight.
+        if (!this.discovering || !this.marketOpen || !this.feedHealthy) {
+          this.deps.positions.release(cand.key);
+          return;
+        }
+
+        const now = Date.now();
+        const finalEvaluation = evaluateCandidate({
+          candidate: cand,
+          quotes: this.deps.quotes.view(),
+          now,
+          maxAgeMs: this.deps.cfg.quoteMaxAgeMs,
+        });
+        if (!finalEvaluation.tradable || finalEvaluation.gross_edge === null) {
+          this.noteRejection(cand, finalEvaluation, "book moved while charges were being priced");
+          this.deps.positions.release(cand.key);
+          return;
+        }
+
+        const finalChargeLegs = buildEntryChargeLegs(cand, finalEvaluation.legs);
+        if (!finalChargeLegs) {
+          this.deps.positions.release(cand.key);
+          return;
+        }
+
+        // If any fill price changed during the await, the response describes old
+        // orders. Re-price these exact final orders, then capture WS books again.
+        if (estimate && !sameChargeLegs(chargeInput, finalChargeLegs)) {
+          if (attempt === MAX_PRICE_ATTEMPTS) {
+            this.deps.positions.release(cand.key);
+            return;
+          }
+          chargeInput = finalChargeLegs;
+          continue;
+        }
+
+        const netEdge = estimate
+          ? projectedNetEdge({
+              grossEdge: finalEvaluation.gross_edge,
+              entryCharges: estimate.entry_total,
+              estimatedExitCharges: estimate.estimated_exit_total,
+              safetyBuffer: this.deps.cfg.safetyBuffer,
+            })
+          : null;
+        if (!qualifiesForEntry(finalEvaluation.gross_edge, netEdge, this.deps.cfg)) {
+          this.markStatus(cand.key, "WATCHING");
+          this.deps.positions.release(cand.key);
+          return;
+        }
+
+        // No await occurs between this final immutable WS snapshot and the
+        // synchronous payload construction at the start of openPaperTrade.
+        const id = await this.deps.openPaperTrade({
+          candidate: cand,
+          evaluation: finalEvaluation,
+          entryLegs: finalChargeLegs,
+          entryChargesTotal: estimate ? estimate.entry_total : null,
+          estimatedExitChargesTotal: estimate ? estimate.estimated_exit_total : null,
+          netEdge,
+          charges: estimate,
+        });
+
+        if (id) {
+          this.stats.entriesOpened++;
+          this.markStatus(cand.key, "PAPER_OPENED");
+        } else {
+          this.deps.positions.release(cand.key);
+        }
         return;
-      }
-
-      // ---- REVALIDATE against the book as it is NOW ----
-      const now = Date.now();
-      const second = evaluateCandidate({
-        candidate: cand,
-        quotes: this.deps.quotes.view(),
-        now,
-        maxAgeMs: this.deps.cfg.quoteMaxAgeMs,
-      });
-
-      if (!second.tradable || second.gross_edge === null) {
-        this.noteRejection(cand, second, "book moved while charges were being priced");
-        this.deps.positions.release(cand.key);
-        return;
-      }
-
-      // Re-price the net edge on the CURRENT touch. The charge estimate is reused
-      // (it is a function of turnover, which barely moves for a tick-sized price
-      // change) but the EDGE is always recomputed from the live book.
-      const netEdge = estimate
-        ? projectedNetEdge({
-            grossEdge: second.gross_edge,
-            entryCharges: estimate.entry_total,
-            estimatedExitCharges: estimate.estimated_exit_total,
-            safetyBuffer: this.deps.cfg.safetyBuffer,
-          })
-        : null;
-
-      // The gate is the GROSS spread; the net figure is carried for the record
-      // and only binds when an explicit net floor is configured.
-      if (!qualifiesForEntry(second.gross_edge, netEdge, this.deps.cfg)) {
-        this.markStatus(cand.key, "WATCHING");
-        this.deps.positions.release(cand.key);
-        return;
-      }
-
-      // The revalidated legs are what the paper fills are recorded at.
-      const revalidatedLegs = buildEntryChargeLegs(cand, second.legs);
-      if (!revalidatedLegs) {
-        this.deps.positions.release(cand.key);
-        return;
-      }
-
-      const id = await this.deps.openPaperTrade({
-        candidate: cand,
-        evaluation: second,
-        entryLegs: revalidatedLegs,
-        entryChargesTotal: estimate ? estimate.entry_total : null,
-        estimatedExitChargesTotal: estimate ? estimate.estimated_exit_total : null,
-        netEdge,
-        charges: estimate,
-      });
-
-      if (id) {
-        this.stats.entriesOpened++;
-        this.markStatus(cand.key, "PAPER_OPENED");
-      } else {
-        // Either a duplicate was caught by the unique index, or persistence is
-        // unavailable. Either way the reservation must not leak.
-        this.deps.positions.release(cand.key);
       }
     } catch (err) {
       console.warn("[Box] entry attempt failed for", cand.key, err);
@@ -556,7 +572,9 @@ export class BoxScanner {
       price_source: ctx.priceSource ?? "touch",
       status,
       reject: evaluation.reject,
-      legs: evaluation.legs,
+      // Depth/version are internal immutable fill-audit data. The opportunity
+      // stream keeps its existing compact per-leg API shape.
+      legs: evaluation.legs.map(({ depth: _depth, quote_version: _version, ...leg }) => leg),
       updated_at: evaluation.at,
     });
   }

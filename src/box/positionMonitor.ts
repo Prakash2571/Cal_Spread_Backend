@@ -13,7 +13,12 @@
  */
 
 import type { BoxConfig } from "./config.js";
-import { BoxChargeEstimator, buildChargeLegsFromEvaluations, type BoxChargeLeg } from "./charges.js";
+import {
+  BoxChargeEstimator,
+  buildChargeLegsFromEvaluations,
+  sameChargeLegs,
+  type BoxChargeLeg,
+} from "./charges.js";
 import { computeExitMetrics, evaluateExitLegs, exitLiquidityOk, round2 } from "./math.js";
 import type { BoxOpenPosition, BoxPositionBook } from "./positions.js";
 import type { BoxQuoteStore } from "./quotes.js";
@@ -73,6 +78,9 @@ const IST_CLOSE_MINUTES = 15 * 60 + 30;
 export class BoxPositionMonitor {
   private timer: NodeJS.Timeout | null = null;
   private ticking = false;
+  /** One evaluator per position; a WS tick received during charge I/O queues a rerun. */
+  private evaluationTasks = new Map<string, Promise<void>>();
+  private pendingEvaluationIds = new Set<string>();
   private closingIds = new Set<string>();
   /** position id → the last liquidity-gap SHAPE written to the ledger. */
   private lastBlockedKey = new Map<string, string>();
@@ -103,29 +111,73 @@ export class BoxPositionMonitor {
     return { ...this.stats, running: this.timer !== null };
   }
 
-  /** Re-price every open position and act on whatever became eligible. */
+  /**
+   * Primary low-latency path: a WS depth update immediately re-evaluates only
+   * open positions that contain one of the changed contracts.
+   */
+  onTokensUpdated(tokens: number[]): void {
+    if (tokens.length === 0) return;
+    const changed = new Set(tokens);
+    for (const pos of this.deps.positions.list()) {
+      const affected = BOX_LEG_ROLES.some((role) => changed.has(pos.legs[role].token));
+      if (affected) void this.requestEvaluation(pos.id);
+    }
+  }
+
+  /**
+   * Queue one position. If another WS packet lands while charge pricing is in
+   * flight, the loop runs again and captures the newer four-leg touch before any
+   * fill is persisted.
+   */
+  private requestEvaluation(id: string): Promise<void> {
+    this.pendingEvaluationIds.add(id);
+    const existing = this.evaluationTasks.get(id);
+    if (existing) return existing;
+
+    const task = (async () => {
+      try {
+        while (this.pendingEvaluationIds.delete(id)) {
+          const pos = this.deps.positions.get(id);
+          if (!pos) break;
+          try {
+            await this.evaluatePosition(pos);
+          } catch (err) {
+            console.warn("[Box] monitor failed for", pos.id, err);
+            this.deps.onEvent("ERROR", pos, pos.metrics, String(err));
+          }
+        }
+      } finally {
+        this.evaluationTasks.delete(id);
+        // Cover the narrow race where a tick queued work after the loop's final
+        // delete but before this task left the map.
+        if (this.pendingEvaluationIds.has(id) && this.deps.positions.get(id)) {
+          void this.requestEvaluation(id);
+        }
+      }
+    })();
+    this.evaluationTasks.set(id, task);
+    return task;
+  }
+
+  /** Re-price every open position as a watchdog; WS updates are the primary path. */
   async cycle(): Promise<void> {
-    if (this.ticking) return; // never overlap cycles
+    if (this.ticking) return; // never overlap watchdog cycles
     this.ticking = true;
     try {
       this.stats.cycles++;
       this.stats.lastCycleAt = Date.now();
-      const positions = this.deps.positions.list();
-      for (const pos of positions) {
-        try {
-          await this.evaluatePosition(pos);
-        } catch (err) {
-          console.warn("[Box] monitor failed for", pos.id, err);
-          this.deps.onEvent("ERROR", pos, pos.metrics, String(err));
-        }
-      }
+      await Promise.all(this.deps.positions.list().map((pos) => this.requestEvaluation(pos.id)));
     } finally {
       this.ticking = false;
     }
   }
 
   /** Recompute the exit arithmetic for one position (no side effects). */
-  measure(pos: BoxOpenPosition, now = Date.now()): BoxExitMetrics {
+  measure(
+    pos: BoxOpenPosition,
+    now = Date.now(),
+    exitChargesTotalOverride?: number | null,
+  ): BoxExitMetrics {
     const legs = evaluateExitLegs({
       legs: BOX_LEG_ROLES.map((role) => ({ role, inst: pos.legs[role] })),
       quotes: this.deps.quotes.view(),
@@ -138,7 +190,10 @@ export class BoxPositionMonitor {
     // otherwise the conservative projection recorded at entry. Falling back to
     // the entry-time projection is deliberate — it is never cheaper than a real
     // unwind of the same size, so it cannot flatter the net P&L.
-    const exitChargesTotal = this.cachedExitChargesTotal(pos, legs);
+    const exitChargesTotal =
+      exitChargesTotalOverride !== undefined
+        ? exitChargesTotalOverride
+        : this.cachedExitChargesTotal(pos, legs);
 
     return computeExitMetrics({
       boxWidth: pos.box_width,
@@ -213,33 +268,67 @@ export class BoxPositionMonitor {
       return;
     }
 
-    // Before committing, price the exit for real at the CURRENT touch, then
-    // re-measure. Charges move the net P&L, and the ≥₹600 / 75% tests must be
-    // decided on priced charges rather than the entry-time projection.
-    const chargeLegs = this.exitChargeLegs(pos, metrics.legs);
-    if (chargeLegs) {
-      const priced = await this.deps.charges.estimateExitOnly(`exitq:${pos.id}`, chargeLegs);
-      if (priced) {
-        metrics = computeExitMetrics({
-          boxWidth: pos.box_width,
-          lotSize: pos.lot_size,
-          entryBoxCostPerUnit: pos.entry_box_cost_per_unit,
-          entryNetEdge: pos.entry_net_edge,
-          entryChargesTotal: pos.entry_charges_total,
-          currentExitChargesTotal: round2(priced.total),
-          legs: evaluateExitLegs({
-            legs: BOX_LEG_ROLES.map((role) => ({ role, inst: pos.legs[role] })),
-            quotes: this.deps.quotes.view(),
-            lotSize: pos.lot_size,
-            now: Date.now(),
-            maxAgeMs: this.deps.cfg.quoteMaxAgeMs,
-          }),
-          now: Date.now(),
-          cfg: this.deps.cfg,
-        });
-        pos.metrics = metrics;
+    // Charge pricing is the only network work before an exit. If the touch moves
+    // during it, price the new exact orders and capture all four WS books again.
+    let chargeInput = this.exitChargeLegs(pos, metrics.legs);
+    let pricedExitCharges: BoxCharges | null = null;
+    let stable = false;
+    const MAX_PRICE_ATTEMPTS = 3;
+    for (let attempt = 1; attempt <= MAX_PRICE_ATTEMPTS; attempt++) {
+      pricedExitCharges = chargeInput
+        ? await this.deps.charges.estimateExitOnly(`exitq:${pos.id}`, chargeInput)
+        : null;
+
+      if (pos.closing || this.closingIds.has(pos.id)) return;
+      if (this.deps.positions.get(pos.id) !== pos) return;
+      if (!this.deps.isMarketOpen() || !this.deps.isFeedHealthy()) return;
+
+      const finalNow = Date.now();
+      const finalLegs = evaluateExitLegs({
+        legs: BOX_LEG_ROLES.map((role) => ({ role, inst: pos.legs[role] })),
+        quotes: this.deps.quotes.view(),
+        lotSize: pos.lot_size,
+        now: finalNow,
+        maxAgeMs: this.deps.cfg.quoteMaxAgeMs,
+      });
+      metrics = computeExitMetrics({
+        boxWidth: pos.box_width,
+        lotSize: pos.lot_size,
+        entryBoxCostPerUnit: pos.entry_box_cost_per_unit,
+        entryNetEdge: pos.entry_net_edge,
+        entryChargesTotal: pos.entry_charges_total,
+        currentExitChargesTotal: pricedExitCharges
+          ? round2(pricedExitCharges.total)
+          : this.cachedExitChargesTotal(pos, finalLegs),
+        legs: finalLegs,
+        now: finalNow,
+        cfg: this.deps.cfg,
+      });
+      pos.metrics = metrics;
+
+      const tentativeReason =
+        metrics.rule_reason ?? (expirySafety ? "EXPIRY_SAFETY" : null);
+      // No fill will be persisted, so fee/fill synchronization is irrelevant.
+      if (!tentativeReason || !exitLiquidityOk(finalLegs)) {
+        stable = true;
+        break;
       }
+
+      const finalChargeLegs = this.exitChargeLegs(pos, finalLegs);
+      if (
+        pricedExitCharges &&
+        chargeInput &&
+        finalChargeLegs &&
+        !sameChargeLegs(chargeInput, finalChargeLegs)
+      ) {
+        if (attempt === MAX_PRICE_ATTEMPTS) return;
+        chargeInput = finalChargeLegs;
+        continue;
+      }
+      stable = true;
+      break;
     }
+    if (!stable) return;
 
     const reason: BoxExitReason | null =
       metrics.rule_reason ?? (expirySafety ? "EXPIRY_SAFETY" : null);
@@ -278,7 +367,7 @@ export class BoxPositionMonitor {
     pos.exit_blocked_reason = null;
     this.lastBlockedKey.delete(pos.id);
 
-    await this.executeExit(pos, metrics, reason);
+    await this.executeExit(pos, metrics, reason, pricedExitCharges);
   }
 
   /** Perform the paper exit at the current executable touch. */
@@ -286,20 +375,21 @@ export class BoxPositionMonitor {
     pos: BoxOpenPosition,
     metrics: BoxExitMetrics,
     reason: BoxExitReason,
+    exitCharges: BoxCharges | null,
+    alreadyClaimed = false,
   ): Promise<void> {
-    if (this.closingIds.has(pos.id)) return;
-    this.closingIds.add(pos.id);
-    pos.closing = true;
+    if (!alreadyClaimed) {
+      if (this.closingIds.has(pos.id)) return;
+      this.closingIds.add(pos.id);
+      pos.closing = true;
+    }
     try {
       this.stats.exitsTriggered++;
       this.deps.onEvent("EXIT_TRIGGERED", pos, metrics, reason);
 
-      const chargeLegs = this.exitChargeLegs(pos, metrics.legs);
-      let exitCharges: BoxCharges | null = null;
-      if (chargeLegs) {
-        exitCharges = await this.deps.charges.estimateExitOnly(`exitfill:${pos.id}`, chargeLegs);
-      }
-
+      // `metrics` is the final immutable WS snapshot. Charge pricing happened
+      // before it; there is deliberately no network await here before the engine
+      // constructs and persists the paper fill.
       const closed = await this.deps.closePaperTrade({
         position: pos,
         metrics,
@@ -345,23 +435,117 @@ export class BoxPositionMonitor {
       };
     }
 
-    const metrics = this.measure(pos);
-    pos.metrics = metrics;
-
-    if (!exitLiquidityOk(metrics.legs)) {
-      const detail = describeLiquidityGap(metrics.legs, pos.lot_size);
-      pos.exit_blocked_reason = detail;
-      this.deps.onEvent("EXIT_SKIPPED_LIQUIDITY", pos, metrics, `manual close refused: ${detail}`);
+    if (!this.deps.isMarketOpen()) {
       return {
         ok: false,
-        error: `Cannot close at an executable price right now: ${detail}. The position is still open and being monitored.`,
-        metrics,
+        error: "Cannot close while the exchange is closed. The position is still monitored.",
+        metrics: pos.metrics,
+        code: 409,
+      };
+    }
+    if (!this.deps.isFeedHealthy()) {
+      return {
+        ok: false,
+        error: "Cannot close while the live WebSocket feed is unavailable. The position is still monitored.",
+        metrics: pos.metrics,
         code: 409,
       };
     }
 
-    await this.executeExit(pos, metrics, "MANUAL");
-    return { ok: true };
+    const first = this.measure(pos);
+    pos.metrics = first;
+    if (!exitLiquidityOk(first.legs)) {
+      const detail = describeLiquidityGap(first.legs, pos.lot_size);
+      pos.exit_blocked_reason = detail;
+      this.deps.onEvent("EXIT_SKIPPED_LIQUIDITY", pos, first, `manual close refused: ${detail}`);
+      return {
+        ok: false,
+        error: `Cannot close at an executable price right now: ${detail}. The position is still open and being monitored.`,
+        metrics: first,
+        code: 409,
+      };
+    }
+
+    // Claim before charge I/O so an automatic evaluation cannot race this manual
+    // request. The fill itself is still captured only after the I/O completes.
+    this.closingIds.add(id);
+    pos.closing = true;
+    let handedToExecute = false;
+    try {
+      let metrics = first;
+      let chargeInput = this.exitChargeLegs(pos, first.legs);
+      let priced: BoxCharges | null = null;
+      const MAX_PRICE_ATTEMPTS = 3;
+      let stable = false;
+
+      for (let attempt = 1; attempt <= MAX_PRICE_ATTEMPTS; attempt++) {
+        priced = chargeInput
+          ? await this.deps.charges.estimateExitOnly(`exitq:${pos.id}`, chargeInput)
+          : null;
+
+        if (!this.deps.isMarketOpen() || !this.deps.isFeedHealthy()) {
+          return {
+            ok: false,
+            error: "Cannot close because the live WebSocket market data became unavailable. The position is still open.",
+            metrics: pos.metrics,
+            code: 409,
+          };
+        }
+
+        metrics = this.measure(
+          pos,
+          Date.now(),
+          priced ? round2(priced.total) : undefined,
+        );
+        pos.metrics = metrics;
+        if (!exitLiquidityOk(metrics.legs)) {
+          const detail = describeLiquidityGap(metrics.legs, pos.lot_size);
+          pos.exit_blocked_reason = detail;
+          this.deps.onEvent("EXIT_SKIPPED_LIQUIDITY", pos, metrics, `manual close refused after revalidation: ${detail}`);
+          return {
+            ok: false,
+            error: `Cannot close at an executable price right now: ${detail}. The position is still open and being monitored.`,
+            metrics,
+            code: 409,
+          };
+        }
+
+        const finalChargeLegs = this.exitChargeLegs(pos, metrics.legs);
+        if (priced && chargeInput && finalChargeLegs && !sameChargeLegs(chargeInput, finalChargeLegs)) {
+          if (attempt === MAX_PRICE_ATTEMPTS) {
+            return {
+              ok: false,
+              error: "Cannot close because the executable touch is moving faster than charges can be priced. Please retry; the position remains monitored.",
+              metrics,
+              code: 409,
+            };
+          }
+          chargeInput = finalChargeLegs;
+          continue;
+        }
+        stable = true;
+        break;
+      }
+      if (!stable) {
+        return {
+          ok: false,
+          error: "Could not obtain a stable executable touch. The position remains monitored.",
+          metrics,
+          code: 409,
+        };
+      }
+
+      // `metrics` and `priced` now describe the same exact order prices. There is
+      // no further external await before the engine constructs the stored fill.
+      handedToExecute = true;
+      await this.executeExit(pos, metrics, "MANUAL", priced, true);
+      return { ok: true };
+    } finally {
+      if (!handedToExecute) {
+        pos.closing = false;
+        this.closingIds.delete(id);
+      }
+    }
   }
 
   /**

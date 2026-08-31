@@ -51,7 +51,6 @@ import {
   BOX_ENTRY_SIDES,
   BOX_LEG_ROLES,
   type BoxCandidate,
-  type BoxDepthSnapshot,
   type BoxEvaluation,
   type BoxCharges,
   type BoxExitMetrics,
@@ -123,7 +122,6 @@ export class BoxEngine {
   private removeTickListener: (() => void) | null = null;
   private universeTimer: NodeJS.Timeout | null = null;
   private publishTimer: NodeJS.Timeout | null = null;
-  private restSeedAt = 0;
 
   private running = false;
   private started = false;
@@ -540,6 +538,9 @@ export class BoxEngine {
         this.feedHealthy = true;
         this.scanner.setFeedHealthy(true);
       }
+      // Open-position exits get first look at every changed WS book. This is the
+      // primary exit path; the monitor timer is only a watchdog.
+      this.monitor.onTokensUpdated(changed);
       this.scanner.onTokensUpdated(changed);
     }
   }
@@ -811,45 +812,7 @@ export class BoxEngine {
     this.maybeReleaseFeed();
   }
 
-  /**
-   * Top up the books of open positions over REST when the WebSocket has nothing
-   * fresh. Rate-limited, and never on the tick path.
-   */
-  async topUpPositionBooks(): Promise<void> {
-    const now = Date.now();
-    if (now - this.restSeedAt < 5000) return;
-    const stale: number[] = [];
-    for (const pos of this.positions.list()) {
-      for (const role of BOX_LEG_ROLES) {
-        const token = pos.legs[role].token;
-        if (!this.quotes.isFresh(token, this.cfg.quoteMaxAgeMs, now)) stale.push(token);
-      }
-    }
-    if (stale.length === 0) return;
-    this.restSeedAt = now;
-    try {
-      const all = await this.deps.getAllInstruments();
-      const resolve = this.deps.makeIdResolver(all);
-      const ids = [...new Set(stale)]
-        .map(resolve)
-        .filter((s): s is string => typeof s === "string");
-      if (ids.length === 0) return;
-      const ladders = await this.deps.kite.getQuoteLadder(ids);
-      const at = Date.now();
-      for (const [token, l] of ladders) this.quotes.applyLadder(token, l, at);
-    } catch (err) {
-      console.warn("[Box] REST top-up failed:", err);
-    }
-  }
-
   /* ------------------------------ paper fills ------------------------------ */
-
-  /** Depth snapshot of a leg at the decision instant. */
-  private depthOf(token: number): BoxDepthSnapshot | null {
-    const q = this.quotes.get(token);
-    if (!q) return null;
-    return { bids: q.bids, asks: q.asks };
-  }
 
   /**
    * Create the paper trade.
@@ -888,7 +851,7 @@ export class BoxEngine {
         entry_ask: ev.ask,
         entry_ask_qty: ev.ask_qty,
         entry_quote_at: ev.quote_at === null ? null : new Date(ev.quote_at),
-        entry_depth: this.depthOf(inst.token),
+        entry_depth: ev.depth ?? null,
         exit_price: null,
         exit_bid: null,
         exit_bid_qty: null,
@@ -1060,7 +1023,7 @@ export class BoxEngine {
       setFields[`legs.${i}.exit_ask`] = ev?.ask ?? null;
       setFields[`legs.${i}.exit_ask_qty`] = ev?.ask_qty ?? null;
       setFields[`legs.${i}.exit_quote_at`] = ev?.quote_at ? new Date(ev.quote_at) : null;
-      setFields[`legs.${i}.exit_depth`] = this.depthOf(position.legs[role].token);
+      setFields[`legs.${i}.exit_depth`] = ev?.depth ?? null;
     }
 
     const closed = await closeBoxTrade(position.id, setFields as never);

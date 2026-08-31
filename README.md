@@ -355,7 +355,14 @@ de-duplicated, so the charge API can never become the bottleneck. The UI is a co
 receives a batched snapshot a couple of times a second and takes part in no decision.
 
 The module reuses the **single** shared Kite WebSocket via the ticker hub rather than opening a
-second connection. Because Zerodha caps instruments per connection, `BOX_MAX_SUBSCRIBED_TOKENS`
+second connection. **Executable option books are WebSocket-only**: REST depth is never admitted to
+the Box quote store, feed-health clock, entry path, automatic exit path, or manual-close path.
+Relevant WebSocket depth updates also re-evaluate affected open positions immediately; the
+one-second monitor is only a fallback watchdog. After any asynchronous charge lookup, all four
+books are captured again and that immutable final snapshot supplies the stored touch prices,
+touch quantities, and five-level depth.
+
+Because Zerodha caps instruments per connection, `BOX_MAX_SUBSCRIBED_TOKENS`
 (default 2,200) bounds the live subscription; underlyings that do not fit are reported in
 `skipped_symbols` on the status endpoint. Legs of an **open position are always subscribed**,
 whatever the budget.
@@ -381,7 +388,7 @@ Every threshold is env-overridable; the defaults are the shipped specification.
 | `BOX_PROFIT_CAPTURE_PCT` | `0.75` | Fraction of the entry edge that alone justifies exiting |
 | `BOX_EXPIRY_SAFETY_MINUTES` | `45` | Minutes before the close on expiry day to force an exit |
 | `BOX_MAX_SUBSCRIBED_TOKENS` | `2200` | Live-feed instrument budget |
-| `BOX_MONITOR_INTERVAL_MS` | `1000` | Open-position monitor cadence |
+| `BOX_MONITOR_INTERVAL_MS` | `1000` | Fallback watchdog cadence; open positions normally re-evaluate immediately on relevant WebSocket depth ticks |
 
 Strikes are fixed at **ATM ±3** in V1 and deliberately not configurable.
 

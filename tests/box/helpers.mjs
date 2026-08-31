@@ -36,6 +36,7 @@ export function quote(token, { bid = 0, bidQty = 0, ask = 0, askQty = 0, last = 
     last,
     bids: levels(bid, bidQty),
     asks: levels(ask, askQty),
+    version: token,
     at,
     source: "ws",
   };

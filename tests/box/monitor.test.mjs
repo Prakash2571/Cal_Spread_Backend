@@ -23,7 +23,6 @@ import {
   chargeStub,
   exitQuotes,
   goodCandidate,
-  storeFrom,
 } from "./helpers.mjs";
 
 /**
@@ -43,13 +42,25 @@ function harness({
   chargesFail = false,
   marketOpen = true,
   feedHealthy = true,
+  onChargeCall,
 } = {}) {
   const { candidate } = goodCandidate();
   const conf = cfg();
   const now = Date.now();
-  const quotes = storeFrom(exitQuotes(candidate, exitValuePerUnit, { at: now - ageMs, qty }));
+  const quotes = new BoxQuoteStore();
+  for (const [token, q] of exitQuotes(candidate, exitValuePerUnit, { at: now - ageMs, qty })) {
+    quotes.applyTicks(
+      [{ token, last_price: q.last, bid: q.bid, ask: q.ask, bids: q.bids, asks: q.asks }],
+      now - ageMs,
+    );
+  }
   const positions = new BoxPositionBook();
-  const stub = chargeStub({ entryTotal: exitFees, exitTotal: exitFees, fail: chargesFail });
+  const stub = chargeStub({
+    entryTotal: exitFees,
+    exitTotal: exitFees,
+    fail: chargesFail,
+    onCall: (groups) => onChargeCall?.({ groups, quotes, candidate, now }),
+  });
   const charges = new BoxChargeEstimator(stub.fn, conf);
 
   const position = {
@@ -105,7 +116,7 @@ function harness({
     isFeedHealthy: () => feedHealthy,
   });
 
-  return { monitor, positions, position, candidate, closes, events, persisted, conf, quotes };
+  return { monitor, positions, position, candidate, closes, events, persisted, conf, quotes, stub };
 }
 
 /* -------------------------------------------------------------- auto exit --- */
@@ -121,6 +132,92 @@ test("a converged, comfortably profitable box is closed automatically", async ()
   assert.ok(metrics.current_net_pnl >= 600);
   assert.equal(h.positions.size, 0);
   assert.ok(h.events.some((e) => e.event === "EXIT_TRIGGERED"));
+});
+
+test("a WebSocket leg update evaluates and closes immediately without waiting for the watchdog", async () => {
+  const h = harness({ exitValuePerUnit: 198 });
+  h.monitor.onTokensUpdated([h.candidate.legs.k1_ce.token]);
+  // cycle() joins the already-running per-position task, avoiding a timing sleep.
+  await h.monitor.cycle();
+
+  assert.equal(h.closes.length, 1);
+  assert.equal(h.closes[0].reason, "EDGE_CONVERGED");
+  assert.equal(h.positions.size, 0);
+});
+
+test("an exit records the post-charge WebSocket touches, never the pre-await snapshot", async () => {
+  const h = harness({
+    exitValuePerUnit: 198,
+    onChargeCall: ({ quotes, candidate }) => {
+      // Simulate a newer WS depth packet arriving while Zerodha prices charges.
+      // The moved book remains eligible, so the recorded fill must use 199, not
+      // the 198 snapshot that caused charge pricing to start.
+      const moved = exitQuotes(candidate, 199, { at: Date.now(), qty: 150 });
+      for (const [token, quote] of moved) {
+        quotes.applyTicks(
+          [{ token, last_price: quote.last, bid: quote.bid, ask: quote.ask, bids: quote.bids, asks: quote.asks }],
+          Date.now(),
+        );
+      }
+    },
+  });
+
+  await h.monitor.cycle();
+  assert.equal(h.closes.length, 1);
+  assert.equal(h.stub.calls.length, 2, "moved fills must be re-priced before closing");
+  const closed = h.closes[0];
+  assert.equal(closed.metrics.exit_box_value_per_unit, 199);
+  assert.equal(closed.metrics.legs.every((leg) => leg.qty_at_touch >= LOT), true);
+  const feeBySymbol = new Map(closed.exitCharges.legs.map((leg) => [leg.tradingsymbol, leg]));
+  for (const leg of closed.metrics.legs) {
+    assert.equal(feeBySymbol.get(leg.tradingsymbol).price, leg.price);
+    assert.ok(leg.quote_version > 0);
+    const side = leg.side === "BUY" ? leg.depth.asks : leg.depth.bids;
+    assert.ok(side.some((level) => level.price === leg.price));
+  }
+});
+
+test("an automatic exit stays open if the WS touch moves through all three charge attempts", async () => {
+  let value = 198;
+  const h = harness({
+    exitValuePerUnit: 198,
+    onChargeCall: ({ quotes, candidate }) => {
+      value += 1;
+      const moved = exitQuotes(candidate, value, { at: Date.now(), qty: 150 });
+      for (const [token, quote] of moved) {
+        quotes.applyTicks(
+          [{ token, last_price: quote.last, bid: quote.bid, ask: quote.ask, bids: quote.bids, asks: quote.asks }],
+          Date.now(),
+        );
+      }
+    },
+  });
+
+  await h.monitor.cycle();
+  assert.equal(h.stub.calls.length, 3);
+  assert.equal(h.closes.length, 0, "never close with charges from an older touch");
+  assert.equal(h.positions.size, 1);
+  assert.equal(h.position.closing, false);
+});
+
+test("a post-charge WS move that removes the exit trigger leaves the box open", async () => {
+  const h = harness({
+    exitValuePerUnit: 198,
+    onChargeCall: ({ quotes, candidate }) => {
+      const moved = exitQuotes(candidate, 180, { at: Date.now(), qty: 150 });
+      for (const [token, quote] of moved) {
+        quotes.applyTicks(
+          [{ token, last_price: quote.last, bid: quote.bid, ask: quote.ask, bids: quote.bids, asks: quote.asks }],
+          Date.now(),
+        );
+      }
+    },
+  });
+
+  await h.monitor.cycle();
+  assert.equal(h.closes.length, 0);
+  assert.equal(h.positions.size, 1);
+  assert.equal(h.position.metrics.exit_box_value_per_unit, 180);
 });
 
 test("23/24. a converged box that is unprofitable or under ₹600 is left open", async () => {

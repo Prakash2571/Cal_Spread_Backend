@@ -13,17 +13,23 @@ import { BoxQuoteStore } from "../../dist/box/quotes.js";
 import { GOOD_BOX, LOT, cfg, chargeStub, goodCandidate, quotesFor } from "./helpers.mjs";
 
 /** A scanner wired to fakes, with the qualifying 7-strike window loaded. */
-function harness({ entryTotal = 150, exitTotal = 150, fail = false, config = {} } = {}) {
+function harness({ entryTotal = 150, exitTotal = 150, fail = false, config = {}, onChargeCall } = {}) {
   const { candidate, all } = goodCandidate();
   const conf = cfg(config);
   const quotes = new BoxQuoteStore();
   const positions = new BoxPositionBook();
-  const stub = chargeStub({ entryTotal, exitTotal, fail });
+  let scanner;
+  const stub = chargeStub({
+    entryTotal,
+    exitTotal,
+    fail,
+    onCall: (groups) => onChargeCall?.({ groups, scanner, quotes, candidate }),
+  });
   const charges = new BoxChargeEstimator(stub.fn, conf);
 
   const opened = [];
   const events = [];
-  const scanner = new BoxScanner({
+  scanner = new BoxScanner({
     cfg: conf,
     quotes,
     charges,
@@ -351,9 +357,75 @@ test("the book is re-checked after the charge call, and a decayed book is refuse
   scanner.onTokensUpdated([candidate.legs.k1_ce.token]);
   await settle();
 
-  assert.equal(stub.calls.length, 1, "the opportunity was priced");
+  assert.equal(stub.calls.length, 2, "the moved order was re-priced before final refusal");
   assert.equal(opened.length, 0, "but the trade was refused on the re-checked book");
   assert.equal(positions.isTaken(candidate.key), false);
+});
+
+test("a moved but still-qualifying entry re-prices charges to the final WS fills", async () => {
+  let moved = false;
+  const h = harness({
+    onChargeCall: ({ scanner, quotes, candidate }) => {
+      if (moved) return;
+      moved = true;
+      const token = candidate.legs.k1_ce.token;
+      const at = Date.now();
+      quotes.applyTicks(
+        [{ token, last_price: 0, bid: 300, ask: 301, bids: [{ price: 300, qty: 150, orders: 1 }], asks: [{ price: 301, qty: 150, orders: 1 }] }],
+        at,
+      );
+      scanner.onTokensUpdated([token]);
+    },
+  });
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+  await settle();
+
+  assert.equal(h.opened.length, 1);
+  assert.equal(h.stub.calls.length, 2, "the final order prices need a new contract note");
+  const opened = h.opened[0];
+  const fills = new Map(opened.evaluation.legs.map((leg) => [leg.tradingsymbol, leg.price]));
+  for (const feeLeg of opened.charges.entry.legs) {
+    assert.equal(feeLeg.price, fills.get(feeLeg.tradingsymbol));
+  }
+  assert.equal(fills.get(h.candidate.legs.k1_ce.tradingsymbol), 301);
+});
+
+test("an entry is skipped if the WS touch moves through all three charge attempts", async () => {
+  let ask = 300;
+  const h = harness({
+    onChargeCall: ({ scanner, quotes, candidate }) => {
+      ask += 1;
+      const token = candidate.legs.k1_ce.token;
+      quotes.applyTicks(
+        [{ token, last_price: 0, bid: ask - 1, ask, bids: [{ price: ask - 1, qty: 150, orders: 1 }], asks: [{ price: ask, qty: 150, orders: 1 }] }],
+        Date.now(),
+      );
+      scanner.onTokensUpdated([token]);
+    },
+  });
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+  await settle();
+
+  assert.equal(h.stub.calls.length, 3);
+  assert.equal(h.opened.length, 0, "never combine charges with a still-moving fill");
+  assert.equal(h.positions.isTaken(h.candidate.key), false, "the reservation is released");
+});
+
+test("entry is abandoned if the WebSocket feed becomes unhealthy during charge pricing", async () => {
+  const h = harness({
+    onChargeCall: ({ scanner }) => scanner.setFeedHealthy(false),
+  });
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+  await settle();
+
+  assert.equal(h.opened.length, 0);
+  assert.equal(h.positions.isTaken(h.candidate.key), false);
 });
 
 test("the paper fills recorded are the REVALIDATED touch prices", async () => {

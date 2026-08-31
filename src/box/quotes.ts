@@ -3,12 +3,9 @@
  *
  * A single Map<token, BoxQuote> holding the newest executable book per
  * instrument, stamped with the instant it was RECEIVED. Every trading decision
- * reads from here, and the freshness gate is measured against those stamps — so
- * a book that stopped updating can never be traded on.
- *
- * Ticks arrive from the SHARED Kite WebSocket (see hub.ts). A REST snapshot is
- * only used to seed instruments that have not ticked yet, and is stamped exactly
- * like a live tick because it is equally a real book at a real instant.
+ * reads from here. Executable books come exclusively from the shared Kite
+ * WebSocket; REST quotes are never admitted to this store or its feed-health
+ * clock. Freshness is measured from the WS receive timestamp.
  */
 
 import type { BoxQuote } from "./types.js";
@@ -27,12 +24,15 @@ export interface BoxTickInput {
   ask: number;
   bids?: { price: number; qty: number; orders: number }[];
   asks?: { price: number; qty: number; orders: number }[];
+  exchange_ts?: number;
 }
 
 export class BoxQuoteStore {
   private quotes = new Map<number, BoxQuote>();
   private updates = 0;
   private lastUpdate: number | null = null;
+  /** Monotonic sequence for immutable WS execution snapshots. */
+  private nextVersion = 1;
 
   /** Number of tokens with a book. */
   get size(): number {
@@ -90,15 +90,36 @@ export class BoxQuoteStore {
         // about the executable touch arrived, so it must keep ageing out.
         continue;
       }
+      // Clone the arrays: the evaluator and persisted fill must retain the exact
+      // WebSocket ladder from this packet even after a later packet replaces it.
+      const frozenBids = bids.map((l) => ({ ...l }));
+      const frozenAsks = asks.map((l) => ({ ...l }));
+      const bestBid = frozenBids.reduce(
+        (best, l) => (l.price > best ? l.price : best),
+        0,
+      );
+      const bestAsk = frozenAsks.reduce(
+        (best, l) => (l.price > 0 && (best === 0 || l.price < best) ? l.price : best),
+        0,
+      );
+      const bid = bestBid > 0 ? bestBid : (t.bid > 0 ? t.bid : 0);
+      const ask = bestAsk > 0 ? bestAsk : (t.ask > 0 ? t.ask : 0);
       this.quotes.set(t.token, {
         token: t.token,
-        bid: t.bid > 0 ? t.bid : (bids[0]?.price ?? 0),
-        bid_qty: bids[0]?.qty ?? 0,
-        ask: t.ask > 0 ? t.ask : (asks[0]?.price ?? 0),
-        ask_qty: asks[0]?.qty ?? 0,
+        bid,
+        bid_qty: frozenBids.reduce(
+          (qty, l) => qty + (l.price === bid && l.qty > 0 ? l.qty : 0),
+          0,
+        ),
+        ask,
+        ask_qty: frozenAsks.reduce(
+          (qty, l) => qty + (l.price === ask && l.qty > 0 ? l.qty : 0),
+          0,
+        ),
         last: t.last_price,
-        bids,
-        asks,
+        bids: frozenBids,
+        asks: frozenAsks,
+        version: this.nextVersion++,
         at,
         source: "ws",
       });
@@ -107,30 +128,6 @@ export class BoxQuoteStore {
       changed.push(t.token);
     }
     return changed;
-  }
-
-  /** Apply a REST ladder snapshot (used to seed tokens that have not ticked). */
-  applyLadder(
-    token: number,
-    ladder: { last: number; bids: { price: number; qty: number }[]; asks: { price: number; qty: number }[] },
-    at = Date.now(),
-  ): void {
-    const bids = ladder.bids.map((l) => ({ price: l.price, qty: l.qty, orders: 0 }));
-    const asks = ladder.asks.map((l) => ({ price: l.price, qty: l.qty, orders: 0 }));
-    this.quotes.set(token, {
-      token,
-      bid: bids[0]?.price ?? 0,
-      bid_qty: bids[0]?.qty ?? 0,
-      ask: asks[0]?.price ?? 0,
-      ask_qty: asks[0]?.qty ?? 0,
-      last: ladder.last,
-      bids,
-      asks,
-      at,
-      source: "rest",
-    });
-    this.updates++;
-    this.lastUpdate = at;
   }
 
   /** Forget tokens that are no longer monitored, so the map cannot grow forever. */

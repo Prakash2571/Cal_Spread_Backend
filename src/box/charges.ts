@@ -106,15 +106,31 @@ export function buildChargeLegsFromEvaluations(
 /**
  * Cache key for a charge estimate.
  *
- * Prices are folded in (rounded to the rupee) because charges are a function of
- * turnover: a materially different fill must not reuse an old estimate. Rounding
- * to the rupee is what makes the cache actually hit while the book jitters in
- * paise, and any error it introduces is a few paise of brokerage on a decision
- * that carries a ₹150 safety buffer.
+ * Prices are folded in at their exact paise value because the stored virtual
+ * contract note must describe the same paper orders as the final fill snapshot.
+ * This intentionally prefers correctness over extra cache hits while the touch
+ * is moving; a stable touch still hits for the full TTL.
  */
 export function chargeCacheKey(candidateKey: string, legs: BoxChargeLeg[]): string {
-  const prices = legs.map((l) => `${l.side[0]}${Math.round(l.price)}`).join(",");
+  // Exact paise are part of the key. A cached contract note must never carry
+  // order prices that differ from the final paper fills it is stored beside.
+  const prices = legs.map((l) => `${l.side[0]}${l.price.toFixed(2)}`).join(",");
   return `${candidateKey}|${legs[0]?.quantity ?? 0}|${prices}`;
+}
+
+/** True when a charge response was requested for these exact paper orders. */
+export function sameChargeLegs(a: BoxChargeLeg[], b: BoxChargeLeg[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((left, index) => {
+    const right = b[index];
+    return (
+      right !== undefined &&
+      left.side === right.side &&
+      left.token === right.token &&
+      left.quantity === right.quantity &&
+      left.price === right.price
+    );
+  });
 }
 
 interface CacheEntry {

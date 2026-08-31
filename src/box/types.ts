@@ -106,10 +106,12 @@ export interface BoxQuote {
   last: number;
   bids: BoxDepthLevel[];
   asks: BoxDepthLevel[];
+  /** Monotonic local sequence assigned when a WebSocket depth packet arrives. */
+  version: number;
   /** Epoch ms when this book was received. */
   at: number;
-  /** Where the book came from — a live tick, or a REST snapshot. */
-  source: "ws" | "rest";
+  /** Executable Box books are accepted from the live WebSocket only. */
+  source: "ws";
 }
 
 /** An option contract in a monitored strike window. */
@@ -200,6 +202,10 @@ export interface BoxLegEvaluation {
   ask: number;
   ask_qty: number;
   quote_at: number | null;
+  /** WS sequence of the exact immutable book used for this leg. */
+  quote_version?: number | null;
+  /** Five-level WS book captured together with price and touch quantity. */
+  depth?: BoxDepthSnapshot | null;
   age_ms: number | null;
   fresh: boolean;
   /** True when price > 0 and qty_at_touch >= lot size. */

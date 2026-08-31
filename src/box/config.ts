@@ -129,7 +129,7 @@ export interface BoxConfig {
   expirySafetyMinutesBeforeClose: number;
 
   // ---- Scheduling / capacity ----
-  /** Open-position monitor cadence (ms). */
+  /** Watchdog cadence (ms); WS depth ticks drive normal exit evaluation. */
   monitorIntervalMs: number;
   /** How often (ms) open-trade live fields are flushed to Mongo. */
   persistIntervalMs: number;
