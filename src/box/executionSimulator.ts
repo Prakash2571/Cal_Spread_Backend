@@ -157,24 +157,38 @@ export class BoxExecutionSimulator {
       wait: this.wait,
       // One definition of the touch/liquidity rules, shared with every other path.
       evaluate: (a) => this.legFromQuote(a),
-      // Orders still working are abandoned if the world changes underneath them.
-      abortReason: () => {
-        if (!this.deps.isMarketOpen()) {
-          return { reason: "market_closed" as const, detail: "the market closed while orders were working" };
-        }
-        if (!this.deps.isFeedHealthy()) {
-          return { reason: "feed_unhealthy" as const, detail: "the WebSocket feed went unhealthy while orders were working" };
-        }
-        if (this.leggingStillWanted && !this.leggingStillWanted()) {
-          return { reason: "discovery_stopped" as const, detail: "the candidate was no longer wanted while orders were working" };
-        }
-        return null;
-      },
     });
   }
 
-  /** `stillWanted` for the legging run in flight, consulted by the executor. */
-  private leggingStillWanted: (() => boolean) | null = null;
+  /**
+   * The abort predicate for ONE legging run.
+   *
+   * Built per call and passed into `legExecutor.run()`, never stored on this
+   * instance: with several pipelines in flight, a shared field meant one
+   * candidate's STOP/window state could cancel a different candidate's orders.
+   */
+  private leggingAbortReason(
+    stillWanted?: () => boolean,
+  ): () => { reason: BoxExecutionFailureReason; detail: string } | null {
+    return () => {
+      if (!this.deps.isMarketOpen()) {
+        return { reason: "market_closed", detail: "the market closed while orders were working" };
+      }
+      if (!this.deps.isFeedHealthy()) {
+        return {
+          reason: "feed_unhealthy",
+          detail: "the WebSocket feed went unhealthy while orders were working",
+        };
+      }
+      if (stillWanted && !stillWanted()) {
+        return {
+          reason: "discovery_stopped",
+          detail: "the candidate was no longer wanted while orders were working",
+        };
+      }
+      return null;
+    };
+  }
 
   /** Close the unhedged-exposure window and derive its duration. */
   private closeExposure(record: PaperLeggingExecutionRecord, at: number): void {
@@ -378,7 +392,6 @@ export class BoxExecutionSimulator {
     this.active++;
     this.deps.metrics?.recordExecutionAttempt();
     this.deps.metrics?.recordLeggingAttempt();
-    this.leggingStillWanted = args.stillWanted ?? null;
 
     try {
       const sentAt = detection.at + Math.max(0, this.deps.cfg.simulatedDecisionMs);
@@ -406,6 +419,8 @@ export class BoxExecutionSimulator {
         }),
         submitAt: sentAt,
         lotSize,
+        // Per-run, closed over THIS candidate's stillWanted only.
+        abortReason: this.leggingAbortReason(args.stillWanted),
       });
 
       const legs = run.legs;
@@ -538,8 +553,17 @@ export class BoxExecutionSimulator {
       // Directional exposure ran from the first fill until the unwind completed.
       this.closeExposure(record, this.now());
       record.decision_to_complete_ms = round2(this.now() - detection.at);
-      record.failure_reason = unwind.unwindFailed ? "unwind_failed" : "legging_incomplete";
-      record.failure_detail = `${filledCount}/4 filled, failed legs: ${failedLegs.join(", ")}${unwind.unwindFailed ? " (one or more could not be unwound)" : ""}`;
+      // Report the CAUSE, not just the symptom. If the run was cut short (STOP, feed
+      // death, market close) that is why the box never completed, and the attempt
+      // record must say so — a bare "legging_incomplete" would hide it. A leg that
+      // could not be unwound is more serious still, so it wins.
+      record.failure_reason = unwind.unwindFailed
+        ? "unwind_failed"
+        : (run.aborted?.reason ?? "legging_incomplete");
+      record.failure_detail =
+        `${filledCount}/4 filled, failed legs: ${failedLegs.join(", ")}` +
+        (run.aborted ? ` — ${run.aborted.detail}` : "") +
+        (unwind.unwindFailed ? " (one or more could not be unwound)" : "");
 
       this.deps.metrics?.recordExecutionFailed(record.failure_reason);
       this.deps.metrics?.recordLeggingLoss(unwind.legging_net_loss);

@@ -404,10 +404,21 @@ export class BoxScanner {
           this.deps.positions.release(cand.key);
           return;
         }
-        if (!this.discovering || !this.marketOpen || !this.feedHealthy) {
-          this.deps.positions.release(cand.key);
-          return;
-        }
+        /**
+         * EXECUTION OWNERSHIP — do not re-check discovery state here.
+         *
+         * Four simulated orders have FILLED and the box qualified on those fill
+         * prices. Those fills happened: releasing the reservation and returning
+         * would delete a complete, hedged position from existence, with no unwind
+         * and no entry in the P&L — the single worst thing a paper simulator can do,
+         * because it silently flatters every result.
+         *
+         * A candidate is freely CANCELLABLE only BEFORE its first fill (the
+         * executor's own abort predicate handles that, and does so per run). From
+         * the first fill onward the execution owns the outcome, so the completed box
+         * is persisted and handed to the monitor — which runs regardless of RUN/STOP,
+         * market hours or feed health, and will exit it when it can.
+         */
         await this.finalizeOpen(cand, legging.evaluation, legging.decision, null, legging.legging);
         return;
       }
@@ -427,13 +438,18 @@ export class BoxScanner {
         return;
       }
 
-      // Re-check the gates one last time before persisting (the simulator already
-      // did, but discovery could have flipped in the same turn).
-      if (!this.discovering || !this.marketOpen || !this.feedHealthy) {
-        this.deps.positions.release(cand.key);
-        return;
-      }
-
+      /**
+       * EXECUTION OWNERSHIP (same rule as the legging path above).
+       *
+       * This used to re-check discovery/market/feed state and abandon the entry.
+       * But the simulator has already produced a FILL at observed executable prices
+       * — the four legs are on. Dropping it here erased that position silently, so a
+       * STOP, a feed blip or the closing bell landing in the same turn made a real
+       * simulated fill vanish from the book and from the P&L.
+       *
+       * The simulator's own pre-fill checks are what cancel an entry safely; once
+       * filled, the position is persisted and the (always-on) monitor owns it.
+       */
       await this.finalizeOpen(cand, result.evaluation, result.decision, result.record, null);
     } catch (err) {
       console.warn("[Box] entry attempt failed for", cand.key, err);
@@ -499,6 +515,13 @@ export class BoxScanner {
   ): Promise<void> {
     const legs = buildEntryChargeLegs(evaluation.candidate, evaluation.legs);
     if (!legs) {
+      // Should be unreachable: a filled evaluation always has four priced legs. But
+      // we are PAST the fill here, so if it ever happens the position exists and we
+      // failed to record it — that must never be silent.
+      console.error(
+        `[Box] LOST FILL: ${cand.key} filled but its charge legs could not be built, ` +
+          `so no position was recorded. This is an accounting hole — investigate.`,
+      );
       this.deps.positions.release(cand.key);
       return;
     }
@@ -526,6 +549,15 @@ export class BoxScanner {
       this.stats.entriesOpened++;
       this.markStatus(cand.key, "PAPER_OPENED");
     } else {
+      // The legs FILLED but nothing was persisted — either the unique index says this
+      // box is already open, or the write failed. Either way simulated exposure was
+      // taken on and is now unrecorded, so the P&L is understated. Loud by design:
+      // durable retry / residual-exposure adoption for this path is not built yet.
+      console.error(
+        `[Box] LOST FILL: ${cand.key} filled but no position was persisted ` +
+          `(duplicate open box, or the insert failed). Simulated exposure is unrecorded — ` +
+          `treat today's P&L as incomplete until this is reconciled.`,
+      );
       this.deps.positions.release(cand.key);
     }
   }

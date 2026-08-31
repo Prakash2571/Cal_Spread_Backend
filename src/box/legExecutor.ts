@@ -68,6 +68,13 @@ export interface LegOrderRequest {
   quantity: number;
 }
 
+/**
+ * Dependencies shared by every run.
+ *
+ * CONCURRENCY CONTRACT: everything here must be either immutable or safe to share
+ * across simultaneous executions. NOTHING run-specific may live on the executor
+ * instance — see the note on `run()`.
+ */
 export interface LegExecutorDeps {
   cfg: Pick<
     BoxConfig,
@@ -93,12 +100,6 @@ export interface LegExecutorDeps {
     now: number;
     maxAgeMs: number;
   }) => BoxLegEvaluation;
-  /**
-   * Reason to abandon everything still working (feed died, market closed,
-   * discovery stopped). Checked on every wake; already-FILLED legs are untouched,
-   * because those fills really happened.
-   */
-  abortReason?: () => { reason: BoxExecutionFailureReason; detail: string } | null;
 }
 
 /** What the run produced. */
@@ -142,6 +143,17 @@ export class LegExecutor {
    * sequential — the next order is submitted only once the previous one FILLED, so
    *              its submit/arrival times are derived from that fill.
    */
+  /**
+   * CONCURRENCY: every piece of run-specific state below is a LOCAL of this
+   * method — leg states, the fill books, the quote listener, the abort predicate.
+   * Nothing is stored on `this`, so any number of executions may share one
+   * executor instance without being able to observe or corrupt each other.
+   *
+   * This is deliberate and load-bearing. An earlier version kept the fill-book map
+   * on the instance; with several pipelines in flight, one candidate's later fill
+   * wrote into another candidate's map, and the victim was then re-qualified
+   * against books it never traded.
+   */
   async run(args: {
     requests: LegOrderRequest[];
     /** When the strategy released the orders. */
@@ -149,6 +161,14 @@ export class LegExecutor {
     /** Per-leg travel time; arrival = submit + this. */
     latencyMs?: number;
     lotSize: number;
+    /**
+     * Reason to abandon everything still working (feed died, market closed,
+     * discovery stopped) — supplied PER RUN, never held on the instance, so one
+     * candidate's discovery state can never cancel another's orders.
+     *
+     * Already-FILLED legs are never touched: those fills really happened.
+     */
+    abortReason?: () => { reason: BoxExecutionFailureReason; detail: string } | null;
   }): Promise<LegRunResult> {
     const latency = Math.max(0, args.latencyMs ?? this.deps.cfg.simulatedLatencyMs);
     const timeout = Math.max(0, this.deps.cfg.legTimeoutMs);
@@ -173,13 +193,14 @@ export class LegExecutor {
         if (!touched.has(st.req.inst.token)) continue;
         // A timed-out order must not be revived by a later tick.
         if (st.leg.timeout_at !== null && at > st.leg.timeout_at) continue;
-        this.tryFill(st, at, args.lotSize);
+        this.tryFill(st, at, args.lotSize, booksAtFill);
       }
     });
 
     let aborted: LegRunResult["aborted"] = null;
+    // LOCAL to this run. Threaded explicitly into tryFill rather than held on the
+    // instance, so concurrent runs cannot write into each other's books.
     const booksAtFill = new Map<number, BoxQuote>();
-    this.booksAtFill = booksAtFill;
 
     try {
       // ONE coordinating loop. Each pass advances the clock to the next boundary —
@@ -188,7 +209,7 @@ export class LegExecutor {
       for (;;) {
         if (++guard > 10_000) break; // never spin forever on a stuck clock
 
-        const abort = this.deps.abortReason?.() ?? null;
+        const abort = args.abortReason?.() ?? null;
         if (abort) {
           aborted = abort;
           for (const st of states) {
@@ -220,7 +241,17 @@ export class LegExecutor {
           st.leg.status = "PENDING";
           st.leg.pending_since = at;
           st.leg.timeout_at = st.leg.arrival_at + timeout;
-          const filled = this.tryFill(st, at, args.lotSize);
+
+          // EVENT-LOOP OVERSHOOT. If the process stalled and we are waking after
+          // this order's deadline had already passed, it expired in the market — it
+          // must NOT be filled at a price from after its own timeout.
+          if (at > st.leg.timeout_at) {
+            this.expire(st, at, timeout);
+            if (sequential) this.cancelRemaining(states, st);
+            continue;
+          }
+
+          const filled = this.tryFill(st, at, args.lotSize, booksAtFill);
           // Sequential: a fill releases the next order from this very instant.
           if (sequential && filled) this.submitNext(states, st, at, latency);
         }
@@ -229,14 +260,7 @@ export class LegExecutor {
         for (const st of states) {
           if (st.done || st.leg.status !== "PENDING") continue;
           if (st.leg.timeout_at === null || st.leg.timeout_at > at) continue;
-          st.leg.status = "TIMED_OUT";
-          st.leg.resolved_at = at;
-          st.leg.fail_reason =
-            `still unfilled ${timeout}ms after arriving — ` +
-            (st.leg.fill_qty > 0
-              ? `only ${st.leg.fill_qty} of ${st.leg.quantity} available`
-              : "the touch never showed a full lot");
-          st.done = true;
+          this.expire(st, at, timeout);
           // Sequential: nothing after a failed leg is ever sent.
           if (sequential) this.cancelRemaining(states, st);
         }
@@ -252,9 +276,6 @@ export class LegExecutor {
 
     return { legs: states.map((s) => s.leg), aborted, booksAtFill };
   }
-
-  /** The books of the run currently in progress (see LegRunResult.booksAtFill). */
-  private booksAtFill: Map<number, BoxQuote> | null = null;
 
   /* ------------------------------- internals ------------------------------ */
 
@@ -287,6 +308,20 @@ export class LegExecutor {
       st.leg.fail_reason = "not submitted — an earlier leg failed (sequential mode)";
       st.done = true;
     }
+  }
+
+  /** The order's deadline passed while it was still unfilled. */
+  private expire(st: LegState, at: number, timeoutMs: number): void {
+    st.leg.status = "TIMED_OUT";
+    // Report the DEADLINE as the resolution instant, not a late wake-up: the order
+    // stopped being workable at timeout_at, whatever time we noticed.
+    st.leg.resolved_at = st.leg.timeout_at ?? at;
+    st.leg.fail_reason =
+      `still unfilled ${timeoutMs}ms after arriving — ` +
+      (st.leg.fill_qty > 0
+        ? `only ${st.leg.fill_qty} of ${st.leg.quantity} available`
+        : "the touch never showed a full lot");
+    st.done = true;
   }
 
   private fail(st: LegState, detail: string): void {
@@ -326,7 +361,12 @@ export class LegExecutor {
    * Records the book it looked at either way, so a leg that never filled still
    * shows what it was seeing — which is what makes an abort diagnosable.
    */
-  private tryFill(st: LegState, at: number, lotSize: number): boolean {
+  private tryFill(
+    st: LegState,
+    at: number,
+    lotSize: number,
+    booksAtFill: Map<number, BoxQuote>,
+  ): boolean {
     const { leg, req } = st;
     const quote = this.deps.quotes.get(req.inst.token);
     if (!quote) {
@@ -371,7 +411,8 @@ export class LegExecutor {
     leg.status = "FILLED";
     // Keep the exact book this leg filled from, so final qualification prices the
     // real fills rather than whatever the store holds once all four are done.
-    this.booksAtFill?.set(req.inst.token, quote);
+    // Passed in per run — never instance state (see the note on run()).
+    booksAtFill.set(req.inst.token, quote);
     leg.fill_price = ev.price;
     leg.fill_at = at;
     leg.resolved_at = at;
