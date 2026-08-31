@@ -104,6 +104,14 @@ export class BoxScanner {
    * close) so a box that existed at the close can be inspected.
    */
   private marketOpen = true;
+  /**
+   * Whether the upstream feed is delivering ticks at all.
+   *
+   * This — not per-instrument quietness — is what "do not trade stale books"
+   * actually protects against: a silently dropped connection leaves every cached
+   * book looking normal while being arbitrarily old.
+   */
+  private feedHealthy = true;
 
   private stats: BoxScannerStats = {
     ticksApplied: 0,
@@ -144,6 +152,15 @@ export class BoxScanner {
 
   isMarketOpen(): boolean {
     return this.marketOpen;
+  }
+
+  /** Tell the scanner whether the upstream tick feed is alive. */
+  setFeedHealthy(healthy: boolean): void {
+    this.feedHealthy = healthy;
+  }
+
+  isFeedHealthy(): boolean {
+    return this.feedHealthy;
   }
 
   getStats(): BoxScannerStats {
@@ -274,6 +291,9 @@ export class BoxScanner {
     if (!this.discovering) return;
     // No entry outside market hours — a fill needs a live executable book.
     if (!this.marketOpen) return;
+    // No entry while the feed is down: every cached book would look normal while
+    // being arbitrarily old.
+    if (!this.feedHealthy) return;
     if (openKeyTaken) return;
     if (!evaluation.tradable) {
       this.noteRejection(cand, evaluation);
@@ -531,6 +551,7 @@ export class BoxScanner {
       safety_buffer: cfg.safetyBuffer,
       projected_net_edge: ctx.cachedNetEdge ? ctx.cachedNetEdge.net : null,
       liquidity_ok: evaluation.tradable,
+      depth_ok: evaluation.depth_ok,
       worst_age_ms: evaluation.worst_age_ms,
       price_source: ctx.priceSource ?? "touch",
       status,

@@ -58,6 +58,13 @@ export interface BoxMonitorDeps {
    * repeatedly "discovering" that would only spam the ledger.
    */
   isMarketOpen: () => boolean;
+  /**
+   * Whether the upstream tick feed is alive.
+   *
+   * Distinct from a single leg being quiet: an untouched book is still valid, but
+   * a broken connection makes every cached book untrustworthy at once.
+   */
+  isFeedHealthy: () => boolean;
 }
 
 /** Market close in IST minutes-of-day (15:30). */
@@ -182,6 +189,9 @@ export class BoxPositionMonitor {
     // open with its metrics refreshed, and no exit — or exit-refusal — is
     // recorded, because "the market is shut" is not a liquidity event.
     if (!this.deps.isMarketOpen()) return;
+    // Same for a dead feed: acting on books of unknown age would be worse than
+    // waiting, and it is not a liquidity event either.
+    if (!this.deps.isFeedHealthy()) return;
 
     const expirySafety = this.isInExpirySafetyWindow(pos);
     if (expirySafety && !pos.expiry_safety) {

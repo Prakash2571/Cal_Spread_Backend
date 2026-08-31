@@ -358,6 +358,10 @@ export function evaluateCandidate(args: {
 
   const reject = firstRejectReason(legs, lotSize);
   const tradable = reject === null && grossEdge !== null;
+  // Depth alone, with freshness deliberately excluded.
+  const depthOk = legs.every(
+    (l) => l.price !== null && l.price > 0 && l.qty_at_touch >= lotSize,
+  );
 
   return {
     candidate,
@@ -367,6 +371,7 @@ export function evaluateCandidate(args: {
     gross_edge_per_unit: grossPerUnit,
     gross_edge: grossEdge,
     tradable,
+    depth_ok: depthOk,
     worst_age_ms: worstAge,
     reject,
   };
@@ -522,6 +527,8 @@ export function evaluateCandidateIndicative(args: {
     gross_edge: grossEdge,
     // Never tradable: there is no executable book behind these numbers.
     tradable: false,
+    // Closing prices carry no bid/ask, so executable size is simply unknown.
+    depth_ok: false,
     worst_age_ms: null,
     reject,
   };

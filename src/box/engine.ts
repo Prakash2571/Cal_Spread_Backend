@@ -121,6 +121,7 @@ export class BoxEngine {
 
   /** Cached exchange-hours state, refreshed on the market timer. */
   private marketOpen = false;
+  private feedHealthy = false;
   private marketTimer: NodeJS.Timeout | null = null;
   private indicativeTimer: NodeJS.Timeout | null = null;
   private indicativeAt: number | null = null;
@@ -205,6 +206,7 @@ export class BoxEngine {
       istDayKey: () => this.deps.istDayKey(),
       istMinutesOfDay: () => istMinutesOfDay(),
       isMarketOpen: () => this.marketOpen,
+      isFeedHealthy: () => this.isFeedHealthy(),
     });
 
     this.marketOpen = this.deps.isMarketOpen();
@@ -351,6 +353,19 @@ export class BoxEngine {
    */
   private startMarketWatch(): void {
     const sync = () => {
+      // Feed health has to be re-evaluated on a timer as well as on a tick: going
+      // FROM healthy TO dead is signalled precisely by ticks no longer arriving,
+      // so nothing else would ever notice.
+      const healthy = this.isFeedHealthy();
+      if (healthy !== this.feedHealthy) {
+        this.feedHealthy = healthy;
+        this.scanner.setFeedHealthy(healthy);
+        if (!healthy && this.marketOpen) {
+          console.warn(
+            `[Box] tick feed has gone quiet (>${this.cfg.feedMaxAgeMs}ms) — entries and automatic exits are paused until it recovers.`,
+          );
+        }
+      }
       const open = this.deps.isMarketOpen();
       if (open !== this.marketOpen) {
         this.marketOpen = open;
@@ -490,7 +505,36 @@ export class BoxEngine {
       }
     }
     const changed = this.quotes.applyTicks(ticks, now);
-    if (changed.length > 0) this.scanner.onTokensUpdated(changed);
+    if (changed.length > 0) {
+      // A tick arriving IS the feed-liveness signal, so the gate reopens here
+      // rather than waiting for the next timer.
+      if (!this.feedHealthy) {
+        this.feedHealthy = true;
+        this.scanner.setFeedHealthy(true);
+      }
+      this.scanner.onTokensUpdated(changed);
+    }
+  }
+
+  /**
+   * Whether the upstream feed is alive: has ANY book in the universe updated
+   * recently?
+   *
+   * With hundreds of instruments subscribed something is always trading during
+   * market hours, so silence across all of them means the connection is broken —
+   * whereas one quiet strike means nothing at all.
+   */
+  private isFeedHealthy(): boolean {
+    if (!this.marketOpen) return false;
+    const at = this.quotes.lastUpdateAt;
+    if (at === null) return false;
+    return Date.now() - at <= this.cfg.feedMaxAgeMs;
+  }
+
+  /** Age (ms) of the newest tick anywhere in the box universe. */
+  private feedAgeMs(): number | null {
+    const at = this.quotes.lastUpdateAt;
+    return at === null ? null : Date.now() - at;
   }
 
   /* ------------------------------- universe ------------------------------- */
@@ -1054,7 +1098,10 @@ export class BoxEngine {
       min_net_edge: this.cfg.minNetEdge,
       require_priced_charges: this.cfg.requirePricedCharges,
       safety_buffer: this.cfg.safetyBuffer,
+      /** How long an UNCHANGED book is still trusted. */
       quote_max_age_ms: this.cfg.quoteMaxAgeMs,
+      /** Feed-liveness limit: newest tick across the whole universe. */
+      feed_max_age_ms: this.cfg.feedMaxAgeMs,
       underlying_max_age_ms: this.cfg.underlyingMaxAgeMs,
       strikes_each_side: this.cfg.strikesEachSide,
       max_strikes: this.cfg.strikesEachSide * 2 + 1,
@@ -1105,6 +1152,9 @@ export class BoxEngine {
       hub_connected: this.deps.tickerHub.isConnected(),
       quotes: this.quotes.size,
       quote_updates: this.quotes.updateCount,
+      /** Feed liveness: age of the newest tick anywhere, and the verdict. */
+      feed_age_ms: this.feedAgeMs(),
+      feed_healthy: this.isFeedHealthy(),
       open_positions: this.positions.size,
       skipped_for_budget: this.skippedForBudget.length,
       skipped_symbols: this.skippedForBudget.slice(0, 25),

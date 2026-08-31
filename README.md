@@ -235,8 +235,17 @@ Guards on every automatic entry:
 - **One-lot touch liquidity.** Each leg needs `ask > 0 && askQty >= lotSize`
   (BUY) or `bid > 0 && bidQty >= lotSize` (SELL), counting only what rests at
   that **exact** best price. V1 does not walk deeper levels.
-- **Freshness.** All four books must be no older than `BOX_QUOTE_MAX_AGE_MS`
-  (default 1,500 ms), measured from when each book was received.
+- **Feed liveness.** The newest tick across the WHOLE universe must be within
+  `BOX_FEED_MAX_AGE_MS` (default 5s). This is the check that catches a silently
+  dropped connection, where every cached book still looks normal while being of
+  unknown age. When it trips, entries and automatic exits pause.
+- **Book trust window.** Each of the four books must have changed within
+  `BOX_QUOTE_MAX_AGE_MS` (default 15s). Note this is NOT a "price age" limit: a
+  depth feed only sends a message when the book *changes*, so silence on a quiet
+  strike is not staleness — an untouched book is still the current, executable
+  book. Illiquid F&O strikes are routinely quiet for seconds at a time, so a
+  sub-second limit here makes the scanner unable to trade anything but the most
+  active names without making it any safer.
 - **Revalidation.** Charge estimation is asynchronous, so after it returns the
   four quotes are re-read and the freshness, liquidity and ₹1,200 spread tests
   are re-applied to the **current** book. A decision is never executed on a
@@ -362,8 +371,10 @@ Every threshold is env-overridable; the defaults are the shipped specification.
 | `MIN_BOX_NET_EDGE` | `0` | Optional *additional* net floor (₹). `0` = fees do not gate entry |
 | `BOX_REQUIRE_PRICED_CHARGES` | `true` | Skip a box whose charges Kite could not price (so exits stay manageable) |
 | `BOX_SAFETY_BUFFER` | `150` | Slippage allowance (₹) reported in the net figure, **not** part of the gate |
+| `BOX_QUOTE_MAX_AGE_MS` | `15000` | How long an UNCHANGED book is still trusted |
+| `BOX_FEED_MAX_AGE_MS` | `5000` | Feed liveness: newest tick across the whole universe |
 | `BOX_INDICATIVE_REFRESH_MS` | `60000` | How often the last-close view is rebuilt while the market is shut |
-| `BOX_QUOTE_MAX_AGE_MS` | `1500` | Maximum age of each of the four books at a decision |
+
 | `BOX_PREFILTER_CHARGE_ALLOWANCE` | `160` | Lower bound on round-trip charges, prefilter only |
 | `BOX_CONVERGENCE_FLOOR` / `BOX_CONVERGENCE_PCT` | `200` / `0.2` | Convergence threshold |
 | `BOX_MIN_EXIT_NET_PNL` | `600` | Minimum net profit for a normal convergence exit |

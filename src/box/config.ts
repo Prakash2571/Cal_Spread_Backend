@@ -76,8 +76,29 @@ export interface BoxConfig {
   requirePricedCharges: boolean;
 
   // ---- Market-data quality ----
-  /** Maximum age (ms) of each of the four option books at a decision. */
+  /**
+   * How long an UNCHANGED order book is still trusted (ms).
+   *
+   * A depth feed only sends a message when the book actually changes, so silence
+   * is not staleness: a resting book nobody has touched for ten seconds is still
+   * the current, executable book. Illiquid F&O strikes are quiet for long
+   * stretches, so a sub-second limit here does not make the system safer — it
+   * simply makes it unable to trade anything but the most active names.
+   *
+   * The protection against a genuinely dead feed is `feedMaxAgeMs` below, which is
+   * the check that actually catches "we are holding old data and do not know it".
+   */
   quoteMaxAgeMs: number;
+  /**
+   * FEED LIVENESS: maximum age (ms) of the newest tick across the WHOLE box
+   * universe.
+   *
+   * With hundreds of instruments subscribed, something is always trading during
+   * market hours, so this going quiet means the connection is broken rather than
+   * the market being calm. When it trips, no entry and no automatic exit happens
+   * at all — that is the real "do not trade stale books" guard.
+   */
+  feedMaxAgeMs: number;
   /** Maximum age (ms) of the underlying value used to place the ATM window. */
   underlyingMaxAgeMs: number;
 
@@ -149,7 +170,8 @@ export function loadBoxConfig(): BoxConfig {
     prefilterChargeAllowance: num("BOX_PREFILTER_CHARGE_ALLOWANCE", 160),
     requirePricedCharges: bool("BOX_REQUIRE_PRICED_CHARGES", true),
 
-    quoteMaxAgeMs: num("BOX_QUOTE_MAX_AGE_MS", 1500),
+    quoteMaxAgeMs: num("BOX_QUOTE_MAX_AGE_MS", 15_000),
+    feedMaxAgeMs: num("BOX_FEED_MAX_AGE_MS", 5_000),
     underlyingMaxAgeMs: num("BOX_UNDERLYING_MAX_AGE_MS", 10_000),
 
     strikesEachSide: 3,

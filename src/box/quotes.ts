@@ -32,6 +32,7 @@ export interface BoxTickInput {
 export class BoxQuoteStore {
   private quotes = new Map<number, BoxQuote>();
   private updates = 0;
+  private lastUpdate: number | null = null;
 
   /** Number of tokens with a book. */
   get size(): number {
@@ -41,6 +42,17 @@ export class BoxQuoteStore {
   /** Total tick applications since start (for the status endpoint). */
   get updateCount(): number {
     return this.updates;
+  }
+
+  /**
+   * When ANY book in the universe last updated.
+   *
+   * This is the feed-liveness signal: with hundreds of instruments subscribed,
+   * something is always trading during market hours, so this going quiet means
+   * the connection is broken rather than the market being calm.
+   */
+  get lastUpdateAt(): number | null {
+    return this.lastUpdate;
   }
 
   get(token: number): BoxQuote | undefined {
@@ -91,6 +103,7 @@ export class BoxQuoteStore {
         source: "ws",
       });
       this.updates++;
+      this.lastUpdate = at;
       changed.push(t.token);
     }
     return changed;
@@ -117,6 +130,7 @@ export class BoxQuoteStore {
       source: "rest",
     });
     this.updates++;
+    this.lastUpdate = at;
   }
 
   /** Forget tokens that are no longer monitored, so the map cannot grow forever. */
@@ -127,6 +141,7 @@ export class BoxQuoteStore {
   /** Drop every book (e.g. when the Zerodha session dies). */
   clear(): void {
     this.quotes.clear();
+    this.lastUpdate = null;
   }
 }
 

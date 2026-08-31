@@ -42,6 +42,7 @@ function harness({
   istMinutes = 11 * 60,
   chargesFail = false,
   marketOpen = true,
+  feedHealthy = true,
 } = {}) {
   const { candidate } = goodCandidate();
   const conf = cfg();
@@ -101,6 +102,7 @@ function harness({
     istDayKey: () => istDay,
     istMinutesOfDay: () => istMinutes,
     isMarketOpen: () => marketOpen,
+    isFeedHealthy: () => feedHealthy,
   });
 
   return { monitor, positions, position, candidate, closes, events, persisted, conf, quotes };
@@ -161,12 +163,43 @@ test("26. without one-lot touch liquidity the exit is SKIPPED and the box stays 
   assert.equal(h.positions.size, 1);
 });
 
-test("a stale exit book also blocks the exit rather than closing on old prices", async () => {
+test("a book quiet for a few seconds is still valid and DOES close", async () => {
+  // 5s of silence on an option book is normal, not staleness: a depth feed only
+  // sends a message when the book changes, and an untouched book is still the
+  // current one. This used to be refused, which made the engine unable to trade
+  // anything but the most active strikes.
   const h = harness({ exitValuePerUnit: 198, ageMs: 5000 });
+  await h.monitor.cycle();
+  assert.equal(h.closes.length, 1);
+  assert.equal(h.closes[0].reason, "EDGE_CONVERGED");
+});
+
+test("a book quiet beyond the trust window DOES block the exit", async () => {
+  const h = harness({ exitValuePerUnit: 198, ageMs: 20_000 });
   await h.monitor.cycle();
   assert.equal(h.closes.length, 0);
   assert.equal(h.positions.size, 1);
   assert.match(h.position.exit_blocked_reason ?? "", /stale/);
+});
+
+test("a DEAD feed pauses exits without pretending it is a liquidity problem", async () => {
+  // The books look perfectly tradable, but nothing is arriving from upstream, so
+  // their real age is unknown. Waiting is safer than acting, and it is not
+  // recorded as a liquidity event.
+  const h = harness({ exitValuePerUnit: 198, feedHealthy: false });
+  await h.monitor.cycle();
+
+  assert.equal(h.closes.length, 0, "no exit on books of unknown age");
+  assert.equal(h.positions.size, 1);
+  assert.equal(h.events.length, 0, "and no EXIT_SKIPPED_LIQUIDITY noise");
+  assert.equal(h.position.exit_blocked_reason, null);
+  // Metrics are still refreshed so the UI keeps showing the position.
+  assert.ok(h.position.metrics);
+
+  // When the feed recovers the same box exits immediately.
+  const back = harness({ exitValuePerUnit: 198, feedHealthy: true });
+  await back.monitor.cycle();
+  assert.equal(back.closes.length, 1);
 });
 
 test("describeLiquidityGap names the leg and the shortfall", () => {

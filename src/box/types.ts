@@ -222,6 +222,15 @@ export interface BoxEvaluation {
   gross_edge: number | null;
   /** All four legs quoted, fresh and one-lot executable. */
   tradable: boolean;
+  /**
+   * All four legs show a whole lot at the touch, IGNORING freshness.
+   *
+   * Reported separately from `tradable` so liquidity and staleness can be told
+   * apart: "the book is thin" and "the book has not been pushed for a while" are
+   * different problems with different fixes, and collapsing them into one flag
+   * made every quiet-but-perfectly-deep option look illiquid.
+   */
+  depth_ok: boolean;
   /** Oldest leg quote age in ms (the freshness that actually binds). */
   worst_age_ms: number | null;
   reject: BoxRejectReason | null;
@@ -258,8 +267,10 @@ export interface BoxOpportunity {
   safety_buffer: number;
   /** grossEdge - entryFees - estExitFees - safetyBuffer, when priced. */
   projected_net_edge: number | null;
-  /** True when every leg is fresh and one-lot executable at the touch. */
+  /** True when every leg is fresh AND one-lot executable at the touch. */
   liquidity_ok: boolean;
+  /** One whole lot available on all four legs, ignoring how quiet the book is. */
+  depth_ok: boolean;
   worst_age_ms: number | null;
   /**
    * Where the prices behind this row came from.

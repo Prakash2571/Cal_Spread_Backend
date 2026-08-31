@@ -181,7 +181,11 @@ test("the shipped configuration is the documented V1 specification", () => {
   assert.equal(c.minGrossEdge, 1200);
   assert.equal(c.minNetEdge, 0);
   assert.equal(c.safetyBuffer, 150);
-  assert.equal(c.quoteMaxAgeMs, 1500);
+  // How long an UNCHANGED book is trusted (silence on a quiet strike is not
+  // staleness), versus the feed-liveness limit that catches a dead connection.
+  assert.equal(c.quoteMaxAgeMs, 15_000);
+  assert.equal(c.feedMaxAgeMs, 5_000);
+  assert.ok(c.feedMaxAgeMs < c.quoteMaxAgeMs, "the feed check must bite first");
   assert.equal(c.strikesEachSide, 3);
   assert.equal(c.convergenceFloor, 200);
   assert.equal(c.convergencePct, 0.2);
