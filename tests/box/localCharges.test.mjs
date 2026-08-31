@@ -152,3 +152,45 @@ test("totals() returns just entry and exit round-trip figures for the hot path",
   assert.equal(t.exit, rt.estimated_exit_total);
   assert.ok(t.entry > 0 && t.exit > 0);
 });
+
+
+/* --------------------------- the shipped rate card ------------------------- */
+
+/**
+ * These pin the DEFAULTS, not the arithmetic. They exist because a wrong statutory
+ * rate is invisible: the system keeps working and every P&L is quietly wrong. STT is
+ * the largest single cost in a box round trip, so understating it flatters results —
+ * which is the dangerous direction to be wrong in.
+ *
+ * Source: option STT was flattened to a uniform 0.15% of premium (sell side) with
+ * effect from 1 April 2026, in the same revision that took futures STT from 0.02% to
+ * 0.05%. If you change these, change the rate version too.
+ */
+test("the shipped rate card matches the rates in force (post 1 April 2026)", () => {
+  const r = loadBoxChargeRates();
+  assert.equal(r.sttSellPct, 0.15, "option STT is 0.15% of premium on the sell side");
+  assert.equal(r.exchangeTxnPct, 0.03503, "NSE options transaction charge, % of premium");
+  assert.equal(r.ipftPerCrore, 50, "NSE IPFT on options is Rs 50 per crore of premium");
+  assert.equal(r.sebiPct, 0.0001, "SEBI turnover fee, % of premium");
+  assert.equal(r.stampDutyBuyPct, 0.003, "stamp duty, buy side, % of premium");
+  assert.equal(r.gstPct, 18, "GST on brokerage + exchange + SEBI");
+  assert.equal(r.brokeragePerOrder, 20, "flat Rs 20 per executed option order");
+  assert.equal(r.sttRoundNearestRupee, true, "the contract note rounds STT to the rupee");
+});
+
+test("the rate card is versioned so old results stay interpretable", () => {
+  const r = loadBoxChargeRates();
+  assert.ok(typeof r.rateVersion === "string" && r.rateVersion.length > 0);
+  assert.match(r.rateVersion, /\d{4}-\d{2}-\d{2}/, "the version should carry its effective date");
+});
+
+test("no charge head is ever negative, and IPFT is now actually billed", () => {
+  const rates = loadBoxChargeRates();
+  const leg = calculateLegCharges({ side: "SELL", tradingsymbol: "X", quantity: 75, price: 300 }, rates);
+  for (const [head, v] of Object.entries(leg)) {
+    if (typeof v === "number") assert.ok(v >= 0, `${head} must not be negative`);
+  }
+  // IPFT previously defaulted to 0 while the comment claimed Rs 50/crore, so the head
+  // was silently omitted. It is small but it must be present.
+  assert.ok(ipftFor(75 * 300, rates) > 0, "IPFT must contribute to the exchange head");
+});

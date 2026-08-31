@@ -480,7 +480,14 @@ Every threshold is env-overridable; the defaults are the shipped specification.
 | `BOX_CHARGE_RECONCILE_WARN_PCT` | `5` | Warn when local vs Zerodha charges differ by more than this % |
 | `BOX_CHARGE_RECONCILE_MAX_ATTEMPTS` | `3` | Bounded retries before charges are recorded unverified (never a hot loop) |
 | `BOX_CHARGE_RECONCILE_RETRY_BASE_MS` | `5000` | Linear backoff base: attempt N waits N × this |
-| `BOX_BROKERAGE_PER_ORDER` / `BOX_STT_SELL_PCT` / `BOX_EXCHANGE_TXN_PCT` / `BOX_SEBI_PCT` / `BOX_STAMP_DUTY_BUY_PCT` / `BOX_GST_PCT` | `20` / `0.15` / `0.03553` / `0.0001` / `0.003` / `18` | The centralised local charge rate card (percentages as PERCENT) |
+| `BOX_BROKERAGE_PER_ORDER` | `20` | Flat ₹ per executed option order |
+| `BOX_STT_SELL_PCT` | `0.15` | Option STT, **percent of premium**, sell side. 0.15% since 1 Apr 2026 (was 0.10%) |
+| `BOX_EXCHANGE_TXN_PCT` | `0.03503` | NSE options transaction charge, percent of premium |
+| `BOX_IPFT_PER_CRORE` | `50` | NSE IPFT, **₹ per crore** of premium (folded into the exchange head) |
+| `BOX_SEBI_PCT` | `0.0001` | SEBI turnover fee, percent of premium |
+| `BOX_STAMP_DUTY_BUY_PCT` | `0.003` | Stamp duty, percent of premium, buy side only |
+| `BOX_GST_PCT` | `18` | GST on (brokerage + exchange + SEBI), percent |
+| `BOX_CHARGE_RATE_VERSION` | `zerodha-nse-options-2026-04-01` | Stamped on every trade/attempt so results survive a rate change |
 | `BOX_REQUIRE_PRICED_CHARGES` | `true` | Skip a box whose charges could not be determined |
 | `BOX_SAFETY_BUFFER` | `150` | Risk allowance (₹) deducted inside the expected-net figure |
 | `BOX_QUOTE_MAX_AGE_MS` | `15000` | How long an UNCHANGED book is still trusted |

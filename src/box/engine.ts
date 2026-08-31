@@ -1039,6 +1039,7 @@ export class BoxEngine {
       expected_net_profit: legging.final_expected_net_profit,
       required_expected_net_profit: legging.required_expected_net_profit,
       abort_after_fill: legging.abort_after_fill,
+      charge_rate_version: this.localCharges.rates.rateVersion,
       filled_leg_count: legging.filled_leg_count,
       failed_legs: legging.failed_legs,
       failure_reason: reason,
@@ -1171,6 +1172,9 @@ export class BoxEngine {
       expected_net_profit: decision.expected_net_profit,
       entry_execution_cost: decision.execution_cost,
       charge_origin: args.chargeOrigin ?? "local",
+      // Stamp the rate card so this trade stays interpretable after statutory rates
+      // change (option STT moved on 1 April 2026).
+      charge_rate_version: this.localCharges.rates.rateVersion,
       entry_charge_reconciliation: {
         status: "pending",
         local_total: localRoundTrip.entry_total,

@@ -68,6 +68,7 @@ export function serializeBoxTrade(doc: BoxTradeDocLike) {
     expected_net_profit: doc.expected_net_profit ?? null,
     entry_execution_cost: doc.entry_execution_cost ?? null,
     charge_origin: doc.charge_origin ?? "local",
+    charge_rate_version: doc.charge_rate_version ?? null,
     entry_charge_reconciliation: doc.entry_charge_reconciliation ?? null,
     exit_charge_reconciliation: doc.exit_charge_reconciliation ?? null,
     entry_execution: doc.entry_execution ?? null,

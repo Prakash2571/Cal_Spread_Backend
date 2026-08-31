@@ -115,6 +115,15 @@ export interface BoxChargeRates {
   gstPct: number;
   /** Kite's label for the transaction tax on this segment. */
   sttType: string;
+  /**
+   * Identifier for THIS rate card, stamped onto every trade and execution attempt.
+   *
+   * Statutory rates change (option STT moved on 1 April 2026), so a P&L number is
+   * only interpretable alongside the rates it was computed with. Recording the
+   * version means results from before and after a change stay comparable instead of
+   * silently blending into one series.
+   */
+  rateVersion: string;
 }
 
 /** The shipped rate card, with every value env-overridable. */
@@ -122,17 +131,34 @@ export function loadBoxChargeRates(): BoxChargeRates {
   return {
     brokeragePerOrder: num("BOX_BROKERAGE_PER_ORDER", 20),
     brokerageMaxPct: num("BOX_BROKERAGE_MAX_PCT", 0),
-    sttSellPct: num("BOX_STT_SELL_PCT", 0.1),
+    /**
+     * Options STT, sell side, percent of PREMIUM.
+     *
+     * 0.15% since 1 April 2026, when option STT was flattened to a uniform rate
+     * (futures went 0.02% → 0.05% in the same revision). The previous default here
+     * was 0.10%, which UNDERSTATED the single largest cost in the round trip by a
+     * third and therefore flattered every paper result — the dangerous direction to
+     * be wrong in. Verify against zerodha.com/charges for your account and override
+     * if it has moved again.
+     */
+    sttSellPct: num("BOX_STT_SELL_PCT", 0.15),
     sttRoundNearestRupee: bool("BOX_STT_ROUND_NEAREST_RUPEE", true),
     exchangeTxnPct: num("BOX_EXCHANGE_TXN_PCT", 0.03503),
-    // ₹ per crore of premium. NSE equity-options IPFT is ₹50 per crore of
-    // premium; default 0 keeps the historical behaviour until deliberately set.
-    ipftPerCrore: num("BOX_IPFT_PER_CRORE", 0),
+    /**
+     * NSE IPFT, ₹ per crore of premium turnover — ₹50/crore on equity options.
+     *
+     * This previously defaulted to 0 while the comment stated ₹50, so the code and
+     * its documentation disagreed and the head was silently omitted. It is small
+     * (₹50/crore ≈ ₹0.11 on a ₹22,500 leg) but it is billed, so it is modelled.
+     */
+    ipftPerCrore: num("BOX_IPFT_PER_CRORE", 50),
     ipftPct: num("BOX_IPFT_PCT", 0),
     sebiPct: num("BOX_SEBI_PCT", 0.0001),
     stampDutyBuyPct: num("BOX_STAMP_DUTY_BUY_PCT", 0.003),
     gstPct: num("BOX_GST_PCT", 18),
     sttType: process.env.BOX_STT_TYPE?.trim() || "stt",
+    rateVersion:
+      process.env.BOX_CHARGE_RATE_VERSION?.trim() || "zerodha-nse-options-2026-04-01",
   };
 }
 

@@ -774,6 +774,8 @@ export interface IBoxExecutionAttempt {
   expected_net_profit: number | null;
   /** The gate the attempt had to clear (₹) — so a miss can be sized, not guessed. */
   required_expected_net_profit?: number | null;
+  /** Which statutory rate card priced this attempt. */
+  charge_rate_version?: string | null;
   /**
    * True for the EXECUTION_ABORT_AFTER_FILL case: 4/4 filled, economics failed on
    * the executed prices, whole box reversed immediately.
@@ -924,6 +926,8 @@ export interface IBoxTrade {
   entry_execution_cost?: number | null;
   /** Where the entry charge numbers came from. */
   charge_origin?: BoxChargeOrigin;
+  /** Which statutory rate card priced this trade (see BoxChargeRates.rateVersion). */
+  charge_rate_version?: string | null;
   /** Zerodha's verdict on the local entry/exit charge calculation. */
   entry_charge_reconciliation?: BoxChargeReconciliation | null;
   exit_charge_reconciliation?: BoxChargeReconciliation | null;

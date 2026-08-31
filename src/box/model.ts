@@ -241,6 +241,9 @@ const boxTradeSchema = new mongoose.Schema<IBoxTrade>(
     expected_net_profit: { type: Number, default: null },
     entry_execution_cost: { type: Number, default: null },
     charge_origin: { type: String, enum: ["local", "kite", "local_verified"], default: "local" },
+    // Which statutory rate card priced this trade. Nullable so documents written
+    // before the rate card was versioned still load unchanged.
+    charge_rate_version: { type: String, default: null },
     entry_charge_reconciliation: { type: chargeReconciliationSchema, default: null },
     exit_charge_reconciliation: { type: chargeReconciliationSchema, default: null },
     // Full detection→execution audit records. Mixed keeps the rich nested shape
@@ -426,6 +429,7 @@ const boxExecutionAttemptSchema = new mongoose.Schema(
     // whole box reversed immediately. Stored flat so it can be queried directly.
     abort_after_fill: { type: Boolean, default: false },
     required_expected_net_profit: { type: Number, default: null },
+    charge_rate_version: { type: String, default: null },
     // The full per-leg legging record: an append-only audit blob.
     legging: { type: mongoose.Schema.Types.Mixed, default: null },
     partial_entry_charges: { type: Number, default: null },
