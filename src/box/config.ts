@@ -32,6 +32,26 @@ function bool(name: string, fallback: boolean): boolean {
   return fallback;
 }
 
+/** Parse a comma-separated list of IST hours (0-23), de-duplicated and sorted. */
+function hours(name: string, fallback: number[]): number[] {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = raw
+    .split(",")
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isInteger(n) && n >= 0 && n <= 23);
+  if (parsed.length === 0) return fallback;
+  return [...new Set(parsed)].sort((a, b) => a - b);
+}
+
+/** Clamp any input to a valid hour-of-day (0-23). */
+function clampHour(v: number, fallback: number): number {
+  if (!Number.isFinite(v)) return fallback;
+  const n = Math.round(v);
+  if (n < 0 || n > 23) return fallback;
+  return n;
+}
+
 /** Clamp any input to a valid strikes-each-side level: 1, 2 or 3. */
 export function clampStrikeLevel(v: number): 1 | 2 | 3 {
   const n = Math.round(v);
@@ -239,6 +259,31 @@ export interface BoxConfig {
   maxPublishedOpportunities: number;
   /** Samples kept in each rolling metrics ring buffer. */
   metricsWindow: number;
+
+  // ---- Daily P&L cache + nightly archive ----
+  /**
+   * Master switch for the live P&L cache and its nightly archive.
+   *
+   * When on (and Upstash Redis is configured), the running net P&L of the day's
+   * box trades — open positions AND trades closed today — is mirrored to Redis on
+   * a slow cadence, then drained into the `box_daily_pnl` Mongo collection once a
+   * night. OFF by default: with it unset the module behaves exactly as before and
+   * touches neither Redis nor the new collection.
+   */
+  pnlCacheEnabled: boolean;
+  /** How often (ms) the running day-P&L snapshot is mirrored to Redis. */
+  pnlCacheIntervalMs: number;
+  /** TTL (seconds) on a day's cached P&L hash — long enough to outlive verify. */
+  pnlCacheTtlSec: number;
+  /** IST hour (0-23) at which the day's cached P&L is drained to Mongo. */
+  pnlArchiveHour: number;
+  /**
+   * IST hours (0-23) at which the archive is re-checked and completed if the 9 PM
+   * drain did not finish (e.g. Redis or Mongo was briefly unavailable).
+   */
+  pnlVerifyHours: number[];
+  /** Delay (ms) between each document while streaming the archive into Mongo. */
+  pnlArchiveDrainDelayMs: number;
 }
 
 export function loadBoxConfig(): BoxConfig {
@@ -302,6 +347,13 @@ export function loadBoxConfig(): BoxConfig {
     chargeConcurrency: num("BOX_CHARGE_CONCURRENCY", 3),
     maxPublishedOpportunities: num("BOX_MAX_PUBLISHED_OPPORTUNITIES", 60),
     metricsWindow: num("BOX_METRICS_WINDOW", 500),
+
+    pnlCacheEnabled: bool("BOX_PNL_CACHE_ENABLED", false),
+    pnlCacheIntervalMs: num("BOX_PNL_CACHE_INTERVAL_MS", 30_000),
+    pnlCacheTtlSec: num("BOX_PNL_CACHE_TTL_SEC", 3 * 24 * 60 * 60),
+    pnlArchiveHour: clampHour(num("BOX_PNL_ARCHIVE_HOUR", 21), 21),
+    pnlVerifyHours: hours("BOX_PNL_VERIFY_HOURS", [22, 23]),
+    pnlArchiveDrainDelayMs: num("BOX_PNL_ARCHIVE_DRAIN_DELAY_MS", 50),
   };
 }
 

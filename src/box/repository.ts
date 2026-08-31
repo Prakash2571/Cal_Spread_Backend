@@ -10,12 +10,15 @@
 import mongoose from "mongoose";
 import { isBoxConnectionReady } from "../db.js";
 import {
+  BoxDailyPnl,
   BoxExecutionAttempt,
   BoxTrade,
   BoxTradeEvent,
   isBoxEventLedgerEnabled,
+  type BoxDailyPnlRecord,
   type BoxExecutionAttemptRecord,
   type BoxTradeRecord,
+  type IBoxDailyPnl,
 } from "./model.js";
 import type {
   BoxChargeReconciliation,
@@ -311,6 +314,55 @@ export async function loadBoxExecutionAttempts(
       .sort({ resolved_at: -1 })
       .limit(limit)
       .lean<BoxExecutionAttemptRecord[]>();
+  } catch {
+    return [];
+  }
+}
+
+/* ----------------------------- daily P&L archive -------------------------- */
+
+/**
+ * Trades closed at or after `sinceMs` — the "closed today" set used to build the
+ * running day-P&L snapshot. Filtered on `closed_at`, which is what makes it a
+ * TODAY query rather than a full history scan.
+ */
+export async function loadBoxTradesClosedSince(sinceMs: number): Promise<BoxTradeRecord[]> {
+  if (!isBoxDbEnabled()) return [];
+  return BoxTrade.find({ status: { $ne: "open" }, closed_at: { $gte: new Date(sinceMs) } })
+    .sort({ closed_at: -1 })
+    .lean<BoxTradeRecord[]>();
+}
+
+/**
+ * Upsert one archived P&L row (per-trade OR the day summary), keyed on
+ * (day, trade_id). Idempotent by design: the nightly drain and the later verify
+ * passes both call this, and re-writing an already-archived row is harmless.
+ */
+export async function upsertBoxDailyPnl(doc: IBoxDailyPnl): Promise<void> {
+  if (!isBoxDbEnabled()) return;
+  await BoxDailyPnl.updateOne(
+    { day: doc.day, trade_id: doc.trade_id },
+    { $set: { ...doc, archived_at: new Date() } },
+    { upsert: true },
+  );
+}
+
+/** The trade ids already archived for a day (used to compute what verify must still drain). */
+export async function loadBoxDailyPnlTradeIds(day: string): Promise<string[]> {
+  if (!isBoxDbEnabled()) return [];
+  try {
+    const rows = await BoxDailyPnl.find({ day }).lean<BoxDailyPnlRecord[]>();
+    return rows.map((r) => r.trade_id);
+  } catch {
+    return [];
+  }
+}
+
+/** All archived P&L rows for a day, newest-updated first (for a reporting view). */
+export async function loadBoxDailyPnl(day: string): Promise<BoxDailyPnlRecord[]> {
+  if (!isBoxDbEnabled()) return [];
+  try {
+    return await BoxDailyPnl.find({ day }).lean<BoxDailyPnlRecord[]>();
   } catch {
     return [];
   }

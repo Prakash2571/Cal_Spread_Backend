@@ -26,6 +26,7 @@ import type {
   IBoxTrade,
   IBoxTradeEvent,
 } from "./types.js";
+import type { BoxDailyPnlRow, BoxDailyPnlSummary } from "./pnlSnapshot.js";
 
 /**
  * Compile-time proof that the box module's dependency-free charge types stay
@@ -433,4 +434,71 @@ export interface BoxExecutionAttemptRecord extends IBoxExecutionAttempt {
 export const BoxExecutionAttempt = boxModel<IBoxExecutionAttempt>(
   "BoxExecutionAttempt",
   boxExecutionAttemptSchema as unknown as mongoose.Schema<IBoxExecutionAttempt>,
+);
+
+/* --------------------------- daily P&L archive ---------------------------- */
+
+/**
+ * One archived row of a day's box P&L.
+ *
+ * Two record kinds share the collection, distinguished by `trade_id`:
+ *   - a per-trade row (real trade id): the running net of an open position or the
+ *     realised net of a trade closed that day, as it stood when the day was
+ *     archived;
+ *   - the day summary (`trade_id: "__summary__"`), carrying the aggregate in
+ *     `summary`.
+ *
+ * This is a REPORTING artifact drained nightly from the Redis cache — never the
+ * source of truth for a trade (that stays in `box_trades`). It exists so the
+ * day's running-P&L view survives beyond the Redis TTL and can be exported.
+ */
+export interface IBoxDailyPnl extends Partial<Omit<BoxDailyPnlRow, "status">> {
+  day: string;
+  trade_id: string;
+  /** "open" / "closed" for a per-trade row, "summary" for the day aggregate. */
+  status?: "open" | "closed" | "summary";
+  summary?: BoxDailyPnlSummary | null;
+  archived_at?: Date;
+}
+
+// Untyped schema + cast at the model, exactly like box_execution_attempts: the
+// mixed record kinds and the nested summary would otherwise fight tsc's strict
+// Schema<T> field-type checking for no runtime benefit.
+const boxDailyPnlSchema = new mongoose.Schema(
+  {
+    day: { type: String, required: true, index: true },
+    trade_id: { type: String, required: true },
+    underlying: { type: String, default: "" },
+    direction: { type: String, default: "LONG_BOX" },
+    lower_strike: { type: Number, default: 0 },
+    upper_strike: { type: Number, default: 0 },
+    expiry: { type: String, default: "" },
+    // Plain String (not an enum): a summary row carries status "summary".
+    status: { type: String, default: "open" },
+    gross_pnl: { type: Number, default: null },
+    net_pnl: { type: Number, default: null },
+    realisable_net_pnl: { type: Number, default: null },
+    realised_net_pnl: { type: Number, default: null },
+    opened_at: { type: String, default: null },
+    closed_at: { type: String, default: null },
+    updated_at: { type: String, default: null },
+    // The per-day aggregate, present only on the "__summary__" document.
+    summary: { type: mongoose.Schema.Types.Mixed, default: null },
+    archived_at: { type: Date, default: () => new Date() },
+  },
+  { collection: "box_daily_pnl" },
+);
+
+// One document per (day, trade). The upsert key that makes re-draining idempotent:
+// a verify pass can safely re-write a row the 9 PM drain already wrote.
+boxDailyPnlSchema.index({ day: 1, trade_id: 1 }, { unique: true, name: "box_daily_pnl_day_trade" });
+
+export interface BoxDailyPnlRecord extends IBoxDailyPnl {
+  _id: mongoose.Types.ObjectId;
+}
+
+/** The daily-P&L archive model (collection: "box_daily_pnl"). */
+export const BoxDailyPnl = boxModel<IBoxDailyPnl>(
+  "BoxDailyPnl",
+  boxDailyPnlSchema as unknown as mongoose.Schema<IBoxDailyPnl>,
 );

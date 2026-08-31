@@ -377,6 +377,34 @@ the market is not there, records and exposes that condition instead of fabricati
 Open positions are re-adopted from MongoDB on boot, so a restart does not orphan one. The
 monitoring loop never depends on React being mounted.
 
+### Running day P&L + nightly archive (optional)
+
+`/api/box/status` always reports a `day_pnl` block — the **running** net P&L of the day's box
+trades: the summed current net of every open position plus the realised net of every trade closed
+today, and their total. It is computed off the same touch-based metrics the monitor uses (no
+valuation model, nothing invented) and reads no database on a status call — the open side is
+in-memory and the closed side is a tally seeded from Mongo at boot and folded forward on each close.
+The Box page shows it as a compact strip above the execution-health panel.
+
+When `BOX_PNL_CACHE_ENABLED=true` **and** Upstash Redis is configured, that day P&L is also:
+
+- **mirrored to Redis** every `BOX_PNL_CACHE_INTERVAL_MS` (default 30s) — a fast,
+  restart-surviving copy of "how today is going" under `calspread:box:pnl:day:<YYYY-MM-DD>`. This is
+  **not** a replacement for `box_trades`: entries and exits still persist to Mongo exactly as
+  before. It is a reporting mirror.
+- **archived to Mongo** once a night into a dedicated `box_daily_pnl` collection (one document per
+  trade per day, plus a per-day summary). The drain is **streamed** — one document at a time with a
+  small delay (`BOX_PNL_ARCHIVE_DRAIN_DELAY_MS`, default 50ms) — so a day's rows never land as a
+  single bulk write, and a failure part-way through is retried rather than losing data. The drain
+  runs at `BOX_PNL_ARCHIVE_HOUR` (default 21:00 IST); two later passes at `BOX_PNL_VERIFY_HOURS`
+  (default 22:00 & 23:00 IST) re-check the day and finish anything the first pass missed. Every
+  upsert is idempotent, keyed on `(day, trade_id)`, so re-draining an already-written row is safe.
+  A process that comes up after the archive hour reconciles the day (and any still-pending earlier
+  day) on boot.
+
+With `BOX_PNL_CACHE_ENABLED` unset the whole subsystem is inert: no Redis writes, no new collection,
+and the module behaves exactly as before.
+
 ### Performance
 
 The decision path is entirely backend-side and event-driven:
@@ -446,6 +474,12 @@ Every threshold is env-overridable; the defaults are the shipped specification.
 | `BOX_MAX_SUBSCRIBED_TOKENS` | `2200` | Live-feed instrument budget |
 | `BOX_MAX_CONCURRENT_EXECUTIONS` | `8` | Cap on simultaneous simulated execution pipelines |
 | `BOX_METRICS_WINDOW` | `500` | Samples kept in each bounded rolling-metrics ring buffer |
+| `BOX_PNL_CACHE_ENABLED` | `false` | Mirror the running day P&L to Redis and archive it nightly to `box_daily_pnl` (needs Upstash) |
+| `BOX_PNL_CACHE_INTERVAL_MS` | `30000` | How often the running day-P&L snapshot is written to Redis |
+| `BOX_PNL_CACHE_TTL_SEC` | `259200` | TTL (s) on a day's cached P&L hash (must outlive the verify passes) |
+| `BOX_PNL_ARCHIVE_HOUR` | `21` | IST hour (0–23) at which the day's cached P&L is drained to Mongo |
+| `BOX_PNL_VERIFY_HOURS` | `22,23` | IST hours (comma-sep) at which the archive is re-checked and completed |
+| `BOX_PNL_ARCHIVE_DRAIN_DELAY_MS` | `50` | Delay (ms) between each document while streaming the archive to Mongo |
 | `BOX_MONITOR_INTERVAL_MS` | `1000` | Fallback watchdog cadence; open positions normally re-evaluate immediately on relevant WebSocket depth ticks |
 
 **Observability.** `/api/box/status` now also exposes bounded rolling metrics: evaluations/sec,

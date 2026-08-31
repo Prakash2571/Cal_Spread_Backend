@@ -50,7 +50,9 @@ import {
   insertBoxExecutionAttempt,
   insertBoxTrade,
   isBoxDbEnabled,
+  loadBoxDailyPnlTradeIds,
   loadBoxExecutionAttempts,
+  loadBoxTradesClosedSince,
   loadOpenBoxTrades,
   serializeBoxTrade,
   setBoxChargeReconciliation,
@@ -58,8 +60,16 @@ import {
   toEventLegs,
   tradeKey,
   updateBoxTradeLive,
+  upsertBoxDailyPnl,
   type SerializedBoxTrade,
 } from "./repository.js";
+import { BoxPnlCache } from "./pnlCache.js";
+import { BoxPnlArchiver, istDayStartMs } from "./pnlArchive.js";
+import type {
+  BoxDailyPnlSummary,
+  ClosedPnlInput,
+  OpenPnlInput,
+} from "./pnlSnapshot.js";
 import { BoxScanner } from "./scanner.js";
 import {
   BOX_DIRECTIONS,
@@ -134,6 +144,14 @@ export class BoxEngine {
   private metrics: BoxMetrics;
   private scanner: BoxScanner;
   private monitor: BoxPositionMonitor;
+  private pnlCache: BoxPnlCache;
+  private pnlArchiver: BoxPnlArchiver;
+
+  /** Running tally of trades CLOSED today, for the day-P&L view (no Mongo on read). */
+  private closedTodayDay = "";
+  private closedTodayCount = 0;
+  private closedTodayNet = 0;
+  private closedTodayGross = 0;
   /** The directions the scanner builds candidates for. */
   private directions: readonly BoxDirection[];
   /**
@@ -322,6 +340,22 @@ export class BoxEngine {
       isFeedHealthy: () => this.isFeedHealthy(),
     });
 
+    // Live P&L cache + nightly archive (inert unless BOX_PNL_CACHE_ENABLED and
+    // Upstash are both configured — see pnlArchive.ts).
+    this.pnlCache = new BoxPnlCache(this.cfg);
+    this.pnlArchiver = new BoxPnlArchiver({
+      cfg: this.cfg,
+      cache: this.pnlCache,
+      getOpenPnl: () => this.openPnlInputs(),
+      loadClosedSince: (sinceMs) => this.closedPnlInputs(sinceMs),
+      upsert: (doc) => upsertBoxDailyPnl(doc),
+      loadPersistedIds: (day) => loadBoxDailyPnlTradeIds(day),
+      istDayKey: () => this.deps.istDayKey(),
+      // A Date whose UTC fields read as IST, matching the EOD scheduler's clock.
+      istNow: () => new Date(Date.now() + 5.5 * 60 * 60 * 1000),
+      isDbEnabled: () => isBoxDbEnabled(),
+    });
+
     this.metrics.startSampling();
     this.marketOpen = this.deps.isMarketOpen();
     this.scanner.setMarketOpen(this.marketOpen);
@@ -350,6 +384,12 @@ export class BoxEngine {
       console.warn("[Box] failed to adopt open positions:", err);
     }
     this.monitor.start();
+    // Seed the "closed today" tally from Mongo so the day-P&L view is correct
+    // immediately after a restart, then start the P&L cache + nightly archiver.
+    await this.refreshClosedTodayFromDb().catch((err) =>
+      console.warn("[Box] closed-today seed failed:", err),
+    );
+    this.pnlArchiver.start();
     if (this.positions.size > 0) {
       // Open positions need live books even with the scanner stopped.
       this.ensureFeed();
@@ -1327,6 +1367,12 @@ export class BoxEngine {
 
     this.positions.remove(position.id);
 
+    // Fold the realised result into the running day-P&L tally.
+    this.rollClosedTodayDay();
+    this.closedTodayCount++;
+    this.closedTodayNet += netPnl ?? 0;
+    this.closedTodayGross += grossPnl ?? 0;
+
     // Verify the exit charges asynchronously, exactly like the entry.
     if (exitCharges) {
       const exitOrders: BoxChargeLeg[] = metrics.legs
@@ -1646,6 +1692,8 @@ export class BoxEngine {
        */
       exchange_lag_ms: this.exchangeLag(),
       open_positions: this.positions.size,
+      /** Running day P&L: open positions' current net + today's realised net. */
+      day_pnl: this.computeDayPnl(),
       skipped_for_budget: this.skippedForBudget.length,
       skipped_symbols: this.skippedForBudget.slice(0, 25),
       scanner: {
@@ -1674,6 +1722,111 @@ export class BoxEngine {
   /** Recent paper_legging execution attempts that did not open a box. */
   async listExecutionAttempts(limit = 100) {
     return loadBoxExecutionAttempts(limit);
+  }
+
+  /* ------------------------------- day P&L -------------------------------- */
+
+  /** Reset the closed-today tally when the IST trading day rolls over. */
+  private rollClosedTodayDay(): void {
+    const today = this.deps.istDayKey();
+    if (this.closedTodayDay !== today) {
+      this.closedTodayDay = today;
+      this.closedTodayCount = 0;
+      this.closedTodayNet = 0;
+      this.closedTodayGross = 0;
+    }
+  }
+
+  /** Seed the closed-today tally from Mongo (called at boot and on day roll). */
+  private async refreshClosedTodayFromDb(): Promise<void> {
+    const day = this.deps.istDayKey();
+    const rows = await loadBoxTradesClosedSince(istDayStartMs(day));
+    let count = 0;
+    let net = 0;
+    let gross = 0;
+    for (const r of rows) {
+      count++;
+      net += r.realised_net_pnl ?? r.net_pnl ?? 0;
+      gross += r.gross_pnl ?? 0;
+    }
+    this.closedTodayDay = day;
+    this.closedTodayCount = count;
+    this.closedTodayNet = net;
+    this.closedTodayGross = gross;
+  }
+
+  /**
+   * The running day P&L: open positions' current net + today's realised net.
+   *
+   * Cheap — the open side reads each position's already-computed metrics and the
+   * closed side is an in-memory tally, so no database is touched on a status read.
+   */
+  private computeDayPnl() {
+    this.rollClosedTodayDay();
+    let openNet = 0;
+    let openGross = 0;
+    let openCount = 0;
+    for (const pos of this.positions.list()) {
+      openCount++;
+      const m = pos.metrics;
+      if (m) {
+        openNet += m.current_net_pnl ?? 0;
+        openGross += m.gross_pnl_if_closed_now ?? 0;
+      }
+    }
+    const cachedSummary = this.pnlArchiver.getLastSummary();
+    return {
+      day: this.closedTodayDay,
+      open_count: openCount,
+      open_running_net_pnl: round2(openNet),
+      open_running_gross_pnl: round2(openGross),
+      closed_count: this.closedTodayCount,
+      closed_realised_net_pnl: round2(this.closedTodayNet),
+      closed_realised_gross_pnl: round2(this.closedTodayGross),
+      /** Open running net + today's realised net — the day's running total (₹). */
+      total_net_pnl: round2(openNet + this.closedTodayNet),
+      total_gross_pnl: round2(openGross + this.closedTodayGross),
+      /** Whether the Redis P&L cache is actively mirroring this figure. */
+      cache_enabled: this.pnlCache.enabled(),
+      last_cached_at: cachedSummary ? cachedSummary.updated_at : null,
+    };
+  }
+
+  /** Map the live open positions to the P&L cache's input shape. */
+  private openPnlInputs(): OpenPnlInput[] {
+    return this.positions.list().map((pos) => {
+      const m = pos.metrics ?? this.monitor.measure(pos);
+      return {
+        id: pos.id,
+        underlying: pos.underlying,
+        direction: pos.direction ?? "LONG_BOX",
+        lower_strike: pos.lower_strike,
+        upper_strike: pos.upper_strike,
+        expiry: pos.expiry,
+        opened_at: new Date(pos.opened_at).toISOString(),
+        gross_pnl: m.gross_pnl_if_closed_now,
+        net_pnl: m.current_net_pnl,
+        realisable_net_pnl: m.realisable_net_pnl,
+      };
+    });
+  }
+
+  /** Map trades closed since `sinceMs` to the P&L cache's input shape. */
+  private async closedPnlInputs(sinceMs: number): Promise<ClosedPnlInput[]> {
+    const rows = await loadBoxTradesClosedSince(sinceMs);
+    return rows.map((doc) => ({
+      id: doc._id.toString(),
+      underlying: doc.underlying,
+      direction: directionOf(doc),
+      lower_strike: doc.lower_strike,
+      upper_strike: doc.upper_strike,
+      expiry: doc.expiry,
+      opened_at: doc.opened_at.toISOString(),
+      closed_at: doc.closed_at ? doc.closed_at.toISOString() : null,
+      gross_pnl: doc.gross_pnl ?? null,
+      net_pnl: doc.net_pnl ?? null,
+      realised_net_pnl: doc.realised_net_pnl ?? null,
+    }));
   }
 
   /**
