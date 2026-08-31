@@ -112,8 +112,15 @@ test("a strike missing either leg cannot form a box", () => {
   }
 });
 
-test("candidate keys identify a box by underlying, expiry and both strikes", () => {
-  assert.equal(candidateKey("NIFTY", "2026-09-24", 19900, 20100), "NIFTY|2026-09-24|19900|20100");
+test("candidate keys identify a box by underlying, expiry, both strikes and direction", () => {
+  assert.equal(
+    candidateKey("NIFTY", "2026-09-24", 19900, 20100),
+    "NIFTY|2026-09-24|19900|20100|LONG_BOX",
+  );
+  assert.equal(
+    candidateKey("NIFTY", "2026-09-24", 19900, 20100, "SHORT_BOX"),
+    "NIFTY|2026-09-24|19900|20100|SHORT_BOX",
+  );
 });
 
 /* --------------------------------------------------------------------- 4 --- */
@@ -393,21 +400,22 @@ test("an OPTIONAL net floor can be switched on, and then it does bind", () => {
   assert.equal(qualifiesForEntry(5000, null, cfg()), true);
 });
 
-test("the local prefilter never discards a box that could still qualify", () => {
+test("the local prefilter is a cheap gross floor, never the decision", () => {
   const c = cfg();
   const threshold = prefilterGrossThreshold(c);
-  // Gross-only gate → the prefilter IS the gross requirement.
+  // The prefilter is purely the gross requirement now: the real gate is expected
+  // NET profit (see the entry-decision tests). It must UNDER-state the true
+  // requirement so it can never discard a box that would have qualified.
   assert.equal(threshold, 1200);
   assert.equal(passesGrossPrefilter(threshold, threshold), true);
   assert.equal(passesGrossPrefilter(threshold - 1, threshold), false);
   assert.equal(passesGrossPrefilter(null, threshold), false);
 
-  // With a net floor configured the prefilter has to reach further, using a
-  // deliberate LOWER bound on charges so it cannot filter out a box that would
-  // have qualified once real charges came back.
-  const floored = cfg({ minNetEdge: 1200 });
-  assert.equal(prefilterGrossThreshold(floored), 1200 + 150 + 160);
-  assert.ok(floored.prefilterChargeAllowance <= 8 * 20 * 1.18 + 1);
+  // The net gate always needs MORE gross than the prefilter (charges + execution
+  // cost + buffer are all positive), so a box that clears the net gate always
+  // cleared the prefilter first.
+  const floored = cfg({ minExpectedNetProfit: 1200 });
+  assert.ok(prefilterGrossThreshold(floored) <= floored.minExpectedNetProfit);
 });
 
 /* -------------------------------------------------------------------- 21 --- */

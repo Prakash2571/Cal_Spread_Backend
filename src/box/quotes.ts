@@ -27,12 +27,17 @@ export interface BoxTickInput {
   exchange_ts?: number;
 }
 
+/** Notified after every accepted batch of WS depth packets. */
+export type BoxQuoteListener = (changed: number[], at: number) => void;
+
 export class BoxQuoteStore {
   private quotes = new Map<number, BoxQuote>();
   private updates = 0;
   private lastUpdate: number | null = null;
   /** Monotonic sequence for immutable WS execution snapshots. */
   private nextVersion = 1;
+  /** Execution simulators waiting for a post-arrival book. */
+  private listeners = new Set<BoxQuoteListener>();
 
   /** Number of tokens with a book. */
   get size(): number {
@@ -62,6 +67,29 @@ export class BoxQuoteStore {
   /** The live map, for read-only use by the evaluator. */
   view(): Map<number, BoxQuote> {
     return this.quotes;
+  }
+
+  /**
+   * Observe accepted depth updates.
+   *
+   * The execution simulator uses this to capture the FIRST book a leg publishes at
+   * or after its simulated order-arrival time. Polling the map alone could miss an
+   * intermediate packet and silently fill at a later, different book — which is
+   * precisely the kind of quiet inaccuracy this module exists to avoid.
+   *
+   * Returns an unsubscribe function; the simulator always calls it, so the set
+   * cannot grow.
+   */
+  subscribe(listener: BoxQuoteListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  /** How many execution pipelines are currently observing the store. */
+  get listenerCount(): number {
+    return this.listeners.size;
   }
 
   /** True when a token has a book no older than maxAgeMs. */
@@ -127,6 +155,16 @@ export class BoxQuoteStore {
       this.lastUpdate = at;
       changed.push(t.token);
     }
+    if (changed.length > 0 && this.listeners.size > 0) {
+      for (const listener of this.listeners) {
+        try {
+          listener(changed, at);
+        } catch (err) {
+          // A misbehaving observer must never break market-data intake.
+          console.warn("[Box] quote listener failed:", err);
+        }
+      }
+    }
     return changed;
   }
 
@@ -139,6 +177,16 @@ export class BoxQuoteStore {
   clear(): void {
     this.quotes.clear();
     this.lastUpdate = null;
+  }
+
+  /**
+   * Replay a recorded batch of ticks as if it had arrived from the WebSocket.
+   *
+   * The seam the deterministic replay harness needs: identical code path,
+   * identical listener notifications, no live Zerodha connection.
+   */
+  replay(ticks: BoxTickInput[], at: number): number[] {
+    return this.applyTicks(ticks, at);
   }
 }
 

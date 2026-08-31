@@ -1,8 +1,8 @@
 /**
  * The open-position monitor.
  *
- * This is BACKEND-OWNED and completely independent of the scanner's RUN state
- * and of any browser:
+ * BACKEND-OWNED and completely independent of the scanner's RUN state and of any
+ * browser:
  *
  *   - it keeps running when the scanner is STOPPED
  *   - it keeps running when nobody is looking at /box
@@ -10,21 +10,34 @@
  *
  * A position's lifecycle can never depend on React being mounted, so every exit
  * decision — and every refusal to exit — happens here.
+ *
+ * TWO THINGS CHANGED FROM THE ORIGINAL
+ *
+ *   1. Exit charges are now priced by the LOCAL calculator, synchronously, on the
+ *      decision-critical path. There is no Zerodha round trip between measuring a
+ *      position and deciding to close it; verification happens asynchronously
+ *      elsewhere (chargeReconciler.ts).
+ *   2. The fill itself goes through the execution simulator. In paper_latency mode
+ *      the recorded exit prices come from the first WebSocket book published at or
+ *      after a simulated arrival — never a stale pre-decision snapshot. In
+ *      paper_touch mode it fills at the current touch, as before.
  */
 
 import type { BoxConfig } from "./config.js";
+import type { BoxExecutionSimulator } from "./executionSimulator.js";
+import { LocalChargeCalculator, ordersFromLegs } from "./localCharges.js";
 import {
-  BoxChargeEstimator,
-  buildChargeLegsFromEvaluations,
-  sameChargeLegs,
-  type BoxChargeLeg,
-} from "./charges.js";
-import { computeExitMetrics, evaluateExitLegs, exitLiquidityOk, round2 } from "./math.js";
+  computeExitMetrics,
+  evaluateExitLegs,
+  exitLiquidityOk,
+  round2,
+} from "./math.js";
 import type { BoxOpenPosition, BoxPositionBook } from "./positions.js";
 import type { BoxQuoteStore } from "./quotes.js";
 import {
   BOX_LEG_ROLES,
-  type BoxCharges,
+  type BoxChargesWithOrigin,
+  type BoxExecutionRecord,
   type BoxExitMetrics,
   type BoxExitReason,
   type BoxLegEvaluation,
@@ -33,14 +46,16 @@ import {
 export interface BoxMonitorDeps {
   cfg: BoxConfig;
   quotes: BoxQuoteStore;
-  charges: BoxChargeEstimator;
+  localCharges: LocalChargeCalculator;
+  executionSim: BoxExecutionSimulator;
   positions: BoxPositionBook;
   /** Persists the close. Returns true when this call is the one that closed it. */
   closePaperTrade: (args: {
     position: BoxOpenPosition;
     metrics: BoxExitMetrics;
-    exitCharges: BoxCharges | null;
+    exitCharges: BoxChargesWithOrigin | null;
     reason: BoxExitReason;
+    execution: BoxExecutionRecord | null;
   }) => Promise<boolean>;
   /** Slow periodic flush of the live convergence figure. */
   persistLive: (position: BoxOpenPosition) => Promise<void>;
@@ -55,20 +70,7 @@ export interface BoxMonitorDeps {
   istDayKey: () => string;
   /** Minutes past midnight IST, for the expiry-safety window. */
   istMinutesOfDay: () => number;
-  /**
-   * Whether the exchange is open.
-   *
-   * Metrics keep being refreshed when it is shut (so the UI stays informative),
-   * but no exit is attempted: there is no executable book to close into, and
-   * repeatedly "discovering" that would only spam the ledger.
-   */
   isMarketOpen: () => boolean;
-  /**
-   * Whether the upstream tick feed is alive.
-   *
-   * Distinct from a single leg being quiet: an untouched book is still valid, but
-   * a broken connection makes every cached book untrustworthy at once.
-   */
   isFeedHealthy: () => boolean;
 }
 
@@ -78,16 +80,15 @@ const IST_CLOSE_MINUTES = 15 * 60 + 30;
 export class BoxPositionMonitor {
   private timer: NodeJS.Timeout | null = null;
   private ticking = false;
-  /** One evaluator per position; a WS tick received during charge I/O queues a rerun. */
   private evaluationTasks = new Map<string, Promise<void>>();
   private pendingEvaluationIds = new Set<string>();
   private closingIds = new Set<string>();
-  /** position id → the last liquidity-gap SHAPE written to the ledger. */
   private lastBlockedKey = new Map<string, string>();
   private stats = {
     cycles: 0,
     exitsTriggered: 0,
     exitsSkippedLiquidity: 0,
+    exitsFailedExecution: 0,
     lastCycleAt: null as number | null,
   };
 
@@ -98,7 +99,6 @@ export class BoxPositionMonitor {
     this.timer = setInterval(() => {
       void this.cycle();
     }, this.deps.cfg.monitorIntervalMs);
-    // Unref so the monitor's timer never holds the process open by itself.
     this.timer.unref?.();
   }
 
@@ -124,11 +124,6 @@ export class BoxPositionMonitor {
     }
   }
 
-  /**
-   * Queue one position. If another WS packet lands while charge pricing is in
-   * flight, the loop runs again and captures the newer four-leg touch before any
-   * fill is persisted.
-   */
   private requestEvaluation(id: string): Promise<void> {
     this.pendingEvaluationIds.add(id);
     const existing = this.evaluationTasks.get(id);
@@ -148,8 +143,6 @@ export class BoxPositionMonitor {
         }
       } finally {
         this.evaluationTasks.delete(id);
-        // Cover the narrow race where a tick queued work after the loop's final
-        // delete but before this task left the map.
         if (this.pendingEvaluationIds.has(id) && this.deps.positions.get(id)) {
           void this.requestEvaluation(id);
         }
@@ -159,9 +152,8 @@ export class BoxPositionMonitor {
     return task;
   }
 
-  /** Re-price every open position as a watchdog; WS updates are the primary path. */
   async cycle(): Promise<void> {
-    if (this.ticking) return; // never overlap watchdog cycles
+    if (this.ticking) return;
     this.ticking = true;
     try {
       this.stats.cycles++;
@@ -172,28 +164,44 @@ export class BoxPositionMonitor {
     }
   }
 
-  /** Recompute the exit arithmetic for one position (no side effects). */
+  /**
+   * Total exit charges for a set of evaluated exit legs, from the LOCAL
+   * calculator. Synchronous — this is the whole point.
+   */
+  private localExitChargesTotal(pos: BoxOpenPosition, legs: BoxLegEvaluation[]): number | null {
+    const orders = ordersFromLegs(legs, pos.quantity);
+    if (!orders) return pos.estimated_exit_charges_total;
+    return this.deps.localCharges.legs(orders, "kite_estimate").total;
+  }
+
+  private localExitCharges(pos: BoxOpenPosition, legs: BoxLegEvaluation[]): BoxChargesWithOrigin | null {
+    const orders = ordersFromLegs(legs, pos.quantity);
+    if (!orders) return null;
+    return this.deps.localCharges.legs(orders, "kite_estimate");
+  }
+
+  /** Recompute the exit arithmetic for one position (no side effects, no I/O). */
   measure(
     pos: BoxOpenPosition,
     now = Date.now(),
     exitChargesTotalOverride?: number | null,
+    captureDepth = false,
   ): BoxExitMetrics {
+    const direction = pos.direction ?? "LONG_BOX";
     const legs = evaluateExitLegs({
       legs: BOX_LEG_ROLES.map((role) => ({ role, inst: pos.legs[role] })),
       quotes: this.deps.quotes.view(),
       lotSize: pos.lot_size,
       now,
       maxAgeMs: this.deps.cfg.quoteMaxAgeMs,
+      direction,
+      captureDepth,
     });
 
-    // The exit charge estimate: the freshly priced one when the cache has it,
-    // otherwise the conservative projection recorded at entry. Falling back to
-    // the entry-time projection is deliberate — it is never cheaper than a real
-    // unwind of the same size, so it cannot flatter the net P&L.
     const exitChargesTotal =
       exitChargesTotalOverride !== undefined
         ? exitChargesTotalOverride
-        : this.cachedExitChargesTotal(pos, legs);
+        : this.localExitChargesTotal(pos, legs);
 
     return computeExitMetrics({
       boxWidth: pos.box_width,
@@ -204,35 +212,22 @@ export class BoxPositionMonitor {
       currentExitChargesTotal: exitChargesTotal,
       legs,
       now,
+      direction,
+      entryEdge: pos.entry_gross_edge,
+      executionCost: this.deps.cfg.expectedExitSlippage,
+      openedAt: pos.opened_at,
+      expirySafety: this.isInExpirySafetyWindow(pos),
       cfg: this.deps.cfg,
     });
-  }
-
-  private exitChargeLegs(
-    pos: BoxOpenPosition,
-    legs: BoxLegEvaluation[],
-  ): BoxChargeLeg[] | null {
-    return buildChargeLegsFromEvaluations(pos.legs, legs, pos.quantity);
-  }
-
-  private cachedExitChargesTotal(
-    pos: BoxOpenPosition,
-    legs: BoxLegEvaluation[],
-  ): number | null {
-    const chargeLegs = this.exitChargeLegs(pos, legs);
-    if (chargeLegs) {
-      const cached = this.deps.charges.peek(`exitq:${pos.id}`, chargeLegs);
-      if (cached) return cached.entry_total;
-    }
-    return pos.estimated_exit_charges_total;
   }
 
   private async evaluatePosition(pos: BoxOpenPosition): Promise<void> {
     const now = Date.now();
     let metrics = this.measure(pos, now);
     pos.metrics = metrics;
+    pos.current_captured_edge = metrics.captured_edge;
+    pos.current_captured_pct = metrics.captured_pct;
 
-    // Slow, non-hot-path persistence of the live convergence figure.
     if (now - pos.last_persist_at >= this.deps.cfg.persistIntervalMs) {
       pos.last_persist_at = now;
       void this.deps.persistLive(pos);
@@ -240,12 +235,9 @@ export class BoxPositionMonitor {
 
     if (pos.closing || this.closingIds.has(pos.id)) return;
 
-    // Outside market hours there is nothing to close into. The position stays
-    // open with its metrics refreshed, and no exit — or exit-refusal — is
-    // recorded, because "the market is shut" is not a liquidity event.
+    // Outside market hours / dead feed: refresh metrics, attempt nothing. Neither
+    // is a liquidity event.
     if (!this.deps.isMarketOpen()) return;
-    // Same for a dead feed: acting on books of unknown age would be worse than
-    // waiting, and it is not a liquidity event either.
     if (!this.deps.isFeedHealthy()) return;
 
     const expirySafety = this.isInExpirySafetyWindow(pos);
@@ -259,162 +251,171 @@ export class BoxPositionMonitor {
       );
     }
 
-    // Act on what the RULES say, not on whether the market can fill it. A box
-    // that should close but cannot has to be recorded (EXIT_SKIPPED_LIQUIDITY)
-    // rather than silently skipped, which is why `rule_reason` is consulted here
-    // instead of the combined `exit_eligible`.
-    if (metrics.rule_reason === null && !expirySafety) {
+    const decision = metrics.decision;
+    // Nothing to do: no rule fired and we are not in the expiry window.
+    if (decision.rule_reason === null && !expirySafety) {
       if (pos.exit_blocked_reason) pos.exit_blocked_reason = null;
+      this.lastBlockedKey.delete(pos.id);
       return;
     }
 
-    // Charge pricing is the only network work before an exit. If the touch moves
-    // during it, price the new exact orders and capture all four WS books again.
-    let chargeInput = this.exitChargeLegs(pos, metrics.legs);
-    let pricedExitCharges: BoxCharges | null = null;
-    let stable = false;
-    const MAX_PRICE_ATTEMPTS = 3;
-    for (let attempt = 1; attempt <= MAX_PRICE_ATTEMPTS; attempt++) {
-      pricedExitCharges = chargeInput
-        ? await this.deps.charges.estimateExitOnly(`exitq:${pos.id}`, chargeInput)
-        : null;
+    const reason: BoxExitReason | null =
+      decision.rule_reason ?? (expirySafety ? "EXPIRY_SAFETY" : null);
+    if (!reason) return;
 
-      if (pos.closing || this.closingIds.has(pos.id)) return;
-      if (this.deps.positions.get(pos.id) !== pos) return;
-      if (!this.deps.isMarketOpen() || !this.deps.isFeedHealthy()) return;
+    // The rules want to close. Does the CURRENT touch support one whole lot?
+    if (!exitLiquidityOk(metrics.legs)) {
+      this.recordLiquiditySkip(pos, metrics);
+      return;
+    }
 
-      const finalNow = Date.now();
-      const finalLegs = evaluateExitLegs({
-        legs: BOX_LEG_ROLES.map((role) => ({ role, inst: pos.legs[role] })),
-        quotes: this.deps.quotes.view(),
-        lotSize: pos.lot_size,
-        now: finalNow,
-        maxAgeMs: this.deps.cfg.quoteMaxAgeMs,
+    // For a convergence/profit exit the net P&L must still be genuinely positive.
+    // Expiry safety overrides profitability but still refuses invented prices.
+    if (reason !== "EXPIRY_SAFETY") {
+      if (metrics.current_net_pnl === null || metrics.current_net_pnl <= 0) return;
+      if (decision.rule_reason === null) return;
+    }
+
+    await this.runExit(pos, metrics, reason, expirySafety);
+  }
+
+  /**
+   * Simulate the exit fill, then persist it.
+   *
+   * paper_latency: the simulator waits the decision + latency delay and fills from
+   * the first post-arrival WS book, re-validating that the exit still makes sense
+   * on those prices. paper_touch: it fills at the current touch immediately.
+   */
+  private async runExit(
+    pos: BoxOpenPosition,
+    detectionMetrics: BoxExitMetrics,
+    reason: BoxExitReason,
+    expirySafety: boolean,
+  ): Promise<void> {
+    if (this.closingIds.has(pos.id)) return;
+    this.closingIds.add(pos.id);
+    pos.closing = true;
+    let handed = false;
+
+    try {
+      const result = await this.deps.executionSim.simulateExit({
+        position: pos,
+        detectionLegs: detectionMetrics.legs,
+        detectedAt: detectionMetrics.at,
+        stillWanted: () =>
+          this.deps.positions.get(pos.id) !== undefined &&
+          this.deps.isMarketOpen() &&
+          this.deps.isFeedHealthy(),
+        validate: (legs) => {
+          // Re-derive the decision on the EXECUTED prices with local charges.
+          const exitTotal = this.localExitChargesTotal(pos, legs);
+          const m = computeExitMetrics({
+            boxWidth: pos.box_width,
+            lotSize: pos.lot_size,
+            entryBoxCostPerUnit: pos.entry_box_cost_per_unit,
+            entryNetEdge: pos.entry_net_edge,
+            entryChargesTotal: pos.entry_charges_total,
+            currentExitChargesTotal: exitTotal,
+            legs,
+            now: Date.now(),
+            direction: pos.direction ?? "LONG_BOX",
+            entryEdge: pos.entry_gross_edge,
+            executionCost: this.deps.cfg.expectedExitSlippage,
+            openedAt: pos.opened_at,
+            expirySafety,
+            cfg: this.deps.cfg,
+          });
+          if (!exitLiquidityOk(legs)) {
+            return { ok: false as const, reason: "insufficient_quantity" as const, detail: "exit touch cannot fill one lot" };
+          }
+          if (!expirySafety) {
+            const stillWants = m.decision.rule_reason !== null;
+            const profitable = m.current_net_pnl !== null && m.current_net_pnl > 0;
+            if (!stillWants || !profitable) {
+              return { ok: false as const, reason: "edge_disappeared" as const, detail: "the exit no longer nets a profit at the executed touch" };
+            }
+          }
+          return { ok: true as const };
+        },
       });
-      metrics = computeExitMetrics({
+
+      if (!result.ok) {
+        // The fill could not happen at post-latency prices. In paper_touch this is
+        // effectively immediate; in paper_latency the book moved away. Either way
+        // the position stays open and the reason is recorded (deduped).
+        this.stats.exitsFailedExecution++;
+        const fresh = this.measure(pos, Date.now());
+        pos.metrics = fresh;
+        if (!exitLiquidityOk(fresh.legs)) this.recordLiquiditySkip(pos, fresh);
+        pos.closing = false;
+        return;
+      }
+
+      // The executed legs are the fill. Price them locally and build the final
+      // metrics the trade is closed on.
+      const exitCharges = this.localExitCharges(pos, result.legs);
+      const exitTotal = exitCharges ? exitCharges.total : this.localExitChargesTotal(pos, result.legs);
+      const finalMetrics = computeExitMetrics({
         boxWidth: pos.box_width,
         lotSize: pos.lot_size,
         entryBoxCostPerUnit: pos.entry_box_cost_per_unit,
         entryNetEdge: pos.entry_net_edge,
         entryChargesTotal: pos.entry_charges_total,
-        currentExitChargesTotal: pricedExitCharges
-          ? round2(pricedExitCharges.total)
-          : this.cachedExitChargesTotal(pos, finalLegs),
-        legs: finalLegs,
-        now: finalNow,
+        currentExitChargesTotal: exitTotal,
+        legs: result.legs,
+        now: Date.now(),
+        direction: pos.direction ?? "LONG_BOX",
+        entryEdge: pos.entry_gross_edge,
+        executionCost: this.deps.cfg.expectedExitSlippage,
+        openedAt: pos.opened_at,
+        expirySafety,
         cfg: this.deps.cfg,
       });
-      pos.metrics = metrics;
+      pos.metrics = finalMetrics;
 
-      const tentativeReason =
-        metrics.rule_reason ?? (expirySafety ? "EXPIRY_SAFETY" : null);
-      // No fill will be persisted, so fee/fill synchronization is irrelevant.
-      if (!tentativeReason || !exitLiquidityOk(finalLegs)) {
-        stable = true;
-        break;
-      }
-
-      const finalChargeLegs = this.exitChargeLegs(pos, finalLegs);
-      if (
-        pricedExitCharges &&
-        chargeInput &&
-        finalChargeLegs &&
-        !sameChargeLegs(chargeInput, finalChargeLegs)
-      ) {
-        if (attempt === MAX_PRICE_ATTEMPTS) return;
-        chargeInput = finalChargeLegs;
-        continue;
-      }
-      stable = true;
-      break;
-    }
-    if (!stable) return;
-
-    const reason: BoxExitReason | null =
-      metrics.rule_reason ?? (expirySafety ? "EXPIRY_SAFETY" : null);
-    if (!reason) return;
-
-    // EXIT QUANTITY: all four reversed legs must again support one whole lot at
-    // the touch. If they do not, the exit is NOT faked — the position stays open
-    // and the condition is recorded.
-    if (!exitLiquidityOk(metrics.legs)) {
-      this.stats.exitsSkippedLiquidity++;
-      const detail = describeLiquidityGap(metrics.legs, pos.lot_size);
-      // Deduped on a STABLE key rather than the message: the human-readable
-      // detail embeds the current age and size, which change every cycle, so
-      // comparing messages would append a near-identical ledger row every second.
-      const key = liquidityGapKey(metrics.legs, pos.lot_size);
-      if (this.lastBlockedKey.get(pos.id) !== key) {
-        this.lastBlockedKey.set(pos.id, key);
-        pos.exit_blocked_reason = detail;
-        this.deps.onEvent("EXIT_SKIPPED_LIQUIDITY", pos, metrics, detail);
-      } else {
-        // Keep the displayed reason current without writing to the ledger again.
-        pos.exit_blocked_reason = detail;
-      }
-      return;
-    }
-
-    // For a convergence/profit exit the net P&L must still be genuinely positive
-    // after the freshly priced charges. Expiry safety is the one case where an
-    // exit is attempted regardless of profitability — an abandoned box at expiry
-    // is a far worse outcome — but it still refuses to invent prices.
-    if (reason !== "EXPIRY_SAFETY") {
-      if (metrics.current_net_pnl === null || metrics.current_net_pnl <= 0) return;
-      if (!metrics.exit_eligible) return;
-    }
-    // Clear any earlier blockage now that the exit is actually going through.
-    pos.exit_blocked_reason = null;
-    this.lastBlockedKey.delete(pos.id);
-
-    await this.executeExit(pos, metrics, reason, pricedExitCharges);
-  }
-
-  /** Perform the paper exit at the current executable touch. */
-  private async executeExit(
-    pos: BoxOpenPosition,
-    metrics: BoxExitMetrics,
-    reason: BoxExitReason,
-    exitCharges: BoxCharges | null,
-    alreadyClaimed = false,
-  ): Promise<void> {
-    if (!alreadyClaimed) {
-      if (this.closingIds.has(pos.id)) return;
-      this.closingIds.add(pos.id);
-      pos.closing = true;
-    }
-    try {
+      pos.exit_blocked_reason = null;
+      this.lastBlockedKey.delete(pos.id);
       this.stats.exitsTriggered++;
-      this.deps.onEvent("EXIT_TRIGGERED", pos, metrics, reason);
+      this.deps.onEvent("EXIT_TRIGGERED", pos, finalMetrics, reason);
 
-      // `metrics` is the final immutable WS snapshot. Charge pricing happened
-      // before it; there is deliberately no network await here before the engine
-      // constructs and persists the paper fill.
+      handed = true;
       const closed = await this.deps.closePaperTrade({
         position: pos,
-        metrics,
+        metrics: finalMetrics,
         exitCharges,
         reason,
+        execution: result.record,
       });
-      if (!closed) {
-        // Someone else closed it first (manual close). Leave the book to them.
-        pos.closing = false;
-      }
+      if (!closed) pos.closing = false;
     } catch (err) {
-      pos.closing = false;
       console.warn("[Box] exit failed for", pos.id, err);
-      this.deps.onEvent("ERROR", pos, metrics, `exit failed: ${String(err)}`);
+      this.deps.onEvent("ERROR", pos, pos.metrics, `exit failed: ${String(err)}`);
+      pos.closing = false;
     } finally {
       this.closingIds.delete(pos.id);
+      if (!handed) pos.closing = false;
+    }
+  }
+
+  private recordLiquiditySkip(pos: BoxOpenPosition, metrics: BoxExitMetrics): void {
+    this.stats.exitsSkippedLiquidity++;
+    const detail = describeLiquidityGap(metrics.legs, pos.lot_size);
+    const key = liquidityGapKey(metrics.legs, pos.lot_size);
+    if (this.lastBlockedKey.get(pos.id) !== key) {
+      this.lastBlockedKey.set(pos.id, key);
+      pos.exit_blocked_reason = detail;
+      this.deps.onEvent("EXIT_SKIPPED_LIQUIDITY", pos, metrics, detail);
+    } else {
+      pos.exit_blocked_reason = detail;
     }
   }
 
   /**
    * Manual close, driven by the UI.
    *
-   * Uses the same executable touch prices as an automatic close. When the
-   * four-leg one-lot market is unavailable it REFUSES rather than inventing
-   * prices, and says why.
+   * Uses the same executable touch as an automatic close, priced with the local
+   * calculator. Refuses rather than inventing prices when the four-leg one-lot
+   * market is unavailable, and says why.
    */
   async closeManually(
     id: string,
@@ -434,7 +435,6 @@ export class BoxPositionMonitor {
         code: 409,
       };
     }
-
     if (!this.deps.isMarketOpen()) {
       return {
         ok: false,
@@ -466,92 +466,84 @@ export class BoxPositionMonitor {
       };
     }
 
-    // Claim before charge I/O so an automatic evaluation cannot race this manual
-    // request. The fill itself is still captured only after the I/O completes.
+    // Claim before the simulated fill so an automatic evaluation cannot race it.
     this.closingIds.add(id);
     pos.closing = true;
-    let handedToExecute = false;
+    let handed = false;
     try {
-      let metrics = first;
-      let chargeInput = this.exitChargeLegs(pos, first.legs);
-      let priced: BoxCharges | null = null;
-      const MAX_PRICE_ATTEMPTS = 3;
-      let stable = false;
+      const result = await this.deps.executionSim.simulateExit({
+        position: pos,
+        detectionLegs: first.legs,
+        detectedAt: first.at,
+        stillWanted: () => this.deps.isMarketOpen() && this.deps.isFeedHealthy(),
+        validate: (legs) =>
+          exitLiquidityOk(legs)
+            ? { ok: true as const }
+            : { ok: false as const, reason: "insufficient_quantity" as const, detail: "exit touch cannot fill one lot" },
+      });
 
-      for (let attempt = 1; attempt <= MAX_PRICE_ATTEMPTS; attempt++) {
-        priced = chargeInput
-          ? await this.deps.charges.estimateExitOnly(`exitq:${pos.id}`, chargeInput)
-          : null;
-
-        if (!this.deps.isMarketOpen() || !this.deps.isFeedHealthy()) {
-          return {
-            ok: false,
-            error: "Cannot close because the live WebSocket market data became unavailable. The position is still open.",
-            metrics: pos.metrics,
-            code: 409,
-          };
+      if (!result.ok) {
+        const fresh = this.measure(pos, Date.now());
+        pos.metrics = fresh;
+        const detail = result.detail;
+        if (!exitLiquidityOk(fresh.legs)) {
+          pos.exit_blocked_reason = describeLiquidityGap(fresh.legs, pos.lot_size);
+          this.deps.onEvent("EXIT_SKIPPED_LIQUIDITY", pos, fresh, `manual close refused: ${pos.exit_blocked_reason}`);
         }
-
-        metrics = this.measure(
-          pos,
-          Date.now(),
-          priced ? round2(priced.total) : undefined,
-        );
-        pos.metrics = metrics;
-        if (!exitLiquidityOk(metrics.legs)) {
-          const detail = describeLiquidityGap(metrics.legs, pos.lot_size);
-          pos.exit_blocked_reason = detail;
-          this.deps.onEvent("EXIT_SKIPPED_LIQUIDITY", pos, metrics, `manual close refused after revalidation: ${detail}`);
-          return {
-            ok: false,
-            error: `Cannot close at an executable price right now: ${detail}. The position is still open and being monitored.`,
-            metrics,
-            code: 409,
-          };
-        }
-
-        const finalChargeLegs = this.exitChargeLegs(pos, metrics.legs);
-        if (priced && chargeInput && finalChargeLegs && !sameChargeLegs(chargeInput, finalChargeLegs)) {
-          if (attempt === MAX_PRICE_ATTEMPTS) {
-            return {
-              ok: false,
-              error: "Cannot close because the executable touch is moving faster than charges can be priced. Please retry; the position remains monitored.",
-              metrics,
-              code: 409,
-            };
-          }
-          chargeInput = finalChargeLegs;
-          continue;
-        }
-        stable = true;
-        break;
-      }
-      if (!stable) {
         return {
           ok: false,
-          error: "Could not obtain a stable executable touch. The position remains monitored.",
-          metrics,
+          error: `Cannot close at an executable price right now: ${detail}. The position is still open and being monitored.`,
+          metrics: fresh,
           code: 409,
         };
       }
 
-      // `metrics` and `priced` now describe the same exact order prices. There is
-      // no further external await before the engine constructs the stored fill.
-      handedToExecute = true;
-      await this.executeExit(pos, metrics, "MANUAL", priced, true);
+      const exitCharges = this.localExitCharges(pos, result.legs);
+      const exitTotal = exitCharges ? exitCharges.total : this.localExitChargesTotal(pos, result.legs);
+      const metrics = computeExitMetrics({
+        boxWidth: pos.box_width,
+        lotSize: pos.lot_size,
+        entryBoxCostPerUnit: pos.entry_box_cost_per_unit,
+        entryNetEdge: pos.entry_net_edge,
+        entryChargesTotal: pos.entry_charges_total,
+        currentExitChargesTotal: exitTotal,
+        legs: result.legs,
+        now: Date.now(),
+        direction: pos.direction ?? "LONG_BOX",
+        entryEdge: pos.entry_gross_edge,
+        executionCost: this.deps.cfg.expectedExitSlippage,
+        openedAt: pos.opened_at,
+        expirySafety: this.isInExpirySafetyWindow(pos),
+        cfg: this.deps.cfg,
+      });
+      pos.metrics = metrics;
+
+      this.stats.exitsTriggered++;
+      this.deps.onEvent("EXIT_TRIGGERED", pos, metrics, "MANUAL");
+      handed = true;
+      const closed = await this.deps.closePaperTrade({
+        position: pos,
+        metrics,
+        exitCharges,
+        reason: "MANUAL",
+        execution: result.record,
+      });
+      if (!closed) {
+        pos.closing = false;
+        return {
+          ok: false,
+          error: "That box position was already closed.",
+          metrics,
+          code: 409,
+        };
+      }
       return { ok: true };
     } finally {
-      if (!handedToExecute) {
-        pos.closing = false;
-        this.closingIds.delete(id);
-      }
+      this.closingIds.delete(id);
+      if (!handed) pos.closing = false;
     }
   }
 
-  /**
-   * True once a position is inside the expiry-safety window: its expiry is today
-   * and the close is near. Positions must not be left to be abandoned at expiry.
-   */
   private isInExpirySafetyWindow(pos: BoxOpenPosition): boolean {
     if (pos.expiry !== this.deps.istDayKey()) return false;
     const minutes = this.deps.istMinutesOfDay();
@@ -560,11 +552,8 @@ export class BoxPositionMonitor {
 }
 
 /**
- * A STABLE identity for the shape of a liquidity gap: which legs are blocked and
+ * A STABLE identity for the SHAPE of a liquidity gap: which legs are blocked and
  * why, with no volatile numbers in it.
- *
- * Used to decide whether a blockage is genuinely new and worth another ledger
- * row, as opposed to the same problem reported a second later.
  */
 export function liquidityGapKey(legs: BoxLegEvaluation[], lotSize: number): string {
   const parts: string[] = [];
@@ -588,13 +577,9 @@ export function describeLiquidityGap(legs: BoxLegEvaluation[], lotSize: number):
     } else if (!l.fresh) {
       problems.push(`${l.tradingsymbol} book is stale (${l.age_ms ?? "?"}ms)`);
     } else if (l.price === null || !(l.price > 0)) {
-      problems.push(
-        `${l.tradingsymbol} has no ${l.side === "BUY" ? "ask" : "bid"}`,
-      );
+      problems.push(`${l.tradingsymbol} has no ${l.side === "BUY" ? "ask" : "bid"}`);
     } else if (l.qty_at_touch < lotSize) {
-      problems.push(
-        `${l.tradingsymbol} shows ${l.qty_at_touch} at ${l.price} (needs ${lotSize})`,
-      );
+      problems.push(`${l.tradingsymbol} shows ${l.qty_at_touch} at ${l.price} (needs ${lotSize})`);
     }
   }
   return problems.length > 0 ? problems.join("; ") : "insufficient touch liquidity";

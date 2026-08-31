@@ -7,7 +7,7 @@
  */
 
 import { candidateKey } from "./math.js";
-import type { BoxEventLeg, BoxLegEvaluation, IBoxTrade } from "./types.js";
+import { directionOf, type BoxEventLeg, type BoxLegEvaluation, type IBoxTrade } from "./types.js";
 
 /** A stored box document plus whatever id shape the driver returned. */
 export interface BoxTradeDocLike extends IBoxTrade {
@@ -23,6 +23,8 @@ export function serializeBoxTrade(doc: BoxTradeDocLike) {
     name: doc.name,
     is_index: doc.is_index,
     expiry: doc.expiry,
+    // Old documents have no direction: they are all long boxes.
+    direction: directionOf(doc),
     lower_strike: doc.lower_strike,
     upper_strike: doc.upper_strike,
     lot_size: doc.lot_size,
@@ -43,6 +45,8 @@ export function serializeBoxTrade(doc: BoxTradeDocLike) {
       entry_ask_qty: l.entry_ask_qty,
       entry_quote_at: l.entry_quote_at ? l.entry_quote_at.toISOString() : null,
       entry_depth: l.entry_depth ?? null,
+      detected_price: l.detected_price ?? null,
+      entry_slippage: l.entry_slippage ?? null,
       exit_price: l.exit_price,
       exit_bid: l.exit_bid,
       exit_bid_qty: l.exit_bid_qty,
@@ -50,6 +54,8 @@ export function serializeBoxTrade(doc: BoxTradeDocLike) {
       exit_ask_qty: l.exit_ask_qty,
       exit_quote_at: l.exit_quote_at ? l.exit_quote_at.toISOString() : null,
       exit_depth: l.exit_depth ?? null,
+      exit_detected_price: l.exit_detected_price ?? null,
+      exit_slippage: l.exit_slippage ?? null,
     })),
     box_width: doc.box_width,
     margin: doc.margin ?? null,
@@ -59,8 +65,17 @@ export function serializeBoxTrade(doc: BoxTradeDocLike) {
     estimated_exit_charges: doc.estimated_exit_charges ?? null,
     safety_buffer: doc.safety_buffer,
     entry_net_edge: doc.entry_net_edge,
+    expected_net_profit: doc.expected_net_profit ?? null,
+    entry_execution_cost: doc.entry_execution_cost ?? null,
+    charge_origin: doc.charge_origin ?? "local",
+    entry_charge_reconciliation: doc.entry_charge_reconciliation ?? null,
+    exit_charge_reconciliation: doc.exit_charge_reconciliation ?? null,
+    entry_execution: doc.entry_execution ?? null,
+    exit_execution: doc.exit_execution ?? null,
     opened_at: doc.opened_at.toISOString(),
     current_remaining_edge: doc.current_remaining_edge,
+    current_captured_edge: doc.current_captured_edge ?? null,
+    current_captured_pct: doc.current_captured_pct ?? null,
     exit_box_value: doc.exit_box_value,
     exit_charges: doc.exit_charges ?? null,
     gross_pnl: doc.gross_pnl,
@@ -77,14 +92,15 @@ export function serializeBoxTrade(doc: BoxTradeDocLike) {
 
 export type SerializedBoxTrade = ReturnType<typeof serializeBoxTrade>;
 
-/** The candidate key of a stored trade (underlying|expiry|K1|K2). */
+/** The candidate key of a stored trade (underlying|expiry|K1|K2|DIRECTION). */
 export function tradeKey(t: {
   underlying: string;
   expiry: string;
   lower_strike: number;
   upper_strike: number;
+  direction?: string | null;
 }): string {
-  return candidateKey(t.underlying, t.expiry, t.lower_strike, t.upper_strike);
+  return candidateKey(t.underlying, t.expiry, t.lower_strike, t.upper_strike, directionOf(t as never));
 }
 
 /** Per-leg quote snapshot for the append-only ledger. */

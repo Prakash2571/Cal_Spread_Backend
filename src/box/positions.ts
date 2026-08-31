@@ -15,6 +15,9 @@
  */
 
 import type {
+  BoxChargeOrigin,
+  BoxDirection,
+  BoxExecutionRecord,
   BoxExitMetrics,
   BoxLegRole,
   BoxOptionInstrument,
@@ -24,25 +27,43 @@ import type {
 /** One live box position, as the monitor sees it. */
 export interface BoxOpenPosition {
   id: string;
-  /** underlying|expiry|K1|K2 */
+  /** underlying|expiry|K1|K2|DIRECTION */
   key: string;
   underlying: string;
   name: string;
   is_index: boolean;
   expiry: string;
+  /**
+   * Which way the box was traded.
+   *
+   * Optional so a position adopted from a document written before short boxes
+   * existed still loads; every reader resolves an absent value to LONG_BOX.
+   */
+  direction?: BoxDirection;
   lower_strike: number;
   upper_strike: number;
   box_width: number;
   lot_size: number;
   quantity: number;
 
-  /** The per-unit cost the four legs were actually filled at. */
+  /**
+   * The signed net debit per unit the four legs were actually filled at:
+   * positive for a long box (money paid), negative for a short box (credit taken).
+   */
   entry_box_cost_per_unit: number;
   entry_gross_edge: number;
   entry_net_edge: number;
   entry_charges_total: number | null;
   estimated_exit_charges_total: number | null;
   safety_buffer: number;
+  /** The decisive entry figure: expected net profit after every cost. */
+  expected_net_profit?: number | null;
+  /** Execution/slippage cost carried into that decision (₹). */
+  entry_execution_cost?: number | null;
+  /** Whether the entry charge numbers are local or Zerodha-verified. */
+  charge_origin?: BoxChargeOrigin;
+  /** The detection → execution audit record of the entry. */
+  entry_execution?: BoxExecutionRecord | null;
   /** Net basket margin the four legs block, captured at entry (₹), or null. */
   margin: number | null;
 
@@ -53,6 +74,9 @@ export interface BoxOpenPosition {
 
   /** Newest exit arithmetic, refreshed by the monitor. */
   metrics: BoxExitMetrics | null;
+  /** Latest captured-edge figures, refreshed by the monitor for persistence. */
+  current_captured_edge?: number | null;
+  current_captured_pct?: number | null;
   /** Set when an automatic exit was wanted but the touch could not fill it. */
   exit_blocked_reason: string | null;
   expiry_safety: boolean;

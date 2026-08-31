@@ -17,7 +17,7 @@
 
 import type { BoxConfig } from "./config.js";
 import { round2 } from "./math.js";
-import { BOX_ENTRY_SIDES, BOX_LEG_ROLES, type BoxCandidate, type BoxLegEvaluation } from "./types.js";
+import { BOX_LEG_ROLES, type BoxCandidate, type BoxLegEvaluation } from "./types.js";
 import type { BoxChargeEstimate, BoxCharges } from "./types.js";
 
 /** The leg shape the injected estimator expects (mirrors index.ts's ChargeLeg). */
@@ -51,8 +51,11 @@ export function reverseBoxLegs(legs: BoxChargeLeg[]): BoxChargeLeg[] {
 }
 
 /**
- * The four entry orders of a long box, priced at the touch each leg would fill
- * at. `evaluations` must be the entry-side evaluation (BUY→ask, SELL→bid).
+ * The four entry orders of a box, priced at the touch each leg would fill at.
+ *
+ * The SIDES COME FROM THE EVALUATION, never from a hardcoded long-box map: the
+ * evaluation was produced for a specific direction, so reading its sides is what
+ * makes a short box charge its own orders rather than a long box's.
  */
 export function buildEntryChargeLegs(
   candidate: BoxCandidate,
@@ -65,7 +68,7 @@ export function buildEntryChargeLegs(
     const inst = candidate.legs[role];
     if (!ev || ev.price === null || !(ev.price > 0)) return null;
     legs.push({
-      side: BOX_ENTRY_SIDES[role],
+      side: ev.side,
       token: inst.token,
       expiry: inst.expiry,
       tradingsymbol: inst.tradingsymbol,
@@ -248,6 +251,18 @@ export class BoxChargeEstimator {
     } finally {
       this.active--;
     }
+  }
+
+  /**
+   * Price one exact group of orders through Zerodha.
+   *
+   * Used by the asynchronous reconciler to check the local calculator's arithmetic
+   * AFTER a paper fill. It is deliberately the same cached, concurrency-limited
+   * path as everything else here, so verification cannot turn into a request
+   * storm against Kite.
+   */
+  async priceOrders(cacheKey: string, legs: BoxChargeLeg[]): Promise<BoxCharges | null> {
+    return this.estimateExitOnly(cacheKey, legs);
   }
 
   /**

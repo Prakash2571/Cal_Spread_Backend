@@ -95,7 +95,24 @@ const boxChargesSchema = new mongoose.Schema<BoxCharges>(
     gst: { type: Number, default: 0 },
     total: { type: Number, default: 0 },
     source: { type: String, enum: ["kite", "kite_estimate"], default: "kite" },
+    // Who produced the figures. Nullable/defaulted so old documents load; a value
+    // of "local" makes clear the number was not Zerodha-confirmed.
+    computed_by: { type: String, enum: ["local", "kite", "local_verified"], default: "local" },
     at: { type: Date, default: () => new Date() },
+  },
+  { _id: false },
+);
+
+/** The verdict of an asynchronous Zerodha reconciliation against local maths. */
+const chargeReconciliationSchema = new mongoose.Schema(
+  {
+    status: { type: String, enum: ["pending", "verified", "failed"], default: "pending" },
+    local_total: { type: Number, default: null },
+    reconciled_total: { type: Number, default: null },
+    abs_diff: { type: Number, default: null },
+    pct_diff: { type: Number, default: null },
+    at: { type: Date, default: null },
+    error: { type: String, default: null },
   },
   { _id: false },
 );
@@ -124,6 +141,9 @@ const boxLegSchema = new mongoose.Schema<IBoxLeg>(
     entry_ask_qty: { type: Number, default: 0 },
     entry_quote_at: { type: Date, default: null },
     entry_depth: { type: depthSnapshotSchema, default: null },
+    // The touch DETECTED before the simulated latency, and the resulting slippage.
+    detected_price: { type: Number, default: null },
+    entry_slippage: { type: Number, default: null },
 
     exit_price: { type: Number, default: null },
     exit_bid: { type: Number, default: null },
@@ -132,6 +152,8 @@ const boxLegSchema = new mongoose.Schema<IBoxLeg>(
     exit_ask_qty: { type: Number, default: null },
     exit_quote_at: { type: Date, default: null },
     exit_depth: { type: depthSnapshotSchema, default: null },
+    exit_detected_price: { type: Number, default: null },
+    exit_slippage: { type: Number, default: null },
   },
   { _id: false },
 );
@@ -140,14 +162,20 @@ const scannerConfigSchema = new mongoose.Schema(
   {
     min_gross_edge: { type: Number, default: 0 },
     min_net_edge: { type: Number, default: 0 },
+    min_expected_net_profit: { type: Number, default: 0 },
     safety_buffer: { type: Number, default: 0 },
+    expected_entry_slippage: { type: Number, default: 0 },
+    expected_exit_slippage: { type: Number, default: 0 },
     quote_max_age_ms: { type: Number, default: 0 },
     strikes_each_side: { type: Number, default: 3 },
     convergence_floor: { type: Number, default: 0 },
     convergence_pct: { type: Number, default: 0 },
     min_exit_net_pnl: { type: Number, default: 0 },
     profit_capture_pct: { type: Number, default: 0 },
+    min_captured_pct: { type: Number, default: 0 },
     execution_mode: { type: String, default: "paper_touch" },
+    simulated_decision_ms: { type: Number, default: 0 },
+    simulated_latency_ms: { type: Number, default: 0 },
   },
   { _id: false },
 );
@@ -157,12 +185,15 @@ const scannerConfigSchema = new mongoose.Schema(
 const boxTradeSchema = new mongoose.Schema<IBoxTrade>(
   {
     // Never "live" — this module never places an exchange order.
-    execution_mode: { type: String, enum: ["paper_touch"], default: "paper_touch" },
+    execution_mode: { type: String, enum: ["paper_touch", "paper_latency"], default: "paper_touch" },
 
     underlying: { type: String, required: true, index: true },
     name: { type: String, default: "" },
     is_index: { type: Boolean, default: false },
     expiry: { type: String, required: true },
+
+    // Absent on documents written before short boxes existed → read as LONG_BOX.
+    direction: { type: String, enum: ["LONG_BOX", "SHORT_BOX"], default: "LONG_BOX" },
 
     lower_strike: { type: Number, required: true },
     upper_strike: { type: Number, required: true },
@@ -191,9 +222,23 @@ const boxTradeSchema = new mongoose.Schema<IBoxTrade>(
     safety_buffer: { type: Number, default: 0 },
     entry_net_edge: { type: Number, required: true },
 
+    // The decisive entry figure and the cost terms behind it (all defaulted).
+    expected_net_profit: { type: Number, default: null },
+    entry_execution_cost: { type: Number, default: null },
+    charge_origin: { type: String, enum: ["local", "kite", "local_verified"], default: "local" },
+    entry_charge_reconciliation: { type: chargeReconciliationSchema, default: null },
+    exit_charge_reconciliation: { type: chargeReconciliationSchema, default: null },
+    // Full detection→execution audit records. Mixed keeps the rich nested shape
+    // (per-leg slippage, both depth snapshots, quote versions) without a schema
+    // the size of the type — it is an append-only audit blob, never queried on.
+    entry_execution: { type: mongoose.Schema.Types.Mixed, default: null },
+    exit_execution: { type: mongoose.Schema.Types.Mixed, default: null },
+
     opened_at: { type: Date, default: () => new Date() },
 
     current_remaining_edge: { type: Number, default: null },
+    current_captured_edge: { type: Number, default: null },
+    current_captured_pct: { type: Number, default: null },
 
     exit_box_value: { type: Number, default: null },
     exit_charges: { type: boxChargesSchema, default: null },
@@ -220,19 +265,25 @@ const boxTradeSchema = new mongoose.Schema<IBoxTrade>(
 );
 
 /**
- * One OPEN box per exact strike pair.
+ * One OPEN box per exact strike pair AND DIRECTION.
  *
  * The partial unique index is the atomic half of duplicate protection: even if
- * two ticks race past the in-memory guard, the second insert is rejected by
- * Mongo rather than creating a second position on the same box. Closed trades
- * are excluded so the same strike pair can be traded again later.
+ * two ticks race past the in-memory guard, the second insert is rejected by Mongo
+ * rather than creating a second position on the same box. Closed trades are
+ * excluded so the same box can be traded again later.
+ *
+ * `direction` is part of the key so a LONG_BOX and a SHORT_BOX on the same strikes
+ * are distinct positions. NOTE for existing deployments: an older
+ * `box_open_unique_pair` index (without `direction`) should be dropped so the two
+ * directions can be open at once; until it is, the second direction's insert is
+ * safely rejected as a duplicate rather than causing any error.
  */
 boxTradeSchema.index(
-  { underlying: 1, expiry: 1, lower_strike: 1, upper_strike: 1 },
+  { underlying: 1, expiry: 1, lower_strike: 1, upper_strike: 1, direction: 1 },
   {
     unique: true,
     partialFilterExpression: { status: "open" },
-    name: "box_open_unique_pair",
+    name: "box_open_unique_pair_dir",
   },
 );
 
@@ -281,6 +332,7 @@ const boxTradeEventSchema = new mongoose.Schema<IBoxTradeEvent>(
     candidate_key: { type: String, default: "", index: true },
     underlying: { type: String, default: "" },
     expiry: { type: String, default: "" },
+    direction: { type: String, enum: ["LONG_BOX", "SHORT_BOX"], default: "LONG_BOX" },
     lower_strike: { type: Number, default: 0 },
     upper_strike: { type: Number, default: 0 },
     lot_size: { type: Number, default: 0 },
@@ -294,9 +346,14 @@ const boxTradeEventSchema = new mongoose.Schema<IBoxTradeEvent>(
     exit_charges_total: { type: Number, default: null },
     safety_buffer: { type: Number, default: null },
     net_edge: { type: Number, default: null },
+    expected_net_profit: { type: Number, default: null },
+    execution_cost: { type: Number, default: null },
     gross_pnl: { type: Number, default: null },
     net_pnl: { type: Number, default: null },
     remaining_edge: { type: Number, default: null },
+    captured_edge: { type: Number, default: null },
+    captured_pct: { type: Number, default: null },
+    execution: { type: mongoose.Schema.Types.Mixed, default: null },
 
     legs: { type: [boxEventLegSchema], default: [] },
     reason: { type: String, default: null },

@@ -1,40 +1,46 @@
 /**
  * The box scanner: the event-driven discovery and paper-entry path.
  *
- *   Kite WebSocket → quote map → affected candidates → fast local calculation
- *   → liquidity/freshness validation → charge validation → paper trade
+ *   Kite WebSocket → quote map → affected candidates → fast LOCAL calculation
+ *   → net-profit qualification → simulated execution → paper trade
  *
- * Nothing in this path touches MongoDB, and nothing waits on the frontend. A
- * tick affects only the candidates that actually reference the token that moved:
- * a token is one leg of at most six of an underlying's 21 strike pairs, so a tick
- * costs six evaluations, not a chain scan.
+ * Nothing on the qualification path touches MongoDB, and nothing waits on the
+ * frontend OR on Zerodha. Charges are computed synchronously by the local
+ * calculator; Zerodha is consulted only afterwards, to reconcile. A tick affects
+ * only the candidates that reference the token that moved.
  *
- * The scanner NEVER places a real order. It records simulated fills at the
- * executable touch that was visible in the snapshot it decided on.
+ * The scanner NEVER places a real order. It hands qualified candidates to the
+ * execution simulator, which records a fill at a book the market actually
+ * published after the simulated order could have arrived.
  */
 
 import type { BoxConfig } from "./config.js";
-import { configSnapshot, prefilterGrossThreshold } from "./config.js";
+import { configSnapshot, prefilterGrossThreshold, requiredNetProfit } from "./config.js";
 import {
   BoxChargeEstimator,
   buildEntryChargeLegs,
-  sameChargeLegs,
   type BoxChargeLeg,
 } from "./charges.js";
+import type { BoxExecutionSimulator } from "./executionSimulator.js";
+import { LocalChargeCalculator } from "./localCharges.js";
+import type { BoxMetrics } from "./metrics.js";
 import {
   evaluateCandidate,
   evaluateCandidateIndicative,
+  evaluateEntryDecision,
   passesGrossPrefilter,
-  projectedNetEdge,
-  qualifiesForEntry,
   round2,
 } from "./math.js";
 import type { BoxQuoteStore } from "./quotes.js";
 import type { BoxPositionBook } from "./positions.js";
 import {
   BOX_LEG_ROLES,
+  directionOf,
   type BoxCandidate,
+  type BoxChargeOrigin,
+  type BoxEntryDecision,
   type BoxEvaluation,
+  type BoxExecutionRecord,
   type BoxOpportunity,
 } from "./types.js";
 
@@ -42,18 +48,25 @@ import {
 export interface BoxScannerDeps {
   cfg: BoxConfig;
   quotes: BoxQuoteStore;
+  /** Zerodha estimator — used ONLY for asynchronous reconciliation now. */
   charges: BoxChargeEstimator;
+  /** The synchronous, deterministic charge calculator for the hot path. */
+  localCharges: LocalChargeCalculator;
+  /** Simulates the fill after a decision + latency delay. */
+  executionSim: BoxExecutionSimulator;
   positions: BoxPositionBook;
+  metrics?: BoxMetrics;
   /** Opens the paper trade. Returns the trade id, or null when it did not open. */
   openPaperTrade: (args: {
     candidate: BoxCandidate;
+    /** The EXECUTION snapshot (with depth) the fill was taken from. */
     evaluation: BoxEvaluation;
     entryLegs: BoxChargeLeg[];
-    /** null only when charges were unavailable and the requirement is disabled. */
     entryChargesTotal: number | null;
     estimatedExitChargesTotal: number | null;
-    netEdge: number | null;
-    charges: Awaited<ReturnType<BoxChargeEstimator["estimate"]>>;
+    chargeOrigin: BoxChargeOrigin;
+    decision: BoxEntryDecision;
+    execution: BoxExecutionRecord;
   }) => Promise<string | null>;
   /** Ledger hook for rejections and detections. */
   onEvent: (
@@ -62,7 +75,9 @@ export interface BoxScannerDeps {
       | "ENTRY_REJECTED_STALE"
       | "ENTRY_REJECTED_LIQUIDITY"
       | "ENTRY_REJECTED_FEES"
-      | "ENTRY_REJECTED_DUPLICATE",
+      | "ENTRY_REJECTED_DUPLICATE"
+      | "ENTRY_REJECTED_NET_PROFIT"
+      | "ENTRY_REJECTED_EXECUTION",
     candidate: BoxCandidate,
     evaluation: BoxEvaluation,
     detail?: string,
@@ -74,11 +89,13 @@ export interface BoxScannerStats {
   ticksApplied: number;
   evaluations: number;
   prefilterPasses: number;
-  chargeAttempts: number;
+  qualifyAttempts: number;
+  executionsAttempted: number;
   entriesOpened: number;
   rejectedStale: number;
   rejectedLiquidity: number;
-  rejectedFees: number;
+  rejectedNetProfit: number;
+  rejectedExecution: number;
   rejectedDuplicate: number;
   lastEvaluationAt: number | null;
 }
@@ -99,34 +116,21 @@ export class BoxScanner {
   private entryInFlight = new Set<string>();
   private lastRejectLogAt = new Map<string, number>();
 
-  /** Discovery of NEW boxes. Monitoring of open boxes never depends on this. */
   private discovering = false;
-  /**
-   * Whether the exchange is open.
-   *
-   * A hard gate on entry: outside market hours there is no executable book, so a
-   * paper fill would be a fiction. Opportunities are still PUBLISHED (from last
-   * close) so a box that existed at the close can be inspected.
-   */
   private marketOpen = true;
-  /**
-   * Whether the upstream feed is delivering ticks at all.
-   *
-   * This — not per-instrument quietness — is what "do not trade stale books"
-   * actually protects against: a silently dropped connection leaves every cached
-   * book looking normal while being arbitrarily old.
-   */
   private feedHealthy = true;
 
   private stats: BoxScannerStats = {
     ticksApplied: 0,
     evaluations: 0,
     prefilterPasses: 0,
-    chargeAttempts: 0,
+    qualifyAttempts: 0,
+    executionsAttempted: 0,
     entriesOpened: 0,
     rejectedStale: 0,
     rejectedLiquidity: 0,
-    rejectedFees: 0,
+    rejectedNetProfit: 0,
+    rejectedExecution: 0,
     rejectedDuplicate: 0,
     lastEvaluationAt: null,
   };
@@ -135,13 +139,6 @@ export class BoxScanner {
 
   /* ------------------------------ lifecycle ------------------------------ */
 
-  /**
-   * Enable/disable DISCOVERY only.
-   *
-   * STOP means: stop opening new boxes. It does not stop the position monitor,
-   * which lives in its own module and keeps managing (and exiting) whatever is
-   * already open.
-   */
   setDiscovering(on: boolean): void {
     this.discovering = on;
   }
@@ -150,7 +147,6 @@ export class BoxScanner {
     return this.discovering;
   }
 
-  /** Tell the scanner whether the exchange is currently open. */
   setMarketOpen(open: boolean): void {
     this.marketOpen = open;
   }
@@ -159,7 +155,6 @@ export class BoxScanner {
     return this.marketOpen;
   }
 
-  /** Tell the scanner whether the upstream tick feed is alive. */
   setFeedHealthy(healthy: boolean): void {
     this.feedHealthy = healthy;
   }
@@ -174,13 +169,7 @@ export class BoxScanner {
 
   /* ------------------------------ candidates ----------------------------- */
 
-  /**
-   * Replace the candidate set for one underlying (called when its ATM window is
-   * built or re-centred) and rebuild that underlying's slice of the dependency
-   * index.
-   */
   setCandidatesForUnderlying(underlying: string, next: BoxCandidate[]): void {
-    // Drop the old slice first so a shifted window cannot leave orphan entries.
     for (const [key, cand] of this.candidates) {
       if (cand.underlying !== underlying) continue;
       this.candidates.delete(key);
@@ -206,7 +195,6 @@ export class BoxScanner {
     }
   }
 
-  /** Remove an underlying entirely (e.g. it fell outside the token budget). */
   removeUnderlying(underlying: string): void {
     this.setCandidatesForUnderlying(underlying, []);
   }
@@ -232,15 +220,13 @@ export class BoxScanner {
   /**
    * Handle a batch of updated tokens.
    *
-   * This is THE hot path. It is synchronous, allocation-light, and only ever
-   * looks at candidates that reference one of the tokens that changed.
+   * THE hot path. Synchronous, allocation-light, and only ever looks at
+   * candidates that reference one of the tokens that changed.
    */
-  onTokensUpdated(tokens: number[]): void {
+  onTokensUpdated(tokens: number[], receivedAt?: number): void {
     if (tokens.length === 0) return;
     this.stats.ticksApplied += tokens.length;
 
-    // Collect the affected candidates once, so a batch that touches several legs
-    // of the same box evaluates that box a single time.
     let affected: Set<string> | null = null;
     for (const token of tokens) {
       const keys = this.tokenIndex.get(token);
@@ -254,11 +240,10 @@ export class BoxScanner {
     for (const key of affected) {
       const cand = this.candidates.get(key);
       if (!cand) continue;
-      this.evaluateAndMaybeEnter(cand, now);
+      this.evaluateAndMaybeEnter(cand, now, receivedAt);
     }
   }
 
-  /** Re-evaluate everything (used when the UI asks for a fresh snapshot). */
   refreshAll(): void {
     const now = Date.now();
     for (const cand of this.candidates.values()) {
@@ -266,38 +251,37 @@ export class BoxScanner {
     }
   }
 
-  private evaluateAndMaybeEnter(cand: BoxCandidate, now: number): void {
+  private evaluateAndMaybeEnter(cand: BoxCandidate, now: number, receivedAt?: number): void {
     this.stats.evaluations++;
     this.stats.lastEvaluationAt = now;
+    this.deps.metrics?.evaluations.mark(1, now);
 
+    // Hot path: NO depth cloning. Only the touch view is built.
     const evaluation = evaluateCandidate({
       candidate: cand,
       quotes: this.deps.quotes.view(),
       now,
       maxAgeMs: this.deps.cfg.quoteMaxAgeMs,
+      captureDepth: false,
     });
+
+    if (receivedAt !== undefined) {
+      this.deps.metrics?.receiveToEvaluation.push(Math.max(0, now - receivedAt));
+    }
 
     const openKeyTaken = this.deps.positions.getByKey(cand.key) !== undefined;
     const threshold = prefilterGrossThreshold(this.deps.cfg);
-
-    // FAST LOCAL PREFILTER. A charge call is only ever considered for a box whose
-    // gross executable edge already clears ₹1,200 + safety + a lower bound on
-    // charges. Everything else is published (so the UI can show near-misses) and
-    // costs nothing more.
     const passedPrefilter = passesGrossPrefilter(evaluation.gross_edge, threshold);
     if (passedPrefilter) this.stats.prefilterPasses++;
 
     this.publish(evaluation, {
       openKeyTaken,
       passedPrefilter,
-      cachedNetEdge: this.cachedNetEdgeFor(evaluation),
+      decision: this.localDecisionFor(evaluation, this.deps.cfg.expectedEntrySlippage),
     });
 
     if (!this.discovering) return;
-    // No entry outside market hours — a fill needs a live executable book.
     if (!this.marketOpen) return;
-    // No entry while the feed is down: every cached book would look normal while
-    // being arbitrarily old.
     if (!this.feedHealthy) return;
     if (openKeyTaken) return;
     if (!evaluation.tradable) {
@@ -306,32 +290,52 @@ export class BoxScanner {
     }
     if (!passedPrefilter) return;
     if (this.entryInFlight.has(cand.key)) return;
-    if (!this.deps.charges.hasCapacity()) return;
+    if (!this.deps.executionSim.hasCapacity()) return;
+
+    // Only candidates that clear the fast local net-profit projection are worth
+    // spending an execution pipeline on. This keeps the hot path cheap.
+    const localDecision = this.localDecisionFor(evaluation, this.deps.cfg.expectedEntrySlippage);
+    if (!localDecision || !localDecision.qualifies) {
+      if (localDecision && localDecision.reject === "below_expected_net_profit") {
+        this.noteNetProfitRejection(cand, evaluation, localDecision);
+      }
+      return;
+    }
 
     void this.attemptEntry(cand, evaluation);
   }
 
   /**
-   * A cached charge estimate for the CURRENT touch, if one happens to be warm.
-   * Lets the published opportunity show real fees without triggering a call.
+   * The projected expected-net-profit decision from the LOCAL calculator.
+   *
+   * Synchronous and allocation-cheap: the calculator does a few dozen float ops
+   * and never touches the network. Used both to publish the opportunity's cost
+   * breakdown and to decide whether a candidate is worth executing.
    */
-  private cachedNetEdgeFor(evaluation: BoxEvaluation): {
-    entry: number;
-    exit: number;
-    net: number;
-  } | null {
+  private localDecisionFor(
+    evaluation: BoxEvaluation,
+    executionCost: number,
+  ): BoxEntryDecision | null {
     if (evaluation.gross_edge === null) return null;
     const legs = buildEntryChargeLegs(evaluation.candidate, evaluation.legs);
     if (!legs) return null;
-    const cached = this.deps.charges.peek(evaluation.candidate.key, legs);
-    if (!cached) return null;
-    const net = projectedNetEdge({
+    const totals = this.deps.localCharges.totals(
+      legs.map((l) => ({
+        side: l.side,
+        tradingsymbol: l.tradingsymbol,
+        quantity: l.quantity,
+        price: l.price,
+      })),
+    );
+    return evaluateEntryDecision({
       grossEdge: evaluation.gross_edge,
-      entryCharges: cached.entry_total,
-      estimatedExitCharges: cached.estimated_exit_total,
-      safetyBuffer: this.deps.cfg.safetyBuffer,
+      entryCharges: totals.entry,
+      estimatedExitCharges: totals.exit,
+      // Entry slippage allowance + the exit-side allowance: the round-trip
+      // execution cost the net figure must survive.
+      executionCost: executionCost + this.deps.cfg.expectedExitSlippage,
+      cfg: this.deps.cfg,
     });
-    return { entry: cached.entry_total, exit: cached.estimated_exit_total, net };
   }
 
   /* ------------------------------ entry path ----------------------------- */
@@ -339,120 +343,110 @@ export class BoxScanner {
   /**
    * The paper-entry pipeline.
    *
-   *   1. snapshot the four quotes            (already done: `first`)
-   *   2. estimate charges                    (async — the book can move here)
-   *   3. RE-EVALUATE the four quotes         (`second`)
-   *   4. require still-fresh, still-liquid, still-qualifying
-   *   5. only then create the paper trade
+   *   1. reserve the strike pair (synchronous, atomic)
+   *   2. hand the DETECTION snapshot to the execution simulator
+   *   3. the simulator waits the decision + latency delay and fills from the
+   *      first post-arrival WebSocket book — re-qualifying on the EXECUTED prices
+   *      with the MEASURED slippage
+   *   4. only a qualified, filled execution creates the paper trade
    *
-   * Step 3 is the whole point: a decision must never be executed on a quote
-   * snapshot that was taken before an API round trip.
+   * There is no charge network call anywhere on this path; the local calculator
+   * prices both the projection and the final qualification.
    */
-  private async attemptEntry(cand: BoxCandidate, first: BoxEvaluation): Promise<void> {
+  private async attemptEntry(cand: BoxCandidate, detection: BoxEvaluation): Promise<void> {
     if (!this.deps.positions.reserve(cand.key)) {
       this.stats.rejectedDuplicate++;
-      this.logRejection("ENTRY_REJECTED_DUPLICATE", cand, first, "strike pair already taken");
+      this.logRejection("ENTRY_REJECTED_DUPLICATE", cand, detection, "strike pair already taken");
       return;
     }
     this.entryInFlight.add(cand.key);
+    this.stats.qualifyAttempts++;
+    this.stats.executionsAttempted++;
+
     try {
-      let chargeInput = buildEntryChargeLegs(cand, first.legs);
-      if (!chargeInput) {
+      const result = await this.deps.executionSim.simulateEntry({
+        candidate: cand,
+        detection,
+        stillWanted: () =>
+          this.discovering &&
+          this.marketOpen &&
+          this.feedHealthy &&
+          this.deps.positions.getByKey(cand.key) === undefined,
+        // The final gate: expected NET profit on the EXECUTED snapshot, with the
+        // measured entry slippage folded into the execution cost.
+        qualify: (execution, measuredSlippage) => {
+          const legs = buildEntryChargeLegs(execution.candidate, execution.legs);
+          if (!legs) {
+            return {
+              gross_edge: execution.gross_edge,
+              entry_charges: null,
+              estimated_exit_charges: null,
+              execution_cost: 0,
+              safety_buffer: this.deps.cfg.safetyBuffer,
+              expected_net_profit: null,
+              min_expected_net_profit: requiredNetProfit(this.deps.cfg),
+              passes_gross_prefilter: false,
+              qualifies: false,
+              reject: "unpriced_charges",
+            };
+          }
+          const totals = this.deps.localCharges.totals(
+            legs.map((l) => ({
+              side: l.side,
+              tradingsymbol: l.tradingsymbol,
+              quantity: l.quantity,
+              price: l.price,
+            })),
+          );
+          return evaluateEntryDecision({
+            grossEdge: execution.gross_edge,
+            entryCharges: totals.entry,
+            estimatedExitCharges: totals.exit,
+            // Measured entry slippage (₹, positive = worse) + the exit allowance.
+            executionCost: Math.max(0, measuredSlippage) + this.deps.cfg.expectedExitSlippage,
+            cfg: this.deps.cfg,
+          });
+        },
+      });
+
+      if (!result.ok) {
+        this.recordExecutionFailure(cand, detection, result.reason, result.detail);
         this.deps.positions.release(cand.key);
         return;
       }
 
-      // A moving touch invalidates the virtual contract note's order prices.
-      // Retry a bounded number of times; if the market never settles, skip this
-      // tick rather than combining stale charges with newer paper fills.
-      const MAX_PRICE_ATTEMPTS = 3;
-      for (let attempt = 1; attempt <= MAX_PRICE_ATTEMPTS; attempt++) {
-        this.stats.chargeAttempts++;
-        const estimate = await this.deps.charges.estimate(cand.key, chargeInput);
-
-        if (!estimate && this.deps.cfg.requirePricedCharges) {
-          this.stats.rejectedFees++;
-          this.markStatus(cand.key, "UNPRICED");
-          this.logRejection(
-            "ENTRY_REJECTED_FEES",
-            cand,
-            first,
-            "Zerodha could not price the eight box orders, so the exit could not be managed net of charges",
-          );
-          this.deps.positions.release(cand.key);
-          return;
-        }
-
-        // The charge request is network I/O. Discovery, market hours, or WS feed
-        // health may have changed while it was in flight.
-        if (!this.discovering || !this.marketOpen || !this.feedHealthy) {
-          this.deps.positions.release(cand.key);
-          return;
-        }
-
-        const now = Date.now();
-        const finalEvaluation = evaluateCandidate({
-          candidate: cand,
-          quotes: this.deps.quotes.view(),
-          now,
-          maxAgeMs: this.deps.cfg.quoteMaxAgeMs,
-        });
-        if (!finalEvaluation.tradable || finalEvaluation.gross_edge === null) {
-          this.noteRejection(cand, finalEvaluation, "book moved while charges were being priced");
-          this.deps.positions.release(cand.key);
-          return;
-        }
-
-        const finalChargeLegs = buildEntryChargeLegs(cand, finalEvaluation.legs);
-        if (!finalChargeLegs) {
-          this.deps.positions.release(cand.key);
-          return;
-        }
-
-        // If any fill price changed during the await, the response describes old
-        // orders. Re-price these exact final orders, then capture WS books again.
-        if (estimate && !sameChargeLegs(chargeInput, finalChargeLegs)) {
-          if (attempt === MAX_PRICE_ATTEMPTS) {
-            this.deps.positions.release(cand.key);
-            return;
-          }
-          chargeInput = finalChargeLegs;
-          continue;
-        }
-
-        const netEdge = estimate
-          ? projectedNetEdge({
-              grossEdge: finalEvaluation.gross_edge,
-              entryCharges: estimate.entry_total,
-              estimatedExitCharges: estimate.estimated_exit_total,
-              safetyBuffer: this.deps.cfg.safetyBuffer,
-            })
-          : null;
-        if (!qualifiesForEntry(finalEvaluation.gross_edge, netEdge, this.deps.cfg)) {
-          this.markStatus(cand.key, "WATCHING");
-          this.deps.positions.release(cand.key);
-          return;
-        }
-
-        // No await occurs between this final immutable WS snapshot and the
-        // synchronous payload construction at the start of openPaperTrade.
-        const id = await this.deps.openPaperTrade({
-          candidate: cand,
-          evaluation: finalEvaluation,
-          entryLegs: finalChargeLegs,
-          entryChargesTotal: estimate ? estimate.entry_total : null,
-          estimatedExitChargesTotal: estimate ? estimate.estimated_exit_total : null,
-          netEdge,
-          charges: estimate,
-        });
-
-        if (id) {
-          this.stats.entriesOpened++;
-          this.markStatus(cand.key, "PAPER_OPENED");
-        } else {
-          this.deps.positions.release(cand.key);
-        }
+      // Re-check the gates one last time before persisting (the simulator already
+      // did, but discovery could have flipped in the same turn).
+      if (!this.discovering || !this.marketOpen || !this.feedHealthy) {
+        this.deps.positions.release(cand.key);
         return;
+      }
+
+      const legs = buildEntryChargeLegs(result.evaluation.candidate, result.evaluation.legs)!;
+      const orders = legs.map((l) => ({
+        side: l.side,
+        tradingsymbol: l.tradingsymbol,
+        quantity: l.quantity,
+        price: l.price,
+      }));
+      const local = this.deps.localCharges.roundTrip(orders);
+
+      const id = await this.deps.openPaperTrade({
+        candidate: cand,
+        evaluation: result.evaluation,
+        entryLegs: legs,
+        entryChargesTotal: local.entry_total,
+        estimatedExitChargesTotal: local.estimated_exit_total,
+        chargeOrigin: "local",
+        decision: result.decision,
+        execution: result.record,
+      });
+
+      if (id) {
+        this.stats.entriesOpened++;
+        this.markStatus(cand.key, "PAPER_OPENED");
+      } else {
+        this.deps.positions.release(cand.key);
       }
     } catch (err) {
       console.warn("[Box] entry attempt failed for", cand.key, err);
@@ -460,6 +454,28 @@ export class BoxScanner {
     } finally {
       this.entryInFlight.delete(cand.key);
     }
+  }
+
+  private recordExecutionFailure(
+    cand: BoxCandidate,
+    detection: BoxEvaluation,
+    reason: string,
+    detail: string,
+  ): void {
+    if (reason === "below_expected_net_profit") {
+      this.stats.rejectedNetProfit++;
+      this.logRejection("ENTRY_REJECTED_NET_PROFIT", cand, detection, detail);
+      return;
+    }
+    if (reason === "insufficient_quantity" || reason === "missing_book" || reason === "price_moved") {
+      this.stats.rejectedLiquidity++;
+      this.logRejection("ENTRY_REJECTED_EXECUTION", cand, detection, `${reason}: ${detail}`);
+      return;
+    }
+    // duplicate / discovery_stopped / market_closed / feed_unhealthy /
+    // edge_disappeared — expected transients, counted but not spammed to the ledger.
+    this.stats.rejectedExecution++;
+    this.logRejection("ENTRY_REJECTED_EXECUTION", cand, detection, `${reason}: ${detail}`);
   }
 
   /* -------------------------------- events -------------------------------- */
@@ -485,19 +501,28 @@ export class BoxScanner {
     }
   }
 
-  /**
-   * Write a rejection to the ledger at most once per candidate per cooldown.
-   *
-   * Only candidates that already cleared the gross prefilter are logged: a thin
-   * book on a box with no edge is not an interesting audit record, whereas a box
-   * that WOULD have qualified but was blocked by liquidity or staleness is.
-   */
+  private noteNetProfitRejection(
+    cand: BoxCandidate,
+    evaluation: BoxEvaluation,
+    decision: BoxEntryDecision,
+  ): void {
+    this.stats.rejectedNetProfit++;
+    this.logRejection(
+      "ENTRY_REJECTED_NET_PROFIT",
+      cand,
+      evaluation,
+      `expected net ₹${decision.expected_net_profit ?? "?"} < required ₹${decision.min_expected_net_profit}`,
+    );
+  }
+
   private logRejection(
     event:
       | "ENTRY_REJECTED_STALE"
       | "ENTRY_REJECTED_LIQUIDITY"
       | "ENTRY_REJECTED_FEES"
-      | "ENTRY_REJECTED_DUPLICATE",
+      | "ENTRY_REJECTED_DUPLICATE"
+      | "ENTRY_REJECTED_NET_PROFIT"
+      | "ENTRY_REJECTED_EXECUTION",
     cand: BoxCandidate,
     evaluation: BoxEvaluation,
     detail?: string,
@@ -525,25 +550,25 @@ export class BoxScanner {
     ctx: {
       openKeyTaken: boolean;
       passedPrefilter: boolean;
-      cachedNetEdge: { entry: number; exit: number; net: number } | null;
+      decision: BoxEntryDecision | null;
       priceSource?: "touch" | "last_close";
     },
   ): void {
     const cand = evaluation.candidate;
     const previous = this.opportunities.get(cand.key);
     const cfg = this.deps.cfg;
+    const direction = cand.direction ?? "LONG_BOX";
 
     const indicative = ctx.priceSource === "last_close";
-    const cachedNet = ctx.cachedNetEdge ? ctx.cachedNetEdge.net : null;
+    const decision = ctx.decision;
+    const expectedNet = decision ? decision.expected_net_profit : null;
 
     let status: BoxOpportunity["status"];
     if (ctx.openKeyTaken) status = "OPEN";
     else if (previous?.status === "PAPER_OPENED" && !ctx.openKeyTaken) status = "PAPER_OPENED";
-    // A last-close view is never eligible, however good the number looks.
     else if (indicative) status = "INDICATIVE";
     else if (!evaluation.tradable) status = ctx.passedPrefilter ? "REJECTED" : "WATCHING";
-    else if (previous?.status === "UNPRICED" && ctx.passedPrefilter) status = "UNPRICED";
-    else if (qualifiesForEntry(evaluation.gross_edge, cachedNet, cfg)) status = "ELIGIBLE";
+    else if (decision && decision.qualifies) status = "ELIGIBLE";
     else status = "WATCHING";
 
     this.opportunities.set(cand.key, {
@@ -552,28 +577,38 @@ export class BoxScanner {
       name: cand.name,
       is_index: cand.is_index,
       expiry: cand.expiry,
+      direction,
       lower_strike: cand.lower_strike,
       upper_strike: cand.upper_strike,
       box_width: cand.box_width,
       lot_size: cand.lot_size,
       quantity: cand.lot_size,
       entry_box_cost:
-        evaluation.entry_box_cost_per_unit === null
+        evaluation.entry_net_debit_per_unit === null
           ? null
-          : round2(evaluation.entry_box_cost_per_unit * cand.lot_size),
+          : round2(evaluation.entry_net_debit_per_unit * cand.lot_size),
       gross_edge: evaluation.gross_edge,
-      entry_charges: ctx.cachedNetEdge ? ctx.cachedNetEdge.entry : null,
-      estimated_exit_charges: ctx.cachedNetEdge ? ctx.cachedNetEdge.exit : null,
+      entry_charges: decision ? decision.entry_charges : null,
+      estimated_exit_charges: decision ? decision.estimated_exit_charges : null,
+      execution_cost: decision ? decision.execution_cost : cfg.expectedEntrySlippage + cfg.expectedExitSlippage,
       safety_buffer: cfg.safetyBuffer,
-      projected_net_edge: ctx.cachedNetEdge ? ctx.cachedNetEdge.net : null,
+      projected_net_edge: expectedNet,
+      expected_net_profit: expectedNet,
+      min_expected_net_profit: requiredNetProfit(cfg),
+      charge_origin: "local",
+      entry_sides: evaluation.legs.map((l) => ({
+        role: l.role,
+        side: l.side,
+        tradingsymbol: l.tradingsymbol,
+      })),
       liquidity_ok: evaluation.tradable,
       depth_ok: evaluation.depth_ok,
       worst_age_ms: evaluation.worst_age_ms,
       price_source: ctx.priceSource ?? "touch",
       status,
       reject: evaluation.reject,
-      // Depth/version are internal immutable fill-audit data. The opportunity
-      // stream keeps its existing compact per-leg API shape.
+      // Depth/version are internal fill-audit data. The opportunity stream keeps
+      // its compact per-leg API shape.
       legs: evaluation.legs.map(({ depth: _depth, quote_version: _version, ...leg }) => leg),
       updated_at: evaluation.at,
     });
@@ -582,11 +617,6 @@ export class BoxScanner {
   /**
    * Publish an INDICATIVE view of every candidate from last traded / closing
    * prices, for when the market is shut.
-   *
-   * These rows exist so an operator can see that a box was mispriced at the
-   * close. They carry `price_source: "last_close"`, are never `tradable`, and the
-   * entry path is separately gated on the market being open — so nothing here can
-   * become a paper fill.
    */
   publishIndicative(lastPrices: Map<number, number>): number {
     const now = Date.now();
@@ -601,7 +631,7 @@ export class BoxScanner {
           evaluation.gross_edge,
           prefilterGrossThreshold(this.deps.cfg),
         ),
-        cachedNetEdge: null,
+        decision: null,
         priceSource: "last_close",
       });
     }
@@ -611,15 +641,10 @@ export class BoxScanner {
 
   /**
    * Opportunities worth showing: anything tradable-and-interesting, anything that
-   * cleared the gross prefilter, and anything already open. The scanner does NOT
-   * dump every F&O box into the UI — 200 underlyings × 21 pairs is 4,200 rows of
-   * noise, and the operator only cares about the ones near a trade.
+   * cleared the gross prefilter, and anything already open.
    */
   listOpportunities(limit: number): BoxOpportunity[] {
     const threshold = prefilterGrossThreshold(this.deps.cfg);
-    // Show boxes within reach of the requirement as well as the qualifying ones,
-    // so a near-miss is visible rather than silently discarded.
-    const visibilityFloor = Math.min(0, this.deps.cfg.minNetEdge * -1);
     const rows: BoxOpportunity[] = [];
     for (const opp of this.opportunities.values()) {
       const interesting =
@@ -629,11 +654,8 @@ export class BoxScanner {
         opp.status === "UNPRICED" ||
         opp.status === "INDICATIVE" ||
         (opp.gross_edge !== null && opp.gross_edge >= Math.min(threshold, 0)) ||
-        (opp.projected_net_edge !== null && opp.projected_net_edge >= visibilityFloor);
+        (opp.expected_net_profit !== null && opp.expected_net_profit >= 0);
       if (!interesting) continue;
-      // Only ever show a box with a real, positive executable edge — a negative
-      // edge is not an "opportunity", it is just a box that costs more than it
-      // pays.
       if (
         opp.status !== "OPEN" &&
         opp.status !== "PAPER_OPENED" &&
@@ -644,22 +666,18 @@ export class BoxScanner {
       rows.push(opp);
     }
     rows.sort((a, b) => {
-      const an = a.projected_net_edge ?? a.gross_edge ?? Number.NEGATIVE_INFINITY;
-      const bn = b.projected_net_edge ?? b.gross_edge ?? Number.NEGATIVE_INFINITY;
+      const an = a.expected_net_profit ?? a.gross_edge ?? Number.NEGATIVE_INFINITY;
+      const bn = b.expected_net_profit ?? b.gross_edge ?? Number.NEGATIVE_INFINITY;
       return bn - an;
     });
     return rows.slice(0, limit);
   }
 
-  /** Opportunity rows for one underlying (for the chain view's leg marking). */
   opportunitiesFor(underlying: string): BoxOpportunity[] {
     return [...this.opportunities.values()].filter((o) => o.underlying === underlying);
   }
 
-  /** Drop published state (e.g. when the session dies). */
   clearOpportunities(): void {
     this.opportunities.clear();
   }
 }
-
-

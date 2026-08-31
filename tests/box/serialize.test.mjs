@@ -103,12 +103,16 @@ test("28. a box document serializes to a stable API shape with ISO dates", () =>
   assert.deepEqual(s.legs[0].entry_depth.asks, [{ price: 300, qty: 150, orders: 1 }]);
   assert.equal(s.legs[0].exit_price, 350);
 
+  // An old document with no direction reads back as a long box.
+  assert.equal(s.direction, "LONG_BOX");
+
   // The settings the trade was taken under are frozen onto it.
   assert.equal(s.scanner_config_snapshot.min_gross_edge, 1200);
   assert.equal(s.scanner_config_snapshot.min_net_edge, 0);
+  assert.equal(s.scanner_config_snapshot.min_expected_net_profit, 1200);
   assert.equal(s.scanner_config_snapshot.safety_buffer, 150);
   assert.equal(s.scanner_config_snapshot.strikes_each_side, 3);
-  assert.equal(s.scanner_config_snapshot.execution_mode, "paper_touch");
+  assert.equal(s.scanner_config_snapshot.execution_mode, "paper_latency");
 
   // No Mongo internals leak.
   assert.equal("_id" in s, false);
@@ -134,10 +138,15 @@ test("an open box serializes with null exit fields rather than placeholders", ()
   assert.equal(s.exit_reason, null);
 });
 
-test("the trade key identifies one box per underlying, expiry and strike pair", () => {
+test("the trade key identifies one box per underlying, expiry, strike pair and direction", () => {
+  // A document with no direction resolves to a long box.
   assert.equal(
     tradeKey({ underlying: "NIFTY", expiry: "2026-09-24", lower_strike: 19900, upper_strike: 20100 }),
-    "NIFTY|2026-09-24|19900|20100",
+    "NIFTY|2026-09-24|19900|20100|LONG_BOX",
+  );
+  assert.equal(
+    tradeKey({ underlying: "NIFTY", expiry: "2026-09-24", lower_strike: 19900, upper_strike: 20100, direction: "SHORT_BOX" }),
+    "NIFTY|2026-09-24|19900|20100|SHORT_BOX",
   );
   const { candidate } = goodCandidate();
   assert.equal(tradeKey({
@@ -145,6 +154,7 @@ test("the trade key identifies one box per underlying, expiry and strike pair", 
     expiry: candidate.expiry,
     lower_strike: candidate.lower_strike,
     upper_strike: candidate.upper_strike,
+    direction: candidate.direction,
   }), candidate.key);
 });
 
@@ -191,8 +201,13 @@ test("the shipped configuration is the documented V1 specification", () => {
   assert.equal(c.convergencePct, 0.2);
   assert.equal(c.minExitNetPnl, 600);
   assert.equal(c.profitCapturePct, 0.75);
+  // THE entry gate is now expected NET profit; the gross figure is a prefilter.
+  assert.equal(c.minExpectedNetProfit, 1200);
   assert.equal(prefilterGrossThreshold(c), 1200);
-  assert.equal(configSnapshot(c).execution_mode, "paper_touch");
+  // The shipped execution model is the realistic latency-based one.
+  assert.equal(c.executionMode, "paper_latency");
+  assert.equal(configSnapshot(c).execution_mode, "paper_latency");
+  assert.equal(configSnapshot(c).min_expected_net_profit, 1200);
   assert.equal(configSnapshot(c).min_gross_edge, 1200);
 });
 

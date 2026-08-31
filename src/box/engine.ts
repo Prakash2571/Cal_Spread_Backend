@@ -17,8 +17,18 @@ import type { Response } from "express";
 import type { Instrument, KiteClient } from "../kite.js";
 import type { TickerHub } from "../hub.js";
 import type { Tick } from "../ticker.js";
-import { configSnapshot, loadBoxConfig, prefilterGrossThreshold, type BoxConfig } from "./config.js";
-import { BoxChargeEstimator, type PriceChargeGroupsFn } from "./charges.js";
+import {
+  configSnapshot,
+  loadBoxConfig,
+  prefilterGrossThreshold,
+  requiredNetProfit,
+  type BoxConfig,
+} from "./config.js";
+import { BoxChargeEstimator, buildEntryChargeLegs, type BoxChargeLeg, type PriceChargeGroupsFn } from "./charges.js";
+import { BoxChargeReconciler } from "./chargeReconciler.js";
+import { BoxExecutionSimulator } from "./executionSimulator.js";
+import { LocalChargeCalculator } from "./localCharges.js";
+import { BoxMetrics } from "./metrics.js";
 import {
   buildUnderlyingState,
   indexOptionChains,
@@ -40,6 +50,7 @@ import {
   isBoxDbEnabled,
   loadOpenBoxTrades,
   serializeBoxTrade,
+  setBoxChargeReconciliation,
   setBoxTradeMargin,
   toEventLegs,
   tradeKey,
@@ -48,11 +59,16 @@ import {
 } from "./repository.js";
 import { BoxScanner } from "./scanner.js";
 import {
-  BOX_ENTRY_SIDES,
+  BOX_DIRECTIONS,
   BOX_LEG_ROLES,
+  directionLabel,
+  directionOf,
   type BoxCandidate,
+  type BoxChargesWithOrigin,
+  type BoxDirection,
+  type BoxEntryDecision,
   type BoxEvaluation,
-  type BoxCharges,
+  type BoxExecutionRecord,
   type BoxExitMetrics,
   type BoxExitReason,
   type BoxLegRole,
@@ -62,6 +78,7 @@ import {
   type IBoxLeg,
   type IBoxTrade,
 } from "./types.js";
+import { entrySideFor } from "./math.js";
 
 export interface BoxEngineDeps {
   kite: KiteClient;
@@ -105,8 +122,14 @@ export class BoxEngine {
   private spots = new SpotStore();
   private positions = new BoxPositionBook();
   private charges: BoxChargeEstimator;
+  private localCharges: LocalChargeCalculator;
+  private executionSim: BoxExecutionSimulator;
+  private reconciler: BoxChargeReconciler;
+  private metrics: BoxMetrics;
   private scanner: BoxScanner;
   private monitor: BoxPositionMonitor;
+  /** The directions the scanner builds candidates for. */
+  private directions: readonly BoxDirection[];
 
   /** Underlying → its current seven-strike window. */
   private windows = new Map<string, BoxUnderlyingState>();
@@ -152,11 +175,52 @@ export class BoxEngine {
   constructor(private deps: BoxEngineDeps) {
     this.cfg = loadBoxConfig();
     this.charges = new BoxChargeEstimator(deps.priceChargeGroups, this.cfg);
+    this.localCharges = new LocalChargeCalculator();
+    this.metrics = new BoxMetrics(this.cfg.metricsWindow);
+    this.directions = this.cfg.enableShortBox ? BOX_DIRECTIONS : (["LONG_BOX"] as const);
+
+    this.executionSim = new BoxExecutionSimulator({
+      cfg: this.cfg,
+      quotes: this.quotes,
+      metrics: this.metrics,
+      isMarketOpen: () => this.marketOpen,
+      isFeedHealthy: () => this.isFeedHealthy(),
+    });
+
+    this.reconciler = new BoxChargeReconciler({
+      cfg: this.cfg,
+      charges: this.charges,
+      metrics: this.metrics,
+      isAuthenticated: () => this.deps.kite.getAccessToken() !== null,
+      persist: (tradeId, phase, verdict) =>
+        setBoxChargeReconciliation(tradeId, phase, verdict),
+      onReconciled: (tradeId, phase, verdict, warned) => {
+        void appendBoxEvent({
+          event: "CHARGES_RECONCILED",
+          trade_id: tradeId,
+          candidate_key: "",
+          underlying: "",
+          expiry: "",
+          lower_strike: 0,
+          upper_strike: 0,
+          lot_size: 0,
+          quantity: 0,
+          execution_mode: this.cfg.executionMode,
+          reason: warned ? "discrepancy_over_threshold" : "verified",
+          detail:
+            `${phase}: local ₹${verdict.local_total} vs Zerodha ₹${verdict.reconciled_total} ` +
+            `(${verdict.pct_diff}%)`,
+        });
+      },
+    });
 
     this.scanner = new BoxScanner({
       cfg: this.cfg,
       quotes: this.quotes,
       charges: this.charges,
+      localCharges: this.localCharges,
+      executionSim: this.executionSim,
+      metrics: this.metrics,
       positions: this.positions,
       openPaperTrade: (args) => this.openPaperTrade(args),
       onEvent: (event, candidate, evaluation, detail) => {
@@ -165,15 +229,17 @@ export class BoxEngine {
           candidate_key: candidate.key,
           underlying: candidate.underlying,
           expiry: candidate.expiry,
+          direction: candidate.direction,
           lower_strike: candidate.lower_strike,
           upper_strike: candidate.upper_strike,
           lot_size: candidate.lot_size,
           quantity: candidate.lot_size,
+          execution_mode: this.cfg.executionMode,
           box_width: candidate.box_width,
           box_cost:
-            evaluation.entry_box_cost_per_unit === null
+            evaluation.entry_net_debit_per_unit === null
               ? null
-              : round2(evaluation.entry_box_cost_per_unit * candidate.lot_size),
+              : round2(evaluation.entry_net_debit_per_unit * candidate.lot_size),
           gross_edge: evaluation.gross_edge,
           safety_buffer: this.cfg.safetyBuffer,
           legs: toEventLegs(evaluation.legs),
@@ -186,12 +252,15 @@ export class BoxEngine {
     this.monitor = new BoxPositionMonitor({
       cfg: this.cfg,
       quotes: this.quotes,
-      charges: this.charges,
+      localCharges: this.localCharges,
+      executionSim: this.executionSim,
       positions: this.positions,
       closePaperTrade: (args) => this.closePaperTrade(args),
       persistLive: (pos) =>
         updateBoxTradeLive(pos.id, {
           current_remaining_edge: pos.metrics?.remaining_edge ?? null,
+          current_captured_edge: pos.metrics?.captured_edge ?? null,
+          current_captured_pct: pos.metrics?.captured_pct ?? null,
           exit_blocked_reason: pos.exit_blocked_reason,
           expiry_safety: pos.expiry_safety,
         }),
@@ -202,10 +271,12 @@ export class BoxEngine {
           candidate_key: pos.key,
           underlying: pos.underlying,
           expiry: pos.expiry,
+          direction: pos.direction ?? "LONG_BOX",
           lower_strike: pos.lower_strike,
           upper_strike: pos.upper_strike,
           lot_size: pos.lot_size,
           quantity: pos.quantity,
+          execution_mode: this.cfg.executionMode,
           box_width: pos.box_width,
           box_cost: round2(pos.entry_box_cost_per_unit * pos.lot_size),
           gross_edge: pos.entry_gross_edge,
@@ -216,6 +287,8 @@ export class BoxEngine {
           gross_pnl: metrics?.gross_pnl_if_closed_now ?? null,
           net_pnl: metrics?.current_net_pnl ?? null,
           remaining_edge: metrics?.remaining_edge ?? null,
+          captured_edge: metrics?.captured_edge ?? null,
+          captured_pct: metrics?.captured_pct ?? null,
           legs: metrics ? toEventLegs(metrics.legs) : [],
           reason: metrics?.exit_reason ?? null,
           detail: detail ?? null,
@@ -227,6 +300,7 @@ export class BoxEngine {
       isFeedHealthy: () => this.isFeedHealthy(),
     });
 
+    this.metrics.startSampling();
     this.marketOpen = this.deps.isMarketOpen();
     this.scanner.setMarketOpen(this.marketOpen);
   }
@@ -530,8 +604,10 @@ export class BoxEngine {
       // kept as a rolling distribution and clearly labelled approximate.
       if (t.exchange_ts && t.exchange_ts > 0) this.sampleExchangeLag(now - t.exchange_ts);
     }
+    this.metrics.ticks.mark(ticks.length, now);
     const changed = this.quotes.applyTicks(ticks, now);
     if (changed.length > 0) {
+      this.metrics.wsUpdates.mark(changed.length, now);
       // A tick arriving IS the feed-liveness signal, so the gate reopens here
       // rather than waiting for the next timer.
       if (!this.feedHealthy) {
@@ -541,7 +617,7 @@ export class BoxEngine {
       // Open-position exits get first look at every changed WS book. This is the
       // primary exit path; the monitor timer is only a watchdog.
       this.monitor.onTokensUpdated(changed);
-      this.scanner.onTokensUpdated(changed);
+      this.scanner.onTokensUpdated(changed, now);
     }
   }
 
@@ -719,6 +795,7 @@ export class BoxEngine {
             strikes: state.strikes,
             ce: state.ce,
             pe: state.pe,
+            directions: this.directions,
           }),
         );
       }
@@ -824,19 +901,33 @@ export class BoxEngine {
   private async openPaperTrade(args: {
     candidate: BoxCandidate;
     evaluation: BoxEvaluation;
+    entryLegs: BoxChargeLeg[];
     entryChargesTotal: number | null;
     estimatedExitChargesTotal: number | null;
-    netEdge: number | null;
-    charges: { entry: BoxCharges; estimated_exit: BoxCharges } | null;
+    chargeOrigin: BoxChargesWithOrigin["computed_by"];
+    decision: BoxEntryDecision;
+    execution: BoxExecutionRecord;
   }): Promise<string | null> {
-    const { candidate, evaluation } = args;
+    const { candidate, evaluation, decision, execution } = args;
+    const direction = candidate.direction ?? "LONG_BOX";
     const byRole = new Map(evaluation.legs.map((l) => [l.role, l]));
+    const execByRole = new Map(execution.legs.map((l) => [l.role, l]));
+
+    // The local contract note for the executed fills, and its reversed projection.
+    const orders = args.entryLegs.map((l) => ({
+      side: l.side,
+      tradingsymbol: l.tradingsymbol,
+      quantity: l.quantity,
+      price: l.price,
+    }));
+    const localRoundTrip = this.localCharges.roundTrip(orders);
 
     const legs: IBoxLeg[] = [];
     for (const role of BOX_LEG_ROLES) {
       const ev = byRole.get(role);
       const inst = candidate.legs[role];
       if (!ev || ev.price === null) return null;
+      const execLeg = execByRole.get(role);
       legs.push({
         role,
         token: inst.token,
@@ -844,7 +935,7 @@ export class BoxEngine {
         exchange: inst.exchange,
         strike: inst.strike,
         instrument_type: inst.instrument_type,
-        side: BOX_ENTRY_SIDES[role],
+        side: entrySideFor(role, direction),
         entry_price: round2(ev.price),
         entry_bid: ev.bid,
         entry_bid_qty: ev.bid_qty,
@@ -852,6 +943,8 @@ export class BoxEngine {
         entry_ask_qty: ev.ask_qty,
         entry_quote_at: ev.quote_at === null ? null : new Date(ev.quote_at),
         entry_depth: ev.depth ?? null,
+        detected_price: execLeg?.detected_price ?? null,
+        entry_slippage: execLeg?.slippage ?? null,
         exit_price: null,
         exit_bid: null,
         exit_bid_qty: null,
@@ -859,22 +952,22 @@ export class BoxEngine {
         exit_ask_qty: null,
         exit_quote_at: null,
         exit_depth: null,
+        exit_detected_price: null,
+        exit_slippage: null,
       });
     }
 
-    // Net basket margin for all four one-lot legs, priced in one request. Best
-    const costPerUnit = evaluation.entry_box_cost_per_unit!;
-    // The net edge is the after-cost figure for the record. With charges
-    // unavailable it falls back to gross minus the buffer, so the exit rules
-    // still have a sane reference point to measure convergence against.
+    const costPerUnit = evaluation.entry_net_debit_per_unit!;
+    // The recorded net edge is the expected NET profit the entry qualified on.
     const recordedNetEdge =
-      args.netEdge ?? round2(evaluation.gross_edge! - this.cfg.safetyBuffer);
+      decision.expected_net_profit ?? round2(evaluation.gross_edge! - this.cfg.safetyBuffer);
     const payload: IBoxTrade = {
-      execution_mode: "paper_touch",
+      execution_mode: this.cfg.executionMode,
       underlying: candidate.underlying,
       name: candidate.name,
       is_index: candidate.is_index,
       expiry: candidate.expiry,
+      direction,
       lower_strike: candidate.lower_strike,
       upper_strike: candidate.upper_strike,
       lot_size: candidate.lot_size,
@@ -882,17 +975,32 @@ export class BoxEngine {
       status: "open",
       legs,
       box_width: candidate.box_width,
-      // Fetched right AFTER the fill, off the critical path (see below), so the
-      // margin round trip never sits between revalidation and creating the trade.
       margin: null,
       entry_box_cost: round2(costPerUnit * candidate.lot_size),
       entry_gross_edge: evaluation.gross_edge!,
-      entry_charges: args.charges ? args.charges.entry : null,
-      estimated_exit_charges: args.charges ? args.charges.estimated_exit : null,
+      entry_charges: localRoundTrip.entry,
+      estimated_exit_charges: localRoundTrip.estimated_exit,
       safety_buffer: this.cfg.safetyBuffer,
       entry_net_edge: recordedNetEdge,
+      expected_net_profit: decision.expected_net_profit,
+      entry_execution_cost: decision.execution_cost,
+      charge_origin: args.chargeOrigin ?? "local",
+      entry_charge_reconciliation: {
+        status: "pending",
+        local_total: localRoundTrip.entry_total,
+        reconciled_total: null,
+        abs_diff: null,
+        pct_diff: null,
+        at: null,
+        error: null,
+      },
+      exit_charge_reconciliation: null,
+      entry_execution: execution,
+      exit_execution: null,
       opened_at: new Date(),
       current_remaining_edge: evaluation.gross_edge,
+      current_captured_edge: 0,
+      current_captured_pct: 0,
       exit_box_value: null,
       exit_charges: null,
       gross_pnl: null,
@@ -908,7 +1016,7 @@ export class BoxEngine {
 
     const doc = await insertBoxTrade(payload);
     if (!doc) {
-      // The unique partial index refused it: this strike pair is already open.
+      // The unique partial index refused it: this box is already open.
       return null;
     }
     const id = doc._id.toString();
@@ -923,6 +1031,7 @@ export class BoxEngine {
       name: candidate.name,
       is_index: candidate.is_index,
       expiry: candidate.expiry,
+      direction,
       lower_strike: candidate.lower_strike,
       upper_strike: candidate.upper_strike,
       box_width: candidate.box_width,
@@ -931,9 +1040,13 @@ export class BoxEngine {
       entry_box_cost_per_unit: costPerUnit,
       entry_gross_edge: evaluation.gross_edge!,
       entry_net_edge: recordedNetEdge,
-      entry_charges_total: args.entryChargesTotal,
-      estimated_exit_charges_total: args.estimatedExitChargesTotal,
+      entry_charges_total: localRoundTrip.entry_total,
+      estimated_exit_charges_total: localRoundTrip.estimated_exit_total,
       safety_buffer: this.cfg.safetyBuffer,
+      expected_net_profit: decision.expected_net_profit,
+      entry_execution_cost: decision.execution_cost,
+      charge_origin: args.chargeOrigin ?? "local",
+      entry_execution: execution,
       margin: null,
       opened_at: Date.now(),
       legs: candidate.legs,
@@ -947,10 +1060,18 @@ export class BoxEngine {
     };
     this.positions.add(position);
 
-    // Margin is captured AFTER the fill is recorded, so a slow /margins/basket
-    // call can never delay the trade or widen the gap after revalidation. It
-    // patches the live position and the stored doc when it returns.
-    void this.captureMargin(id, candidate.legs, candidate.lot_size, candidate.key);
+    // Margin is captured AFTER the fill is recorded, off the hot path.
+    void this.captureMargin(id, candidate.legs, candidate.lot_size, candidate.key, direction);
+
+    // Verify the local entry charges against Zerodha — asynchronously, never
+    // blocking the fill and never hammering the API.
+    this.reconciler.submit({
+      tradeId: id,
+      phase: "entry",
+      localTotal: localRoundTrip.entry_total,
+      legs: args.entryLegs,
+      label: `${candidate.underlying} ${candidate.lower_strike}→${candidate.upper_strike} ${direction}`,
+    });
 
     void appendBoxEvent({
       event: "ENTRY",
@@ -958,39 +1079,48 @@ export class BoxEngine {
       candidate_key: candidate.key,
       underlying: candidate.underlying,
       expiry: candidate.expiry,
+      direction,
       lower_strike: candidate.lower_strike,
       upper_strike: candidate.upper_strike,
       lot_size: candidate.lot_size,
       quantity: candidate.lot_size,
+      execution_mode: this.cfg.executionMode,
       box_width: candidate.box_width,
       box_cost: round2(costPerUnit * candidate.lot_size),
       gross_edge: evaluation.gross_edge,
-      entry_charges_total: args.entryChargesTotal,
-      exit_charges_total: args.estimatedExitChargesTotal,
+      entry_charges_total: localRoundTrip.entry_total,
+      exit_charges_total: localRoundTrip.estimated_exit_total,
       safety_buffer: this.cfg.safetyBuffer,
       net_edge: recordedNetEdge,
+      expected_net_profit: decision.expected_net_profit,
+      execution_cost: decision.execution_cost,
+      execution,
       legs: toEventLegs(evaluation.legs),
-      reason: "paper_touch fills at the revalidated executable touch",
-      detail: `1 lot (${candidate.lot_size} qty)`,
+      reason: `${this.cfg.executionMode} fill; expected net ₹${decision.expected_net_profit}`,
+      detail: `1 lot (${candidate.lot_size} qty), slippage ₹${execution.total_slippage}`,
     });
 
     console.log(
-      `[Box] PAPER ENTRY ${candidate.underlying} ${candidate.lower_strike}→${candidate.upper_strike} ` +
-        `${candidate.expiry} gross ₹${evaluation.gross_edge} (net after fees ₹${recordedNetEdge})`,
+      `[Box] PAPER ENTRY ${directionLabel(direction)} ${candidate.underlying} ` +
+        `${candidate.lower_strike}→${candidate.upper_strike} ${candidate.expiry} ` +
+        `gross ₹${evaluation.gross_edge} expected-net ₹${decision.expected_net_profit} ` +
+        `(slippage ₹${execution.total_slippage})`,
     );
     this.broadcast("entry", { trade: serializeBoxTrade(doc) });
     return id;
   }
 
-  /** Persist a paper exit at the executable touch. */
+  /** Persist a paper exit at the executed touch. */
   private async closePaperTrade(args: {
     position: BoxOpenPosition;
     metrics: BoxExitMetrics;
-    exitCharges: BoxCharges | null;
+    exitCharges: BoxChargesWithOrigin | null;
     reason: BoxExitReason;
+    execution: BoxExecutionRecord | null;
   }): Promise<boolean> {
-    const { position, metrics, exitCharges, reason } = args;
+    const { position, metrics, exitCharges, reason, execution } = args;
     const byRole = new Map(metrics.legs.map((l) => [l.role, l]));
+    const execByRole = new Map((execution?.legs ?? []).map((l) => [l.role, l]));
 
     const exitChargesTotal = exitCharges ? round2(exitCharges.total) : metrics.estimated_exit_charges;
     const totalCharges =
@@ -1009,14 +1139,29 @@ export class BoxEngine {
       exit_reason: reason,
       exit_box_value: metrics.exit_box_value,
       exit_charges: exitCharges,
+      exit_execution: execution,
+      exit_charge_reconciliation: exitCharges
+        ? {
+            status: "pending",
+            local_total: round2(exitCharges.total),
+            reconciled_total: null,
+            abs_diff: null,
+            pct_diff: null,
+            at: null,
+            error: null,
+          }
+        : null,
       gross_pnl: grossPnl,
       total_charges: totalCharges,
       net_pnl: netPnl,
       current_remaining_edge: metrics.remaining_edge,
+      current_captured_edge: metrics.captured_edge,
+      current_captured_pct: metrics.captured_pct,
       exit_blocked_reason: null,
     };
     for (const [i, role] of BOX_LEG_ROLES.entries()) {
       const ev = byRole.get(role);
+      const execLeg = execByRole.get(role);
       setFields[`legs.${i}.exit_price`] = ev?.price ?? null;
       setFields[`legs.${i}.exit_bid`] = ev?.bid ?? null;
       setFields[`legs.${i}.exit_bid_qty`] = ev?.bid_qty ?? null;
@@ -1024,6 +1169,8 @@ export class BoxEngine {
       setFields[`legs.${i}.exit_ask_qty`] = ev?.ask_qty ?? null;
       setFields[`legs.${i}.exit_quote_at`] = ev?.quote_at ? new Date(ev.quote_at) : null;
       setFields[`legs.${i}.exit_depth`] = ev?.depth ?? null;
+      setFields[`legs.${i}.exit_detected_price`] = execLeg?.detected_price ?? null;
+      setFields[`legs.${i}.exit_slippage`] = execLeg?.slippage ?? null;
     }
 
     const closed = await closeBoxTrade(position.id, setFields as never);
@@ -1031,16 +1178,42 @@ export class BoxEngine {
 
     this.positions.remove(position.id);
 
+    // Verify the exit charges asynchronously, exactly like the entry.
+    if (exitCharges) {
+      const exitOrders: BoxChargeLeg[] = metrics.legs
+        .filter((l) => l.price !== null && l.price > 0)
+        .map((l) => ({
+          side: l.side,
+          token: l.token,
+          expiry: position.expiry,
+          tradingsymbol: l.tradingsymbol,
+          exchange: position.legs[l.role].exchange,
+          quantity: position.quantity,
+          price: round2(l.price!),
+        }));
+      if (exitOrders.length === BOX_LEG_ROLES.length) {
+        this.reconciler.submit({
+          tradeId: position.id,
+          phase: "exit",
+          localTotal: round2(exitCharges.total),
+          legs: exitOrders,
+          label: `${position.underlying} ${position.lower_strike}→${position.upper_strike}`,
+        });
+      }
+    }
+
     void appendBoxEvent({
       event: "EXIT",
       trade_id: position.id,
       candidate_key: position.key,
       underlying: position.underlying,
       expiry: position.expiry,
+      direction: position.direction ?? "LONG_BOX",
       lower_strike: position.lower_strike,
       upper_strike: position.upper_strike,
       lot_size: position.lot_size,
       quantity: position.quantity,
+      execution_mode: this.cfg.executionMode,
       box_width: position.box_width,
       box_cost: round2(position.entry_box_cost_per_unit * position.lot_size),
       gross_edge: position.entry_gross_edge,
@@ -1051,14 +1224,17 @@ export class BoxEngine {
       gross_pnl: grossPnl,
       net_pnl: netPnl,
       remaining_edge: metrics.remaining_edge,
+      captured_edge: metrics.captured_edge,
+      captured_pct: metrics.captured_pct,
+      execution,
       legs: toEventLegs(metrics.legs),
       reason,
-      detail: `paper_touch exit — ${reason}`,
+      detail: `${this.cfg.executionMode} exit — ${reason} (slippage ₹${execution?.total_slippage ?? 0})`,
     });
 
     console.log(
-      `[Box] PAPER EXIT ${position.underlying} ${position.lower_strike}→${position.upper_strike} ` +
-        `${reason} net ₹${netPnl ?? "?"}`,
+      `[Box] PAPER EXIT ${directionLabel(position.direction ?? "LONG_BOX")} ${position.underlying} ` +
+        `${position.lower_strike}→${position.upper_strike} ${reason} net ₹${netPnl ?? "?"}`,
     );
     this.broadcast("exit", { trade: serializeBoxTrade(closed) });
     this.maybeReleaseFeed();
@@ -1078,13 +1254,16 @@ export class BoxEngine {
     legs: Record<BoxLegRole, BoxOptionInstrument>,
     lotSize: number,
     key: string,
+    direction: BoxDirection = "LONG_BOX",
   ): Promise<void> {
     if (this.marginInFlight.has(id)) return;
     this.marginInFlight.add(id);
+    // The sides depend on the direction: a short box blocks a different basket
+    // margin from a long box on the same strikes.
     const orders = BOX_LEG_ROLES.map((role) => ({
       exchange: legs[role].exchange,
       tradingsymbol: legs[role].tradingsymbol,
-      transaction_type: BOX_ENTRY_SIDES[role],
+      transaction_type: entrySideFor(role, direction),
       variety: "regular",
       product: "NRML",
       order_type: "MARKET",
@@ -1143,7 +1322,7 @@ export class BoxEngine {
     for (const pos of this.positions.list()) {
       if (pos.margin !== null) continue;
       if (this.marginInFlight.has(pos.id)) continue;
-      void this.captureMargin(pos.id, pos.legs, pos.lot_size, pos.key);
+      void this.captureMargin(pos.id, pos.legs, pos.lot_size, pos.key, pos.direction ?? "LONG_BOX");
     }
   }
 
@@ -1190,6 +1369,8 @@ export class BoxEngine {
         name: doc.name,
         is_index: doc.is_index,
         expiry: doc.expiry,
+        // Old documents carry no direction; directionOf() resolves them to LONG_BOX.
+        direction: directionOf(doc),
         lower_strike: doc.lower_strike,
         upper_strike: doc.upper_strike,
         box_width: doc.box_width,
@@ -1204,6 +1385,10 @@ export class BoxEngine {
           ? doc.estimated_exit_charges.total
           : null,
         safety_buffer: doc.safety_buffer,
+        expected_net_profit: doc.expected_net_profit ?? null,
+        entry_execution_cost: doc.entry_execution_cost ?? null,
+        charge_origin: doc.charge_origin ?? "local",
+        entry_execution: doc.entry_execution ?? null,
         margin: doc.margin ?? null,
         opened_at: doc.opened_at.getTime(),
         legs,
@@ -1223,10 +1408,23 @@ export class BoxEngine {
 
   getConfig() {
     return {
-      /** THE ENTRY GATE — ₹ from the spread alone. */
+      /** THE ENTRY GATE — minimum expected NET profit (₹) after every cost. */
+      min_expected_net_profit: requiredNetProfit(this.cfg),
+      /** A cheap gross prefilter (₹), never the decision. */
       min_gross_edge: this.cfg.minGrossEdge,
-      /** Optional extra net floor; 0 means fees do not gate entry. */
+      /** Legacy extra net floor; 0 means it does not raise the gate. */
       min_net_edge: this.cfg.minNetEdge,
+      /** Execution model and its simulated delays. */
+      execution_mode: this.cfg.executionMode,
+      simulated_decision_ms: this.cfg.simulatedDecisionMs,
+      simulated_latency_ms: this.cfg.simulatedLatencyMs,
+      expected_entry_slippage: this.cfg.expectedEntrySlippage,
+      expected_exit_slippage: this.cfg.expectedExitSlippage,
+      enable_short_box: this.cfg.enableShortBox,
+      directions: this.directions,
+      min_captured_pct: this.cfg.minCapturedPct,
+      reconcile_charges: this.cfg.reconcileCharges,
+      charge_reconcile_warn_pct: this.cfg.chargeReconcileWarnPct,
       require_priced_charges: this.cfg.requirePricedCharges,
       safety_buffer: this.cfg.safetyBuffer,
       /** How long an UNCHANGED book is still trusted. */
@@ -1245,7 +1443,6 @@ export class BoxEngine {
       expiry_safety_minutes: this.cfg.expirySafetyMinutesBeforeClose,
       max_subscribed_tokens: this.cfg.maxSubscribedTokens,
       lots: 1,
-      execution_mode: "paper_touch" as const,
       universe: "NSE F&O options only — F&O stocks + supported indices",
     };
   }
@@ -1268,7 +1465,7 @@ export class BoxEngine {
       /** The session the last-close prices come from, and legs dropped as stale. */
       indicative_session_day: this.indicativeSessionDay,
       indicative_stale_legs: this.indicativeStaleLegs,
-      execution_mode: "paper_touch" as const,
+      execution_mode: this.cfg.executionMode,
       authenticated: this.deps.kite.getAccessToken() !== null,
       db_enabled: isBoxDbEnabled(),
       started_at: this.startedAt,
@@ -1296,9 +1493,20 @@ export class BoxEngine {
       open_positions: this.positions.size,
       skipped_for_budget: this.skippedForBudget.length,
       skipped_symbols: this.skippedForBudget.slice(0, 25),
-      scanner,
+      scanner: {
+        ...scanner,
+        // Execution simulation headline figures the operator watches.
+        simulated_entries_attempted: scanner.executionsAttempted,
+        simulated_entries_filled: scanner.entriesOpened,
+        simulated_entries_failed:
+          scanner.rejectedExecution + scanner.rejectedLiquidity + scanner.rejectedNetProfit,
+        active_execution_pipelines: this.executionSim.activeCount,
+      },
       monitor: this.monitor.getStats(),
       charges: this.charges.getStats(),
+      reconciliation: this.reconciler.getStats(),
+      /** Rolling latency / slippage / throughput distributions (bounded rings). */
+      metrics: this.metrics.snapshot(),
       last_error: this.lastError,
       config: this.getConfig(),
     };
@@ -1404,14 +1612,16 @@ export class BoxEngine {
   getOpenPositions() {
     return this.positions.list().map((pos) => {
       const m = pos.metrics ?? this.monitor.measure(pos);
+      const direction = pos.direction ?? "LONG_BOX";
       return {
         id: pos.id,
         key: pos.key,
-        execution_mode: "paper_touch" as const,
+        execution_mode: this.cfg.executionMode,
         underlying: pos.underlying,
         name: pos.name,
         is_index: pos.is_index,
         expiry: pos.expiry,
+        direction,
         lower_strike: pos.lower_strike,
         upper_strike: pos.upper_strike,
         box_width: pos.box_width,
@@ -1425,9 +1635,12 @@ export class BoxEngine {
         estimated_exit_charges_at_entry: pos.estimated_exit_charges_total,
         safety_buffer: pos.safety_buffer,
         entry_net_edge: pos.entry_net_edge,
+        expected_net_profit: pos.expected_net_profit ?? null,
+        entry_execution_cost: pos.entry_execution_cost ?? null,
+        charge_origin: pos.charge_origin ?? "local",
         entry_legs: BOX_LEG_ROLES.map((role) => ({
           role,
-          side: BOX_ENTRY_SIDES[role],
+          side: entrySideFor(role, direction),
           tradingsymbol: pos.legs[role].tradingsymbol,
           strike: pos.legs[role].strike,
           instrument_type: pos.legs[role].instrument_type,
@@ -1451,16 +1664,26 @@ export class BoxEngine {
         current_exit_charges: m.estimated_exit_charges,
         total_charges: m.total_round_trip_charges,
         net_pnl: m.current_net_pnl,
+        realisable_net_pnl: m.realisable_net_pnl,
+        estimated_execution_cost: m.estimated_execution_cost,
         remaining_edge: m.remaining_edge,
+        /** Convergence progress the UI shows to make "is it converging" obvious. */
+        entry_edge: m.entry_edge,
+        captured_edge: m.captured_edge,
+        captured_pct: m.captured_pct,
+        time_in_trade_ms: m.time_in_trade_ms,
         convergence_threshold: m.convergence_threshold,
         min_exit_net_pnl: m.min_exit_net_pnl,
         profit_capture_target: m.profit_capture_target,
+        min_captured_pct: m.min_captured_pct,
         liquidity_ok: m.liquidity_ok,
         worst_age_ms: m.worst_age_ms,
         exit_eligible: m.exit_eligible,
         exit_reason: m.exit_reason,
         /** What the rules say even when the market cannot currently fill it. */
         exit_rule_reason: m.rule_reason,
+        /** Why it is being held, or why an eligible exit is blocked. */
+        blocked_reason: m.blocked_reason,
         exit_blocked_reason: pos.exit_blocked_reason,
         expiry_safety: pos.expiry_safety,
         status: "open" as const,

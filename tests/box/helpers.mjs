@@ -12,9 +12,22 @@ import { buildCandidates } from "../../dist/box/math.js";
 /** A NIFTY-like lot size, taken from "instrument metadata" in every fixture. */
 export const LOT = 75;
 
-/** Config with the shipped defaults (₹1,200 / ₹150 / 1,500 ms / ATM±3). */
+/**
+ * Config with the shipped defaults, plus test-friendly overrides.
+ *
+ * The default execution model is paper_latency with a real latency; most tests
+ * want the deterministic paper_touch model and no slippage allowance so the
+ * classic ₹1,875 gross → ₹1,425 net arithmetic holds. Pass explicit overrides to
+ * exercise paper_latency.
+ */
 export function cfg(overrides = {}) {
-  return { ...loadBoxConfig(), ...overrides };
+  return {
+    ...loadBoxConfig(),
+    executionMode: "paper_touch",
+    expectedEntrySlippage: 0,
+    expectedExitSlippage: 0,
+    ...overrides,
+  };
 }
 
 /** One book level list from a single price/qty pair. */
@@ -26,7 +39,7 @@ function levels(price, qty) {
  * A quote with an explicit touch and the size resting at it.
  * `at` is the RECEIVE time the freshness gate is measured against.
  */
-export function quote(token, { bid = 0, bidQty = 0, ask = 0, askQty = 0, last = 0, at = 0 }) {
+export function quote(token, { bid = 0, bidQty = 0, ask = 0, askQty = 0, last = 0, at = 0, version }) {
   return {
     token,
     bid,
@@ -36,7 +49,7 @@ export function quote(token, { bid = 0, bidQty = 0, ask = 0, askQty = 0, last = 
     last,
     bids: levels(bid, bidQty),
     asks: levels(ask, askQty),
-    version: token,
+    version: version ?? token,
     at,
     source: "ws",
   };
@@ -72,8 +85,8 @@ export function chain({ first = 19700, step = 100, count = 11, expiry = "2026-09
   return { strikes, ce, pe, expiry, lotSize };
 }
 
-/** Candidates for a strike window of the given chain. */
-export function candidatesFor(strikes, c = chain(), { underlying = "NIFTY" } = {}) {
+/** Candidates for a strike window of the given chain (directions selectable). */
+export function candidatesFor(strikes, c = chain(), { underlying = "NIFTY", directions } = {}) {
   return buildCandidates({
     underlying,
     name: "NIFTY 50",
@@ -83,11 +96,12 @@ export function candidatesFor(strikes, c = chain(), { underlying = "NIFTY" } = {
     strikes,
     ce: c.ce,
     pe: c.pe,
+    directions,
   });
 }
 
 /**
- * The canonical qualifying box used across the tests.
+ * The canonical qualifying LONG box used across the tests.
  *
  *   width  = 20100 - 19900 = 200
  *   cost   = 300 (K1 CE ask) - 220 (K2 CE bid) + 200 (K2 PE ask) - 105 (K1 PE bid) = 175
@@ -118,21 +132,24 @@ export function quotesFor(candidate, overrides = {}, { at = 1_000_000, base = GO
   return map;
 }
 
-/** The single qualifying candidate (K1=19900, K2=20100) from a 7-strike window. */
-export function goodCandidate() {
+/** The single qualifying LONG candidate (K1=19900, K2=20100) from a 7-strike window. */
+export function goodCandidate({ directions } = {}) {
   const c = chain();
   const window = [19700, 19800, 19900, 20000, 20100, 20200, 20300];
-  const all = candidatesFor(window, c);
+  const all = candidatesFor(window, c, { directions });
   const cand = all.find(
-    (x) => x.lower_strike === GOOD_BOX.k1 && x.upper_strike === GOOD_BOX.k2,
+    (x) =>
+      x.lower_strike === GOOD_BOX.k1 &&
+      x.upper_strike === GOOD_BOX.k2 &&
+      (x.direction ?? "LONG_BOX") === "LONG_BOX",
   );
   if (!cand) throw new Error("fixture: qualifying candidate not found");
   return { candidate: cand, all, chain: c, window };
 }
 
 /**
- * A charge estimator stub standing in for Zerodha's virtual contract note.
- * Returns a flat total per group so the arithmetic under test stays exact.
+ * A Zerodha charge estimator stub standing in for the virtual contract note,
+ * used only by the asynchronous RECONCILER now (never on the entry path).
  */
 export function chargeStub({ entryTotal = 150, exitTotal = 150, fail = false, onCall } = {}) {
   const calls = [];
@@ -174,6 +191,55 @@ export function chargeStub({ entryTotal = 150, exitTotal = 150, fail = false, on
   return { fn, calls };
 }
 
+/**
+ * A LocalChargeCalculator-shaped stub with fixed per-side totals.
+ *
+ * The real calculator (localCharges.ts) is exercised directly in
+ * localCharges.test.mjs; here a flat total keeps the P&L arithmetic under test
+ * exact and independent of statutory rates.
+ */
+export function localChargesStub({ entryTotal = 150, exitTotal = 150 } = {}) {
+  const mk = (orders, total) => ({
+    legs: orders.map((o) => ({
+      side: o.side,
+      tradingsymbol: o.tradingsymbol,
+      quantity: o.quantity,
+      price: o.price,
+      value: o.quantity * o.price,
+      brokerage: 0,
+      stt: 0,
+      stt_type: "",
+      exchange_txn: 0,
+      sebi: 0,
+      stamp_duty: 0,
+      gst: 0,
+      total: total / Math.max(1, orders.length),
+    })),
+    value: 0,
+    brokerage: 0,
+    stt: 0,
+    exchange_txn: 0,
+    sebi: 0,
+    stamp_duty: 0,
+    gst: 0,
+    total,
+    source: "kite",
+    at: new Date(0),
+    computed_by: "local",
+  });
+  return {
+    rates: {},
+    legs: (orders, source = "kite") => mk(orders, source === "kite_estimate" ? exitTotal : entryTotal),
+    roundTrip: (orders) => ({
+      entry: mk(orders, entryTotal),
+      estimated_exit: mk(orders, exitTotal),
+      entry_total: entryTotal,
+      estimated_exit_total: exitTotal,
+    }),
+    totals: () => ({ entry: entryTotal, exit: exitTotal }),
+  };
+}
+
 /** A position as the monitor holds it in memory. */
 export function positionFrom(candidate, overrides = {}) {
   const legs = candidate.legs;
@@ -184,6 +250,7 @@ export function positionFrom(candidate, overrides = {}) {
     name: candidate.name,
     is_index: candidate.is_index,
     expiry: candidate.expiry,
+    direction: candidate.direction ?? "LONG_BOX",
     lower_strike: candidate.lower_strike,
     upper_strike: candidate.upper_strike,
     box_width: candidate.box_width,
@@ -195,6 +262,11 @@ export function positionFrom(candidate, overrides = {}) {
     entry_charges_total: 150,
     estimated_exit_charges_total: 150,
     safety_buffer: 150,
+    expected_net_profit: 1425,
+    entry_execution_cost: 0,
+    charge_origin: "local",
+    entry_execution: null,
+    margin: null,
     opened_at: 0,
     legs,
     entry_prices: { k1_ce: 300, k2_ce: 220, k2_pe: 200, k1_pe: 105 },
@@ -209,24 +281,23 @@ export function positionFrom(candidate, overrides = {}) {
 }
 
 /**
- * Exit-side quotes producing a chosen exit box value per unit.
+ * Exit-side quotes producing a chosen exit box value per unit for a LONG box.
  *
  *   exitValue = Bid(K1 CE) - Ask(K2 CE) + Bid(K2 PE) - Ask(K1 PE)
  *
  * K2 CE ask and K1 PE ask are pinned, so the requested value is reached by
  * moving the two BIDs the exit sells into.
  */
-export function exitQuotes(candidate, exitValuePerUnit, { at = 1_000_000, qty = 150 } = {}) {
+export function exitQuotes(candidate, exitValuePerUnit, { at = 1_000_000, qty = 150, version } = {}) {
   const k2ceAsk = 221;
   const k1peAsk = 106;
-  // exitValue = k1ceBid - k2ceAsk + k2peBid - k1peAsk, split evenly across bids.
   const bidSum = exitValuePerUnit + k2ceAsk + k1peAsk;
   const k1ceBid = Math.round((bidSum * 2) / 3);
   const k2peBid = bidSum - k1ceBid;
   const map = new Map();
   const put = (role, spec) => {
     const token = candidate.legs[role].token;
-    map.set(token, quote(token, { ...spec, at }));
+    map.set(token, quote(token, { ...spec, at, version }));
   };
   put("k1_ce", { bid: k1ceBid, bidQty: qty, ask: k1ceBid + 1, askQty: qty });
   put("k2_ce", { ask: k2ceAsk, askQty: qty, bid: k2ceAsk - 1, bidQty: qty });
@@ -235,11 +306,25 @@ export function exitQuotes(candidate, exitValuePerUnit, { at = 1_000_000, qty = 
   return map;
 }
 
+/** Apply a role→quote map to a real BoxQuoteStore as WS ticks. */
+export function seedStore(store, map, at = Date.now()) {
+  const tokens = [];
+  for (const [token, q] of map) {
+    store.applyTicks(
+      [{ token, last_price: q.last, bid: q.bid, ask: q.ask, bids: q.bids, asks: q.asks }],
+      at,
+    );
+    tokens.push(token);
+  }
+  return tokens;
+}
+
 /** A quote store pre-loaded with a fixed map (the engine's store, but seeded). */
 export function storeFrom(map) {
   return {
     view: () => map,
     get: (t) => map.get(t),
+    subscribe: () => () => {},
     isFresh: (t, maxAge, now = Date.now()) => {
       const q = map.get(t);
       return !!q && now - q.at <= maxAge;

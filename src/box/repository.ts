@@ -16,8 +16,12 @@ import {
   type BoxTradeRecord,
 } from "./model.js";
 import type {
+  BoxChargeReconciliation,
+  BoxDirection,
   BoxEventLeg,
   BoxEventType,
+  BoxExecutionRecord,
+  ExecutionMode,
   IBoxTrade,
   IBoxTradeEvent,
 } from "./types.js";
@@ -120,6 +124,8 @@ export async function updateBoxTradeLive(
   id: string,
   fields: {
     current_remaining_edge: number | null;
+    current_captured_edge?: number | null;
+    current_captured_pct?: number | null;
     exit_blocked_reason?: string | null;
     expiry_safety?: boolean;
   },
@@ -129,6 +135,34 @@ export async function updateBoxTradeLive(
     await BoxTrade.updateOne({ _id: id }, { $set: fields });
   } catch (err) {
     console.warn("[Box] live update failed for", id, err);
+  }
+}
+
+/**
+ * Store the verdict of an asynchronous charge reconciliation.
+ *
+ * Written well after the fill. When Zerodha agreed, the charge record's
+ * `computed_by` is promoted to "local_verified" so the UI can show the number was
+ * confirmed; the totals themselves are never rewritten.
+ */
+export async function setBoxChargeReconciliation(
+  id: string,
+  phase: "entry" | "exit",
+  verdict: BoxChargeReconciliation,
+): Promise<void> {
+  if (!isBoxDbEnabled() || !isValidBoxId(id)) return;
+  const set: Record<string, unknown> = {
+    [`${phase}_charge_reconciliation`]: verdict,
+  };
+  if (verdict.status === "verified") {
+    const chargeField = phase === "entry" ? "entry_charges" : "exit_charges";
+    set[`${chargeField}.computed_by`] = "local_verified";
+    if (phase === "entry") set["charge_origin"] = "local_verified";
+  }
+  try {
+    await BoxTrade.updateOne({ _id: id }, { $set: set });
+  } catch (err) {
+    console.warn("[Box] reconciliation update failed for", id, err);
   }
 }
 
@@ -169,6 +203,7 @@ export interface BoxEventInput {
   candidate_key: string;
   underlying: string;
   expiry: string;
+  direction?: BoxDirection;
   lower_strike: number;
   upper_strike: number;
   lot_size: number;
@@ -181,9 +216,15 @@ export interface BoxEventInput {
   exit_charges_total?: number | null;
   safety_buffer?: number | null;
   net_edge?: number | null;
+  expected_net_profit?: number | null;
+  execution_cost?: number | null;
   gross_pnl?: number | null;
   net_pnl?: number | null;
   remaining_edge?: number | null;
+  captured_edge?: number | null;
+  captured_pct?: number | null;
+  execution?: BoxExecutionRecord | null;
+  execution_mode?: ExecutionMode;
   legs?: BoxEventLeg[];
   reason?: string | null;
   detail?: string | null;
@@ -206,11 +247,12 @@ export async function appendBoxEvent(input: BoxEventInput): Promise<void> {
     candidate_key: input.candidate_key,
     underlying: input.underlying,
     expiry: input.expiry,
+    direction: input.direction ?? "LONG_BOX",
     lower_strike: input.lower_strike,
     upper_strike: input.upper_strike,
     lot_size: input.lot_size,
     quantity: input.quantity,
-    execution_mode: "paper_touch",
+    execution_mode: input.execution_mode ?? "paper_touch",
     box_width: input.box_width ?? null,
     box_cost: input.box_cost ?? null,
     gross_edge: input.gross_edge ?? null,
@@ -218,9 +260,14 @@ export async function appendBoxEvent(input: BoxEventInput): Promise<void> {
     exit_charges_total: input.exit_charges_total ?? null,
     safety_buffer: input.safety_buffer ?? null,
     net_edge: input.net_edge ?? null,
+    expected_net_profit: input.expected_net_profit ?? null,
+    execution_cost: input.execution_cost ?? null,
     gross_pnl: input.gross_pnl ?? null,
     net_pnl: input.net_pnl ?? null,
     remaining_edge: input.remaining_edge ?? null,
+    captured_edge: input.captured_edge ?? null,
+    captured_pct: input.captured_pct ?? null,
+    execution: input.execution ?? null,
     legs: input.legs ?? [],
     reason: input.reason ?? null,
     detail: input.detail ?? null,

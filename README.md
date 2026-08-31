@@ -159,12 +159,19 @@ analytics, schema and collections are untouched, and box positions live in their
 > ### Paper execution — read this before trusting a number
 >
 > **This module never places a real order.** No Zerodha order-placement API is called anywhere in
-> it. Every fill is simulated and stored with `execution_mode: "paper_touch"`.
+> it. Every fill is simulated and stored with an `execution_mode` of `paper_latency` (default) or
+> `paper_touch`.
 >
-> A paper box fill assumes **all four one-lot legs were simultaneously executable at the touch
-> recorded in that decision snapshot**. That is a real, tick-valid price that was genuinely quoted
-> — but it **does not guarantee the same result in live trading**, because a real execution can
-> also experience:
+> - **`paper_touch`** assumes all four one-lot legs were simultaneously executable at the touch in
+>   the detection snapshot. Optimistic, kept for comparison.
+> - **`paper_latency`** (default) is more realistic: it waits a simulated decision + order-send
+>   delay and then fills from the **first WebSocket book each leg publishes at or after that
+>   moment**, so every recorded price is one the exchange actually showed *after* the order could
+>   have arrived. There is **no invented slippage percentage** — slippage is measured against the
+>   detection touch. If a leg publishes no post-arrival book, nothing is filled.
+>
+> Either way these are **simulated fills at observed quotes**, not exchange fills, and do not
+> guarantee the same result live, which can also experience:
 >
 > - inter-leg latency (four orders do not fill at the same instant)
 > - queue position (being at the touch is not being first at the touch)
@@ -176,55 +183,71 @@ analytics, schema and collections are untouched, and box positions live in their
 > These are **simulated fills at observed quotes**, not exchange fills, and are labelled as such
 > in the API and the UI.
 
-### The box
+### The box — LONG and SHORT
 
-For strikes `K1 < K2` on the same underlying and expiry, a **long box** is
+For strikes `K1 < K2` on the same underlying and expiry, both directions are evaluated:
 
 ```
-BUY  K1 CE      SELL K2 CE      BUY  K2 PE      SELL K1 PE
+LONG_BOX    BUY  K1 CE   SELL K2 CE   BUY  K2 PE   SELL K1 PE
+SHORT_BOX   SELL K1 CE   BUY  K2 CE   SELL K2 PE   BUY  K1 PE
 ```
 
-Its payoff at expiry is a fixed `K2 - K1` per unit wherever the underlying settles, so the edge is
-the difference between that width and what the four legs cost to put on.
+Both settle at a fixed `K2 - K1` per unit wherever the underlying goes: the long box **receives**
+that width at expiry, the short box **pays** it. So the mispricing is signed by direction. One
+formula covers both (`sign = +1` long, `-1` short):
+
+```
+netDebitPerUnit  = Σ (+ask for each BUY leg, -bid for each SELL leg)   # executable touch only
+grossEdgePerUnit = sign x (K2 - K1) - netDebitPerUnit
+grossEdge        = grossEdgePerUnit x lotSize
+```
+
+A long box is the opportunity when the box trades **below** its width; a short box when it trades
+**above** it. Direction is part of a box's identity — the candidate/position key is
+`underlying|expiry|K1|K2|DIRECTION`, so a long and a short box on the same strikes are distinct
+positions. Old documents with no direction load as `LONG_BOX`. Short boxes can be turned off with
+`BOX_ENABLE_SHORT_BOX=false`.
 
 All pricing is **executable only** — a BUY uses the best **ask**, a SELL uses the best **bid**.
 LTP, mid-price and theoretical values are never used to size, qualify or close a position.
 
-```
-entryBoxCostPerUnit = Ask(K1 CE) - Bid(K2 CE) + Ask(K2 PE) - Bid(K1 PE)
-grossEdgePerUnit    = (K2 - K1) - entryBoxCostPerUnit
-grossEdge           = grossEdgePerUnit x lotSize
-```
+### Entry: ₹1,200 of EXPECTED NET PROFIT
 
-### Entry: ₹1,200 from the SPREAD
-
-The gate is the **gross** arbitrage the executable prices actually show:
+The decisive gate is realistic **expected net profit**, evaluated on the **executed** snapshot
+(after the simulated latency), with every term visible:
 
 ```
-grossEdge = ((K2 - K1) - entryBoxCostPerUnit) x lotSize
-enter if    grossEdge >= MIN_BOX_GROSS_EDGE          (default ₹1,200)
+expectedNet = grossEdge
+            - entryCharges              # local calculator, see below
+            - estimatedExitCharges
+            - executionCost             # MEASURED entry slippage + an exit allowance
+            - safetyBuffer
+enter if      expectedNet >= BOX_MIN_EXPECTED_NET_PROFIT      (default ₹1,200)
 ```
 
-Charges are **still** estimated, stored and displayed — they are simply not
-deducted before deciding to enter, because fees are managed by hand. The
-after-cost figure is reported alongside every opportunity and frozen onto every
-trade:
+The gross spread is now only a **cheap prefilter** (`MIN_BOX_GROSS_EDGE`, default ₹1,200) that
+decides whether a candidate is worth costing out — it can never on its own open a trade. Worked
+examples:
 
-```
-projectedNetEdge = grossEdge - entryCharges - estimatedExitCharges - safetyBuffer
-```
+- gross ₹1,900, fees ₹350, slippage ₹250, buffer ₹150 → expected net **₹1,150 → REJECT**
+- gross ₹2,400, fees ₹350, slippage ₹200, buffer ₹150 → expected net **₹1,700 → eligible**
 
-If you later want a net cushion as well, set `MIN_BOX_NET_EDGE` to a positive
-number and it becomes an **additional** floor. It is `0` (off) by default.
+The legacy `MIN_BOX_NET_EDGE` still works: if set above 0 it raises the effective gate to
+`max(BOX_MIN_EXPECTED_NET_PROFIT, MIN_BOX_NET_EDGE)`.
 
-Charges come from the **same Zerodha virtual contract note** the calendar trades
-use (`POST /charges/orders`), wrapped for a box: four entry orders and four
-reversed exit orders priced in **one** request, with a per-leg breakdown and
-totals stored on the trade. A box whose charges cannot be priced is shown
-`UNPRICED` and skipped — not because of the threshold, but because the exit rules
-are evaluated net of charges, so such a position could never have its net P&L
-computed and would never auto-exit. Set `BOX_REQUIRE_PRICED_CHARGES=false` to
-allow it anyway and manage those by hand.
+#### Charges are computed LOCALLY, then reconciled
+
+The decision path no longer waits on Zerodha. A **local, synchronous, deterministic** calculator
+(`localCharges.ts`) prices the eight box orders in a few dozen float operations, reusing the exact
+heads and rounding the calendar ledger uses (brokerage, STT sell-side only, exchange transaction
+charge, SEBI, stamp duty buy-side only, GST). Every rate is centralised and env-overridable.
+
+After a paper trade is opened, Zerodha's virtual contract note (`POST /charges/orders`) is called
+**asynchronously** to reconcile — it never delays a fill. The trade stores the local total, the
+reconciled total, the absolute and percentage difference, and a status; when they agree the charge
+record is promoted to `local_verified`. A discrepancy over `BOX_CHARGE_RECONCILE_WARN_PCT`
+(default 5%) logs a warning and is surfaced in `/api/box/status`. Reconciliation is
+concurrency-limited and cached, so Zerodha is never hammered.
 
 Guards on every automatic entry:
 
@@ -298,27 +321,33 @@ window re-centres when the underlying drifts past a hysteresis band (and no more
 `BOX_WINDOW_MIN_INTERVAL_MS`), so a price sitting on a strike boundary cannot cause continuous
 resubscription.
 
-### Exit: convergence, but only while genuinely profitable
+### Exit: convergence, measured explicitly
 
-The exit reverses every leg — the two longs sell into the **bid**, the two shorts are bought back
-at the **ask**:
+The strategy is not held to expiry — it enters a temporary mispricing and leaves once it has
+converged enough to bank a worthwhile net profit. The exit reverses every leg (direction-aware),
+and `evaluateExitDecision()` returns one structured verdict rather than scattered booleans:
 
 ```
-exitBoxValuePerUnit = Bid(K1 CE) - Ask(K2 CE) + Bid(K2 PE) - Ask(K1 PE)
-grossPnL            = (exitBoxValuePerUnit - entryBoxCostPerUnit) x lotSize
-currentNetPnL       = grossPnL - (entryCharges + currentEstimatedExitCharges)
-remainingEdge       = ((K2 - K1) - exitBoxValuePerUnit) x lotSize
-threshold           = max(₹200, 20% x entryNetEdge)
+exitCreditPerUnit = Σ (+price for each closing SELL, -price for each closing BUY)   # executable touch
+grossPnL          = (exitCreditPerUnit - entryNetDebitPerUnit) x lotSize
+currentNetPnL     = grossPnL - (entryCharges + currentEstimatedExitCharges)
+remainingEdge     = (sign x (K2 - K1) - exitCreditPerUnit) x lotSize
+capturedEdge      = entryEdge - remainingEdge
+capturedPct       = capturedEdge / |entryEdge|
+threshold         = max(₹200, 20% x entryNetEdge)
 ```
 
-A box closes automatically when **either**
+A box closes automatically when it is executable **and** either
 
-1. `remainingEdge <= threshold` **AND** `currentNetPnL >= ₹600`, or
-2. `currentNetPnL >= 75% x entryNetEdge` (profit capture, even if the raw edge has not converged)
+1. `remainingEdge <= threshold` **AND** `currentNetPnL >= ₹600` (`EDGE_CONVERGED`), or
+2. `currentNetPnL >= ₹600` **AND** (`currentNetPnL >= 75% x entryNetEdge` **or**
+   `capturedPct >= BOX_MIN_CAPTURED_PCT`) (`PROFIT_CAPTURE`).
 
-and in **both** cases only while `currentNetPnL > 0` and all four reversed legs have fresh one-lot
-touch liquidity. **Convergence alone never closes a losing or break-even box** — the decision
-always uses executable exit prices plus currently estimated exit fees.
+In **all** cases the net P&L is computed from executable exit prices plus current exit fees, so a
+theoretical threshold being crossed can never close a trade that would not actually pay — that case
+is reported as a held `net_below_floor` reason rather than acted on. Sign handling is identical for
+long and short boxes (no inverted P&L). Expiry safety is a separate emergency rule that overrides
+profitability but still refuses to invent a price.
 
 If the arithmetic says close but the touch cannot supply a whole lot, the exit is **not faked**:
 the position stays open, `EXIT_SKIPPED_LIQUIDITY` is recorded with the specific shortfall, and
@@ -374,35 +403,71 @@ Every threshold is env-overridable; the defaults are the shipped specification.
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
 | `BOX_MONGODB_URI` | *(unset)* | Dedicated database for `box_trades` + `box_trade_events`; falls back to `MONGODB_URI` |
-| `MIN_BOX_GROSS_EDGE` | `1200` | **The entry gate**: minimum GROSS edge (₹) from the spread alone |
-| `MIN_BOX_NET_EDGE` | `0` | Optional *additional* net floor (₹). `0` = fees do not gate entry |
-| `BOX_REQUIRE_PRICED_CHARGES` | `true` | Skip a box whose charges Kite could not price (so exits stay manageable) |
-| `BOX_SAFETY_BUFFER` | `150` | Slippage allowance (₹) reported in the net figure, **not** part of the gate |
+| `BOX_MIN_EXPECTED_NET_PROFIT` | `1200` | **The entry gate**: minimum expected NET profit (₹) after every cost |
+| `MIN_BOX_GROSS_EDGE` | `1200` | Cheap gross prefilter (₹) — never the decision |
+| `MIN_BOX_NET_EDGE` | `0` | Legacy *additional* net floor (₹). `>0` raises the effective gate |
+| `BOX_EXECUTION_MODE` | `paper_latency` | `paper_latency` (realistic) or `paper_touch` (optimistic, for comparison) |
+| `BOX_SIMULATED_LATENCY_MS` | `250` | Simulated order-send → exchange arrival delay |
+| `BOX_SIMULATED_DECISION_MS` | `40` | Simulated internal decision time before an order is "sent" |
+| `BOX_EXECUTION_MAX_WAIT_MS` | `1500` | How long the simulator waits for a post-arrival book per leg |
+| `BOX_ENABLE_SHORT_BOX` | `true` | Evaluate SHORT/reverse boxes as well as long boxes |
+| `BOX_EXPECTED_ENTRY_SLIPPAGE` / `BOX_EXPECTED_EXIT_SLIPPAGE` | `250` / `250` | Slippage allowances (₹) used before/for the un-measured side |
+| `BOX_RECONCILE_CHARGES` | `true` | Verify local charge maths against Zerodha asynchronously after a fill |
+| `BOX_CHARGE_RECONCILE_WARN_PCT` | `5` | Warn when local vs Zerodha charges differ by more than this % |
+| `BOX_BROKERAGE_PER_ORDER` / `BOX_STT_SELL_PCT` / `BOX_EXCHANGE_TXN_PCT` / `BOX_SEBI_PCT` / `BOX_STAMP_DUTY_BUY_PCT` / `BOX_GST_PCT` | `20` / `0.15` / `0.03553` / `0.0001` / `0.003` / `18` | The centralised local charge rate card (percentages as PERCENT) |
+| `BOX_REQUIRE_PRICED_CHARGES` | `true` | Skip a box whose charges could not be determined |
+| `BOX_SAFETY_BUFFER` | `150` | Risk allowance (₹) deducted inside the expected-net figure |
 | `BOX_QUOTE_MAX_AGE_MS` | `15000` | How long an UNCHANGED book is still trusted |
 | `BOX_FEED_MAX_AGE_MS` | `5000` | Feed liveness: newest tick across the whole universe |
 | `BOX_INDICATIVE_REFRESH_MS` | `60000` | How often the last-close view is rebuilt while the market is shut |
-
 | `BOX_PREFILTER_CHARGE_ALLOWANCE` | `160` | Lower bound on round-trip charges, prefilter only |
 | `BOX_CONVERGENCE_FLOOR` / `BOX_CONVERGENCE_PCT` | `200` / `0.2` | Convergence threshold |
 | `BOX_MIN_EXIT_NET_PNL` | `600` | Minimum net profit for a normal convergence exit |
 | `BOX_PROFIT_CAPTURE_PCT` | `0.75` | Fraction of the entry edge that alone justifies exiting |
+| `BOX_MIN_CAPTURED_PCT` | `0.75` | Fraction of the ORIGINAL edge captured that alone justifies exiting |
 | `BOX_EXPIRY_SAFETY_MINUTES` | `45` | Minutes before the close on expiry day to force an exit |
 | `BOX_MAX_SUBSCRIBED_TOKENS` | `2200` | Live-feed instrument budget |
+| `BOX_MAX_CONCURRENT_EXECUTIONS` | `8` | Cap on simultaneous simulated execution pipelines |
+| `BOX_METRICS_WINDOW` | `500` | Samples kept in each bounded rolling-metrics ring buffer |
 | `BOX_MONITOR_INTERVAL_MS` | `1000` | Fallback watchdog cadence; open positions normally re-evaluate immediately on relevant WebSocket depth ticks |
+
+**Observability.** `/api/box/status` now also exposes bounded rolling metrics: evaluations/sec,
+WS updates/sec, receive→evaluation and event-loop-lag percentiles, decision→fill latency
+percentiles, simulated slippage distributions, execution failure rate by reason, and charge
+reconciliation discrepancy stats — all from fixed-size ring buffers, never unbounded arrays.
+
+**Architecture.** New focused modules keep `engine.ts` from growing: `localCharges.ts` (the rate
+card + calculator), `executionSimulator.ts` (the detection→latency→fill pipeline),
+`chargeReconciler.ts` (async Zerodha verification) and `metrics.ts` (ring buffers). The quote
+store exposes a `replay()` + `subscribe()` seam so recorded tick batches can be driven through the
+exact live code path (store → scanner → execution simulator → monitor) without a Zerodha
+connection — the basis of a deterministic replay harness.
 
 Strikes are fixed at **ATM ±3** in V1 and deliberately not configurable.
 
 ### Tests
 
 `npm test` builds and runs the box suite (`tests/box/`, Node's built-in runner, no extra
-dependency). It covers the trading core deterministically: strike-window selection and the
-seven-strike/21-pair limits, the long-box legs, ask-for-BUY and bid-for-SELL, box cost, expiry
-payoff and gross edge, one-lot enforcement and touch-quantity validation, freshness and
-missing-bid/missing-ask rejection, fee and safety-buffer reporting, ₹1,199 vs ₹1,200 of spread,
-duplicate rejection, token-dependent recalculation, reversed exit sides, the convergence
-threshold, the market-closed gate, the indicative last-close view and its plausibility bound, the refusal to exit at a loss or under ₹600, the 75% capture rule, insufficient exit
-liquidity leaving a position open, manual close (including its refusal), serialization, and that
-STOP blocks new entries while still managing open positions.
+dependency) — **118 deterministic tests**, no clock, network or database. Alongside the original
+math/scanner/monitor/serialize coverage it adds:
+
+- **Direction** — long and short side maps, opposite edge signs on the same book, the short-box
+  opportunity being "box above width", direction in the identity key, and old documents loading as
+  `LONG_BOX`.
+- **Execution simulator** — zero / favourable / adverse post-latency moves, insufficient quantity
+  after the delay, a missing post-arrival book (never faked into a fill), a dead feed during the
+  delay, the edge disappearing, expected-net falling below the gate, and duplicate-pipeline
+  prevention — all with an injected clock so latency is exercised deterministically.
+- **Local charges** — known deterministic examples, `sum(heads) == leg total` and
+  `sum(legs) == group total`, sell-side STT / buy-side stamp duty, the reversed exit projection,
+  and env-override of a rate.
+- **Entry decision** — gross-high-but-net-below-₹1,200 → reject, gross-high-and-net-above →
+  eligible, the exact ₹1,200 boundary, slippage biting the decision, and the legacy floor.
+- **Exit/convergence** — no/partial/threshold convergence, high captured %, converged-but-
+  unprofitable held, profitable executable exit, insufficient exit liquidity, short-box signs, and
+  expiry safety.
+- **Replay harness** — recorded batches driven through `store.replay()` notify observers exactly
+  as a live tick would.
 
 ---
 
@@ -438,8 +503,8 @@ Box arbitrage (paper, admin-only — full admin or trade access):
 
 | Endpoint | Purpose |
 | -------- | ------- |
-| `GET /api/box/status` | Scanner state, `market_open`, universe/candidate counts, monitor + charge stats |
-| `GET /api/box/config` | Active thresholds (₹1,200 spread, ₹150 safety, 1,500 ms, ATM ±3, 1 lot) |
+| `GET /api/box/status` | Scanner state, `market_open`, universe/candidate counts, execution + reconciliation stats, rolling latency/slippage metrics |
+| `GET /api/box/config` | Active thresholds (₹1,200 expected net, execution mode + latency, long/short, ATM ±3, 1 lot) |
 | `POST /api/box/start` | RUN — begin discovering and auto-opening paper boxes |
 | `POST /api/box/stop` | STOP — stop opening NEW boxes (open ones stay monitored) |
 | `GET /api/box/opportunities` | Current opportunities, best net edge first |

@@ -1,7 +1,11 @@
 /**
  * The position monitor: automatic exits, the refusal to fake an exit without
- * liquidity, manual close, and the guarantee that monitoring is independent of
- * the scanner's RUN state.
+ * liquidity, manual close, expiry safety, and the guarantee that monitoring is
+ * independent of the scanner's RUN state.
+ *
+ * Exit charges are now priced by the LOCAL calculator synchronously, and the
+ * fill goes through the execution simulator (paper_touch here for determinism;
+ * paper_latency is exercised in execution.test.mjs).
  */
 
 import test from "node:test";
@@ -12,9 +16,10 @@ import {
   describeLiquidityGap,
   liquidityGapKey,
 } from "../../dist/box/positionMonitor.js";
-import { BoxChargeEstimator } from "../../dist/box/charges.js";
+import { BoxExecutionSimulator } from "../../dist/box/executionSimulator.js";
 import { BoxPositionBook } from "../../dist/box/positions.js";
 import { BoxScanner } from "../../dist/box/scanner.js";
+import { BoxChargeEstimator } from "../../dist/box/charges.js";
 import { BoxQuoteStore } from "../../dist/box/quotes.js";
 import {
   GOOD_BOX,
@@ -23,6 +28,8 @@ import {
   chargeStub,
   exitQuotes,
   goodCandidate,
+  localChargesStub,
+  seedStore,
 } from "./helpers.mjs";
 
 /**
@@ -39,29 +46,27 @@ function harness({
   expiry = "2026-09-24",
   istDay = "2026-08-29",
   istMinutes = 11 * 60,
-  chargesFail = false,
   marketOpen = true,
   feedHealthy = true,
-  onChargeCall,
+  config = {},
 } = {}) {
   const { candidate } = goodCandidate();
-  const conf = cfg();
+  const conf = cfg(config);
   const now = Date.now();
   const quotes = new BoxQuoteStore();
-  for (const [token, q] of exitQuotes(candidate, exitValuePerUnit, { at: now - ageMs, qty })) {
-    quotes.applyTicks(
-      [{ token, last_price: q.last, bid: q.bid, ask: q.ask, bids: q.bids, asks: q.asks }],
-      now - ageMs,
-    );
-  }
+  seedStore(quotes, exitQuotes(candidate, exitValuePerUnit, { at: now - ageMs, qty }), now - ageMs);
+
   const positions = new BoxPositionBook();
-  const stub = chargeStub({
-    entryTotal: exitFees,
-    exitTotal: exitFees,
-    fail: chargesFail,
-    onCall: (groups) => onChargeCall?.({ groups, quotes, candidate, now }),
+  const localCharges = localChargesStub({ entryTotal: exitFees, exitTotal: exitFees });
+
+  let mktOpen = marketOpen;
+  let feedOk = feedHealthy;
+  const executionSim = new BoxExecutionSimulator({
+    cfg: conf,
+    quotes,
+    isMarketOpen: () => mktOpen,
+    isFeedHealthy: () => feedOk,
   });
-  const charges = new BoxChargeEstimator(stub.fn, conf);
 
   const position = {
     id: "box1",
@@ -70,6 +75,7 @@ function harness({
     name: candidate.name,
     is_index: candidate.is_index,
     expiry,
+    direction: "LONG_BOX",
     lower_strike: candidate.lower_strike,
     upper_strike: candidate.upper_strike,
     box_width: candidate.box_width,
@@ -81,6 +87,11 @@ function harness({
     entry_charges_total: 150,
     estimated_exit_charges_total: 150,
     safety_buffer: 150,
+    expected_net_profit: entryNetEdge,
+    entry_execution_cost: 0,
+    charge_origin: "local",
+    entry_execution: null,
+    margin: null,
     opened_at: now - 60_000,
     legs: candidate.legs,
     entry_prices: { k1_ce: 300, k2_ce: 220, k2_pe: 200, k1_pe: 105 },
@@ -99,7 +110,8 @@ function harness({
   const monitor = new BoxPositionMonitor({
     cfg: conf,
     quotes,
-    charges,
+    localCharges,
+    executionSim,
     positions,
     closePaperTrade: async (args) => {
       closes.push(args);
@@ -112,11 +124,23 @@ function harness({
     onEvent: (event, pos, metrics, detail) => events.push({ event, detail, metrics }),
     istDayKey: () => istDay,
     istMinutesOfDay: () => istMinutes,
-    isMarketOpen: () => marketOpen,
-    isFeedHealthy: () => feedHealthy,
+    isMarketOpen: () => mktOpen,
+    isFeedHealthy: () => feedOk,
   });
 
-  return { monitor, positions, position, candidate, closes, events, persisted, conf, quotes, stub };
+  return {
+    monitor,
+    positions,
+    position,
+    candidate,
+    closes,
+    events,
+    persisted,
+    conf,
+    quotes,
+    setMarket: (v) => (mktOpen = v),
+    setFeed: (v) => (feedOk = v),
+  };
 }
 
 /* -------------------------------------------------------------- auto exit --- */
@@ -132,12 +156,14 @@ test("a converged, comfortably profitable box is closed automatically", async ()
   assert.ok(metrics.current_net_pnl >= 600);
   assert.equal(h.positions.size, 0);
   assert.ok(h.events.some((e) => e.event === "EXIT_TRIGGERED"));
+  // The captured-edge convergence figures are populated.
+  assert.equal(metrics.captured_edge, metrics.entry_edge - metrics.remaining_edge);
+  assert.ok(metrics.captured_pct > 0);
 });
 
 test("a WebSocket leg update evaluates and closes immediately without waiting for the watchdog", async () => {
   const h = harness({ exitValuePerUnit: 198 });
   h.monitor.onTokensUpdated([h.candidate.legs.k1_ce.token]);
-  // cycle() joins the already-running per-position task, avoiding a timing sleep.
   await h.monitor.cycle();
 
   assert.equal(h.closes.length, 1);
@@ -145,89 +171,30 @@ test("a WebSocket leg update evaluates and closes immediately without waiting fo
   assert.equal(h.positions.size, 0);
 });
 
-test("an exit records the post-charge WebSocket touches, never the pre-await snapshot", async () => {
-  const h = harness({
-    exitValuePerUnit: 198,
-    onChargeCall: ({ quotes, candidate }) => {
-      // Simulate a newer WS depth packet arriving while Zerodha prices charges.
-      // The moved book remains eligible, so the recorded fill must use 199, not
-      // the 198 snapshot that caused charge pricing to start.
-      const moved = exitQuotes(candidate, 199, { at: Date.now(), qty: 150 });
-      for (const [token, quote] of moved) {
-        quotes.applyTicks(
-          [{ token, last_price: quote.last, bid: quote.bid, ask: quote.ask, bids: quote.bids, asks: quote.asks }],
-          Date.now(),
-        );
-      }
-    },
-  });
-
+test("the exit fill records the executable touches with their depth", async () => {
+  const h = harness({ exitValuePerUnit: 198 });
   await h.monitor.cycle();
   assert.equal(h.closes.length, 1);
-  assert.equal(h.stub.calls.length, 2, "moved fills must be re-priced before closing");
   const closed = h.closes[0];
-  assert.equal(closed.metrics.exit_box_value_per_unit, 199);
+  assert.equal(closed.metrics.exit_box_value_per_unit, 198);
   assert.equal(closed.metrics.legs.every((leg) => leg.qty_at_touch >= LOT), true);
-  const feeBySymbol = new Map(closed.exitCharges.legs.map((leg) => [leg.tradingsymbol, leg]));
+  // The execution record and per-leg depth are attached for the audit trail.
+  assert.ok(closed.execution, "an execution record is attached");
   for (const leg of closed.metrics.legs) {
-    assert.equal(feeBySymbol.get(leg.tradingsymbol).price, leg.price);
-    assert.ok(leg.quote_version > 0);
+    assert.ok(leg.depth, "the fill depth is captured");
     const side = leg.side === "BUY" ? leg.depth.asks : leg.depth.bids;
     assert.ok(side.some((level) => level.price === leg.price));
   }
 });
 
-test("an automatic exit stays open if the WS touch moves through all three charge attempts", async () => {
-  let value = 198;
-  const h = harness({
-    exitValuePerUnit: 198,
-    onChargeCall: ({ quotes, candidate }) => {
-      value += 1;
-      const moved = exitQuotes(candidate, value, { at: Date.now(), qty: 150 });
-      for (const [token, quote] of moved) {
-        quotes.applyTicks(
-          [{ token, last_price: quote.last, bid: quote.bid, ask: quote.ask, bids: quote.bids, asks: quote.asks }],
-          Date.now(),
-        );
-      }
-    },
-  });
-
-  await h.monitor.cycle();
-  assert.equal(h.stub.calls.length, 3);
-  assert.equal(h.closes.length, 0, "never close with charges from an older touch");
-  assert.equal(h.positions.size, 1);
-  assert.equal(h.position.closing, false);
-});
-
-test("a post-charge WS move that removes the exit trigger leaves the box open", async () => {
-  const h = harness({
-    exitValuePerUnit: 198,
-    onChargeCall: ({ quotes, candidate }) => {
-      const moved = exitQuotes(candidate, 180, { at: Date.now(), qty: 150 });
-      for (const [token, quote] of moved) {
-        quotes.applyTicks(
-          [{ token, last_price: quote.last, bid: quote.bid, ask: quote.ask, bids: quote.bids, asks: quote.asks }],
-          Date.now(),
-        );
-      }
-    },
-  });
-
-  await h.monitor.cycle();
-  assert.equal(h.closes.length, 0);
-  assert.equal(h.positions.size, 1);
-  assert.equal(h.position.metrics.exit_box_value_per_unit, 180);
-});
-
 test("23/24. a converged box that is unprofitable or under ₹600 is left open", async () => {
-  // Under water despite the spread having converged.
   const losing = harness({ exitValuePerUnit: 198, entryCost: 199 });
   await losing.monitor.cycle();
   assert.equal(losing.closes.length, 0, "never close at a loss");
   assert.equal(losing.positions.size, 1);
+  // The block is exposed as a held reason, not hidden.
+  assert.equal(losing.position.metrics.blocked_reason, "net_below_floor");
 
-  // Profitable, but only ₹225 net — not worth the round trip.
   const thin = harness({ exitValuePerUnit: 198, entryCost: 191 });
   await thin.monitor.cycle();
   assert.equal(thin.closes.length, 0, "below the ₹600 floor");
@@ -254,17 +221,12 @@ test("26. without one-lot touch liquidity the exit is SKIPPED and the box stays 
   const skipped = h.events.filter((e) => e.event === "EXIT_SKIPPED_LIQUIDITY");
   assert.equal(skipped.length, 1);
   assert.match(h.position.exit_blocked_reason, /needs 75/);
-  // And it keeps being monitored: metrics are refreshed every cycle.
   assert.ok(h.position.metrics.remaining_edge !== null);
   await h.monitor.cycle();
   assert.equal(h.positions.size, 1);
 });
 
 test("a book quiet for a few seconds is still valid and DOES close", async () => {
-  // 5s of silence on an option book is normal, not staleness: a depth feed only
-  // sends a message when the book changes, and an untouched book is still the
-  // current one. This used to be refused, which made the engine unable to trade
-  // anything but the most active strikes.
   const h = harness({ exitValuePerUnit: 198, ageMs: 5000 });
   await h.monitor.cycle();
   assert.equal(h.closes.length, 1);
@@ -280,9 +242,6 @@ test("a book quiet beyond the trust window DOES block the exit", async () => {
 });
 
 test("a DEAD feed pauses exits without pretending it is a liquidity problem", async () => {
-  // The books look perfectly tradable, but nothing is arriving from upstream, so
-  // their real age is unknown. Waiting is safer than acting, and it is not
-  // recorded as a liquidity event.
   const h = harness({ exitValuePerUnit: 198, feedHealthy: false });
   await h.monitor.cycle();
 
@@ -290,10 +249,8 @@ test("a DEAD feed pauses exits without pretending it is a liquidity problem", as
   assert.equal(h.positions.size, 1);
   assert.equal(h.events.length, 0, "and no EXIT_SKIPPED_LIQUIDITY noise");
   assert.equal(h.position.exit_blocked_reason, null);
-  // Metrics are still refreshed so the UI keeps showing the position.
   assert.ok(h.position.metrics);
 
-  // When the feed recovers the same box exits immediately.
   const back = harness({ exitValuePerUnit: 198, feedHealthy: true });
   await back.monitor.cycle();
   assert.equal(back.closes.length, 1);
@@ -316,8 +273,6 @@ test("describeLiquidityGap names the leg and the shortfall", () => {
 /* -------------------------------------------------------------------- 27 --- */
 
 test("27. manual close fills at the current executable touch", async () => {
-  // A box with no automatic trigger at all (edge far from converged, profit
-  // below the capture target) still closes on request.
   const h = harness({ exitValuePerUnit: 180, entryNetEdge: 1425 });
   const pre = h.monitor.measure(h.position);
   assert.equal(pre.exit_eligible, false, "no automatic exit is due");
@@ -326,7 +281,6 @@ test("27. manual close fills at the current executable touch", async () => {
   assert.equal(result.ok, true);
   assert.equal(h.closes.length, 1);
   assert.equal(h.closes[0].reason, "MANUAL");
-  // Exit prices are the reversed touches, not the LTP or a midpoint.
   const byRole = new Map(h.closes[0].metrics.legs.map((l) => [l.role, l]));
   assert.equal(byRole.get("k1_ce").side, "SELL");
   assert.equal(byRole.get("k2_ce").side, "BUY");
@@ -359,11 +313,17 @@ test("manual close of an unknown position is a 404, not a crash", async () => {
 test("30. STOP stops discovery but the monitor keeps managing and exiting", async () => {
   const h = harness({ exitValuePerUnit: 198 });
 
-  // A scanner that is explicitly STOPPED, sharing the same position book.
   const scanner = new BoxScanner({
     cfg: h.conf,
     quotes: new BoxQuoteStore(),
     charges: new BoxChargeEstimator(chargeStub({}).fn, h.conf),
+    localCharges: localChargesStub(),
+    executionSim: new BoxExecutionSimulator({
+      cfg: h.conf,
+      quotes: new BoxQuoteStore(),
+      isMarketOpen: () => true,
+      isFeedHealthy: () => true,
+    }),
     positions: h.positions,
     openPaperTrade: async () => {
       throw new Error("discovery must not run while stopped");
@@ -374,8 +334,6 @@ test("30. STOP stops discovery but the monitor keeps managing and exiting", asyn
   assert.equal(scanner.isDiscovering(), false);
   assert.equal(h.positions.size, 1, "the open box survives STOP");
 
-  // The monitor is wired to nothing but the position book — it does not consult
-  // the scanner's state at all, which is exactly why STOP cannot orphan a box.
   await h.monitor.cycle();
   assert.equal(h.closes.length, 1, "the open box still auto-exits while stopped");
   assert.equal(h.closes[0].reason, "EDGE_CONVERGED");
@@ -383,20 +341,19 @@ test("30. STOP stops discovery but the monitor keeps managing and exiting", asyn
 });
 
 test("the monitor keeps refreshing metrics and periodically persists them", async () => {
-  const h = harness({ exitValuePerUnit: 180 }); // no exit trigger
+  const h = harness({ exitValuePerUnit: 180 });
   await h.monitor.cycle();
   assert.equal(h.closes.length, 0);
   assert.ok(h.position.metrics, "metrics are refreshed every cycle");
   assert.equal(h.position.metrics.exit_box_value_per_unit, 180);
 
-  // Force the persistence window open and confirm the slow flush happens.
   h.position.last_persist_at = 0;
   await h.monitor.cycle();
   assert.deepEqual(h.persisted, ["box1"]);
   assert.ok(h.monitor.getStats().cycles >= 2);
 });
 
-test("cycles never overlap, so a slow charge call cannot double-close a box", async () => {
+test("cycles never overlap, so a slow evaluation cannot double-close a box", async () => {
   const h = harness({ exitValuePerUnit: 198 });
   await Promise.all([h.monitor.cycle(), h.monitor.cycle(), h.monitor.cycle()]);
   assert.equal(h.closes.length, 1);
@@ -405,7 +362,6 @@ test("cycles never overlap, so a slow charge call cannot double-close a box", as
 /* ----------------------------- expiry safety ------------------------------ */
 
 test("the expiry-safety window is entered on expiry day near the close", async () => {
-  // Expiring today, 15:00 IST — inside the default 45-minute window.
   const h = harness({
     exitValuePerUnit: 180,
     expiry: "2026-08-29",
@@ -416,8 +372,6 @@ test("the expiry-safety window is entered on expiry day near the close", async (
 
   assert.equal(h.position.expiry_safety ?? false, true);
   assert.ok(h.events.some((e) => e.event === "EXPIRY_SAFETY"));
-  // It closes even though no convergence/profit rule fired, because an abandoned
-  // box at expiry is the worse outcome.
   assert.equal(h.closes.length, 1);
   assert.equal(h.closes[0].reason, "EXPIRY_SAFETY");
 });
@@ -451,20 +405,16 @@ test("a box expiring later is not in the expiry-safety window", async () => {
   assert.equal(h.closes.length, 0);
 });
 
-
 /* ---------------------------- market closed ------------------------------- */
 
 test("market CLOSED: metrics keep refreshing but no exit is attempted", async () => {
-  // A box that WOULD auto-exit during market hours.
   const h = harness({ exitValuePerUnit: 198, marketOpen: false });
   await h.monitor.cycle();
 
   assert.equal(h.closes.length, 0, "there is nothing to close into after hours");
   assert.equal(h.positions.size, 1);
-  // The position is still measured, so the UI stays informative overnight.
   assert.ok(h.position.metrics, "metrics are still refreshed");
   assert.equal(h.position.metrics.remaining_edge, (200 - 198) * LOT);
-  // "The market is shut" is not a liquidity event, so nothing is logged.
   assert.equal(h.events.length, 0);
   assert.equal(h.position.exit_blocked_reason, null);
 });
@@ -474,7 +424,7 @@ test("market CLOSED does not fabricate an expiry-safety close either", async () 
     exitValuePerUnit: 180,
     expiry: "2026-08-29",
     istDay: "2026-08-29",
-    istMinutes: 16 * 60, // past the close
+    istMinutes: 16 * 60,
     marketOpen: false,
   });
   await h.monitor.cycle();
@@ -492,7 +442,6 @@ test("a persistent liquidity gap is logged once, not once per cycle", async () =
   const skipped = h.events.filter((e) => e.event === "EXIT_SKIPPED_LIQUIDITY");
   assert.equal(skipped.length, 1, "the same blockage must not spam the ledger");
   assert.equal(h.positions.size, 1);
-  // The displayed reason is still kept current for the operator.
   assert.match(h.position.exit_blocked_reason, /needs 75/);
 });
 
@@ -510,17 +459,14 @@ test("liquidityGapKey is stable across cycles but changes when the cause does", 
   });
   const ok = { role: "k2_ce", side: "BUY", tradingsymbol: "B", price: 10, qty_at_touch: 200, fresh: true, quote_at: 1, age_ms: 5 };
 
-  // Same cause, different volatile numbers → same key (so no repeat ledger row).
   const a = liquidityGapKey([base({ age_ms: 5 }), ok], 75);
   const b = liquidityGapKey([base({ age_ms: 900, qty_at_touch: 41 }), ok], 75);
   assert.equal(a, b);
   assert.equal(a, "k1_ce:thin");
 
-  // A different cause → a different key, so it IS reported.
   const stale = liquidityGapKey([base({ fresh: false }), ok], 75);
   assert.notEqual(stale, a);
   assert.equal(stale, "k1_ce:stale");
 
-  // Everything fillable → no gap at all.
   assert.equal(liquidityGapKey([base({ qty_at_touch: 200 }), ok], 75), "ok");
 });

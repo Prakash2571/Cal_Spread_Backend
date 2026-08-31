@@ -5,21 +5,46 @@
  * feeds it quotes and configuration and it returns decisions. That is what makes
  * the trading rules deterministically testable.
  *
- * Two rules are absolute throughout this file:
+ * Three rules are absolute throughout this file:
  *
  *   1. Prices come from the EXECUTABLE TOUCH ONLY. A BUY fills at the best ask
  *      and a SELL fills at the best bid. LTP, mid-price and theoretical values
  *      are never used to size, qualify or close a trade.
  *   2. A leg is only executable if the ENTIRE lot is available AT that exact
- *      best price. V1 never walks deeper levels.
+ *      best price. Deeper levels are never walked.
+ *   3. DIRECTION IS NEVER ASSUMED. Every signed quantity is derived from
+ *      `directionSign()` and the per-direction side map, so a long box and a
+ *      short box cannot disagree about which way profit runs.
+ *
+ * THE TWO DIRECTIONS, IN ONE FORMULA
+ *
+ *   netDebitPerUnit = Σ over the four legs of (+price if BUY, -price if SELL)
+ *   grossEdgePerUnit = directionSign x width - netDebitPerUnit
+ *
+ *   LONG_BOX  (sign +1): BUY K1CE / SELL K2CE / BUY K2PE / SELL K1PE
+ *       netDebit = Ask(K1CE) - Bid(K2CE) + Ask(K2PE) - Bid(K1PE)   (a cost)
+ *       edge     = width - cost
+ *
+ *   SHORT_BOX (sign -1): SELL K1CE / BUY K2CE / SELL K2PE / BUY K1PE
+ *       netDebit = Ask(K2CE) + Ask(K1PE) - Bid(K1CE) - Bid(K2PE) = -credit
+ *       edge     = -width + credit = credit - width
+ *
+ * Both reduce to "what the box settles at, minus what it cost to hold" — which is
+ * why no sign is written out by hand anywhere below.
  */
 
 import type { BoxConfig } from "./config.js";
+import { requiredNetProfit } from "./config.js";
 import {
-  BOX_ENTRY_SIDES,
+  BOX_ENTRY_SIDES_BY_DIRECTION,
   BOX_LEG_ROLES,
+  directionSign,
   type BoxCandidate,
+  type BoxDirection,
+  type BoxEntryDecision,
   type BoxEvaluation,
+  type BoxExitBlockedReason,
+  type BoxExitDecision,
   type BoxExitMetrics,
   type BoxExitReason,
   type BoxLegEvaluation,
@@ -33,6 +58,21 @@ import {
 /** Round money to paise so float noise never reaches the ledger. */
 export function round2(v: number): number {
   return Math.round(v * 100) / 100;
+}
+
+/** The side a leg trades on ENTRY for a given direction. */
+export function entrySideFor(role: BoxLegRole, direction: BoxDirection = "LONG_BOX"): OrderSide {
+  return BOX_ENTRY_SIDES_BY_DIRECTION[direction][role];
+}
+
+/** The side that CLOSES a leg — the exact reverse of how it was opened. */
+export function exitSideFor(role: BoxLegRole, direction: BoxDirection = "LONG_BOX"): OrderSide {
+  return entrySideFor(role, direction) === "BUY" ? "SELL" : "BUY";
+}
+
+/** +1 when a side pays money out, -1 when it takes money in. */
+function debitSign(side: OrderSide): 1 | -1 {
+  return side === "BUY" ? 1 : -1;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -65,7 +105,7 @@ export function bestPrice(
  *
  * Summed across levels because an exchange can report the same price twice in a
  * padded depth payload. Quantity at deeper (worse) prices is deliberately
- * ignored: V1 does not walk the book.
+ * ignored: this module does not walk the book.
  */
 export function qtyAtPrice(
   levels: { price: number; qty: number }[],
@@ -81,7 +121,7 @@ export function qtyAtPrice(
 /**
  * The executable touch for one side of a trade, with the size available there.
  *
- * `bid`/`ask` fields on a tick are used only as a fallback when the five-level
+ * `bid`/`ask` scalars on a tick are used only as a fallback when the five-level
  * depth is absent; the quantity then has to come from the depth, so a book with
  * no depth can never satisfy the one-lot test (which is the safe outcome).
  */
@@ -99,6 +139,14 @@ export function touchFor(
   if (price === null) return { price: null, qty: 0 };
   const qty = qtyAtPrice(quote.bids, price) || (quote.bid === price ? quote.bid_qty : 0);
   return { price, qty };
+}
+
+/** A clone of a book's five levels — the audit record of one exact packet. */
+export function cloneDepth(quote: BoxQuote): { bids: typeof quote.bids; asks: typeof quote.asks } {
+  return {
+    bids: quote.bids.map((l) => ({ ...l })),
+    asks: quote.asks.map((l) => ({ ...l })),
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -132,11 +180,11 @@ export function strikeStepOf(strikes: number[]): number {
 }
 
 /**
- * The V1 monitored window: the ATM strike plus up to three strikes each side,
- * taken from the strikes that ACTUALLY EXIST in the chain.
+ * The monitored window: the ATM strike plus up to three strikes each side, taken
+ * from the strikes that ACTUALLY EXIST in the chain.
  *
- * At most seven strikes come back — never more. Near the end of a chain fewer
- * are returned rather than reaching further in the other direction, because a
+ * At most seven strikes come back — never more. Near the end of a chain fewer are
+ * returned rather than reaching further in the other direction, because a
  * lopsided window would silently change which strikes are monitored.
  */
 export function selectStrikeWindow(
@@ -156,10 +204,10 @@ export function selectStrikeWindow(
 /**
  * Whether the ATM window should be re-centred.
  *
- * The spot must move PAST the midpoint between the current ATM and its
- * neighbour by an extra fraction of a strike step (the hysteresis band) before
- * the window moves. Without that band a price sitting exactly on a strike
- * boundary would resubscribe the whole window on alternating ticks.
+ * The spot must move PAST the midpoint between the current ATM and its neighbour
+ * by an extra fraction of a strike step (the hysteresis band) before the window
+ * moves. Without that band a price sitting exactly on a strike boundary would
+ * resubscribe the whole window on alternating ticks.
  */
 export function shouldRecentreWindow(
   currentAtm: number,
@@ -173,25 +221,36 @@ export function shouldRecentreWindow(
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Candidate construction: at most C(7,2) = 21 pairs                         */
+/*  Candidate construction                                                    */
 /* -------------------------------------------------------------------------- */
 
-/** Stable identity of a box: one open box per exact strike pair. */
+/**
+ * Stable identity of a box: the strike pair AND the direction.
+ *
+ * The direction is part of the key because a long box and a short box on the same
+ * strikes are opposite trades — letting one key stand for both would silently
+ * prevent the two from ever being open at the same time, and would make an
+ * adopted position ambiguous after a restart.
+ */
 export function candidateKey(
   underlying: string,
   expiry: string,
   k1: number,
   k2: number,
+  direction: BoxDirection = "LONG_BOX",
 ): string {
-  return `${underlying}|${expiry}|${k1}|${k2}`;
+  return `${underlying}|${expiry}|${k1}|${k2}|${direction}`;
 }
 
 /**
- * Every distinct strike pair K1 < K2 in the window.
+ * Every distinct strike pair K1 < K2 in the window, for each requested direction.
  *
- * Seven strikes give exactly C(7,2) = 21 pairs, which is the entire V1 search
- * space for one underlying. A pair is skipped when either strike is missing a CE
- * or a PE, since all four legs are required to form a box.
+ * Seven strikes give C(7,2) = 21 pairs; evaluating both directions gives 42
+ * candidates for one underlying. A pair is skipped when either strike is missing
+ * a CE or a PE, since all four legs are required to form a box.
+ *
+ * `directions` defaults to LONG_BOX only, so a caller that has not opted into
+ * short boxes keeps exactly its previous candidate set.
  */
 export function buildCandidates(args: {
   underlying: string;
@@ -202,8 +261,10 @@ export function buildCandidates(args: {
   strikes: number[];
   ce: Map<number, BoxOptionInstrument>;
   pe: Map<number, BoxOptionInstrument>;
+  directions?: readonly BoxDirection[];
 }): BoxCandidate[] {
   const sorted = [...new Set(args.strikes)].sort((a, b) => a - b);
+  const directions = args.directions ?? (["LONG_BOX"] as const);
   const out: BoxCandidate[] = [];
   for (let i = 0; i < sorted.length; i++) {
     for (let j = i + 1; j < sorted.length; j++) {
@@ -214,18 +275,21 @@ export function buildCandidates(args: {
       const k2pe = args.pe.get(k2);
       const k1pe = args.pe.get(k1);
       if (!k1ce || !k2ce || !k2pe || !k1pe) continue;
-      out.push({
-        key: candidateKey(args.underlying, args.expiry, k1, k2),
-        underlying: args.underlying,
-        name: args.name,
-        is_index: args.is_index,
-        expiry: args.expiry,
-        lower_strike: k1,
-        upper_strike: k2,
-        box_width: round2(k2 - k1),
-        lot_size: args.lot_size,
-        legs: { k1_ce: k1ce, k2_ce: k2ce, k2_pe: k2pe, k1_pe: k1pe },
-      });
+      for (const direction of directions) {
+        out.push({
+          key: candidateKey(args.underlying, args.expiry, k1, k2, direction),
+          underlying: args.underlying,
+          name: args.name,
+          is_index: args.is_index,
+          expiry: args.expiry,
+          direction,
+          lower_strike: k1,
+          upper_strike: k2,
+          box_width: round2(k2 - k1),
+          lot_size: args.lot_size,
+          legs: { k1_ce: k1ce, k2_ce: k2ce, k2_pe: k2pe, k1_pe: k1pe },
+        });
+      }
     }
   }
   return out;
@@ -235,6 +299,15 @@ export function buildCandidates(args: {
 /*  Entry evaluation                                                          */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Evaluate one leg from one book.
+ *
+ * `captureDepth` is FALSE on the hot path. Cloning four five-level ladders for
+ * every one of up to 42 candidates on every tick was pure allocation churn, and
+ * none of the qualification arithmetic looks past the touch. The ladder is
+ * captured only where it is genuinely needed: an entry fill, an exit fill, an
+ * audit event or an explicit chain request.
+ */
 function evaluateLeg(args: {
   role: BoxLegRole;
   side: OrderSide;
@@ -243,9 +316,9 @@ function evaluateLeg(args: {
   lotSize: number;
   now: number;
   maxAgeMs: number;
-  /** Reverse the entry side — used to price an exit. */
+  captureDepth: boolean;
 }): BoxLegEvaluation {
-  const { role, side, inst, quote, lotSize, now, maxAgeMs } = args;
+  const { role, side, inst, quote, lotSize, now, maxAgeMs, captureDepth } = args;
   if (!quote) {
     return {
       role,
@@ -286,10 +359,7 @@ function evaluateLeg(args: {
     ask_qty: quote.ask_qty,
     quote_at: quote.at,
     quote_version: quote.version,
-    depth: {
-      bids: quote.bids.map((l) => ({ ...l })),
-      asks: quote.asks.map((l) => ({ ...l })),
-    },
+    depth: captureDepth ? cloneDepth(quote) : null,
     age_ms: age,
     fresh,
     // One ENTIRE lot must rest at the exact touch price.
@@ -316,108 +386,202 @@ function firstRejectReason(
 /**
  * Evaluate one candidate from the executable book.
  *
- *   entryBoxCostPerUnit = Ask(K1 CE) - Bid(K2 CE) + Ask(K2 PE) - Bid(K1 PE)
- *   grossEdgePerUnit    = (K2 - K1) - entryBoxCostPerUnit
- *   grossEdge           = grossEdgePerUnit * lotSize
+ *   netDebitPerUnit  = Σ (+ask for BUY legs, -bid for SELL legs)
+ *   grossEdgePerUnit = directionSign x width - netDebitPerUnit
+ *   grossEdge        = grossEdgePerUnit x lotSize
  *
  * The cost and the edge are reported whenever all four prices exist, even if a
  * leg is stale or too thin, so the UI can show a near-miss. `tradable` is what
  * gates a paper entry.
+ *
+ * HOT PATH: no Map is built, no depth is cloned, and the four legs are visited
+ * exactly once.
  */
 export function evaluateCandidate(args: {
   candidate: BoxCandidate;
   quotes: Map<number, BoxQuote>;
   now: number;
   maxAgeMs: number;
+  /** Capture the five-level ladders. Only for fills, audits and chain views. */
+  captureDepth?: boolean;
 }): BoxEvaluation {
   const { candidate, quotes, now, maxAgeMs } = args;
+  const captureDepth = args.captureDepth === true;
   const lotSize = candidate.lot_size;
+  const direction = candidate.direction ?? "LONG_BOX";
+  const sides = BOX_ENTRY_SIDES_BY_DIRECTION[direction];
 
-  const legs: BoxLegEvaluation[] = BOX_LEG_ROLES.map((role) =>
-    evaluateLeg({
+  const legs: BoxLegEvaluation[] = new Array(BOX_LEG_ROLES.length);
+  let havePrices = true;
+  let netDebit = 0;
+  let worstAge: number | null = null;
+  let agesSeen = 0;
+  let version: number | null = null;
+  let depthOk = true;
+
+  for (let i = 0; i < BOX_LEG_ROLES.length; i++) {
+    const role = BOX_LEG_ROLES[i]!;
+    const inst = candidate.legs[role];
+    const leg = evaluateLeg({
       role,
-      side: BOX_ENTRY_SIDES[role],
-      inst: candidate.legs[role],
-      quote: quotes.get(candidate.legs[role].token),
+      side: sides[role],
+      inst,
+      quote: quotes.get(inst.token),
       lotSize,
       now,
       maxAgeMs,
-    }),
-  );
+      captureDepth,
+    });
+    legs[i] = leg;
 
-  const byRole = new Map(legs.map((l) => [l.role, l]));
-  const k1ce = byRole.get("k1_ce")!;
-  const k2ce = byRole.get("k2_ce")!;
-  const k2pe = byRole.get("k2_pe")!;
-  const k1pe = byRole.get("k1_pe")!;
+    if (leg.price === null) havePrices = false;
+    else netDebit += debitSign(leg.side) * leg.price;
 
-  const havePrices =
-    k1ce.price !== null && k2ce.price !== null && k2pe.price !== null && k1pe.price !== null;
+    if (leg.age_ms !== null) {
+      agesSeen++;
+      if (worstAge === null || leg.age_ms > worstAge) worstAge = leg.age_ms;
+    }
+    if (leg.quote_version !== null && leg.quote_version !== undefined) {
+      if (version === null || leg.quote_version > version) version = leg.quote_version;
+    }
+    if (!(leg.price !== null && leg.price > 0 && leg.qty_at_touch >= lotSize)) depthOk = false;
+  }
 
-  const costPerUnit = havePrices
-    ? round2(k1ce.price! - k2ce.price! + k2pe.price! - k1pe.price!)
-    : null;
-  const grossPerUnit = costPerUnit === null ? null : round2(candidate.box_width - costPerUnit);
+  const netDebitPerUnit = havePrices ? round2(netDebit) : null;
+  const grossPerUnit =
+    netDebitPerUnit === null
+      ? null
+      : round2(directionSign(direction) * candidate.box_width - netDebitPerUnit);
   const grossEdge = grossPerUnit === null ? null : round2(grossPerUnit * lotSize);
 
-  const ages = legs.map((l) => l.age_ms).filter((a): a is number => a !== null);
-  const worstAge = ages.length === 4 ? Math.max(...ages) : null;
-
   const reject = firstRejectReason(legs, lotSize);
-  const tradable = reject === null && grossEdge !== null;
-  // Depth alone, with freshness deliberately excluded.
-  const depthOk = legs.every(
-    (l) => l.price !== null && l.price > 0 && l.qty_at_touch >= lotSize,
-  );
 
   return {
     candidate,
     at: now,
     legs,
-    entry_box_cost_per_unit: costPerUnit,
+    entry_net_debit_per_unit: netDebitPerUnit,
+    entry_box_cost_per_unit: netDebitPerUnit,
     gross_edge_per_unit: grossPerUnit,
     gross_edge: grossEdge,
-    tradable,
+    tradable: reject === null && grossEdge !== null,
     depth_ok: depthOk,
-    worst_age_ms: worstAge,
+    worst_age_ms: agesSeen === BOX_LEG_ROLES.length ? worstAge : null,
+    quote_version: version,
     reject,
   };
 }
 
 /**
- * The after-cost picture, reported on every opportunity and stored on every
- * trade:
+ * The after-cost picture:
  *
- *   projectedNetEdge = grossEdge - entryFees - estimatedExitFees - safetyBuffer
+ *   projectedNetEdge = grossEdge - entryFees - estExitFees - executionCost - buffer
  *
- * This is INFORMATIONAL by default. The entry gate is the gross spread (see
- * qualifiesForEntry) — fees are shown so they can be managed, not deducted
- * before deciding to trade, unless an explicit net floor is configured.
+ * `executionCost` defaults to 0 so older callers keep their arithmetic.
  */
 export function projectedNetEdge(args: {
   grossEdge: number;
   entryCharges: number;
   estimatedExitCharges: number;
   safetyBuffer: number;
+  executionCost?: number;
 }): number {
   return round2(
-    args.grossEdge - args.entryCharges - args.estimatedExitCharges - args.safetyBuffer,
+    args.grossEdge -
+      args.entryCharges -
+      args.estimatedExitCharges -
+      (args.executionCost ?? 0) -
+      args.safetyBuffer,
   );
 }
 
 /**
- * THE ENTRY GATE: ₹1,200 from the SPREAD alone.
+ * THE ENTRY DECISION — expected NET profit, with every term visible.
  *
- *   qualifies = grossEdge >= minGrossEdge
- *               AND (minNetEdge <= 0 OR projectedNetEdge >= minNetEdge)
+ *   expectedNet = gross - entryFees - estExitFees - executionCost - safetyBuffer
+ *   qualifies   = expectedNet >= requiredNetProfit(cfg)
  *
- * The comparison is `>=`, so exactly ₹1,200 gross qualifies and ₹1,199.99 does
- * not. The net floor is OPTIONAL and disabled by default (minNetEdge = 0): the
- * charges are still estimated, stored and displayed, they simply do not raise the
- * bar the spread has to clear.
+ * The gross figure is only a prefilter: it decides whether a candidate is worth
+ * costing out at all. Nothing is entered on gross alone.
  *
- * `netEdge` may be null (charges unavailable); that only matters when a net floor
- * is actually configured.
+ * `executionCost` is the honest part. Before the execution simulator has run it
+ * is the configured allowance; afterwards the caller passes the MEASURED entry
+ * slippage plus the exit allowance, and the same function is applied to the
+ * execution snapshot. That is what makes the final qualification a statement
+ * about a fill rather than about a sighting.
+ */
+export function evaluateEntryDecision(args: {
+  grossEdge: number | null;
+  entryCharges: number | null;
+  estimatedExitCharges: number | null;
+  executionCost: number;
+  cfg: Pick<
+    BoxConfig,
+    "minExpectedNetProfit" | "minNetEdge" | "minGrossEdge" | "safetyBuffer"
+  >;
+}): BoxEntryDecision {
+  const { grossEdge, entryCharges, estimatedExitCharges, cfg } = args;
+  const executionCost = round2(args.executionCost);
+  const minNet = requiredNetProfit(cfg);
+  const passesPrefilter = grossEdge !== null && grossEdge >= cfg.minGrossEdge;
+
+  const base: Omit<BoxEntryDecision, "qualifies" | "reject" | "expected_net_profit"> = {
+    gross_edge: grossEdge,
+    entry_charges: entryCharges,
+    estimated_exit_charges: estimatedExitCharges,
+    execution_cost: executionCost,
+    safety_buffer: cfg.safetyBuffer,
+    min_expected_net_profit: minNet,
+    passes_gross_prefilter: passesPrefilter,
+  };
+
+  if (grossEdge === null) {
+    return { ...base, expected_net_profit: null, qualifies: false, reject: "no_quote" };
+  }
+  if (entryCharges === null || estimatedExitCharges === null) {
+    // Without charges the after-cost picture does not exist, so there is nothing
+    // to compare against the gate.
+    return {
+      ...base,
+      expected_net_profit: null,
+      qualifies: false,
+      reject: "unpriced_charges",
+    };
+  }
+
+  const expectedNet = projectedNetEdge({
+    grossEdge,
+    entryCharges,
+    estimatedExitCharges,
+    executionCost,
+    safetyBuffer: cfg.safetyBuffer,
+  });
+
+  if (!passesPrefilter) {
+    return {
+      ...base,
+      expected_net_profit: expectedNet,
+      qualifies: false,
+      reject: "below_gross_prefilter",
+    };
+  }
+  if (expectedNet < minNet) {
+    return {
+      ...base,
+      expected_net_profit: expectedNet,
+      qualifies: false,
+      reject: "below_expected_net_profit",
+    };
+  }
+  return { ...base, expected_net_profit: expectedNet, qualifies: true, reject: null };
+}
+
+/**
+ * LEGACY gross/net gate, kept for the prefilter and for existing callers.
+ *
+ * The decisive check is `evaluateEntryDecision`; this one only answers "is the
+ * gross spread big enough to be worth costing out", plus the optional legacy net
+ * floor.
  */
 export function qualifiesForEntry(
   grossEdge: number | null,
@@ -433,7 +597,7 @@ export function qualifiesForEntry(
   return true;
 }
 
-/** Whether a candidate's gross edge justifies a (slow) charge estimation. */
+/** Whether a candidate's gross edge justifies the full qualification pipeline. */
 export function passesGrossPrefilter(grossEdge: number | null, threshold: number): boolean {
   return grossEdge !== null && grossEdge >= threshold;
 }
@@ -446,12 +610,9 @@ export function passesGrossPrefilter(grossEdge: number | null, threshold: number
  * Evaluate a box from LAST TRADED / CLOSING prices instead of the touch.
  *
  * Used only while the market is shut, so an opportunity that existed at the close
- * can still be inspected. This is deliberately a SEPARATE function from
+ * can still be inspected. Deliberately a SEPARATE function from
  * evaluateCandidate: there is no bid/ask and therefore no executable price, so
- * the result is always marked `tradable: false` and can never reach the entry
- * path. It is a read-only view, not a trading signal.
- *
- *   indicativeCostPerUnit = Last(K1 CE) - Last(K2 CE) + Last(K2 PE) - Last(K1 PE)
+ * the result is always `tradable: false` and can never reach the entry path.
  */
 export function evaluateCandidateIndicative(args: {
   candidate: BoxCandidate;
@@ -461,13 +622,15 @@ export function evaluateCandidateIndicative(args: {
 }): BoxEvaluation {
   const { candidate, lastPrices, now } = args;
   const lotSize = candidate.lot_size;
+  const direction = candidate.direction ?? "LONG_BOX";
+  const sides = BOX_ENTRY_SIDES_BY_DIRECTION[direction];
 
   const legs: BoxLegEvaluation[] = BOX_LEG_ROLES.map((role) => {
     const inst = candidate.legs[role];
     const last = lastPrices.get(inst.token) ?? 0;
     return {
       role,
-      side: BOX_ENTRY_SIDES[role],
+      side: sides[role],
       token: inst.token,
       tradingsymbol: inst.tradingsymbol,
       strike: inst.strike,
@@ -489,35 +652,29 @@ export function evaluateCandidateIndicative(args: {
   });
 
   const havePrices = legs.every((l) => l.price !== null);
-  const byRole = new Map(legs.map((l) => [l.role, l]));
-  const rawCost = havePrices
-    ? round2(
-        byRole.get("k1_ce")!.price! -
-          byRole.get("k2_ce")!.price! +
-          byRole.get("k2_pe")!.price! -
-          byRole.get("k1_pe")!.price!,
-      )
-    : null;
+  let rawDebit = 0;
+  if (havePrices) for (const l of legs) rawDebit += debitSign(l.side) * l.price!;
+  const netDebit = havePrices ? round2(rawDebit) : null;
 
   // PLAUSIBILITY BOUND — the reason this function cannot simply do the arithmetic
   // and publish it.
   //
-  // A long box always costs money and can never cost more than it pays, so its
-  // cost per unit must sit strictly inside (0, width). Outside that range the
-  // inputs are not a coherent snapshot: a NEGATIVE cost implies free money of
-  // unlimited size, which no exchange offers, and a cost above the width implies
-  // paying more than the guaranteed payoff.
-  //
-  // It happens because a last-traded price is NOT a closing price for an illiquid
-  // option: a strike that has not traded for days carries a price struck when the
-  // underlying was somewhere else entirely, and combining four legs each stale
-  // from a different session produces an enormous fictional edge. Reporting no
-  // edge is the honest answer.
-  const plausible =
-    rawCost !== null && rawCost > 0 && rawCost < candidate.box_width;
+  // A box's fair value is the width, undiscounted. For a LONG box the net debit
+  // (its cost) must sit strictly inside (0, width); for a SHORT box the mirror
+  // holds, so the DIRECTION-SIGNED cost must sit inside (0, width). Outside that
+  // band the inputs are not a coherent snapshot — the normal case for a
+  // last-traded price, because a strike that has not traded for days carries a
+  // price struck when the underlying was somewhere else entirely. Four legs each
+  // stale from a different session produce an enormous fictional edge; reporting
+  // no edge is the honest answer.
+  const signedCost = netDebit === null ? null : directionSign(direction) * netDebit;
+  const plausible = signedCost !== null && signedCost > 0 && signedCost < candidate.box_width;
 
-  const costPerUnit = plausible ? rawCost : null;
-  const grossPerUnit = costPerUnit === null ? null : round2(candidate.box_width - costPerUnit);
+  const netDebitPerUnit = plausible ? netDebit : null;
+  const grossPerUnit =
+    netDebitPerUnit === null
+      ? null
+      : round2(directionSign(direction) * candidate.box_width - netDebitPerUnit);
   const grossEdge = grossPerUnit === null ? null : round2(grossPerUnit * lotSize);
 
   let reject: BoxRejectReason;
@@ -531,7 +688,8 @@ export function evaluateCandidateIndicative(args: {
     legs,
     // Deliberately null rather than the raw figure when implausible: a number
     // that cannot be true must not be displayed as though it were.
-    entry_box_cost_per_unit: costPerUnit,
+    entry_net_debit_per_unit: netDebitPerUnit,
+    entry_box_cost_per_unit: netDebitPerUnit,
     gross_edge_per_unit: grossPerUnit,
     gross_edge: grossEdge,
     // Never tradable: there is no executable book behind these numbers.
@@ -539,6 +697,7 @@ export function evaluateCandidateIndicative(args: {
     // Closing prices carry no bid/ask, so executable size is simply unknown.
     depth_ok: false,
     worst_age_ms: null,
+    quote_version: null,
     reject,
   };
 }
@@ -547,20 +706,12 @@ export function evaluateCandidateIndicative(args: {
 /*  Exit evaluation                                                           */
 /* -------------------------------------------------------------------------- */
 
-/** The side that CLOSES a leg — the exact reverse of how it was opened. */
-export function exitSideFor(role: BoxLegRole): OrderSide {
-  return BOX_ENTRY_SIDES[role] === "BUY" ? "SELL" : "BUY";
-}
-
 /**
  * Price the unwind of an open box from the executable book.
  *
- * Entry bought K1 CE and K2 PE and sold K2 CE and K1 PE, so the exit sells the
- * two longs into the BID and buys the two shorts back at the ASK:
- *
- *   exitBoxValuePerUnit = Bid(K1 CE) - Ask(K2 CE) + Bid(K2 PE) - Ask(K1 PE)
- *
- * No LTP, no midpoint, no theoretical price.
+ * Each leg is evaluated on the side that CLOSES it, so the two longs are sold
+ * into the bid and the two shorts are bought back at the ask (and the mirror for
+ * a short box). No LTP, no midpoint, no theoretical price.
  */
 export function evaluateExitLegs(args: {
   legs: { role: BoxLegRole; inst: BoxOptionInstrument }[];
@@ -568,16 +719,20 @@ export function evaluateExitLegs(args: {
   lotSize: number;
   now: number;
   maxAgeMs: number;
+  direction?: BoxDirection;
+  captureDepth?: boolean;
 }): BoxLegEvaluation[] {
+  const direction = args.direction ?? "LONG_BOX";
   return args.legs.map(({ role, inst }) =>
     evaluateLeg({
       role,
-      side: exitSideFor(role),
+      side: exitSideFor(role, direction),
       inst,
       quote: args.quotes.get(inst.token),
       lotSize: args.lotSize,
       now: args.now,
       maxAgeMs: args.maxAgeMs,
+      captureDepth: args.captureDepth === true,
     }),
   );
 }
@@ -591,114 +746,22 @@ export function convergenceThreshold(
 }
 
 /**
- * Full exit arithmetic plus the automatic-close decision for one open box.
+ * The net CREDIT per unit received by unwinding the four legs right now:
  *
- *   exitBoxValue   = exitBoxValuePerUnit * lotSize
- *   grossPnL       = (exitBoxValuePerUnit - entryBoxCostPerUnit) * lotSize
- *   roundTrip      = entryCharges + currentEstimatedExitCharges
- *   currentNetPnL  = grossPnL - roundTrip
- *   remainingEdge  = (boxWidth - exitBoxValuePerUnit) * lotSize
+ *   Σ (+price for every closing SELL, -price for every closing BUY)
  *
- * A trade auto-closes when EITHER
- *
- *   A) remainingEdge <= max(₹200, 20% of entryNetEdge)  AND  currentNetPnL >= ₹600
- *   B) currentNetPnL >= 75% of entryNetEdge
- *
- * and in BOTH cases only when all four reversed legs have fresh one-lot touch
- * liquidity AND currentNetPnL is strictly positive. Convergence alone never
- * closes a losing or break-even box.
+ * For a long box that is the familiar
+ * Bid(K1CE) - Ask(K2CE) + Bid(K2PE) - Ask(K1PE); for a short box it is negative,
+ * because closing a short box costs money. Same formula either way.
  */
-export function computeExitMetrics(args: {
-  boxWidth: number;
-  lotSize: number;
-  entryBoxCostPerUnit: number;
-  entryNetEdge: number;
-  entryChargesTotal: number | null;
-  /** Charges to unwind, priced now; falls back to the stored estimate. */
-  currentExitChargesTotal: number | null;
-  legs: BoxLegEvaluation[];
-  now: number;
-  cfg: Pick<
-    BoxConfig,
-    "convergenceFloor" | "convergencePct" | "minExitNetPnl" | "profitCapturePct"
-  >;
-}): BoxExitMetrics {
-  const { boxWidth, lotSize, entryBoxCostPerUnit, entryNetEdge, legs, now, cfg } = args;
-
-  const byRole = new Map(legs.map((l) => [l.role, l]));
-  const k1ce = byRole.get("k1_ce");
-  const k2ce = byRole.get("k2_ce");
-  const k2pe = byRole.get("k2_pe");
-  const k1pe = byRole.get("k1_pe");
-
-  const havePrices =
-    !!k1ce?.price && !!k2ce?.price && !!k2pe?.price && !!k1pe?.price;
-
-  // Exit sides: k1_ce and k2_pe are SOLD (bid), k2_ce and k1_pe are BOUGHT (ask).
-  const exitValuePerUnit = havePrices
-    ? round2(k1ce!.price! - k2ce!.price! + k2pe!.price! - k1pe!.price!)
-    : null;
-  const exitBoxValue = exitValuePerUnit === null ? null : round2(exitValuePerUnit * lotSize);
-
-  const grossPnl =
-    exitValuePerUnit === null
-      ? null
-      : round2((exitValuePerUnit - entryBoxCostPerUnit) * lotSize);
-
-  const entryCharges = args.entryChargesTotal;
-  const exitCharges = args.currentExitChargesTotal;
-  const roundTrip =
-    entryCharges === null || exitCharges === null
-      ? null
-      : round2(entryCharges + exitCharges);
-  const netPnl = grossPnl === null || roundTrip === null ? null : round2(grossPnl - roundTrip);
-
-  const remainingEdge =
-    exitValuePerUnit === null ? null : round2((boxWidth - exitValuePerUnit) * lotSize);
-
-  const threshold = convergenceThreshold(entryNetEdge, cfg);
-  const captureTarget = round2(cfg.profitCapturePct * entryNetEdge);
-
-  const liquidityOk = legs.length === 4 && legs.every((l) => l.fresh && l.executable);
-  const ages = legs.map((l) => l.age_ms).filter((a): a is number => a !== null);
-  const worstAge = ages.length === legs.length && ages.length > 0 ? Math.max(...ages) : null;
-
-  // What the rules conclude from the arithmetic alone.
-  //
-  // The CRITICAL rule is enforced here: never close on convergence alone. Every
-  // automatic exit must be genuinely profitable on the simulated fills after all
-  // charges, so a null or non-positive net P&L can never produce a reason.
-  let ruleReason: BoxExitReason | null = null;
-  if (netPnl !== null && netPnl > 0 && remainingEdge !== null) {
-    if (remainingEdge <= threshold && netPnl >= cfg.minExitNetPnl) {
-      ruleReason = "EDGE_CONVERGED";
-    } else if (netPnl >= captureTarget) {
-      ruleReason = "PROFIT_CAPTURE";
-    }
+export function exitNetCreditPerUnit(legs: BoxLegEvaluation[]): number | null {
+  let credit = 0;
+  for (const l of legs) {
+    if (l.price === null || !(l.price > 0)) return null;
+    // A closing SELL takes money in, a closing BUY pays money out.
+    credit += -debitSign(l.side) * l.price;
   }
-  // Whether it can actually be done right now. Deliberately a separate flag: the
-  // caller must be able to see "should close but cannot" and record it.
-  const eligible = ruleReason !== null && liquidityOk;
-
-  return {
-    at: now,
-    legs,
-    exit_box_value_per_unit: exitValuePerUnit,
-    exit_box_value: exitBoxValue,
-    gross_pnl_if_closed_now: grossPnl,
-    estimated_exit_charges: exitCharges,
-    total_round_trip_charges: roundTrip,
-    current_net_pnl: netPnl,
-    remaining_edge: remainingEdge,
-    convergence_threshold: threshold,
-    min_exit_net_pnl: cfg.minExitNetPnl,
-    profit_capture_target: captureTarget,
-    liquidity_ok: liquidityOk,
-    worst_age_ms: worstAge,
-    rule_reason: ruleReason,
-    exit_eligible: eligible,
-    exit_reason: eligible ? ruleReason : null,
-  };
+  return round2(credit);
 }
 
 /**
@@ -707,4 +770,242 @@ export function computeExitMetrics(args: {
  */
 export function exitLiquidityOk(legs: BoxLegEvaluation[]): boolean {
   return legs.length === 4 && legs.every((l) => l.fresh && l.executable);
+}
+
+/**
+ * THE EXIT DECISION — one pure function, one structured answer.
+ *
+ * The strategy is not a hold-to-expiry trade: it enters a temporary four-leg
+ * mispricing and leaves as soon as the discrepancy has closed enough to bank a
+ * worthwhile profit. So the decision is expressed in terms of CONVERGENCE, not of
+ * time or of price levels:
+ *
+ *   remainingEdge = (directionSign x width - exitCreditPerUnit) x lot
+ *   capturedEdge  = entryEdge - remainingEdge          (= gross P&L)
+ *   capturedPct   = capturedEdge / |entryEdge|
+ *
+ * A trade closes when it is EXECUTABLE and genuinely worth closing:
+ *
+ *   EXPIRY_SAFETY  the emergency rule — expiry is imminent, so leave regardless
+ *                  of profit (but never at an invented price)
+ *   EDGE_CONVERGED remainingEdge <= max(floor, pct x entryNetEdge)
+ *                  AND netPnl >= minExitNetPnl
+ *   PROFIT_CAPTURE netPnl >= minExitNetPnl
+ *                  AND (netPnl >= profitCapturePct x entryNetEdge
+ *                       OR capturedPct >= minCapturedPct)
+ *
+ * `netPnl` is computed from the EXECUTABLE touch and the current exit charges, so
+ * "the threshold was crossed" can never on its own close a trade that would not
+ * actually pay: that is the `net_below_floor` block below, and it is the whole
+ * point of returning a structured decision instead of a boolean.
+ */
+export function evaluateExitDecision(args: {
+  direction: BoxDirection;
+  boxWidth: number;
+  lotSize: number;
+  /** Signed net debit per unit the position was opened at. */
+  entryNetDebitPerUnit: number;
+  /** The original mispricing (₹) every capture figure is measured against. */
+  entryEdge: number;
+  /** The expected net edge recorded at entry, used for the thresholds. */
+  entryNetEdge: number;
+  entryChargesTotal: number | null;
+  currentExitChargesTotal: number | null;
+  legs: BoxLegEvaluation[];
+  expirySafety?: boolean;
+  cfg: Pick<
+    BoxConfig,
+    | "convergenceFloor"
+    | "convergencePct"
+    | "minExitNetPnl"
+    | "profitCapturePct"
+    | "minCapturedPct"
+  >;
+}): BoxExitDecision {
+  const { direction, boxWidth, lotSize, entryNetDebitPerUnit, entryEdge, legs, cfg } = args;
+
+  const exitCredit = exitNetCreditPerUnit(legs);
+  const grossPnl =
+    exitCredit === null ? null : round2((exitCredit - entryNetDebitPerUnit) * lotSize);
+  const roundTrip =
+    args.entryChargesTotal === null || args.currentExitChargesTotal === null
+      ? null
+      : round2(args.entryChargesTotal + args.currentExitChargesTotal);
+  const netPnl = grossPnl === null || roundTrip === null ? null : round2(grossPnl - roundTrip);
+
+  const remainingEdge =
+    exitCredit === null
+      ? null
+      : round2((directionSign(direction) * boxWidth - exitCredit) * lotSize);
+  const capturedEdge = remainingEdge === null ? null : round2(entryEdge - remainingEdge);
+  const capturedPct =
+    capturedEdge === null || !(Math.abs(entryEdge) > 0)
+      ? null
+      : round2(capturedEdge / Math.abs(entryEdge));
+
+  const threshold = convergenceThreshold(args.entryNetEdge, cfg);
+  const captureTarget = round2(cfg.profitCapturePct * args.entryNetEdge);
+  const executable = exitLiquidityOk(legs);
+  const expirySafety = args.expirySafety === true;
+
+  // What the ARITHMETIC concludes, before asking whether it can be done.
+  let ruleReason: BoxExitReason | null = null;
+  let blocked: BoxExitBlockedReason = null;
+
+  if (netPnl === null) {
+    blocked = "unpriced_charges";
+  } else if (netPnl > 0 && remainingEdge !== null) {
+    const clearsFloor = netPnl >= cfg.minExitNetPnl;
+    const converged = remainingEdge <= threshold;
+    const capturedEnough =
+      netPnl >= captureTarget || (capturedPct !== null && capturedPct >= cfg.minCapturedPct);
+
+    if (converged && clearsFloor) ruleReason = "EDGE_CONVERGED";
+    else if (clearsFloor && capturedEnough) ruleReason = "PROFIT_CAPTURE";
+    else if (converged || capturedEnough) {
+      // The convergence/capture condition IS satisfied, but the executable prices
+      // would not pay enough to be worth the round trip. Recorded, never acted on.
+      blocked = "net_below_floor";
+    }
+  } else if (remainingEdge !== null && remainingEdge <= threshold) {
+    // Converged into a loss: hold and say so rather than crystallising it.
+    blocked = "net_below_floor";
+  }
+
+  // A normal reason is preferred when one exists, so an emergency close is never
+  // recorded for a trade that simply converged. Expiry safety is the fallback that
+  // overrides profitability — an abandoned box at expiry is a far worse outcome —
+  // but it still refuses to invent a price.
+  const reason: BoxExitReason | null = executable
+    ? (ruleReason ?? (expirySafety ? "EXPIRY_SAFETY" : null))
+    : null;
+
+  if ((ruleReason !== null || expirySafety) && !executable) {
+    blocked = "insufficient_exit_liquidity";
+  }
+
+  return {
+    should_exit: reason !== null && executable,
+    reason: reason !== null && executable ? reason : null,
+    rule_reason: ruleReason,
+    remaining_edge: remainingEdge,
+    captured_edge: capturedEdge,
+    captured_pct: capturedPct,
+    gross_pnl: grossPnl,
+    net_pnl: netPnl,
+    executable,
+    blocked_reason: blocked,
+  };
+}
+
+/**
+ * Full exit arithmetic for one open box: the decision above, plus every figure
+ * the UI and the ledger display.
+ *
+ * Accepts the original long-box argument names so existing callers and tests keep
+ * working: `entryBoxCostPerUnit` is the signed net debit, and when
+ * `entryEdge`/`direction` are not supplied they default to a long box derived
+ * from the width.
+ */
+export function computeExitMetrics(args: {
+  boxWidth: number;
+  lotSize: number;
+  /** Signed net debit per unit (the long box's cost). */
+  entryBoxCostPerUnit: number;
+  entryNetEdge: number;
+  entryChargesTotal: number | null;
+  /** Charges to unwind, priced now; falls back to the stored estimate. */
+  currentExitChargesTotal: number | null;
+  legs: BoxLegEvaluation[];
+  now: number;
+  direction?: BoxDirection;
+  /** The original mispricing (₹). Derived for a long box when omitted. */
+  entryEdge?: number;
+  /** Execution/slippage allowance reported for the unwind (₹). */
+  executionCost?: number;
+  openedAt?: number;
+  expirySafety?: boolean;
+  cfg: Pick<
+    BoxConfig,
+    | "convergenceFloor"
+    | "convergencePct"
+    | "minExitNetPnl"
+    | "profitCapturePct"
+    | "minCapturedPct"
+  >;
+}): BoxExitMetrics {
+  const direction = args.direction ?? "LONG_BOX";
+  const { boxWidth, lotSize, entryBoxCostPerUnit, entryNetEdge, legs, now, cfg } = args;
+  const entryEdge =
+    args.entryEdge ??
+    round2((directionSign(direction) * boxWidth - entryBoxCostPerUnit) * lotSize);
+
+  const decision = evaluateExitDecision({
+    direction,
+    boxWidth,
+    lotSize,
+    entryNetDebitPerUnit: entryBoxCostPerUnit,
+    entryEdge,
+    entryNetEdge,
+    entryChargesTotal: args.entryChargesTotal,
+    currentExitChargesTotal: args.currentExitChargesTotal,
+    legs,
+    expirySafety: args.expirySafety === true,
+    cfg,
+  });
+
+  const exitCredit = decision.gross_pnl === null ? null : exitNetCreditPerUnit(legs);
+  const exitBoxValue = exitCredit === null ? null : round2(exitCredit * lotSize);
+  const roundTrip =
+    args.entryChargesTotal === null || args.currentExitChargesTotal === null
+      ? null
+      : round2(args.entryChargesTotal + args.currentExitChargesTotal);
+
+  const executionCost = round2(args.executionCost ?? 0);
+  const realisable =
+    decision.net_pnl === null ? null : round2(decision.net_pnl - executionCost);
+
+  let worstAge: number | null = null;
+  let agesSeen = 0;
+  for (const l of legs) {
+    if (l.age_ms === null) continue;
+    agesSeen++;
+    if (worstAge === null || l.age_ms > worstAge) worstAge = l.age_ms;
+  }
+
+  // `exit_eligible` keeps its original meaning: the rules say close AND the market
+  // can fill it. Expiry safety is reported through `decision.reason`, which is what
+  // the monitor acts on, so an emergency close is never mistaken for a normal one.
+  const eligible = decision.rule_reason !== null && decision.executable;
+
+  return {
+    at: now,
+    direction,
+    legs,
+    exit_net_credit_per_unit: exitCredit,
+    exit_box_value_per_unit: exitCredit,
+    exit_box_value: exitBoxValue,
+    gross_pnl_if_closed_now: decision.gross_pnl,
+    estimated_exit_charges: args.currentExitChargesTotal,
+    total_round_trip_charges: roundTrip,
+    current_net_pnl: decision.net_pnl,
+    estimated_execution_cost: executionCost,
+    realisable_net_pnl: realisable,
+    remaining_edge: decision.remaining_edge,
+    entry_edge: entryEdge,
+    captured_edge: decision.captured_edge,
+    captured_pct: decision.captured_pct,
+    convergence_threshold: convergenceThreshold(entryNetEdge, cfg),
+    min_exit_net_pnl: cfg.minExitNetPnl,
+    profit_capture_target: round2(cfg.profitCapturePct * entryNetEdge),
+    min_captured_pct: cfg.minCapturedPct,
+    time_in_trade_ms: args.openedAt === undefined ? null : Math.max(0, now - args.openedAt),
+    liquidity_ok: decision.executable,
+    worst_age_ms: agesSeen === legs.length && agesSeen > 0 ? worstAge : null,
+    rule_reason: decision.rule_reason,
+    exit_eligible: eligible,
+    exit_reason: eligible ? decision.rule_reason : null,
+    blocked_reason: decision.blocked_reason,
+    decision,
+  };
 }

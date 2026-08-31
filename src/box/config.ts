@@ -2,16 +2,19 @@
  * Box-scanner configuration.
  *
  * Everything the trading rules depend on is here and overridable by env var, so
- * the thresholds can be tuned without touching the engine. The DEFAULTS are:
+ * the thresholds can be tuned without touching the engine. The headline
+ * DEFAULTS are:
  *
- *   MIN_BOX_GROSS_EDGE    ₹1,200 from the SPREAD alone — the entry gate
- *   MIN_BOX_NET_EDGE      0 = no additional net floor (fees are managed by hand)
- *   BOX_SAFETY_BUFFER     ₹150, reported in the net figure, NOT part of the gate
- *   BOX_QUOTE_MAX_AGE_MS  1,500 ms — no paper trade on a stale book
- *   strikes each side     3  (ATM ± 3 → at most 7 strikes → at most 21 pairs)
+ *   BOX_MIN_EXPECTED_NET_PROFIT  ₹1,200 — THE ENTRY GATE, after every cost
+ *   MIN_BOX_GROSS_EDGE           ₹1,200 — a cheap prefilter only
+ *   BOX_SAFETY_BUFFER            ₹150   — risk allowance inside the net figure
+ *   BOX_EXECUTION_MODE           paper_latency
+ *   BOX_SIMULATED_LATENCY_MS     250 ms — decision → exchange arrival
+ *   BOX_QUOTE_MAX_AGE_MS         15,000 ms — how long an UNCHANGED book is valid
+ *   strikes each side            3  (ATM ± 3 → at most 7 strikes → 21 pairs)
  */
 
-import type { BoxScannerConfigSnapshot } from "./types.js";
+import type { BoxScannerConfigSnapshot, ExecutionMode } from "./types.js";
 
 function num(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -29,51 +32,106 @@ function bool(name: string, fallback: boolean): boolean {
   return fallback;
 }
 
+function executionMode(name: string, fallback: ExecutionMode): ExecutionMode {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const v = raw.trim().toLowerCase();
+  if (v === "paper_touch") return "paper_touch";
+  if (v === "paper_latency") return "paper_latency";
+  console.warn(`[Box] ignoring unknown ${name}="${raw}" — using ${fallback}.`);
+  return fallback;
+}
+
 export interface BoxConfig {
+  // ---- Execution model ----
+  /**
+   * How a paper fill is simulated.
+   *
+   * "paper_latency" (default) waits a simulated decision + send delay and then
+   * fills from the first WebSocket book published at or after that moment, so a
+   * recorded fill is always a price the market actually showed AFTER the order
+   * could have arrived. "paper_touch" fills at the detection touch and is kept
+   * for comparison.
+   */
+  executionMode: ExecutionMode;
+  /** Simulated internal decision/processing time before an order is "sent" (ms). */
+  simulatedDecisionMs: number;
+  /** Simulated order-send → exchange arrival latency (ms). */
+  simulatedLatencyMs: number;
+  /**
+   * How long the simulator waits for a post-arrival book on every leg (ms).
+   *
+   * If a leg publishes nothing in that window there is no evidence of what it
+   * would have filled at, so NO fill is invented — the attempt is recorded as
+   * `missing_book`.
+   */
+  executionMaxWaitMs: number;
+  /** How often the simulator re-checks for post-arrival books (ms). */
+  executionPollMs: number;
+  /** Cap on simultaneous simulated execution pipelines. */
+  maxConcurrentExecutions: number;
+
   // ---- Entry qualification ----
   /**
-   * THE ENTRY GATE: minimum GROSS edge (₹) from the spread alone.
+   * THE ENTRY GATE: minimum EXPECTED NET PROFIT (₹).
    *
-   *   grossEdge = ((K2 - K1) - entryBoxCostPerUnit) x lotSize
+   *   expectedNet = grossEdge
+   *               - entryCharges
+   *               - estimatedExitCharges
+   *               - executionCost (measured entry slippage + exit allowance)
+   *               - safetyBuffer
    *
-   * This is the arbitrage the executable prices actually show, before any
-   * charges or buffer are considered. Fees are still estimated, stored and
-   * displayed — they are just not deducted before deciding to enter.
+   * Evaluated on the EXECUTION snapshot, not merely on detection.
+   */
+  minExpectedNetProfit: number;
+  /**
+   * A cheap gross PREFILTER (₹) — performance only, never the decision.
+   *
+   * It must UNDER-state the true requirement, because its only job is to skip
+   * candidates that cannot possibly qualify. Since the net gate above always
+   * needs more gross than this, it can never discard a qualifying box.
    */
   minGrossEdge: number;
   /**
-   * OPTIONAL extra floor (₹) on the projected NET edge
-   * (gross - entryFees - estExitFees - safetyBuffer).
-   *
-   * 0 (the default) disables it, so the gate is the gross spread alone. Set it to
-   * a positive number to additionally require a net cushion.
+   * Legacy extra floor (₹) on the projected net edge. When set above 0 it raises
+   * the effective requirement to max(minExpectedNetProfit, minNetEdge), so an
+   * existing MIN_BOX_NET_EDGE deployment keeps its stricter behaviour.
    */
   minNetEdge: number;
-  /**
-   * Conservative slippage/safety allowance (₹) per complete round trip.
-   *
-   * Reported in the projected NET edge so the after-cost picture is visible, and
-   * used by the optional net floor above — but NOT part of the gross entry gate.
-   */
+  /** Risk/safety allowance (₹) deducted inside the expected-net figure. */
   safetyBuffer: number;
   /**
+   * Expected ENTRY execution cost (₹) used before a real measurement exists —
+   * i.e. in the published opportunity projection. Once the execution simulator
+   * has run, the MEASURED slippage replaces it.
+   */
+  expectedEntrySlippage: number;
+  /**
+   * Expected EXIT execution cost (₹). Always an estimate: the unwind has not
+   * happened yet, so its slippage cannot be measured at entry time.
+   */
+  expectedExitSlippage: number;
+  /**
    * A deliberate LOWER bound on what a round trip can cost in charges (₹), used
-   * ONLY by the prefilter when an optional net floor is configured. It must
-   * under-estimate: the prefilter's job is to skip candidates that cannot
-   * possibly qualify, so a value larger than the true minimum charge would
-   * discard genuine opportunities. Eight option orders at ₹20 brokerage plus GST
-   * is already ≈ ₹189, so ₹160 is safe.
+   * only by the prefilter. Eight option orders at ₹20 brokerage plus GST is
+   * already ≈ ₹189, so ₹160 is safe.
    */
   prefilterChargeAllowance: number;
   /**
-   * Whether a box may be auto-entered when Zerodha could not price its charges.
+   * Whether a box may be auto-entered when its charges could not be determined.
    *
-   * Default true. This is NOT about the threshold (which is gross-only): the
-   * exit rules are computed net of charges, so a position with no charge figures
-   * cannot have its net P&L evaluated and would never auto-exit. Set it to false
-   * only if you intend to manage such positions by hand.
+   * With the local calculator this is virtually always possible, so it now only
+   * guards genuinely pathological input (a zero-price leg).
    */
   requirePricedCharges: boolean;
+
+  // ---- Charges ----
+  /** Verify local charge maths against Zerodha asynchronously after a fill. */
+  reconcileCharges: boolean;
+  /** Warn when |local - Zerodha| exceeds this percentage of the Zerodha total. */
+  chargeReconcileWarnPct: number;
+  /** Max concurrent reconciliation calls (Zerodha must not be hammered). */
+  chargeReconcileConcurrency: number;
 
   // ---- Market-data quality ----
   /**
@@ -81,48 +139,42 @@ export interface BoxConfig {
    *
    * A depth feed only sends a message when the book actually changes, so silence
    * is not staleness: a resting book nobody has touched for ten seconds is still
-   * the current, executable book. Illiquid F&O strikes are quiet for long
-   * stretches, so a sub-second limit here does not make the system safer — it
-   * simply makes it unable to trade anything but the most active names.
-   *
-   * The protection against a genuinely dead feed is `feedMaxAgeMs` below, which is
-   * the check that actually catches "we are holding old data and do not know it".
+   * the current, executable book. The protection against a genuinely dead feed is
+   * `feedMaxAgeMs`.
    */
   quoteMaxAgeMs: number;
   /**
    * FEED LIVENESS: maximum age (ms) of the newest tick across the WHOLE box
-   * universe.
-   *
-   * With hundreds of instruments subscribed, something is always trading during
-   * market hours, so this going quiet means the connection is broken rather than
-   * the market being calm. When it trips, no entry and no automatic exit happens
-   * at all — that is the real "do not trade stale books" guard.
+   * universe. When it trips, no entry and no automatic exit happens at all.
    */
   feedMaxAgeMs: number;
   /** Maximum age (ms) of the underlying value used to place the ATM window. */
   underlyingMaxAgeMs: number;
 
   // ---- Strike window ----
-  /** Strikes each side of ATM. V1 is fixed at 3 and is NOT env-tunable. */
+  /** Strikes each side of ATM. Fixed at 3 and NOT env-tunable in this version. */
   readonly strikesEachSide: 3;
   /**
    * Extra fraction of a strike step the spot must travel PAST the midpoint
-   * before the ATM is re-centred. Stops a price oscillating on a strike
-   * boundary from resubscribing the window on every tick.
+   * before the ATM is re-centred.
    */
   atmHysteresis: number;
   /** Minimum gap (ms) between two window rebuilds for one underlying. */
   windowMinIntervalMs: number;
+  /** Evaluate SHORT boxes as well as LONG boxes. */
+  enableShortBox: boolean;
 
   // ---- Exit rules ----
   /** Floor of the convergence threshold (₹). */
   convergenceFloor: number;
   /** Fraction of the original entry net edge used as the threshold. */
   convergencePct: number;
-  /** Minimum simulated NET profit (₹) for a normal convergence exit. */
+  /** Minimum realisable NET profit (₹) for any normal (non-emergency) exit. */
   minExitNetPnl: number;
-  /** Fraction of the original net edge that alone justifies taking profit. */
+  /** Net profit that alone justifies taking profit, as a fraction of net edge. */
   profitCapturePct: number;
+  /** Fraction of the ORIGINAL edge captured that alone justifies an exit. */
+  minCapturedPct: number;
 
   // ---- Expiry safety ----
   /** Minutes before the close on expiry day to start forcing an exit. */
@@ -137,38 +189,45 @@ export interface BoxConfig {
   publishIntervalMs: number;
   /** How often (ms) the universe/expiry/window set is refreshed. */
   universeRefreshMs: number;
-  /**
-   * How often (ms) the last-close view is rebuilt while the market is shut.
-   *
-   * One REST /quote call per 500 instruments, so a minute is comfortable — the
-   * numbers cannot change while the exchange is closed anyway.
-   */
+  /** How often (ms) the last-close view is rebuilt while the market is shut. */
   indicativeRefreshMs: number;
-  /**
-   * Cap on simultaneously subscribed box option tokens. Zerodha allows ~3,000
-   * instruments per WebSocket connection and the calendar board already uses
-   * part of that budget on the same shared socket.
-   */
+  /** Cap on simultaneously subscribed box option tokens. */
   maxSubscribedTokens: number;
   /** Cap on underlyings scanned (0 = no cap beyond the token budget). */
   maxUnderlyings: number;
   /** TTL (ms) of a cached charge estimate for one candidate at given prices. */
   chargeCacheTtlMs: number;
-  /** Max concurrent charge estimations in flight. */
+  /** Max concurrent Zerodha charge estimations in flight. */
   chargeConcurrency: number;
   /** Opportunities published to the UI. */
   maxPublishedOpportunities: number;
+  /** Samples kept in each rolling metrics ring buffer. */
+  metricsWindow: number;
 }
 
 export function loadBoxConfig(): BoxConfig {
   return {
-    // ₹1,200 from the spread alone.
+    executionMode: executionMode("BOX_EXECUTION_MODE", "paper_latency"),
+    simulatedDecisionMs: num("BOX_SIMULATED_DECISION_MS", 40),
+    simulatedLatencyMs: num("BOX_SIMULATED_LATENCY_MS", 250),
+    executionMaxWaitMs: num("BOX_EXECUTION_MAX_WAIT_MS", 1500),
+    executionPollMs: num("BOX_EXECUTION_POLL_MS", 20),
+    maxConcurrentExecutions: num("BOX_MAX_CONCURRENT_EXECUTIONS", 8),
+
+    // THE gate: ₹1,200 of expected net profit after every cost.
+    minExpectedNetProfit: num("BOX_MIN_EXPECTED_NET_PROFIT", 1200),
+    // Prefilter only.
     minGrossEdge: num("MIN_BOX_GROSS_EDGE", 1200),
-    // No net floor by default — fees are managed by hand.
     minNetEdge: num("MIN_BOX_NET_EDGE", 0),
     safetyBuffer: num("BOX_SAFETY_BUFFER", 150),
+    expectedEntrySlippage: num("BOX_EXPECTED_ENTRY_SLIPPAGE", 250),
+    expectedExitSlippage: num("BOX_EXPECTED_EXIT_SLIPPAGE", 250),
     prefilterChargeAllowance: num("BOX_PREFILTER_CHARGE_ALLOWANCE", 160),
     requirePricedCharges: bool("BOX_REQUIRE_PRICED_CHARGES", true),
+
+    reconcileCharges: bool("BOX_RECONCILE_CHARGES", true),
+    chargeReconcileWarnPct: num("BOX_CHARGE_RECONCILE_WARN_PCT", 5),
+    chargeReconcileConcurrency: num("BOX_CHARGE_RECONCILE_CONCURRENCY", 2),
 
     quoteMaxAgeMs: num("BOX_QUOTE_MAX_AGE_MS", 15_000),
     feedMaxAgeMs: num("BOX_FEED_MAX_AGE_MS", 5_000),
@@ -177,11 +236,13 @@ export function loadBoxConfig(): BoxConfig {
     strikesEachSide: 3,
     atmHysteresis: num("BOX_ATM_HYSTERESIS", 0.15),
     windowMinIntervalMs: num("BOX_WINDOW_MIN_INTERVAL_MS", 15_000),
+    enableShortBox: bool("BOX_ENABLE_SHORT_BOX", true),
 
     convergenceFloor: num("BOX_CONVERGENCE_FLOOR", 200),
     convergencePct: num("BOX_CONVERGENCE_PCT", 0.2),
     minExitNetPnl: num("BOX_MIN_EXIT_NET_PNL", 600),
     profitCapturePct: num("BOX_PROFIT_CAPTURE_PCT", 0.75),
+    minCapturedPct: num("BOX_MIN_CAPTURED_PCT", 0.75),
 
     expirySafetyMinutesBeforeClose: num("BOX_EXPIRY_SAFETY_MINUTES", 45),
 
@@ -195,24 +256,33 @@ export function loadBoxConfig(): BoxConfig {
     chargeCacheTtlMs: num("BOX_CHARGE_CACHE_TTL_MS", 30_000),
     chargeConcurrency: num("BOX_CHARGE_CONCURRENCY", 3),
     maxPublishedOpportunities: num("BOX_MAX_PUBLISHED_OPPORTUNITIES", 60),
+    metricsWindow: num("BOX_METRICS_WINDOW", 500),
   };
 }
 
 /**
- * The gross edge (₹) a candidate must clear before it is worth spending a
- * charge-estimation call on — the FAST LOCAL PREFILTER.
+ * The minimum expected NET profit a box must show to be entered.
  *
- * With the default gross-only gate this is simply the gross requirement. When an
- * optional net floor is configured it also has to cover that floor plus the
- * buffer and a deliberate LOWER bound on charges, so the prefilter can never
- * discard a candidate that would have qualified once real charges came back.
+ * One number, one decision path: the new gate, raised by the legacy
+ * MIN_BOX_NET_EDGE floor if somebody has deliberately configured a stricter one.
+ */
+export function requiredNetProfit(
+  cfg: Pick<BoxConfig, "minExpectedNetProfit" | "minNetEdge">,
+): number {
+  return Math.max(cfg.minExpectedNetProfit, cfg.minNetEdge > 0 ? cfg.minNetEdge : 0);
+}
+
+/**
+ * The gross edge (₹) a candidate must clear before it is worth running the full
+ * qualification and execution pipeline on it — the FAST LOCAL PREFILTER.
+ *
+ * Deliberately a LOWER bound. The real gate needs
+ * `requiredNetProfit + charges + executionCost + buffer` of gross, which is
+ * strictly more than this, so the prefilter cannot discard a box that would have
+ * qualified.
  */
 export function prefilterGrossThreshold(cfg: BoxConfig): number {
-  const netDerived =
-    cfg.minNetEdge > 0
-      ? cfg.minNetEdge + cfg.safetyBuffer + cfg.prefilterChargeAllowance
-      : 0;
-  return Math.max(cfg.minGrossEdge, netDerived);
+  return Math.max(0, cfg.minGrossEdge);
 }
 
 /** The immutable settings frozen onto every trade document. */
@@ -220,13 +290,19 @@ export function configSnapshot(cfg: BoxConfig): BoxScannerConfigSnapshot {
   return {
     min_gross_edge: cfg.minGrossEdge,
     min_net_edge: cfg.minNetEdge,
+    min_expected_net_profit: requiredNetProfit(cfg),
     safety_buffer: cfg.safetyBuffer,
+    expected_entry_slippage: cfg.expectedEntrySlippage,
+    expected_exit_slippage: cfg.expectedExitSlippage,
     quote_max_age_ms: cfg.quoteMaxAgeMs,
     strikes_each_side: cfg.strikesEachSide,
     convergence_floor: cfg.convergenceFloor,
     convergence_pct: cfg.convergencePct,
     min_exit_net_pnl: cfg.minExitNetPnl,
     profit_capture_pct: cfg.profitCapturePct,
-    execution_mode: "paper_touch",
+    min_captured_pct: cfg.minCapturedPct,
+    execution_mode: cfg.executionMode,
+    simulated_decision_ms: cfg.simulatedDecisionMs,
+    simulated_latency_ms: cfg.simulatedLatencyMs,
   };
 }
