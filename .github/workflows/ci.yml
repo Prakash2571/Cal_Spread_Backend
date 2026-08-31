@@ -1,0 +1,45 @@
+name: CI
+
+# Every push to main and every pull request must compile and pass the Box suite.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only token. This workflow needs NO secrets: the Box tests are pure and
+# offline — no Zerodha credentials, no MongoDB, no Redis, no market access. Every
+# dependency the trading logic has (clock, sleep, quote store, charges, persistence)
+# is injected, so the suite runs deterministically against recorded fixtures.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Typecheck + Box tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Pinned major: the backend targets Node 22 (see @types/node) and uses
+          # node:test, which is stable there.
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install (locked)
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # `npm test` runs `npm run build` first (see package.json), so the BUILD is
+      # exercised here rather than in a third redundant `tsc -b` invocation:
+      #   build === typecheck === `tsc -b`, and test = build + node --test.
+      # Steps run in order and fail fast, so a type error stops the job above.
+      - name: Build + test
+        run: npm test
