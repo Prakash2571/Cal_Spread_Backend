@@ -140,6 +140,8 @@ export class BoxEngine {
   private indicativeTimer: NodeJS.Timeout | null = null;
   private indicativeAt: number | null = null;
   private indicativePriced = 0;
+  /** Positions whose margin fetch is currently in flight (dedupe guard). */
+  private marginInFlight = new Set<string>();
   /** Rolling ring of (receive time − exchange timestamp) samples, in ms. */
   private exchangeLagSamples: number[] = [];
   private exchangeLagCursor = 0;
@@ -384,6 +386,9 @@ export class BoxEngine {
           );
         }
       }
+      // Enrich any open position still missing its margin (adopted-on-restart
+      // trades, or entries whose margin call had failed).
+      this.backfillMissingMargins();
       const open = this.deps.isMarketOpen();
       if (open !== this.marketOpen) {
         this.marketOpen = open;
@@ -982,7 +987,7 @@ export class BoxEngine {
     // Margin is captured AFTER the fill is recorded, so a slow /margins/basket
     // call can never delay the trade or widen the gap after revalidation. It
     // patches the live position and the stored doc when it returns.
-    void this.captureMargin(id, candidate);
+    void this.captureMargin(id, candidate.legs, candidate.lot_size, candidate.key);
 
     void appendBoxEvent({
       event: "ENTRY",
@@ -1105,51 +1110,77 @@ export class BoxEngine {
    * its network latency never delays the fill. Best-effort — a failure just
    * leaves margin null, exactly like the calendar trade.
    */
-  private async captureMargin(id: string, candidate: BoxCandidate): Promise<void> {
+  private async captureMargin(
+    id: string,
+    legs: Record<BoxLegRole, BoxOptionInstrument>,
+    lotSize: number,
+    key: string,
+  ): Promise<void> {
+    if (this.marginInFlight.has(id)) return;
+    this.marginInFlight.add(id);
     const orders = BOX_LEG_ROLES.map((role) => ({
-      exchange: candidate.legs[role].exchange,
-      tradingsymbol: candidate.legs[role].tradingsymbol,
+      exchange: legs[role].exchange,
+      tradingsymbol: legs[role].tradingsymbol,
       transaction_type: BOX_ENTRY_SIDES[role],
       variety: "regular",
       product: "NRML",
       order_type: "MARKET",
-      quantity: candidate.lot_size,
+      quantity: lotSize,
       price: 0,
     }));
 
-    // Retry a few times: the margin API can transiently 5xx or rate-limit right
-    // at entry, and a single failure used to leave margin permanently blank. The
-    // trade already exists, so this is pure enrichment — retrying is safe.
+    // Retry a few times: the margin API can transiently 5xx or rate-limit, and a
+    // single failure used to leave margin permanently blank. The trade already
+    // exists, so this is pure enrichment — retrying is safe.
     const MAX_ATTEMPTS = 4;
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      // Stop if the position closed and its doc no longer needs enriching.
-      if (attempt > 1 && !this.positions.get(id)) {
-        // It may have closed; still try ONCE more so the closed doc gets margin.
-      }
-      try {
-        const res = await this.deps.getBasketMargin(orders);
-        const margin = Math.round(res.total);
-        if (!(margin > 0)) {
-          // A zero/blank margin is not useful; treat it as a miss and retry.
-          throw new Error(`basket margin returned ${res.total}`);
+    try {
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+          const res = await this.deps.getBasketMargin(orders);
+          // Accept whatever the API returns, INCLUDING a small or zero figure: a
+          // long box is a hedged position, so Zerodha's position-aware margin can
+          // legitimately be low. Only a thrown error (network / auth / rate
+          // limit) is a miss worth retrying — a successful small number is real.
+          if (!Number.isFinite(res.total)) {
+            throw new Error(`basket margin returned a non-numeric total`);
+          }
+          const margin = Math.max(0, Math.round(res.total));
+          const pos = this.positions.get(id);
+          if (pos) pos.margin = margin;
+          await setBoxTradeMargin(id, margin);
+          if (attempt > 1) {
+            console.log(`[Box] margin for ${key} captured on attempt ${attempt}: ₹${margin}`);
+          }
+          return;
+        } catch (err) {
+          const last = attempt === MAX_ATTEMPTS;
+          console.warn(
+            `[Box] basket margin fetch failed for ${key} (attempt ${attempt}/${MAX_ATTEMPTS})${last ? " — will retry later on the backfill sweep" : ", retrying"}:`,
+            err instanceof Error ? err.message : err,
+          );
+          if (last) return;
+          await new Promise((r) => setTimeout(r, 1500 * attempt));
         }
-        const pos = this.positions.get(id);
-        if (pos) pos.margin = margin;
-        await setBoxTradeMargin(id, margin);
-        if (attempt > 1) {
-          console.log(`[Box] margin for ${candidate.key} captured on attempt ${attempt}: ₹${margin}`);
-        }
-        return;
-      } catch (err) {
-        const last = attempt === MAX_ATTEMPTS;
-        console.warn(
-          `[Box] basket margin fetch failed for ${candidate.key} (attempt ${attempt}/${MAX_ATTEMPTS})${last ? " — giving up, margin stays unpriced" : ", retrying"}:`,
-          err instanceof Error ? err.message : err,
-        );
-        if (last) return;
-        // Back off: 1.5s, 3s, 4.5s — clear of a transient rate-limit window.
-        await new Promise((r) => setTimeout(r, 1500 * attempt));
       }
+    } finally {
+      this.marginInFlight.delete(id);
+    }
+  }
+
+  /**
+   * Fill in margin for any open position that still lacks it.
+   *
+   * Covers three cases the entry-time capture misses: a trade adopted from a
+   * previous process (opened before margin existed), an entry whose margin call
+   * failed every retry, and a session that only came up after entry. Runs on the
+   * slow market-watch timer, so it is nowhere near the hot path.
+   */
+  private backfillMissingMargins(): void {
+    if (!this.deps.kite.getAccessToken()) return;
+    for (const pos of this.positions.list()) {
+      if (pos.margin !== null) continue;
+      if (this.marginInFlight.has(pos.id)) continue;
+      void this.captureMargin(pos.id, pos.legs, pos.lot_size, pos.key);
     }
   }
 
