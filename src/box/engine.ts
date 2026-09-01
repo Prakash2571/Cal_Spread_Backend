@@ -261,7 +261,7 @@ export class BoxEngine {
    * succeeded. Retained so a fill is NEVER silently erased when persistence is
    * temporarily unavailable; drained by a slow background retry. See openPaperTrade.
    */
-  private pendingPersists: { payload: IBoxTrade; attempts: number }[] = [];
+  private pendingPersists: { payload: IBoxTrade; key: string; attempts: number }[] = [];
   private ownedRetryTimer: NodeJS.Timeout | null = null;
   private static readonly OWNED_RETRY_MS = 15_000;
   /** How many synchronous insert attempts one fill gets before it is retained. */
@@ -1637,7 +1637,7 @@ export class BoxEngine {
     try {
       doc = await this.insertWithRetry(payload);
     } catch (err) {
-      this.retainOwnedExecution(payload);
+      this.retainOwnedExecution(payload, candidate.key);
       console.error(
         `[Box] persistence unavailable for filled box ${candidate.key} — RETAINED for ` +
           `background retry (degraded). ${String(err)}`,
@@ -2120,9 +2120,17 @@ export class BoxEngine {
    * position is adopted into the live book and managed normally. Until then the
    * engine reports `degraded`.
    */
-  private retainOwnedExecution(payload: IBoxTrade): void {
-    this.pendingPersists.push({ payload, attempts: BoxEngine.PERSIST_RETRY_ATTEMPTS });
+  private retainOwnedExecution(payload: IBoxTrade, key: string): void {
+    this.pendingPersists.push({ payload, key, attempts: BoxEngine.PERSIST_RETRY_ATTEMPTS });
     this.degraded = true;
+    // Hold the strike-pair reservation so no new tick can open a DUPLICATE box for
+    // this key while the fill is unpersisted (the Mongo unique index cannot help
+    // yet — nothing is persisted). The scanner releases the reservation right after
+    // openPaperTrade returns null, so re-claim it on the next microtask. It is
+    // cleared when the box is finally persisted (positions.add) or found duplicate.
+    queueMicrotask(() => {
+      if (!this.positions.getByKey(key)) this.positions.reserve(key);
+    });
     if (!this.ownedRetryTimer) {
       this.ownedRetryTimer = setInterval(() => void this.drainOwnedExecutions(), BoxEngine.OWNED_RETRY_MS);
       this.ownedRetryTimer.unref?.();
@@ -2139,17 +2147,20 @@ export class BoxEngine {
       if (this.residualByAttempt.size === 0) this.degraded = false;
       return;
     }
-    const still: { payload: IBoxTrade; attempts: number }[] = [];
+    const still: { payload: IBoxTrade; key: string; attempts: number }[] = [];
     for (const entry of this.pendingPersists) {
       try {
         const doc = await insertBoxTrade(entry.payload);
         if (doc) {
+          // adoptDoc → positions.add clears the held reservation as it takes over.
           this.adoptDoc(doc);
           this.ensureFeed();
           console.log(`[Box] recovered a retained filled box into the live book (${doc._id.toString()}).`);
+        } else {
+          // Duplicate-key: the box is already open, so the retained copy is
+          // redundant. Release the reservation we were holding and drop it.
+          this.positions.release(entry.key);
         }
-        // A null here is a duplicate-key: the box is already open, so the retained
-        // copy is redundant and is dropped. Either way this entry is resolved.
       } catch {
         entry.attempts++;
         still.push(entry);
