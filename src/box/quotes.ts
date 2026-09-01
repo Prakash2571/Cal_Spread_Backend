@@ -149,6 +149,10 @@ export class BoxQuoteStore {
         asks: frozenAsks,
         version: this.nextVersion++,
         at,
+        // Preserve the EXCHANGE timestamp alongside the receive time when the feed
+        // supplied one. Receive time still drives freshness/feed-health; the
+        // exchange timestamp is what makes cross-leg temporal coherence meaningful.
+        exchange_at: typeof t.exchange_ts === "number" && t.exchange_ts > 0 ? t.exchange_ts : null,
         source: "ws",
       });
       this.updates++;

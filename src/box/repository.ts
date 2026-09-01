@@ -119,6 +119,9 @@ const LIST_EXCLUDE_AUDIT = {
   entry_execution: 0,
   entry_legging: 0,
   exit_execution: 0,
+  // The independent-order exit audit is the same kind of fat Mixed blob as the
+  // others and no list view renders it, so it is projected out here too.
+  exit_legging: 0,
   "legs.entry_depth": 0,
   "legs.exit_depth": 0,
 } as const;
@@ -347,12 +350,14 @@ export async function appendBoxEvent(input: BoxEventInput): Promise<void> {
  */
 export async function insertBoxExecutionAttempt(
   attempt: IBoxExecutionAttempt,
-): Promise<void> {
-  if (!isBoxDbEnabled()) return;
+): Promise<string | null> {
+  if (!isBoxDbEnabled()) return null;
   try {
-    await BoxExecutionAttempt.create(attempt);
+    const doc = await BoxExecutionAttempt.create(attempt);
+    return doc._id.toString();
   } catch (err) {
     console.warn("[Box] failed to persist execution attempt:", err);
+    return null;
   }
 }
 
@@ -368,6 +373,41 @@ export async function loadBoxExecutionAttempts(
       .lean<BoxExecutionAttemptRecord[]>();
   } catch {
     return [];
+  }
+}
+
+/**
+ * Attempts that still hold RESIDUAL exposure (resolved:false), newest first.
+ *
+ * The startup-reconciliation query: outstanding simulated contracts an execution
+ * could not flatten must be re-adopted and worked again after a restart, whether
+ * or not anyone presses RUN. Legacy documents have no `resolved` field; they are
+ * all fully-resolved aborts, so `resolved: false` correctly excludes them.
+ */
+export async function loadUnresolvedBoxExecutionAttempts(
+  limit = 200,
+): Promise<BoxExecutionAttemptRecord[]> {
+  if (!isBoxDbEnabled()) return [];
+  try {
+    return await BoxExecutionAttempt.find({ resolved: false })
+      .sort({ resolved_at: -1 })
+      .limit(limit)
+      .lean<BoxExecutionAttemptRecord[]>();
+  } catch {
+    return [];
+  }
+}
+
+/** Mark an execution attempt's residual exposure as flattened (best-effort). */
+export async function resolveBoxExecutionAttempt(id: string): Promise<void> {
+  if (!isBoxDbEnabled() || !isValidBoxId(id)) return;
+  try {
+    await BoxExecutionAttempt.updateOne(
+      { _id: id },
+      { $set: { resolved: true, residual_exposure: null } },
+    );
+  } catch (err) {
+    console.warn("[Box] failed to mark execution attempt resolved:", id, err);
   }
 }
 

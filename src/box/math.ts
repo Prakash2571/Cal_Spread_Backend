@@ -92,6 +92,68 @@ function debitSign(side: OrderSide): 1 | -1 {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Four-leg temporal coherence                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Cross-sectional temporal coherence of the four legs at one instant.
+ *
+ * Quote age alone cannot say whether the four books form a coherent snapshot.
+ * This does: receive-time and (where available) exchange-time dispersion across
+ * the legs, per-leg feed latency, and how many books moved during the decision
+ * latency.
+ *
+ * PURE: it never rejects anything; it only measures. The exchange-time dispersion
+ * is null unless ALL legs carry an exchange timestamp, so a caller can safely fall
+ * back to receive-time logic when the feed did not supply one — the module never
+ * rejects a candidate for missing data it cannot control.
+ */
+export function temporalCoherence(
+  legs: {
+    received_at: number | null;
+    exchange_at: number | null;
+    current_version: number | null;
+    detection_version: number | null;
+  }[],
+  now: number,
+): import("./types.js").BoxTemporalCoherence {
+  const received = legs.map((l) => l.received_at).filter((v): v is number => v !== null);
+  const exchange = legs.map((l) => l.exchange_at).filter((v): v is number => v !== null);
+  const ages = received.map((r) => now - r);
+
+  const receiveDispersion =
+    received.length >= 2 ? round2(Math.max(...received) - Math.min(...received)) : null;
+  // Only meaningful — and only used to reject — when EVERY leg has an exchange ts.
+  const exchangeDispersion =
+    exchange.length === legs.length && legs.length >= 2
+      ? round2(Math.max(...exchange) - Math.min(...exchange))
+      : null;
+
+  let booksChanged = 0;
+  for (const l of legs) {
+    if (
+      l.current_version !== null &&
+      l.detection_version !== null &&
+      l.current_version !== l.detection_version
+    ) {
+      booksChanged++;
+    }
+  }
+
+  return {
+    oldest_quote_age_ms: ages.length > 0 ? round2(Math.max(...ages)) : null,
+    newest_quote_age_ms: ages.length > 0 ? round2(Math.min(...ages)) : null,
+    receive_dispersion_ms: receiveDispersion,
+    exchange_dispersion_ms: exchangeDispersion,
+    legs_with_exchange_ts: exchange.length,
+    receive_to_exchange_delay_ms: legs.map((l) =>
+      l.received_at !== null && l.exchange_at !== null ? round2(l.received_at - l.exchange_at) : null,
+    ),
+    books_changed_during_latency: booksChanged,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Touch prices                                                              */
 /* -------------------------------------------------------------------------- */
 

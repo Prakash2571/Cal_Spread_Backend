@@ -439,11 +439,13 @@ test("4/4 filled but the executed net is NEGATIVE: still aborts, and the loss is
   assert.ok(res.legging.legging_net_loss < 0, "an abort always costs money");
 });
 
-test("4/4 filled, edge destroyed in flight: the executed prices are what qualification sees", async () => {
+test("a runaway adverse move in flight is REFUSED by the limit, so the box never fills 4/4", async () => {
   const b = leggingBuild();
   const detection = detect(b);
-  // During the latency the box gets much more expensive to buy, but every leg is
-  // still executable — so all four fill and the GROSS edge itself is gone.
+  // During the latency K1 CE runs far past its chase limit (₹300 → ₹400). Under
+  // the marketable-limit model that leg must NOT fill — the order does not chase a
+  // runaway price. So the box cannot complete and aborts as an incomplete legging,
+  // never as a 4/4 fill on a price we would never actually have paid.
   b.clock.at(100, () => {
     pushLeg(b, "k1_ce", { bid: 399, bidQty: 150, ask: 400, askQty: 150 }, b.clock.now());
   });
@@ -453,12 +455,9 @@ test("4/4 filled, edge destroyed in flight: the executed prices are what qualifi
     qualify: qualifyWith(b.conf),
   });
   assert.equal(res.ok, false, "a decayed dislocation must not open a box");
-  assert.equal(res.legging.filled_leg_count, 4);
-  assert.equal(res.legging.abort_after_fill, true);
-  assert.ok(
-    res.legging.final_expected_net_profit < 1200,
-    `executed net should have collapsed (got ${res.legging.final_expected_net_profit})`,
-  );
+  assert.ok(res.legging.filled_leg_count < 4, "the runaway leg is refused, so not 4/4");
+  assert.ok(res.legging.failed_legs.includes("k1_ce"), "K1 CE could not fill within its limit");
+  assert.equal(res.legging.abort_after_fill, false, "there was no complete fill to abort");
 });
 
 test("abort-after-fill whose unwind partially fails is reported as unwind_failed, not a clean abort", async () => {

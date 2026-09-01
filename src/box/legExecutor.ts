@@ -3,103 +3,85 @@
  *
  * WHY THIS MODULE EXISTS
  *
- * The first paper_legging model still resolved all four legs against a SINGLE
- * snapshot taken at one common arrival instant. That cannot express the thing that
- * actually kills four-leg arbitrage: legs filling at different moments, one leg
- * resting unfilled while the others are already on, and one leg never filling at
- * all. If every leg is decided from the same book at the same millisecond, legging
- * risk is structurally invisible.
+ * A box is four orders, and four-leg arbitrage is killed by the things a single
+ * shared snapshot cannot express: legs filling at different instants, one leg
+ * resting while the others are already on, a leg that only PARTIALLY fills and
+ * rests for more liquidity, and a leg that never fills. So each leg here is a real
+ * order with its own lifecycle:
  *
- * So each leg here is a real order with its own lifecycle:
+ *   CREATED → SUBMITTED → IN_FLIGHT → (arrival) walk the book within the LIMIT
+ *      → FILLED                    (took the whole lot)
+ *      → PARTIALLY_FILLED → rest → complete on a later book → FILLED
+ *                                 → or TIMED_OUT at arrival + legTimeoutMs
+ *      → PENDING (nothing executable within the limit yet) → …
  *
- *   CREATED → SUBMITTED → IN_FLIGHT → (at arrival) fill? → FILLED
- *                                              └ no → PENDING → fill on a later
- *                                                     book update → FILLED
- *                                                     └ or TIMED_OUT at
- *                                                       arrival_at + legTimeoutMs
+ * FOUR RULES THAT MUST NOT REGRESS
  *
- * TWO RULES THAT MUST NOT REGRESS
+ *  1. MARKETABLE LIMIT, NOT A MARKET ORDER. Every order carries a limit price a
+ *     bounded number of ticks past the reference touch (see executionPolicy /
+ *     orderPricing). The book is walked only down to that limit; a level worse
+ *     than the limit is never taken. An order that cannot fill within its limit
+ *     RESTS — it does not consume a runaway price.
  *
- *  1. RESTING BOOK. A book does NOT have to publish a new tick after arrival to be
- *     valid. At arrival we read the latest known valid book; an option quoted
- *     `Ask 100 x 500` that has not ticked for 200ms is still executable. Only if
- *     THAT book cannot fill the lot does the order rest as PENDING, after which a
- *     later update may fill it.
- *
- *  2. NEVER INVENT A PRICE. Every fill is an observed executable touch from a real
- *     WebSocket book, recorded with its version and receive timestamp. There is no
+ *  2. NEVER INVENT A PRICE. Every fill slice is an observed executable level from a
+ *     real WebSocket book, recorded with its version and receive timestamp. No
  *     random slippage anywhere.
+ *
+ *  3. RESTING BOOK. A book need not publish a new tick after arrival to be valid:
+ *     at arrival we walk the latest known valid book. Only what it cannot fill
+ *     rests, and a later update may complete it.
+ *
+ *  4. CONSERVATIVE QUEUE. Displayed depth is not assumed to be all ours (see the
+ *     queue model in orderPricing). Deterministic; no randomness.
  *
  * EVENT-DRIVEN, YET DETERMINISTIC
  *
- * Pending orders are woken by the quote store's `subscribe()` seam, which fires
- * synchronously as a depth packet is applied — so a fill is stamped with the
- * TICK'S OWN timestamp, not whenever a poller happened to look. Timers are used
- * only for arrival and timeout deadlines. The clock and the sleep are injected, so
- * a recorded tick stream reproduces byte-identical fill times, prices and P&L.
- *
- * Scheduling is driven by ONE coordinating loop rather than four concurrent
- * waiters: concurrent sleeps against a shared simulated clock would race and
- * advance it past a deadline, which would quietly destroy determinism.
+ * Pending/partial orders are woken by the quote store's `subscribe()` seam, which
+ * fires synchronously as a depth packet is applied — so a fill is stamped with the
+ * TICK'S OWN timestamp. Timers are used only for arrival and timeout deadlines. The
+ * clock and the sleep are injected, so a recorded tick stream reproduces
+ * byte-identical fills, prices and P&L. Scheduling is driven by ONE coordinating
+ * loop, never four concurrent waiters (which would race a shared simulated clock).
  */
 
-import type { BoxConfig } from "./config.js";
+import type { BoxExecutionPolicy, ExecutionPhase } from "./executionPolicy.js";
 import { round2, slippagePerUnit } from "./math.js";
+import { touchPrice, walkDepth } from "./orderPricing.js";
 import type { BoxQuoteStore } from "./quotes.js";
 import type {
   BoxExecutionFailureReason,
-  BoxLegEvaluation,
   BoxLegRole,
   BoxOptionInstrument,
   BoxQuote,
   OrderSide,
   PaperLegExecution,
+  PaperLegStatus,
 } from "./types.js";
 
-/** One order to work: what to trade, and when it was sent. */
+/** One order to work: what to trade, and the reference it is priced against. */
 export interface LegOrderRequest {
   role: BoxLegRole;
   side: OrderSide;
   inst: BoxOptionInstrument;
-  /** The touch visible at DETECTION, for slippage measurement. */
+  /** The touch visible at DETECTION — the reference the limit is priced against. */
   detected_price: number | null;
   detected_qty: number;
-  /** One lot. */
+  /** Requested quantity (one lot on entry; the outstanding quantity on an unwind). */
   quantity: number;
 }
 
 /**
  * Dependencies shared by every run.
  *
- * CONCURRENCY CONTRACT: everything here must be either immutable or safe to share
- * across simultaneous executions. NOTHING run-specific may live on the executor
- * instance — see the note on `run()`.
+ * CONCURRENCY CONTRACT: everything here must be immutable or safe to share across
+ * simultaneous executions. NOTHING run-specific may live on the executor instance
+ * — see the note on `run()`.
  */
 export interface LegExecutorDeps {
-  cfg: Pick<
-    BoxConfig,
-    | "legExecutionMode"
-    | "legTimeoutMs"
-    | "quoteMaxAgeMs"
-    | "simulatedLatencyMs"
-    | "executionPollMs"
-  >;
+  policy: BoxExecutionPolicy;
   quotes: BoxQuoteStore;
   now: () => number;
   wait: (ms: number) => Promise<void>;
-  /**
-   * Price one leg against one book. Injected so the touch/liquidity rules live in
-   * exactly one place (the simulator's `legFromQuote`) and cannot drift.
-   */
-  evaluate: (args: {
-    role: BoxLegRole;
-    side: OrderSide;
-    inst: BoxOptionInstrument;
-    quote: BoxQuote;
-    lotSize: number;
-    now: number;
-    maxAgeMs: number;
-  }) => BoxLegEvaluation;
 }
 
 /** What the run produced. */
@@ -108,11 +90,10 @@ export interface LegRunResult {
   /** Set when the run was cut short (feed/market/discovery), else null. */
   aborted: { reason: BoxExecutionFailureReason; detail: string } | null;
   /**
-   * token → the EXACT book each filled leg filled from.
+   * token → the EXACT book each leg last filled a slice from.
    *
-   * Essential for final qualification: legs fill at different instants, so the
-   * store's current books are not what we traded. Re-qualifying on these means the
-   * decision is made on the actual fill prices.
+   * Essential for final qualification and depth audit: legs fill at different
+   * instants, so the store's current books are not what we traded.
    */
   booksAtFill: Map<number, BoxQuote>;
 }
@@ -125,11 +106,14 @@ interface LegState {
   done: boolean;
 }
 
-const TERMINAL: ReadonlySet<string> = new Set([
+/** Statuses that are fully resolved — no further fills possible. */
+const TERMINAL: ReadonlySet<PaperLegStatus> = new Set<PaperLegStatus>([
   "FILLED",
-  "PARTIALLY_FILLED",
   "TIMED_OUT",
+  "CANCELLED",
   "FAILED",
+  "UNWOUND",
+  "UNWIND_FAILED",
 ]);
 
 export class LegExecutor {
@@ -138,21 +122,13 @@ export class LegExecutor {
   /**
    * Work all four orders.
    *
-   * parallel   — every order is submitted at `submitAt` and travels concurrently;
-   *              each fills (or rests, or times out) on its own timeline.
-   * sequential — the next order is submitted only once the previous one FILLED, so
-   *              its submit/arrival times are derived from that fill.
-   */
-  /**
-   * CONCURRENCY: every piece of run-specific state below is a LOCAL of this
-   * method — leg states, the fill books, the quote listener, the abort predicate.
-   * Nothing is stored on `this`, so any number of executions may share one
-   * executor instance without being able to observe or corrupt each other.
+   * parallel   — every order is submitted at `submitAt` and travels concurrently.
+   * sequential — the next order is submitted only once the previous one FILLED.
    *
-   * This is deliberate and load-bearing. An earlier version kept the fill-book map
-   * on the instance; with several pipelines in flight, one candidate's later fill
-   * wrote into another candidate's map, and the victim was then re-qualified
-   * against books it never traded.
+   * CONCURRENCY: every piece of run-specific state below (leg states, fill books,
+   * the quote listener, the abort predicate) is a LOCAL of this method. Nothing is
+   * stored on `this`, so any number of executions may share one executor instance
+   * without observing or corrupting each other.
    */
   async run(args: {
     requests: LegOrderRequest[];
@@ -160,24 +136,27 @@ export class LegExecutor {
     submitAt: number;
     /** Per-leg travel time; arrival = submit + this. */
     latencyMs?: number;
-    lotSize: number;
+    /** entry (default) or unwind — decides the chase band the policy applies. */
+    phase?: ExecutionPhase;
+    /** Deterministic id prefix for order ids ("<key>:entry", "<key>:unwind"). */
+    orderIdPrefix: string;
     /**
-     * Reason to abandon everything still working (feed died, market closed,
-     * discovery stopped) — supplied PER RUN, never held on the instance, so one
-     * candidate's discovery state can never cancel another's orders.
-     *
-     * Already-FILLED legs are never touched: those fills really happened.
+     * Reason to abandon everything still working — supplied PER RUN, never held on
+     * the instance. Already-filled quantity is never touched: those fills happened.
      */
     abortReason?: () => { reason: BoxExecutionFailureReason; detail: string } | null;
   }): Promise<LegRunResult> {
-    const latency = Math.max(0, args.latencyMs ?? this.deps.cfg.simulatedLatencyMs);
-    const timeout = Math.max(0, this.deps.cfg.legTimeoutMs);
-    const sequential = this.deps.cfg.legExecutionMode === "sequential";
+    const policy = this.deps.policy;
+    const phase: ExecutionPhase = args.phase ?? "entry";
+    const latency = Math.max(0, args.latencyMs ?? policy.latencyMs);
+    const timeout = policy.legTimeoutMs;
+    const sequential = policy.legExecutionMode === "sequential";
+    const maxAgeMs = policy.quoteMaxAgeMs;
 
     const states: LegState[] = args.requests.map((req) => ({
       req,
       done: false,
-      leg: blankLeg(req, args.lotSize),
+      leg: blankLeg(req, args.orderIdPrefix, phase),
     }));
 
     // Submit: in parallel every order goes now; sequentially only the first does.
@@ -185,26 +164,24 @@ export class LegExecutor {
       if (!sequential || i === 0) this.submit(st, args.submitAt, latency);
     }
 
-    // Pending orders are filled by book updates at the TICK's own timestamp.
+    const booksAtFill = new Map<number, BoxQuote>();
+
+    // Pending/partial orders are filled by book updates at the TICK's own timestamp.
     const unsubscribe = this.deps.quotes.subscribe((changed, at) => {
       const touched = new Set(changed);
       for (const st of states) {
-        if (st.done || st.leg.status !== "PENDING") continue;
+        if (st.done) continue;
+        if (st.leg.status !== "PENDING" && st.leg.status !== "PARTIALLY_FILLED") continue;
         if (!touched.has(st.req.inst.token)) continue;
         // A timed-out order must not be revived by a later tick.
         if (st.leg.timeout_at !== null && at > st.leg.timeout_at) continue;
-        this.tryFill(st, at, args.lotSize, booksAtFill);
+        this.tryFill(st, at, phase, maxAgeMs, booksAtFill);
       }
     });
 
     let aborted: LegRunResult["aborted"] = null;
-    // LOCAL to this run. Threaded explicitly into tryFill rather than held on the
-    // instance, so concurrent runs cannot write into each other's books.
-    const booksAtFill = new Map<number, BoxQuote>();
 
     try {
-      // ONE coordinating loop. Each pass advances the clock to the next boundary —
-      // an arrival or a timeout — and processes everything due at that instant.
       let guard = 0;
       for (;;) {
         if (++guard > 10_000) break; // never spin forever on a stuck clock
@@ -214,7 +191,7 @@ export class LegExecutor {
           aborted = abort;
           for (const st of states) {
             if (st.done) continue;
-            this.fail(st, abort.detail);
+            this.abandon(st, abort.detail);
           }
           break;
         }
@@ -223,18 +200,13 @@ export class LegExecutor {
         if (next === null) break; // everything resolved
 
         if (next > this.deps.now()) {
-          // Sleep toward the boundary in BOUNDED steps. Ticks landing inside a step
-          // fire the subscription above and fill pending orders at their exact
-          // timestamps, so stepping costs no accuracy — it only bounds how long a
-          // feed death / market close / STOP can go unnoticed while orders rest.
-          const step = Math.max(1, this.deps.cfg.executionPollMs);
+          const step = policy.executionPollMs;
           await this.deps.wait(Math.min(next - this.deps.now(), step));
-          // Not at the boundary yet: re-check the abort conditions first.
-          if (this.deps.now() < next) continue;
+          if (this.deps.now() < next) continue; // not at the boundary yet
         }
         const at = this.deps.now();
 
-        // 1) Orders that have now ARRIVED: try the latest valid resting book.
+        // 1) Orders that have now ARRIVED: begin resting and try the current book.
         for (const st of states) {
           if (st.done || st.leg.status !== "IN_FLIGHT") continue;
           if (st.leg.arrival_at > at) continue;
@@ -242,26 +214,25 @@ export class LegExecutor {
           st.leg.pending_since = at;
           st.leg.timeout_at = st.leg.arrival_at + timeout;
 
-          // EVENT-LOOP OVERSHOOT. If the process stalled and we are waking after
-          // this order's deadline had already passed, it expired in the market — it
-          // must NOT be filled at a price from after its own timeout.
+          // EVENT-LOOP OVERSHOOT: if we woke after this order's deadline, it expired
+          // in the market — it must not fill at a price from after its own timeout.
           if (at > st.leg.timeout_at) {
-            this.expire(st, at, timeout);
+            this.expire(st, timeout);
             if (sequential) this.cancelRemaining(states, st);
             continue;
           }
 
-          const filled = this.tryFill(st, at, args.lotSize, booksAtFill);
-          // Sequential: a fill releases the next order from this very instant.
-          if (sequential && filled) this.submitNext(states, st, at, latency);
+          const result = this.tryFill(st, at, phase, maxAgeMs, booksAtFill);
+          // Sequential: only a COMPLETE fill releases the next order.
+          if (sequential && result === "filled") this.submitNext(states, st, at, latency);
         }
 
-        // 2) Orders still resting at their deadline: give up.
+        // 2) Orders still working at their deadline: give up (keeping any partial).
         for (const st of states) {
-          if (st.done || st.leg.status !== "PENDING") continue;
+          if (st.done) continue;
+          if (st.leg.status !== "PENDING" && st.leg.status !== "PARTIALLY_FILLED") continue;
           if (st.leg.timeout_at === null || st.leg.timeout_at > at) continue;
-          this.expire(st, at, timeout);
-          // Sequential: nothing after a failed leg is ever sent.
+          this.expire(st, timeout);
           if (sequential) this.cancelRemaining(states, st);
         }
       }
@@ -271,7 +242,7 @@ export class LegExecutor {
 
     // Anything still open (guard tripped) is recorded honestly, never as a fill.
     for (const st of states) {
-      if (!st.done) this.fail(st, st.leg.fail_reason ?? "unresolved when the run ended");
+      if (!st.done) this.abandon(st, st.leg.fail_reason ?? "unresolved when the run ended");
     }
 
     return { legs: states.map((s) => s.leg), aborted, booksAtFill };
@@ -286,12 +257,7 @@ export class LegExecutor {
   }
 
   /** Sequential mode: release the order after `afterState`, timed from its fill. */
-  private submitNext(
-    states: LegState[],
-    afterState: LegState,
-    at: number,
-    latencyMs: number,
-  ): void {
+  private submitNext(states: LegState[], afterState: LegState, at: number, latencyMs: number): void {
     const i = states.indexOf(afterState);
     const next = states[i + 1];
     if (!next || next.leg.status !== "CREATED") return;
@@ -310,27 +276,32 @@ export class LegExecutor {
     }
   }
 
-  /** The order's deadline passed while it was still unfilled. */
-  private expire(st: LegState, at: number, timeoutMs: number): void {
+  /** The order's deadline passed while it was still not fully filled. */
+  private expire(st: LegState, timeoutMs: number): void {
     st.leg.status = "TIMED_OUT";
-    // Report the DEADLINE as the resolution instant, not a late wake-up: the order
-    // stopped being workable at timeout_at, whatever time we noticed.
-    st.leg.resolved_at = st.leg.timeout_at ?? at;
+    // Report the DEADLINE as the resolution instant, not a late wake-up.
+    st.leg.resolved_at = st.leg.timeout_at ?? this.deps.now();
     st.leg.fail_reason =
       `still unfilled ${timeoutMs}ms after arriving — ` +
       (st.leg.fill_qty > 0
-        ? `only ${st.leg.fill_qty} of ${st.leg.quantity} available`
-        : "the touch never showed a full lot");
+        ? `only ${st.leg.fill_qty} of ${st.leg.quantity} filled within the limit`
+        : "no executable quantity within the limit");
     st.done = true;
   }
 
-  private fail(st: LegState, detail: string): void {
-    // A leg that already filled keeps its fill: that money was really spent.
+  /**
+   * Abandon an unfilled/partial order because the run was cut short.
+   *
+   * A partial keeps its fill (that quantity was really acquired) and becomes
+   * CANCELLED so the outstanding exposure stays visible; a zero-fill order becomes
+   * FAILED. A leg that already reached a terminal state is left untouched.
+   */
+  private abandon(st: LegState, detail: string): void {
     if (TERMINAL.has(st.leg.status)) {
       st.done = true;
       return;
     }
-    st.leg.status = "FAILED";
+    st.leg.status = st.leg.fill_qty > 0 ? "CANCELLED" : "FAILED";
     st.leg.resolved_at = this.deps.now();
     st.leg.fail_reason = detail;
     st.done = true;
@@ -338,7 +309,7 @@ export class LegExecutor {
 
   /**
    * The next instant anything can happen: the earliest pending arrival, or the
-   * earliest resting order's deadline. null when every order is resolved.
+   * earliest working order's deadline. null when every order is resolved.
    */
   private nextBoundary(states: LegState[]): number | null {
     let next: number | null = null;
@@ -349,90 +320,135 @@ export class LegExecutor {
     for (const st of states) {
       if (st.done) continue;
       if (st.leg.status === "IN_FLIGHT") consider(st.leg.arrival_at);
-      else if (st.leg.status === "PENDING") consider(st.leg.timeout_at);
+      else if (st.leg.status === "PENDING" || st.leg.status === "PARTIALLY_FILLED") {
+        consider(st.leg.timeout_at);
+      }
       // CREATED legs (sequential, not yet released) are driven by the leg ahead.
     }
     return next;
   }
 
   /**
-   * Attempt a fill from the CURRENT book. Returns true when it filled.
+   * Attempt to fill (more of) an order from the CURRENT book by walking depth
+   * within the order's limit.
    *
-   * Records the book it looked at either way, so a leg that never filled still
-   * shows what it was seeing — which is what makes an abort diagnosable.
+   * Returns "filled" (order complete), "partial" (some quantity taken, remainder
+   * rests) or "none" (nothing executable within the limit on this book). Records
+   * the book it looked at either way, so an order that never filled still shows
+   * what it was seeing — which is what makes an abort diagnosable.
    */
   private tryFill(
     st: LegState,
     at: number,
-    lotSize: number,
+    phase: ExecutionPhase,
+    maxAgeMs: number,
     booksAtFill: Map<number, BoxQuote>,
-  ): boolean {
+  ): "filled" | "partial" | "none" {
     const { leg, req } = st;
     const quote = this.deps.quotes.get(req.inst.token);
     if (!quote) {
       leg.fail_reason = "no book for this instrument yet";
-      return false;
+      return "none";
     }
 
-    const ev = this.deps.evaluate({
-      role: req.role,
+    const age = at - quote.at;
+    // A book that has aged out is not evidence of an executable price. Keep resting.
+    if (!(age >= 0 && age <= maxAgeMs)) {
+      leg.fail_reason = `book is stale (${age}ms) — waiting for a refresh`;
+      return "none";
+    }
+
+    // Price the order the first time it can see a book (reference = detection touch,
+    // or the current touch when detection had none). The limit is FIXED from here.
+    if (!leg.pricing) {
+      const ref = leg.detected_price ?? touchPrice(req.side, quote.bids, quote.asks);
+      if (ref === null || !(ref > 0)) {
+        leg.fail_reason = `no ${req.side === "BUY" ? "ask" : "bid"} to price against`;
+        return "none";
+      }
+      leg.pricing = this.deps.policy.priceOrder({
+        side: req.side,
+        quantity: req.quantity,
+        referencePrice: ref,
+        inst: req.inst,
+        phase,
+      });
+    }
+
+    const levels = req.side === "BUY" ? quote.asks : quote.bids;
+    const walk = walkDepth({
       side: req.side,
-      inst: req.inst,
-      quote,
-      lotSize,
-      now: at,
-      maxAgeMs: this.deps.cfg.quoteMaxAgeMs,
+      levels,
+      remainingQty: leg.remaining_qty,
+      limitPrice: leg.pricing.limit_price,
+      queueModel: this.deps.policy.queueModel,
+      haircutPct: this.deps.policy.queueHaircutPct,
+      at,
+      quoteVersion: quote.version,
     });
 
-    leg.quote_version = ev.quote_version ?? quote.version;
+    if (walk.filled_qty <= 0) {
+      // Either nothing within the limit, or the queue haircut left nothing for us.
+      const touch = touchPrice(req.side, quote.bids, quote.asks);
+      leg.fail_reason =
+        touch !== null && ((req.side === "BUY" && touch > leg.pricing.limit_price) ||
+          (req.side === "SELL" && touch < leg.pricing.limit_price))
+          ? `touch ${touch} is past the limit ${leg.pricing.limit_price}`
+          : `no executable quantity within the limit ${leg.pricing.limit_price}`;
+      return "none";
+    }
+
+    // Apply the slices and update the running aggregate.
+    for (const s of walk.slices) leg.fills.push(s);
+    leg.fill_qty += walk.filled_qty;
+    leg.remaining_qty = Math.max(0, leg.quantity - leg.fill_qty);
+    const avg = weightedAverage(leg.fills);
+    leg.fill_price = avg;
+    leg.average_fill_price = avg;
+    leg.quote_version = quote.version;
     leg.book_at = quote.at;
-    leg.book_age_ms = at - quote.at;
-
-    // A book that has aged out is not evidence of an executable price. The order
-    // keeps resting: a refresh may make it fillable before the deadline.
-    if (!ev.fresh) {
-      leg.fail_reason = `book is stale (${leg.book_age_ms}ms) — waiting for a refresh`;
-      return false;
-    }
-    if (ev.price === null || !(ev.price > 0)) {
-      leg.fail_reason = `no ${req.side === "BUY" ? "ask" : "bid"} to trade against`;
-      return false;
-    }
-    // TOUCH-ONLY: the whole lot must be resting at the touch. Depth walking (and
-    // therefore PARTIALLY_FILLED) arrives with Phase 3; a thin touch rests instead
-    // of half-filling, because a half-filled box leg is not a box.
-    if (ev.qty_at_touch < lotSize) {
-      leg.fill_qty = 0;
-      leg.remaining_qty = lotSize;
-      leg.fail_reason = `only ${ev.qty_at_touch} of ${lotSize} resting at ${ev.price}`;
-      return false;
-    }
-
-    leg.status = "FILLED";
-    // Keep the exact book this leg filled from, so final qualification prices the
-    // real fills rather than whatever the store holds once all four are done.
-    // Passed in per run — never instance state (see the note on run()).
-    booksAtFill.set(req.inst.token, quote);
-    leg.fill_price = ev.price;
-    leg.fill_at = at;
-    leg.resolved_at = at;
-    leg.fill_qty = lotSize;
-    leg.remaining_qty = 0;
+    leg.book_exchange_at = quote.exchange_at;
+    leg.book_age_ms = age;
+    const perUnit = slippagePerUnit(req.side, req.detected_price, avg);
+    leg.slippage = perUnit === null ? null : round2(perUnit * leg.fill_qty);
     leg.fail_reason = null;
-    const perUnit = slippagePerUnit(req.side, req.detected_price, ev.price);
-    leg.slippage = perUnit === null ? null : round2(perUnit * lotSize);
-    st.done = true;
-    return true;
+    booksAtFill.set(req.inst.token, quote);
+
+    if (leg.remaining_qty <= 0) {
+      leg.status = "FILLED";
+      leg.fill_at = at;
+      leg.resolved_at = at;
+      st.done = true;
+      return "filled";
+    }
+    // Some quantity taken; the remainder rests for later liquidity.
+    leg.status = "PARTIALLY_FILLED";
+    return "partial";
   }
 }
 
+/** Quantity-weighted average price across a set of fill slices. */
+function weightedAverage(slices: { price: number; qty: number }[]): number | null {
+  let q = 0;
+  let v = 0;
+  for (const s of slices) {
+    q += s.qty;
+    v += s.price * s.qty;
+  }
+  return q > 0 ? round2(v / q) : null;
+}
+
 /** A freshly created order, before submission. */
-function blankLeg(req: LegOrderRequest, lotSize: number): PaperLegExecution {
+function blankLeg(req: LegOrderRequest, orderIdPrefix: string, phase: ExecutionPhase): PaperLegExecution {
+  const orderId = `${orderIdPrefix}:${req.role}`;
   return {
     role: req.role,
     side: req.side,
     token: req.inst.token,
     tradingsymbol: req.inst.tradingsymbol,
+    order_id: orderId,
+    client_order_id: orderId,
+    pricing: null,
     detected_price: req.detected_price,
     detected_qty: req.detected_qty,
     submit_at: 0,
@@ -442,17 +458,24 @@ function blankLeg(req: LegOrderRequest, lotSize: number): PaperLegExecution {
     fill_at: null,
     resolved_at: null,
     fill_price: null,
-    quantity: lotSize,
+    average_fill_price: null,
+    quantity: req.quantity,
+    requested_qty: req.quantity,
     fill_qty: 0,
-    remaining_qty: lotSize,
+    remaining_qty: req.quantity,
+    fills: [],
     quote_version: null,
     book_at: null,
+    book_exchange_at: null,
     book_age_ms: null,
     slippage: null,
     status: "CREATED",
     unwind_price: null,
     unwind_slippage: null,
+    unwound_qty: 0,
     fail_reason: null,
+    // `phase` is not stored on the leg; it is captured by the order id prefix
+    // ("…:entry" / "…:unwind") and used only to select the chase band.
   };
 }
 
@@ -460,7 +483,7 @@ function blankLeg(req: LegOrderRequest, lotSize: number): PaperLegExecution {
 
 /** Fill-timing summary over a finished set of orders. */
 export interface FillTiming {
-  /** max(fill_at) − min(fill_at) across FILLED legs — the dispersion. */
+  /** max(fill_at) − min(fill_at) across FULLY FILLED legs — the dispersion. */
   first_to_last_fill_ms: number | null;
   decision_to_first_fill_ms: number | null;
   decision_to_last_fill_ms: number | null;
@@ -471,9 +494,8 @@ export interface FillTiming {
 /**
  * Fill timings measured from the legs themselves.
  *
- * Deliberately derived here rather than assumed from a common arrival instant:
  * `first_to_last_fill_ms` is the literal spread between the earliest and latest
- * fill, so it is 0 for a single fill and grows only when legs really did land
+ * FULL fill, so it is 0 for a single fill and grows only when legs really did land
  * apart. Detection-relative figures are reported separately.
  */
 export function fillTiming(legs: PaperLegExecution[], detectedAt: number): FillTiming {

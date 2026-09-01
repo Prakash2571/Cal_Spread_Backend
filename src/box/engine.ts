@@ -60,6 +60,8 @@ import {
   loadBoxSettings,
   loadBoxTradesClosedSince,
   loadOpenBoxTrades,
+  loadUnresolvedBoxExecutionAttempts,
+  resolveBoxExecutionAttempt,
   saveBoxSettings,
   serializeBoxTrade,
   setBoxChargeReconciliation,
@@ -70,6 +72,7 @@ import {
   upsertBoxDailyPnl,
   type SerializedBoxTrade,
 } from "./repository.js";
+import type { BoxTradeRecord } from "./model.js";
 import { BoxClosedTradeCache, liteClosedTrade } from "./closedCache.js";
 import { BoxPnlCache } from "./pnlCache.js";
 import { BoxPnlArchiver, istDayStartMs } from "./pnlArchive.js";
@@ -100,6 +103,7 @@ import {
   type IBoxLeg,
   type IBoxTrade,
   type PaperLeggingExecutionRecord,
+  type ResidualLegExposure,
 } from "./types.js";
 import type { BoxExecutionFailureReason } from "./types.js";
 import { entrySideFor } from "./math.js";
@@ -250,6 +254,30 @@ export class BoxEngine {
   private indicativeSessionDay: string | null = null;
   /** Legs discarded because they last traded in an EARLIER session. */
   private indicativeStaleLegs = 0;
+
+  /* ------------------------- execution durability ------------------------- */
+  /**
+   * Simulated boxes whose four legs FILLED but whose Mongo insert has not yet
+   * succeeded. Retained so a fill is NEVER silently erased when persistence is
+   * temporarily unavailable; drained by a slow background retry. See openPaperTrade.
+   */
+  private pendingPersists: { payload: IBoxTrade; attempts: number }[] = [];
+  private ownedRetryTimer: NodeJS.Timeout | null = null;
+  private static readonly OWNED_RETRY_MS = 15_000;
+  /** How many synchronous insert attempts one fill gets before it is retained. */
+  private static readonly PERSIST_RETRY_ATTEMPTS = 3;
+  /**
+   * True when something the engine OWNS (a filled box, or residual exposure) could
+   * not be persisted/flattened and is being retried. Surfaced in /api/box/status
+   * so a degraded run is never mistaken for a clean one.
+   */
+  private degraded = false;
+  /**
+   * Outstanding residual exposure the engine is still trying to flatten, keyed by
+   * the execution-attempt id it belongs to. Rebuilt at startup from unresolved
+   * attempts, so an interrupted unwind is resumed whether or not RUN is pressed.
+   */
+  private residualByAttempt = new Map<string, ResidualLegExposure[]>();
 
   constructor(private deps: BoxEngineDeps) {
     this.cfg = loadBoxConfig();
@@ -434,6 +462,13 @@ export class BoxEngine {
       await this.adoptOpenPositions();
     } catch (err) {
       console.warn("[Box] failed to adopt open positions:", err);
+    }
+    // Re-adopt any outstanding residual exposure from an interrupted unwind, so it
+    // is resumed regardless of whether RUN is ever pressed.
+    try {
+      await this.reconcileResidualExposure();
+    } catch (err) {
+      console.warn("[Box] failed to reconcile residual exposure:", err);
     }
     this.monitor.start();
     // Seed the "closed today" tally AND the closed-today trade list from Mongo, so
@@ -760,6 +795,37 @@ export class BoxEngine {
       void this.refreshClosedMarketView().catch(() => {/* view only */});
     }
     this.publish();
+  }
+
+  /**
+   * Tear everything down: stop discovery and the monitor, clear every timer, drop
+   * the feed retainer and metrics sampling.
+   *
+   * The engine is a long-lived singleton in normal operation, so this exists for
+   * clean shutdown and for tests — every timer/listener the engine owns is cleared
+   * here so nothing keeps the process alive or leaks across a re-create.
+   */
+  dispose(): void {
+    this.stop();
+    this.monitor.stop();
+    this.metrics.stopSampling();
+    this.pnlArchiver.stop();
+    for (const t of [this.marketTimer, this.indicativeTimer, this.publishTimer, this.universeTimer, this.ownedRetryTimer]) {
+      if (t) clearInterval(t);
+    }
+    this.marketTimer = null;
+    this.indicativeTimer = null;
+    this.publishTimer = null;
+    this.universeTimer = null;
+    this.ownedRetryTimer = null;
+    if (this.removeTickListener) {
+      this.removeTickListener();
+      this.removeTickListener = null;
+    }
+    if (this.releaseRetainer) {
+      this.releaseRetainer();
+      this.releaseRetainer = null;
+    }
   }
 
   /**
@@ -1362,6 +1428,7 @@ export class BoxEngine {
     const direction = candidate.direction ?? "LONG_BOX";
     const grossAbort = legging.legging_gross_loss ?? null;
     const netAbort = legging.legging_net_loss ?? null;
+    const residual = legging.residual_exposure ?? [];
     const attempt: IBoxExecutionAttempt = {
       candidate_key: candidate.key,
       direction,
@@ -1393,8 +1460,22 @@ export class BoxEngine {
       unwind_charges: legging.unwind_charges,
       gross_abort_pnl: grossAbort,
       net_abort_pnl: netAbort,
+      // Outstanding contracts the unwind could not flatten. `resolved` false keeps
+      // this attempt visible to startup reconciliation until it is flattened.
+      residual_exposure: residual.length > 0 ? residual : [],
+      resolved: residual.length === 0,
     };
-    await insertBoxExecutionAttempt(attempt);
+    const attemptId = await insertBoxExecutionAttempt(attempt);
+    if (residual.length > 0) {
+      // Track the outstanding exposure so it is never lost, and mark the run
+      // degraded. The id lets a later flatten mark this attempt resolved.
+      this.residualByAttempt.set(attemptId ?? `local:${candidate.key}:${Date.now()}`, residual);
+      this.degraded = true;
+      console.warn(
+        `[Box] ${residual.length} residual simulated leg(s) left OUTSTANDING by ${candidate.key} ` +
+          `(could not be flattened) — recorded and will be retried.`,
+      );
+    }
 
     void appendBoxEvent({
       event: "EXECUTION_ABORTED",
@@ -1549,7 +1630,20 @@ export class BoxEngine {
       error: null,
     };
 
-    const doc = await insertBoxTrade(payload);
+    // DURABILITY: the four legs have FILLED, so this box exists. Persist it with a
+    // bounded synchronous retry; if the store is genuinely unavailable, retain the
+    // owned fill and retry in the background rather than dropping the exposure.
+    let doc: BoxTradeRecord | null;
+    try {
+      doc = await this.insertWithRetry(payload);
+    } catch (err) {
+      this.retainOwnedExecution(payload);
+      console.error(
+        `[Box] persistence unavailable for filled box ${candidate.key} — RETAINED for ` +
+          `background retry (degraded). ${String(err)}`,
+      );
+      return null;
+    }
     if (!doc) {
       // The unique partial index refused it: this box is already open.
       return null;
@@ -1653,6 +1747,10 @@ export class BoxEngine {
     exitCharges: BoxChargesWithOrigin | null;
     reason: BoxExitReason;
     execution: BoxExecutionRecord | null;
+    /** The independent-order exit audit, when the exit used paper_legging. */
+    legging?: PaperLeggingExecutionRecord | null;
+    /** Residual exposure a partial exit left behind, if any. */
+    residual?: ResidualLegExposure[] | null;
   }): Promise<boolean> {
     const { position, metrics, exitCharges, reason, execution } = args;
     const byRole = new Map(metrics.legs.map((l) => [l.role, l]));
@@ -1676,6 +1774,8 @@ export class BoxEngine {
       exit_box_value: metrics.exit_box_value,
       exit_charges: exitCharges,
       exit_execution: execution,
+      exit_legging: args.legging ?? null,
+      residual_exposure: args.residual && args.residual.length > 0 ? args.residual : null,
       exit_charge_reconciliation: exitCharges
         ? {
             status: "pending",
@@ -1914,71 +2014,185 @@ export class BoxEngine {
   private async adoptOpenPositions(): Promise<void> {
     const open = await loadOpenBoxTrades();
     if (open.length === 0) return;
-    for (const doc of open) {
-      const legs = {} as Record<BoxLegRole, BoxOptionInstrument>;
-      const entryPrices = {} as Record<BoxLegRole, number>;
-      let complete = true;
-      for (const role of BOX_LEG_ROLES) {
-        const l = doc.legs.find((x) => x.role === role);
-        if (!l) {
-          complete = false;
-          break;
-        }
-        legs[role] = {
-          token: l.token,
-          tradingsymbol: l.tradingsymbol,
-          exchange: l.exchange,
-          strike: l.strike,
-          instrument_type: l.instrument_type,
-          expiry: doc.expiry,
-          lot_size: doc.lot_size,
-        };
-        entryPrices[role] = l.entry_price;
-      }
-      if (!complete) {
-        console.warn("[Box] skipping malformed open trade", doc._id.toString());
-        continue;
-      }
-      this.positions.add({
-        id: doc._id.toString(),
-        key: tradeKey(doc),
-        underlying: doc.underlying,
-        name: doc.name,
-        is_index: doc.is_index,
-        expiry: doc.expiry,
-        // Old documents carry no direction; directionOf() resolves them to LONG_BOX.
-        direction: directionOf(doc),
-        lower_strike: doc.lower_strike,
-        upper_strike: doc.upper_strike,
-        box_width: doc.box_width,
-        lot_size: doc.lot_size,
-        quantity: doc.quantity,
-        entry_box_cost_per_unit:
-          doc.lot_size > 0 ? doc.entry_box_cost / doc.lot_size : doc.entry_box_cost,
-        entry_gross_edge: doc.entry_gross_edge,
-        entry_net_edge: doc.entry_net_edge,
-        entry_charges_total: doc.entry_charges ? doc.entry_charges.total : null,
-        estimated_exit_charges_total: doc.estimated_exit_charges
-          ? doc.estimated_exit_charges.total
-          : null,
-        safety_buffer: doc.safety_buffer,
-        expected_net_profit: doc.expected_net_profit ?? null,
-        entry_execution_cost: doc.entry_execution_cost ?? null,
-        charge_origin: doc.charge_origin ?? "local",
-        entry_execution: doc.entry_execution ?? null,
-        margin: doc.margin ?? null,
-        opened_at: doc.opened_at.getTime(),
-        legs,
-        entry_prices: entryPrices,
-        metrics: null,
-        exit_blocked_reason: doc.exit_blocked_reason,
-        expiry_safety: doc.expiry_safety,
-        closing: false,
-        last_persist_at: Date.now(),
-        config: doc.scanner_config_snapshot,
-      });
-    }
+    for (const doc of open) this.adoptDoc(doc);
     console.log(`[Box] adopted ${this.positions.size} open paper box position(s).`);
+  }
+
+  /**
+   * Rebuild ONE open position into the in-memory book from its stored document.
+   *
+   * Shared by restart adoption and by the durable-persistence drain (a box whose
+   * insert only succeeded on a later retry is adopted through exactly this path).
+   * Returns true when the position was adopted.
+   */
+  private adoptDoc(doc: BoxTradeRecord): boolean {
+    const legs = {} as Record<BoxLegRole, BoxOptionInstrument>;
+    const entryPrices = {} as Record<BoxLegRole, number>;
+    for (const role of BOX_LEG_ROLES) {
+      const l = doc.legs.find((x) => x.role === role);
+      if (!l) {
+        console.warn("[Box] skipping malformed open trade", doc._id.toString());
+        return false;
+      }
+      legs[role] = {
+        token: l.token,
+        tradingsymbol: l.tradingsymbol,
+        exchange: l.exchange,
+        strike: l.strike,
+        instrument_type: l.instrument_type,
+        expiry: doc.expiry,
+        lot_size: doc.lot_size,
+      };
+      entryPrices[role] = l.entry_price;
+    }
+    this.positions.add({
+      id: doc._id.toString(),
+      key: tradeKey(doc),
+      underlying: doc.underlying,
+      name: doc.name,
+      is_index: doc.is_index,
+      expiry: doc.expiry,
+      // Old documents carry no direction; directionOf() resolves them to LONG_BOX.
+      direction: directionOf(doc),
+      lower_strike: doc.lower_strike,
+      upper_strike: doc.upper_strike,
+      box_width: doc.box_width,
+      lot_size: doc.lot_size,
+      quantity: doc.quantity,
+      entry_box_cost_per_unit:
+        doc.lot_size > 0 ? doc.entry_box_cost / doc.lot_size : doc.entry_box_cost,
+      entry_gross_edge: doc.entry_gross_edge,
+      entry_net_edge: doc.entry_net_edge,
+      entry_charges_total: doc.entry_charges ? doc.entry_charges.total : null,
+      estimated_exit_charges_total: doc.estimated_exit_charges
+        ? doc.estimated_exit_charges.total
+        : null,
+      safety_buffer: doc.safety_buffer,
+      expected_net_profit: doc.expected_net_profit ?? null,
+      entry_execution_cost: doc.entry_execution_cost ?? null,
+      charge_origin: doc.charge_origin ?? "local",
+      entry_execution: doc.entry_execution ?? null,
+      margin: doc.margin ?? null,
+      opened_at: doc.opened_at.getTime(),
+      legs,
+      entry_prices: entryPrices,
+      metrics: null,
+      exit_blocked_reason: doc.exit_blocked_reason,
+      expiry_safety: doc.expiry_safety,
+      closing: false,
+      last_persist_at: Date.now(),
+      config: doc.scanner_config_snapshot,
+    });
+    return true;
+  }
+
+  /* ----------------------- execution durability --------------------------- */
+
+  /**
+   * Insert an open box, retrying a THROWN (transient) failure a bounded number of
+   * times with linear backoff. A duplicate-key is not an error — it means the box
+   * is already open — so it returns null immediately without retrying. Runs off
+   * the hot scanner path (openPaperTrade is already awaited outside the tick loop).
+   */
+  private async insertWithRetry(payload: IBoxTrade): Promise<BoxTradeRecord | null> {
+    let lastErr: unknown = null;
+    for (let attempt = 1; attempt <= BoxEngine.PERSIST_RETRY_ATTEMPTS; attempt++) {
+      try {
+        return await insertBoxTrade(payload);
+      } catch (err) {
+        lastErr = err;
+        if (attempt < BoxEngine.PERSIST_RETRY_ATTEMPTS) {
+          await new Promise((r) => {
+            const t = setTimeout(r, attempt * 250);
+            (t as { unref?: () => void }).unref?.();
+          });
+        }
+      }
+    }
+    throw lastErr;
+  }
+
+  /**
+   * Retain a filled box whose insert has failed after the bounded retries.
+   *
+   * The exposure is REAL, so it must never be forgotten. It is queued and a slow,
+   * bounded background timer keeps re-attempting the insert; once it succeeds the
+   * position is adopted into the live book and managed normally. Until then the
+   * engine reports `degraded`.
+   */
+  private retainOwnedExecution(payload: IBoxTrade): void {
+    this.pendingPersists.push({ payload, attempts: BoxEngine.PERSIST_RETRY_ATTEMPTS });
+    this.degraded = true;
+    if (!this.ownedRetryTimer) {
+      this.ownedRetryTimer = setInterval(() => void this.drainOwnedExecutions(), BoxEngine.OWNED_RETRY_MS);
+      this.ownedRetryTimer.unref?.();
+    }
+  }
+
+  /** Retry every retained owned box; adopt each one that finally persists. */
+  private async drainOwnedExecutions(): Promise<void> {
+    if (this.pendingPersists.length === 0) {
+      if (this.ownedRetryTimer) {
+        clearInterval(this.ownedRetryTimer);
+        this.ownedRetryTimer = null;
+      }
+      if (this.residualByAttempt.size === 0) this.degraded = false;
+      return;
+    }
+    const still: { payload: IBoxTrade; attempts: number }[] = [];
+    for (const entry of this.pendingPersists) {
+      try {
+        const doc = await insertBoxTrade(entry.payload);
+        if (doc) {
+          this.adoptDoc(doc);
+          this.ensureFeed();
+          console.log(`[Box] recovered a retained filled box into the live book (${doc._id.toString()}).`);
+        }
+        // A null here is a duplicate-key: the box is already open, so the retained
+        // copy is redundant and is dropped. Either way this entry is resolved.
+      } catch {
+        entry.attempts++;
+        still.push(entry);
+      }
+    }
+    this.pendingPersists = still;
+    if (this.pendingPersists.length === 0 && this.residualByAttempt.size === 0) this.degraded = false;
+  }
+
+  /* --------------------- residual-exposure reconciliation ------------------ */
+
+  /**
+   * On startup, load execution attempts that still hold residual exposure and
+   * register it, so an interrupted unwind is resumed whether or not RUN is pressed.
+   *
+   * This does NOT depend on the scanner: outstanding simulated contracts are the
+   * engine's responsibility to keep flattening while the market is open and the
+   * feed is healthy, exactly like an open position.
+   */
+  private async reconcileResidualExposure(): Promise<void> {
+    const attempts = await loadUnresolvedBoxExecutionAttempts();
+    let total = 0;
+    for (const a of attempts) {
+      const residual = (a.residual_exposure ?? []) as ResidualLegExposure[];
+      if (!Array.isArray(residual) || residual.length === 0) continue;
+      this.residualByAttempt.set(a._id.toString(), residual);
+      total += residual.length;
+    }
+    if (total > 0) {
+      this.degraded = true;
+      console.warn(
+        `[Box] ${total} residual simulated leg(s) across ${this.residualByAttempt.size} attempt(s) ` +
+          `were outstanding at boot — they will be flattened when the feed is healthy.`,
+      );
+      if (this.positions.size === 0) this.ensureFeed(); // need books to flatten
+    }
+  }
+
+  /** How many residual legs are still outstanding across all attempts. */
+  private residualLegCount(): number {
+    let n = 0;
+    for (const legs of this.residualByAttempt.values()) n += legs.length;
+    return n;
   }
 
   /* --------------------------------- views -------------------------------- */
@@ -2090,6 +2304,15 @@ export class BoxEngine {
        */
       exchange_lag_ms: this.exchangeLag(),
       open_positions: this.positions.size,
+      /**
+       * DEGRADED: something the engine owns could not be persisted or flattened
+       * and is being retried (a filled box awaiting its Mongo insert, or residual
+       * exposure from a failed unwind). A clean run reports false. Never hidden —
+       * "tests pass" must never be read as "flat and healthy" when it is not.
+       */
+      degraded: this.degraded,
+      owned_unpersisted: this.pendingPersists.length,
+      residual_exposure_legs: this.residualLegCount(),
       /** Running day P&L: open positions' current net + today's realised net. */
       day_pnl: this.computeDayPnl(),
       skipped_for_budget: this.skippedForBudget.length,

@@ -41,6 +41,8 @@ import {
   type BoxExitMetrics,
   type BoxExitReason,
   type BoxLegEvaluation,
+  type PaperLeggingExecutionRecord,
+  type ResidualLegExposure,
 } from "./types.js";
 
 export interface BoxMonitorDeps {
@@ -56,6 +58,9 @@ export interface BoxMonitorDeps {
     exitCharges: BoxChargesWithOrigin | null;
     reason: BoxExitReason;
     execution: BoxExecutionRecord | null;
+    /** The independent-order exit audit, when the exit used paper_legging. */
+    legging?: PaperLeggingExecutionRecord | null;
+    residual?: ResidualLegExposure[] | null;
   }) => Promise<boolean>;
   /** Slow periodic flush of the live convergence figure. */
   persistLive: (position: BoxOpenPosition) => Promise<void>;
@@ -301,6 +306,20 @@ export class BoxPositionMonitor {
     pos.closing = true;
     let handed = false;
 
+    // paper_legging: close with four INDEPENDENT orders, so a partial close leaves
+    // visible residual exposure rather than a fabricated clean exit.
+    if (this.deps.cfg.executionMode === "paper_legging") {
+      try {
+        await this.runLeggingExit(pos, detectionMetrics, reason);
+      } finally {
+        this.closingIds.delete(pos.id);
+        // runLeggingExit hands the close itself when it fully fills; otherwise the
+        // position stays open and must be un-marked so a later cycle can retry.
+        if (this.deps.positions.get(pos.id)) pos.closing = false;
+      }
+      return;
+    }
+
     try {
       const result = await this.deps.executionSim.simulateExit({
         position: pos,
@@ -406,6 +425,88 @@ export class BoxPositionMonitor {
       this.closingIds.delete(pos.id);
       if (!handed) pos.closing = false;
     }
+  }
+
+  /**
+   * Close a box with four INDEPENDENT exit orders (paper_legging).
+   *
+   * A clean 4/4 close is priced on the actual average fills and persisted like any
+   * exit. If only SOME exit legs fill the box is no longer whole: the trade is NOT
+   * closed and NOT marked flat — the residual exposure (the legs that could not be
+   * closed) is recorded and surfaced, and the next cycle retries the full close.
+   * This is the paper simulation's honest handling of a partial exit: it never
+   * pretends the position stayed intact, and it never fabricates a clean exit.
+   */
+  private async runLeggingExit(
+    pos: BoxOpenPosition,
+    detectionMetrics: BoxExitMetrics,
+    reason: BoxExitReason,
+  ): Promise<void> {
+    const result = await this.deps.executionSim.simulateLeggingExit({
+      position: pos,
+      detectionLegs: detectionMetrics.legs,
+      detectedAt: detectionMetrics.at,
+      stillWanted: () =>
+        this.deps.positions.get(pos.id) !== undefined &&
+        this.deps.isMarketOpen() &&
+        this.deps.isFeedHealthy(),
+    });
+
+    if (!result.ok) {
+      // Some or none of the exit legs filled. Keep the position open, record the
+      // residual exposure for visibility, and let a later cycle retry.
+      this.stats.exitsFailedExecution++;
+      const residual = result.record.residual_exposure;
+      const detail =
+        `paper_legging exit ${result.record.filled_leg_count}/4 filled` +
+        (residual.length > 0 ? `; ${residual.length} leg(s) still open` : "");
+      pos.exit_blocked_reason = detail;
+      // Dedupe the event the same way a liquidity skip is deduped.
+      const gapKey = `legging_exit:${result.record.filled_leg_count}`;
+      if (this.lastBlockedKey.get(pos.id) !== gapKey) {
+        this.lastBlockedKey.set(pos.id, gapKey);
+        this.deps.onEvent("EXIT_SKIPPED_LIQUIDITY", pos, pos.metrics, detail);
+      }
+      return;
+    }
+
+    // Clean four-leg close on the actual average fills.
+    const exitCharges = this.localExitCharges(pos, result.legs);
+    const exitTotal = exitCharges ? exitCharges.total : this.localExitChargesTotal(pos, result.legs);
+    const finalMetrics = computeExitMetrics({
+      boxWidth: pos.box_width,
+      lotSize: pos.lot_size,
+      entryBoxCostPerUnit: pos.entry_box_cost_per_unit,
+      entryNetEdge: pos.entry_net_edge,
+      entryChargesTotal: pos.entry_charges_total,
+      currentExitChargesTotal: exitTotal,
+      legs: result.legs,
+      now: Date.now(),
+      direction: pos.direction ?? "LONG_BOX",
+      entryEdge: pos.entry_gross_edge,
+      // The exit executed at known prices: no forward allowance (Task 6/7).
+      executionCost: 0,
+      useRealisableForFloor: false,
+      openedAt: pos.opened_at,
+      expirySafety: this.isInExpirySafetyWindow(pos),
+      cfg: this.deps.cfg,
+    });
+    pos.metrics = finalMetrics;
+    pos.exit_blocked_reason = null;
+    this.lastBlockedKey.delete(pos.id);
+    this.stats.exitsTriggered++;
+    this.deps.onEvent("EXIT_TRIGGERED", pos, finalMetrics, reason);
+    await this.deps.closePaperTrade({
+      position: pos,
+      metrics: finalMetrics,
+      exitCharges,
+      reason,
+      // No single BoxExecutionRecord for a legging exit; the per-leg audit is the
+      // legging record instead.
+      execution: null,
+      legging: result.record,
+      residual: null,
+    });
   }
 
   private recordLiquiditySkip(pos: BoxOpenPosition, metrics: BoxExitMetrics): void {

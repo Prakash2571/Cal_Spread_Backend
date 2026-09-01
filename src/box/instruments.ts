@@ -32,7 +32,7 @@ export interface BoxChainIndex {
 }
 
 function toBoxInstrument(i: Instrument): BoxOptionInstrument {
-  return {
+  const inst: BoxOptionInstrument = {
     token: i.instrument_token,
     tradingsymbol: i.tradingsymbol,
     exchange: i.exchange,
@@ -41,6 +41,12 @@ function toBoxInstrument(i: Instrument): BoxOptionInstrument {
     expiry: i.expiry,
     lot_size: i.lot_size,
   };
+  // Carry the real exchange tick size through, so marketable-limit pricing in
+  // paper_legging uses the instrument's own tick rather than a hard-coded ₹0.05.
+  // Only set when the dump reports a usable value (exactOptionalPropertyTypes:
+  // the field must be genuinely absent, not `undefined`, when unknown).
+  if (i.tick_size > 0) inst.tick_size = i.tick_size;
+  return inst;
 }
 
 /**

@@ -319,17 +319,35 @@ test("8. an unchanged resting book fills at arrival — no post-arrival tick req
   }
 });
 
-/* ------------------ 9-10. pre-arrival moves are respected ------------------ */
+/* ------------------ 9-10. pre-arrival moves and the LIMIT ------------------ */
 
-test("9. an ADVERSE update before arrival is the price that fills", async () => {
+test("9. an adverse move WITHIN the chase limit fills at that (worse) price", async () => {
+  // Default chase is 2 ticks × ₹0.05 = ₹0.10, so a BUY reference of ₹300 has a
+  // limit of ₹300.10. A move to exactly the limit is executable.
   const b = build();
   const detection = detect(b);
-  // k1_ce is a BUY: a higher ask is worse for us.
+  b.clock.at(100, () => pushLeg(b, "k1_ce", { bid: 300, bidQty: 150, ask: 300.1, askQty: 150 }, b.clock.now()));
+  const res = await b.sim.simulateLeggingEntry({ candidate: b.candidate, detection, qualify: qualify(b.conf) });
+  const leg = legOf(res, "k1_ce");
+  assert.equal(leg.status, "FILLED");
+  assert.equal(leg.fill_price, 300.1, "fills at the within-limit price");
+  assert.equal(leg.slippage, Math.round((300.1 - GOOD_BOX.prices.k1_ce.ask) * LOT * 100) / 100);
+});
+
+test("9b. an adverse move BEYOND the chase limit is REFUSED — the order does not chase", async () => {
+  // A runaway move (₹300 → ₹305, 100 ticks) is far past the ₹300.10 limit. The
+  // order must NOT consume it (that is the market-order behaviour we removed); it
+  // rests and, with no better price arriving, times out — so the box does not
+  // fill 4/4.
+  const b = build();
+  const detection = detect(b);
   b.clock.at(100, () => pushLeg(b, "k1_ce", { bid: 304, bidQty: 150, ask: 305, askQty: 150 }, b.clock.now()));
   const res = await b.sim.simulateLeggingEntry({ candidate: b.candidate, detection, qualify: qualify(b.conf) });
   const leg = legOf(res, "k1_ce");
-  assert.equal(leg.fill_price, 305);
-  assert.equal(leg.slippage, (305 - GOOD_BOX.prices.k1_ce.ask) * LOT, "adverse slippage is positive");
+  assert.notEqual(leg.status, "FILLED", "a price beyond the limit must not fill");
+  assert.equal(leg.fill_qty, 0);
+  assert.equal(res.ok, false, "the box cannot open with a leg stuck past its limit");
+  assert.ok(res.legging.failed_legs.includes("k1_ce"));
 });
 
 test("10. a FAVOURABLE update before arrival is the price that fills", async () => {
@@ -344,17 +362,17 @@ test("10. a FAVOURABLE update before arrival is the price that fills", async () 
 
 /* ---------------- 11. adverse move while PENDING is respected -------------- */
 
-test("11. a leg that fills while PENDING uses the book at THAT moment, not at arrival", async () => {
+test("11. a leg that fills while PENDING uses the book at THAT moment (within the limit)", async () => {
   const b = build();
   const detection = detect(b);
   b.clock.at(100, () => pushLeg(b, "k1_ce", thin("k1_ce", 1), b.clock.now()));
-  // It becomes fillable later, but only at a worse price.
-  b.clock.at(320, () => pushLeg(b, "k1_ce", { bid: 309, bidQty: 150, ask: 310, askQty: 150 }, b.clock.now()));
+  // It becomes executable later at a within-limit worse price (₹300 → ₹300.10).
+  b.clock.at(320, () => pushLeg(b, "k1_ce", { bid: 300, bidQty: 150, ask: 300.1, askQty: 150 }, b.clock.now()));
 
   const res = await b.sim.simulateLeggingEntry({ candidate: b.candidate, detection, qualify: qualify(b.conf) });
   const leg = legOf(res, "k1_ce");
   assert.equal(relative(b, leg.fill_at), 320);
-  assert.equal(leg.fill_price, 310);
+  assert.equal(leg.fill_price, 300.1);
   assert.equal(leg.book_at, b.clock.base + 320, "the fill book is the one from that tick");
   assert.ok(leg.slippage > 0);
 });

@@ -240,6 +240,14 @@ export class BoxMetrics {
     legging_abort_after_fill: 0,
     legging_attempts: 0,
     legging_leg_timeouts: 0,
+    // Depth-walking / queue realism.
+    partial_fills: 0,
+    unwind_success: 0,
+    unwind_failure: 0,
+    residual_exposures: 0,
+    cross_leg_skew_rejects: 0,
+    queue_haircut_rejects: 0,
+    limit_price_rejects: 0,
   };
   /** Failure reason → count. A small, fixed key space, so this cannot grow. */
   private failures = new Map<string, number>();
@@ -359,6 +367,41 @@ export class BoxMetrics {
     this.exposureDuration.push(ms);
   }
 
+  /** One order filled some, but not all, of its requested quantity. */
+  recordPartialFill(): void {
+    this.counters.partial_fills++;
+  }
+
+  /** An emergency unwind fully flattened the exposure it worked. */
+  recordUnwindSuccess(): void {
+    this.counters.unwind_success++;
+  }
+
+  /** An emergency unwind could not fully flatten — residual exposure remains. */
+  recordUnwindFailure(): void {
+    this.counters.unwind_failure++;
+  }
+
+  /** N residual legs were left outstanding by an execution. */
+  recordResidualExposure(count: number): void {
+    this.counters.residual_exposures += Math.max(0, Math.round(count));
+  }
+
+  /** A candidate was refused because the four legs' exchange times were too skewed. */
+  recordCrossLegSkewReject(): void {
+    this.counters.cross_leg_skew_rejects++;
+  }
+
+  /** An order could not fill because the queue haircut left no executable quantity. */
+  recordQueueHaircutReject(): void {
+    this.counters.queue_haircut_rejects++;
+  }
+
+  /** An order could not fill because the book was entirely past its limit price. */
+  recordLimitPriceReject(): void {
+    this.counters.limit_price_rejects++;
+  }
+
   /** Expected net at entry minus the realised net of the closed trade (₹). */
   recordRealisedVsExpected(diff: number): void {
     this.expectedVsRealised.push(diff);
@@ -416,6 +459,17 @@ export class BoxMetrics {
         attempts: c.legging_attempts,
         /** Orders that arrived and expired unfilled at BOX_LEG_TIMEOUT_MS. */
         leg_timeouts: c.legging_leg_timeouts,
+        /** Orders that filled some, but not all, of the requested quantity. */
+        partial_fills: c.partial_fills,
+        /** Emergency-unwind outcomes and outstanding residual legs. */
+        unwind_success: c.unwind_success,
+        unwind_failure: c.unwind_failure,
+        residual_exposures: c.residual_exposures,
+        /** Candidates refused for four-leg exchange-timestamp skew. */
+        cross_leg_skew_rejects: c.cross_leg_skew_rejects,
+        /** Orders that could not fill within the limit / after the queue haircut. */
+        limit_price_rejects: c.limit_price_rejects,
+        queue_haircut_rejects: c.queue_haircut_rejects,
         /** Dispersion of the fills: max(fill_at) − min(fill_at). */
         first_to_last_fill_ms: this.firstToLastFill.summary(),
         /** Detection → first fill, and detection → last fill. */

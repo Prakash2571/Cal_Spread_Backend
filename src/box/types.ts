@@ -125,6 +125,18 @@ export interface BoxChargeReconciliation {
  *                     published after the order could have arrived.
  */
 export type ExecutionMode = "paper_touch" | "paper_latency" | "paper_legging";
+
+/**
+ * How displayed order-book depth is treated as executable for our simulated
+ * order.
+ *
+ *   "none"    — the full displayed quantity at a price is assumed available to us.
+ *   "haircut" — only a configurable fraction is treated as safely executable, a
+ *               transparent, DETERMINISTIC stand-in for the queue ahead of us that
+ *               level-2 depth cannot reveal. This is NOT a reconstruction of true
+ *               NSE queue priority — see orderPricing.ts.
+ */
+export type BoxQueueModel = "none" | "haircut";
 export const EXECUTION_MODES: readonly ExecutionMode[] = [
   "paper_touch",
   "paper_latency",
@@ -204,8 +216,18 @@ export interface BoxQuote {
   asks: BoxDepthLevel[];
   /** Monotonic local sequence assigned when a WebSocket depth packet arrives. */
   version: number;
-  /** Epoch ms when this book was received. */
+  /** Epoch ms when this book was RECEIVED — what the freshness gate is measured against. */
   at: number;
+  /**
+   * The EXCHANGE timestamp of this packet (epoch ms), when the feed supplied one.
+   *
+   * Kept ALONGSIDE `at`, never instead of it: receive time drives feed-health and
+   * freshness (a genuinely dead feed is only visible in receive time), while the
+   * exchange timestamp is what makes cross-leg temporal coherence meaningful — it
+   * says when the exchange published the book, not when our process saw it. Null
+   * when the feed did not carry one, in which case callers fall back to `at`.
+   */
+  exchange_at: number | null;
   /** Executable Box books are accepted from the live WebSocket only. */
   source: "ws";
 }
@@ -246,6 +268,15 @@ export interface BoxOptionInstrument {
   instrument_type: "CE" | "PE";
   expiry: string;
   lot_size: number;
+  /**
+   * The exchange tick size (₹) for this contract, from the instrument dump.
+   *
+   * Used to price marketable-limit orders in paper_legging — the limit is a whole
+   * number of ticks past the reference touch. Optional so a leg constructed before
+   * tick size was carried (or from a fixture) still loads; the executor falls back
+   * to `BOX_DEFAULT_TICK_SIZE` when it is absent.
+   */
+  tick_size?: number;
 }
 
 /** One underlying being scanned, with its resolved seven-strike window. */
@@ -531,8 +562,13 @@ export type BoxExecutionFailureReason =
   | "duplicate"
   /** paper_legging: at least one leg did not fill before the timeout. */
   | "legging_incomplete"
-  /** paper_legging: a filled leg could not be unwound (no opposite liquidity). */
+  /** paper_legging: a filled leg could not be unwound (no executable opposite price). */
   | "unwind_failed"
+  /**
+   * The four legs' EXCHANGE timestamps were too far apart to be a coherent
+   * cross-sectional snapshot, so the candidate was not auto-entered.
+   */
+  | "cross_leg_time_skew"
   /**
    * paper_legging: ALL FOUR legs filled, but the final economics computed on the
    * EXECUTED prices no longer clear the required expected net profit.
@@ -616,39 +652,92 @@ export type BoxLegExecutionMode = "parallel" | "sequential";
  *   CREATED          built, not yet submitted (sequential mode: waiting its turn)
  *   SUBMITTED        released to the simulated broker at submit_at
  *   IN_FLIGHT        travelling; cannot fill before arrival_at
- *   PENDING          arrived and resting — the book could not fill it yet
- *   FILLED           the full lot filled at an observed executable touch
- *   PARTIALLY_FILLED reserved for depth walking (Phase 3); unreachable while the
- *                    order style is touch-only, which fills one lot or nothing
- *   TIMED_OUT        still unfilled at arrival_at + BOX_LEG_TIMEOUT_MS
- *   FAILED           could not be worked at all (never submitted, feed died, …)
+ *   PENDING          arrived and resting — the book could not fill any of it yet
+ *   PARTIALLY_FILLED some quantity filled by walking depth within the limit, but
+ *                    not the whole order; the remainder rests for later liquidity
+ *   FILLED           the full requested quantity filled at observed executable prices
+ *   TIMED_OUT        still not fully filled at arrival_at + BOX_LEG_TIMEOUT_MS
+ *                    (may carry a non-zero fill_qty — a partial that never completed)
+ *   CANCELLED        withdrawn before completing (STOP / feed / market before fill)
+ *   FAILED           could not be worked at all (never submitted, sequential skip)
+ *   UNWINDING        a filled/partial leg whose reversal is in flight
  *   UNWOUND          filled, then successfully reversed
- *   UNWIND_FAILED    filled, and the reversal found no opposite touch — so
- *                    simulated exposure is STILL OUTSTANDING and must stay visible
+ *   UNWIND_FAILED    filled, and the reversal found no executable opposite price —
+ *                    so simulated exposure is STILL OUTSTANDING and must stay visible
  */
 export type PaperLegStatus =
   | "CREATED"
   | "SUBMITTED"
   | "IN_FLIGHT"
   | "PENDING"
-  | "FILLED"
   | "PARTIALLY_FILLED"
+  | "FILLED"
   | "TIMED_OUT"
+  | "CANCELLED"
   | "FAILED"
+  | "UNWINDING"
   | "UNWOUND"
   | "UNWIND_FAILED";
+
+/** The kind of order the simulator submits. Only a marketable limit is modelled. */
+export type PaperOrderType = "MARKETABLE_LIMIT";
+
+/**
+ * The executable price envelope of one simulated order.
+ *
+ * This is the heart of the realism model: an order does NOT consume whatever the
+ * book shows on arrival. It carries a LIMIT computed from the reference touch it
+ * was priced against plus a bounded number of ticks of chase, and no depth level
+ * worse than that limit is ever filled.
+ *
+ *   BUY : limit_price = reference_price + max_chase_ticks × tick_size
+ *   SELL: limit_price = reference_price − max_chase_ticks × tick_size
+ */
+export interface PaperOrderPricing {
+  order_type: PaperOrderType;
+  side: OrderSide;
+  quantity: number;
+  /** The touch this order was priced against (ask for a BUY, bid for a SELL). */
+  reference_price: number;
+  /** Exchange tick size used to size the chase band (₹). */
+  tick_size: number;
+  /** How many ticks past the reference the order may chase. */
+  max_chase_ticks: number;
+  /** The worst price the order will accept (₹). */
+  limit_price: number;
+}
+
+/** One executed slice of an order: a quantity taken at one book level and instant. */
+export interface PaperFillSlice {
+  price: number;
+  qty: number;
+  /** Quantity DISPLAYED at that level in the book. */
+  displayed_qty: number;
+  /** Quantity treated as executable for us after the queue model (≤ displayed). */
+  effective_qty: number;
+  /** When this slice filled (epoch ms) — the timestamp of the book it came from. */
+  at: number;
+  /** WS version of the book this slice was taken from. */
+  quote_version: number | null;
+}
 
 /**
  * One leg's independent execution attempt under paper_legging.
  *
- * Every price here is an observed executable touch from a real WebSocket book at
- * the leg's own simulated arrival time — never invented.
+ * Every price here is an observed executable price from a real WebSocket book at
+ * the moment it filled — never invented, never a random slippage figure.
  */
 export interface PaperLegExecution {
   role: BoxLegRole;
   side: OrderSide;
   token: number;
   tradingsymbol: string;
+  /** Deterministic internal id of this order, for reconciliation. */
+  order_id: string;
+  /** Client order id (mirrors order_id in paper; the seam a real broker would map). */
+  client_order_id: string;
+  /** The executable-price envelope this order was worked under. */
+  pricing: PaperOrderPricing | null;
   /** The touch visible when the box was detected. */
   detected_price: number | null;
   detected_qty: number;
@@ -659,27 +748,65 @@ export interface PaperLegExecution {
   pending_since: number | null;
   /** arrival_at + BOX_LEG_TIMEOUT_MS — the instant this order gives up. */
   timeout_at: number | null;
-  /** When the fill happened (distinct from resolved_at, which any end-state sets). */
+  /** When the order became FULLY filled (null if it never did). */
   fill_at: number | null;
   /** When the fill (or failure) resolved. */
   resolved_at: number | null;
+  /** The weighted-average fill price across all slices, or null if nothing filled. */
   fill_price: number | null;
+  /** Same figure under an explicit name. */
+  average_fill_price: number | null;
+  /** The requested quantity (one lot). */
   quantity: number;
+  requested_qty: number;
   /** Quantity actually filled, and what was left unfilled. */
   fill_qty: number;
   remaining_qty: number;
+  /** Individual fill slices, in fill order. */
+  fills: PaperFillSlice[];
+  /** WS version of the LAST book a slice was taken from. */
   quote_version: number | null;
-  /** RECEIVE timestamp of the book the fill was taken from. */
+  /** RECEIVE timestamp of the last book a slice was taken from. */
   book_at: number | null;
+  /** EXCHANGE timestamp of that book, when the feed supplied one. */
+  book_exchange_at: number | null;
   /** Book age at the leg's arrival (ms). */
   book_age_ms: number | null;
-  /** fill − detected, signed so positive is always worse (₹, whole lot). */
+  /** fill − detected, signed so positive is always worse (₹, over filled qty). */
   slippage: number | null;
   status: PaperLegStatus;
-  /** If the leg had to be unwound, the opposite-touch price it was closed at. */
+  /** If the leg had to be unwound, the average opposite price it was closed at. */
   unwind_price: number | null;
   unwind_slippage: number | null;
+  /** Quantity actually flattened by the unwind (≤ fill_qty). */
+  unwound_qty: number;
   fail_reason: string | null;
+}
+
+/**
+ * Outstanding simulated exposure that a box execution could not resolve to a flat
+ * or complete position.
+ *
+ * Created when a partial entry cannot be fully unwound, a partial exit leaves the
+ * original box half-closed, or an emergency unwind fails. It is NEVER treated as
+ * flat: the engine keeps it visible and the monitor keeps trying to flatten it
+ * while the market is open and the feed is healthy.
+ */
+export type ResidualExposureSource = "partial_entry" | "partial_exit" | "failed_unwind";
+
+export interface ResidualLegExposure {
+  token: number;
+  tradingsymbol: string;
+  role: BoxLegRole;
+  /** The side we are currently HOLDING (BUY = long the contract, SELL = short it). */
+  side: OrderSide;
+  /** Outstanding quantity still on our book. */
+  quantity: number;
+  /** Average price we acquired it at (₹). */
+  average_price: number;
+  /** Where this residual came from. */
+  source: ResidualExposureSource;
+  created_at: number;
 }
 
 /**
@@ -714,8 +841,10 @@ export interface PaperLeggingExecutionRecord {
   decision_to_first_fill_ms: number | null;
   /** Detection → the LAST leg's fill (ms). */
   decision_to_last_fill_ms: number | null;
-  /** Roles that arrived but were still unfilled at their timeout. */
+  /** Roles that arrived but were still (fully) unfilled at their timeout. */
   timed_out_legs: BoxLegRole[];
+  /** Roles that filled only part of the requested lot before resolving. */
+  partial_fill_legs: BoxLegRole[];
   /**
    * UNHEDGED EXPOSURE WINDOW: when the first leg filled, and when the position
    * stopped being one-sided — either the fourth leg completed the box, or the
@@ -748,8 +877,36 @@ export interface PaperLeggingExecutionRecord {
   final_expected_net_profit: number | null;
   /** The gate that figure was tested against (₹). */
   required_expected_net_profit: number | null;
+  /* ---- four-leg temporal coherence (analytics; see math.ts) ---- */
+  temporal: BoxTemporalCoherence | null;
+  /* ---- residual exposure: outstanding simulated contracts, if any ---- */
+  residual_exposure: ResidualLegExposure[];
   failure_reason: BoxExecutionFailureReason | null;
   failure_detail: string | null;
+}
+
+/**
+ * Four-leg temporal coherence at a decision/execution instant.
+ *
+ * Quote age alone cannot tell whether the four legs form a coherent
+ * cross-sectional snapshot. These figures do: how far apart the four books are in
+ * receive time and (where available) in exchange time, and how many legs moved
+ * during the decision latency.
+ */
+export interface BoxTemporalCoherence {
+  /** Oldest / newest leg quote age at the instant measured (ms). */
+  oldest_quote_age_ms: number | null;
+  newest_quote_age_ms: number | null;
+  /** newest − oldest RECEIVE timestamp across the four legs (ms). */
+  receive_dispersion_ms: number | null;
+  /** newest − oldest EXCHANGE timestamp across the four legs (ms), when all four have one. */
+  exchange_dispersion_ms: number | null;
+  /** How many of the four legs carried a valid exchange timestamp. */
+  legs_with_exchange_ts: number;
+  /** Per-leg (received_at − exchange_at) where both exist (ms) — feed-latency calibration. */
+  receive_to_exchange_delay_ms: (number | null)[];
+  /** How many legs' books changed (version advanced) during the decision latency. */
+  books_changed_during_latency: number;
 }
 
 /** A persisted record of an execution ATTEMPT that did not open a box. */
@@ -791,6 +948,13 @@ export interface IBoxExecutionAttempt {
   unwind_charges: number | null;
   gross_abort_pnl: number | null;
   net_abort_pnl: number | null;
+  /**
+   * Outstanding simulated exposure this attempt could not flatten, hoisted for
+   * querying. Empty when the attempt resolved flat. `resolved` is false while any
+   * residual remains, so startup reconciliation can find and keep flattening it.
+   */
+  residual_exposure?: ResidualLegExposure[];
+  resolved?: boolean;
 }
 
 /** One leg of a persisted box trade. */
@@ -872,6 +1036,12 @@ export interface BoxScannerConfigSnapshot {
   execution_mode: ExecutionMode;
   simulated_decision_ms?: number;
   simulated_latency_ms?: number;
+  /** Executable-order-pricing knobs a paper_legging fill was taken under. */
+  leg_max_chase_ticks?: number;
+  unwind_max_chase_ticks?: number;
+  queue_model?: BoxQueueModel;
+  queue_liquidity_haircut_pct?: number;
+  max_cross_leg_exchange_dispersion_ms?: number;
 }
 
 /** A persisted box paper trade. */
@@ -938,6 +1108,14 @@ export interface IBoxTrade {
   entry_legging?: PaperLeggingExecutionRecord | null;
   /** The same for the exit. */
   exit_execution?: BoxExecutionRecord | null;
+  /** The per-leg legging record when the EXIT used the independent-order model. */
+  exit_legging?: PaperLeggingExecutionRecord | null;
+  /**
+   * Outstanding simulated exposure left by an incomplete exit (some exit legs
+   * filled, others did not), so the trade is never shown as cleanly flat when it
+   * is not. Optional/absent on the overwhelmingly common clean close.
+   */
+  residual_exposure?: ResidualLegExposure[] | null;
 
   opened_at: Date;
 

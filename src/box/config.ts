@@ -14,7 +14,7 @@
  *   strikes each side            3  (ATM ± 3 → at most 7 strikes → 21 pairs)
  */
 
-import type { BoxScannerConfigSnapshot, ExecutionMode } from "./types.js";
+import type { BoxQueueModel, BoxScannerConfigSnapshot, ExecutionMode } from "./types.js";
 
 function num(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -58,6 +58,40 @@ export function clampStrikeLevel(v: number): 1 | 2 | 3 {
   if (n <= 1) return 1;
   if (n >= 3) return 3;
   return 2;
+}
+
+/**
+ * Clamp an integer to [min, max] with a fallback for garbage input.
+ *
+ * Used for the new execution-realism knobs (chase ticks, dispersion), so a typo
+ * in an env var can never widen the price band without bound or turn a delay
+ * negative.
+ */
+function clampInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const v = Number(raw);
+  if (!Number.isFinite(v)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(v)));
+}
+
+/** Clamp a percentage to [0, 100]. */
+function clampPct(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const v = Number(raw);
+  if (!Number.isFinite(v)) return fallback;
+  return Math.min(100, Math.max(0, v));
+}
+
+function queueModel(name: string, fallback: BoxQueueModel): BoxQueueModel {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const v = raw.trim().toLowerCase();
+  if (v === "none") return "none";
+  if (v === "haircut") return "haircut";
+  console.warn(`[Box] ignoring unknown ${name}="${raw}" — using ${fallback}.`);
+  return fallback;
 }
 
 function executionMode(name: string, fallback: ExecutionMode): ExecutionMode {
@@ -110,6 +144,60 @@ export interface BoxConfig {
   legTimeoutMs: number;
   /** Simulated latency for the emergency unwind of partial fills (ms). */
   legUnwindLatencyMs: number;
+
+  // ---- paper_legging: executable order pricing (marketable-limit) ----
+  /**
+   * How many ticks past the reference touch an ENTRY marketable-limit order may
+   * chase. The limit price is `reference ± maxChaseTicks × tickSize` (up for a
+   * BUY, down for a SELL). A depth level worse than the limit is never filled —
+   * this is what stops a simulated order behaving like an unrestricted market
+   * order that consumes whatever the book shows on arrival.
+   */
+  legMaxChaseTicks: number;
+  /**
+   * Chase band for an EMERGENCY UNWIND, which may deliberately tolerate a wider
+   * price band than a normal entry because flattening exposure is more urgent
+   * than getting a good price. Defaults higher than `legMaxChaseTicks`.
+   */
+  unwindMaxChaseTicks: number;
+  /**
+   * Fallback tick size (₹) when an instrument's real tick size is unavailable.
+   * The real tick size from the instrument dump is preferred wherever present.
+   */
+  defaultTickSize: number;
+
+  // ---- paper_legging: conservative queue-position approximation ----
+  /**
+   * How displayed depth is treated as executable for our simulated order.
+   *
+   *   "none"    — the full displayed quantity at each level is assumed available.
+   *   "haircut" — only a fraction of the displayed quantity is treated as safely
+   *               executable, a transparent stand-in for the queue ahead of us
+   *               that we cannot observe from level-2 data.
+   *
+   * This is NOT a reconstruction of true NSE order-level queue priority (which is
+   * not derivable from level-2 depth); it is a deterministic, configurable
+   * approximation that lets a paper run compare raw vs conservative liquidity.
+   */
+  queueModel: BoxQueueModel;
+  /**
+   * Percentage of displayed quantity assumed to be QUEUED AHEAD of our order and
+   * therefore not available to us, when `queueModel === "haircut"`. Effective
+   * quantity at a level is `floor(displayed × (1 − pct/100))`. Deterministic; no
+   * randomness.
+   */
+  queueLiquidityHaircutPct: number;
+
+  // ---- paper_legging: four-leg temporal coherence ----
+  /**
+   * Maximum spread (ms) between the newest and oldest leg EXCHANGE timestamps a
+   * candidate may show and still auto-enter. When all four legs carry valid
+   * exchange timestamps and the dispersion exceeds this, the candidate is rejected
+   * as `cross_leg_time_skew` rather than traded on books that are not a coherent
+   * cross-sectional snapshot. 0 disables the check. When any leg lacks an exchange
+   * timestamp the check is skipped and the existing receive-time logic stands.
+   */
+  maxCrossLegExchangeDispersionMs: number;
 
   // ---- Entry qualification ----
   /**
@@ -426,6 +514,26 @@ export function loadBoxConfig(): BoxConfig {
     legTimeoutMs: num("BOX_LEG_TIMEOUT_MS", 500),
     legUnwindLatencyMs: num("BOX_LEG_UNWIND_LATENCY_MS", 150),
 
+    // Executable order pricing. 2 ticks (₹0.10 at a ₹0.05 tick) of chase on entry
+    // is a marketable limit that tolerates a small in-flight move but refuses a
+    // runaway one; unwinds get a wider band because flattening matters more.
+    legMaxChaseTicks: clampInt("BOX_LEG_MAX_CHASE_TICKS", 2, 0, 100),
+    unwindMaxChaseTicks: clampInt("BOX_UNWIND_MAX_CHASE_TICKS", 5, 0, 200),
+    defaultTickSize: (() => {
+      const v = num("BOX_DEFAULT_TICK_SIZE", 0.05);
+      return v > 0 ? v : 0.05;
+    })(),
+
+    // Conservative queue approximation, on by default: treat 30% of displayed
+    // depth as queued ahead of us. Set BOX_QUEUE_MODEL=none for raw displayed
+    // liquidity (the optimistic comparison baseline).
+    queueModel: queueModel("BOX_QUEUE_MODEL", "haircut"),
+    queueLiquidityHaircutPct: clampPct("BOX_QUEUE_LIQUIDITY_HAIRCUT_PCT", 30),
+
+    // Four-leg exchange-timestamp coherence. 250ms is generous for a genuine
+    // cross-sectional snapshot yet rejects legs that are visibly out of step.
+    maxCrossLegExchangeDispersionMs: clampInt("BOX_MAX_CROSS_LEG_EXCHANGE_DISPERSION_MS", 250, 0, 60_000),
+
     // THE gate: ₹1,200 of expected net profit after every cost.
     minExpectedNetProfit: num("BOX_MIN_EXPECTED_NET_PROFIT", 1200),
     // Prefilter only.
@@ -534,5 +642,12 @@ export function configSnapshot(cfg: BoxConfig): BoxScannerConfigSnapshot {
     execution_mode: cfg.executionMode,
     simulated_decision_ms: cfg.simulatedDecisionMs,
     simulated_latency_ms: cfg.simulatedLatencyMs,
+    // Executable-order-pricing knobs, frozen so a paper_legging fill stays
+    // interpretable after the defaults are retuned.
+    leg_max_chase_ticks: cfg.legMaxChaseTicks,
+    unwind_max_chase_ticks: cfg.unwindMaxChaseTicks,
+    queue_model: cfg.queueModel,
+    queue_liquidity_haircut_pct: cfg.queueLiquidityHaircutPct,
+    max_cross_leg_exchange_dispersion_ms: cfg.maxCrossLegExchangeDispersionMs,
   };
 }

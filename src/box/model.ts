@@ -187,6 +187,13 @@ const scannerConfigSchema = new mongoose.Schema(
     execution_mode: { type: String, default: "paper_touch" },
     simulated_decision_ms: { type: Number, default: 0 },
     simulated_latency_ms: { type: Number, default: 0 },
+    // Executable-order-pricing knobs a paper_legging fill was taken under. All
+    // optional/defaulted so trades written before they existed keep loading.
+    leg_max_chase_ticks: { type: Number, default: null },
+    unwind_max_chase_ticks: { type: Number, default: null },
+    queue_model: { type: String, default: null },
+    queue_liquidity_haircut_pct: { type: Number, default: null },
+    max_cross_leg_exchange_dispersion_ms: { type: Number, default: null },
   },
   { _id: false },
 );
@@ -252,6 +259,12 @@ const boxTradeSchema = new mongoose.Schema<IBoxTrade>(
     entry_execution: { type: mongoose.Schema.Types.Mixed, default: null },
     entry_legging: { type: mongoose.Schema.Types.Mixed, default: null },
     exit_execution: { type: mongoose.Schema.Types.Mixed, default: null },
+    // The independent-order EXIT audit (paper_legging exits), and any residual
+    // exposure a partial exit left behind. Both Mixed/defaulted so every document
+    // written before they existed keeps loading, and both are audit blobs the list
+    // views never render (see LIST_EXCLUDE_AUDIT).
+    exit_legging: { type: mongoose.Schema.Types.Mixed, default: null },
+    residual_exposure: { type: mongoose.Schema.Types.Mixed, default: null },
 
     opened_at: { type: Date, default: () => new Date() },
 
@@ -452,11 +465,19 @@ const boxExecutionAttemptSchema = new mongoose.Schema(
     unwind_charges: { type: Number, default: null },
     gross_abort_pnl: { type: Number, default: null },
     net_abort_pnl: { type: Number, default: null },
+    // Outstanding simulated exposure this attempt could not flatten. `resolved` is
+    // false while any residual remains, so startup reconciliation can find it and
+    // keep trying to flatten it. Both optional/defaulted for old documents.
+    residual_exposure: { type: mongoose.Schema.Types.Mixed, default: null },
+    resolved: { type: Boolean, default: true, index: true },
   },
   { collection: "box_execution_attempts" },
 );
 
 boxExecutionAttemptSchema.index({ resolved_at: -1 });
+// Unresolved attempts (those still holding residual exposure), newest first — the
+// query startup reconciliation runs to resume flattening.
+boxExecutionAttemptSchema.index({ resolved: 1, resolved_at: -1 });
 
 export interface BoxExecutionAttemptRecord extends IBoxExecutionAttempt {
   _id: mongoose.Types.ObjectId;
