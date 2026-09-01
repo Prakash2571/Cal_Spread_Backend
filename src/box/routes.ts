@@ -74,6 +74,40 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
     }
   });
 
+  /**
+   * ADMIN control: the live entry gate (₹ expected net) and safety buffer (₹).
+   *
+   * Persisted to `box_settings`, so it survives a restart and is shared by every
+   * browser. Takes effect on the next evaluation and applies to NEW boxes only —
+   * positions already open are never re-judged against a changed threshold.
+   *
+   * Body: { min_expected_net_profit?: number, safety_buffer?: number }
+   */
+  app.post("/api/box/settings", requireAdmin, async (req: Request, res: Response) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      // Attribute the change in the append-only ledger. This threshold governs
+      // automatic entries, so "it moved" is not enough — the role that moved it
+      // belongs in the audit trail alongside the values.
+      const token = req.header("x-admin-token") ?? undefined;
+      const actor = deps.getAdminRole(token) ?? "admin";
+      const result = await engine.setTuning(
+        {
+          minExpectedNetProfit: body.min_expected_net_profit ?? body.minExpectedNetProfit,
+          safetyBuffer: body.safety_buffer ?? body.safetyBuffer,
+        },
+        actor,
+      );
+      if (!result.ok) {
+        res.status(result.code).json({ error: result.error });
+        return;
+      }
+      res.json({ ok: true, config: engine.getConfig(), status: engine.getStatus() });
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
   /** RUN — begin discovering and auto-opening paper boxes. */
   app.post("/api/box/start", requireAdmin, async (_req: Request, res: Response) => {
     try {
@@ -147,12 +181,50 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
     res.json({ dbEnabled: isBoxDbEnabled(), open: engine.getOpenPositions() });
   });
 
+  /**
+   * Closed box trades.
+   *
+   * `?scope=today` is the FAST path: today's trades come from memory (or Redis
+   * after a restart), never from a full-book Mongo sort, so the Closed-trades tab
+   * can render the session the operator actually cares about immediately. The
+   * default `scope=all` is the whole closed book from Mongo and is the slower call
+   * the UI makes second, in the background.
+   */
   app.get("/api/box/trades/history", requireAdmin, async (req: Request, res: Response) => {
     try {
+      const scope = String(req.query.scope ?? "all").trim().toLowerCase();
+      if (scope === "today") {
+        const { trades, source, day } = await engine.getClosedToday();
+        res.json({
+          dbEnabled: isBoxDbEnabled(),
+          scope: "today",
+          /** Which tier answered: memory | redis | mongo | none. */
+          source,
+          day,
+          cacheEnabled: engine.isClosedCacheEnabled(),
+          /**
+           * These rows have their execution-audit blobs stripped (see
+           * liteClosedTrade). Stated explicitly so a client can tell "stripped"
+           * from "this trade genuinely has no execution record", and so the UI
+           * knows not to let one overwrite a fuller row it already holds.
+           */
+          lite: true,
+          trades,
+        });
+        return;
+      }
       const raw = Number(req.query.limit ?? 0);
       const limit = Number.isFinite(raw) && raw > 0 ? Math.min(1000, Math.round(raw)) : 300;
       const trades = await loadClosedBoxTrades(limit);
-      res.json({ dbEnabled: isBoxDbEnabled(), trades: trades.map(serializeBoxTrade) });
+      res.json({
+        dbEnabled: isBoxDbEnabled(),
+        scope: "all",
+        source: "mongo",
+        cacheEnabled: engine.isClosedCacheEnabled(),
+        /** Full documents, audit blobs included. */
+        lite: false,
+        trades: trades.map(serializeBoxTrade),
+      });
     } catch (err) {
       fail(res, err);
     }

@@ -309,6 +309,22 @@ boxTradeSchema.index(
 
 boxTradeSchema.index({ opened_at: -1 });
 
+/**
+ * The Closed-trades read path: closed/errored trades sorted by `closed_at` desc.
+ *
+ * Without this the sort is a BLOCKING in-memory top-K over documents that carry
+ * fat Mixed audit blobs, and the whole query fails once the closed book is large
+ * enough to exceed Mongo's 32 MB sort allowance — which presents as an empty
+ * Closed-trades tab rather than as an error.
+ *
+ * `status` leads the key so the same index also serves the "closed since IST
+ * midnight" query behind the day-P&L tally. NOTE: the queries must filter status
+ * with `$in: ["closed", "error"]` rather than `$ne: "open"` for this index to
+ * supply sorted output — a `$ne` is a multi-range prefix and forces the blocking
+ * sort back. See CLOSED_STATUSES in repository.ts.
+ */
+boxTradeSchema.index({ status: 1, closed_at: -1 });
+
 export interface BoxTradeRecord extends IBoxTrade {
   _id: mongoose.Types.ObjectId;
 }
@@ -518,3 +534,35 @@ export const BoxDailyPnl = boxModel<IBoxDailyPnl>(
   "BoxDailyPnl",
   boxDailyPnlSchema as unknown as mongoose.Schema<IBoxDailyPnl>,
 );
+
+/* ------------------------------ box settings ------------------------------ */
+
+/**
+ * One admin-set box threshold, persisted so it survives a restart.
+ *
+ * Modelled on the app-wide `app_settings` store (see db.ts) — a tiny keyed
+ * number — but bound to the BOX connection and its own collection, so a
+ * deployment using BOX_MONGODB_URI keeps its box settings alongside its box
+ * trades rather than in the calendar database.
+ *
+ * The env var remains the DEFAULT: a saved value overrides it at boot, and
+ * deleting the document restores the env-configured value.
+ */
+export interface IBoxSetting {
+  /** The setting key, e.g. "min_expected_net_profit". */
+  _id: string;
+  value: number;
+  updated_at: Date;
+}
+
+const boxSettingSchema = new mongoose.Schema<IBoxSetting>(
+  {
+    _id: { type: String },
+    value: { type: Number, required: true },
+    updated_at: { type: Date, default: () => new Date() },
+  },
+  { collection: "box_settings" },
+);
+
+/** Admin-controlled box thresholds (collection: "box_settings"). */
+export const BoxSetting = boxModel<IBoxSetting>("BoxSetting", boxSettingSchema);
