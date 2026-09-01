@@ -221,8 +221,12 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
         scope: "all",
         source: "mongo",
         cacheEnabled: engine.isClosedCacheEnabled(),
-        /** Full documents, audit blobs included. */
-        lite: false,
+        /**
+         * The audit blobs are projected out of list queries — they are most of a
+         * document's bytes and no list renders them. Carrying them made this
+         * response large enough to hit a gateway timeout.
+         */
+        lite: true,
         trades: trades.map(serializeBoxTrade),
       });
     } catch (err) {
