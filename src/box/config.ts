@@ -258,6 +258,27 @@ export interface BoxConfig {
   universeRefreshMs: number;
   /** How often (ms) the last-close view is rebuilt while the market is shut. */
   indicativeRefreshMs: number;
+  /**
+   * Whether the last-close view is built for the WHOLE universe while the market
+   * is shut and the scanner is stopped.
+   *
+   * With the exchange closed there is nothing to execute and no tick feed to pay
+   * for, so the strike windows can be built and priced from REST /quote purely to
+   * be looked at — which is the only way to see which boxes were mispriced at the
+   * close without pressing RUN. It subscribes NOTHING: indicative windows never
+   * cost a feed subscription, so this cannot affect live trading capacity.
+   */
+  indicativeDiscovery: boolean;
+  /**
+   * Cap on underlyings given an indicative-only window (0 = no cap).
+   *
+   * Indicative windows cost no feed subscription, so `maxSubscribedTokens` does not
+   * bound them — without a separate cap a stopped engine would hold a window and a
+   * full candidate set for every F&O underlying and re-quote all of it every
+   * `indicativeRefreshMs`, all night. The board is priority-ordered, so the cap
+   * keeps the most liquid names.
+   */
+  indicativeMaxUnderlyings: number;
   /** Cap on simultaneously subscribed box option tokens. */
   maxSubscribedTokens: number;
   /** Cap on underlyings scanned (0 = no cap beyond the token budget). */
@@ -295,7 +316,99 @@ export interface BoxConfig {
   pnlVerifyHours: number[];
   /** Delay (ms) between each document while streaming the archive into Mongo. */
   pnlArchiveDrainDelayMs: number;
+
+  // ---- Today's closed trades: Redis read-path cache ----
+  /**
+   * Mirror TODAY's closed trades to Redis so the Closed-trades tab loads without
+   * a full-book Mongo query. ON by default (unlike the P&L cache): it is a pure
+   * read accelerator, and with no Upstash configured it is inert and every read
+   * falls back to Mongo. See closedCache.ts.
+   */
+  closedCacheEnabled: boolean;
+  /** TTL (seconds) on a day's cached closed-trade hash. */
+  closedCacheTtlSec: number;
 }
+
+/* ------------------------------ live tuning ------------------------------- */
+
+/**
+ * The thresholds an admin may change at RUNTIME from the UI.
+ *
+ * Deliberately just these two. They are the numbers an operator tunes while
+ * watching the market — the entry gate and the risk allowance inside it — and
+ * both are pure decision inputs: changing one alters which NEW boxes qualify and
+ * nothing else. Positions already open are never re-judged, and every trade keeps
+ * the `scanner_config_snapshot` of the settings it was actually taken under, so
+ * history stays interpretable after a change.
+ *
+ * Everything else in BoxConfig stays env-only on purpose: latencies, feed
+ * freshness and capacity limits describe the execution model, not an operator
+ * preference, and letting them drift at runtime would make paper fills
+ * incomparable across a session.
+ */
+export interface BoxTuning {
+  /** THE ENTRY GATE: minimum expected NET profit (₹). */
+  minExpectedNetProfit: number;
+  /** Risk/safety allowance (₹) deducted inside the expected-net figure. */
+  safetyBuffer: number;
+}
+
+/** Hard bounds on a tunable, so a typo cannot disable the gate or wedge it shut. */
+export const BOX_TUNING_LIMITS: Record<keyof BoxTuning, { min: number; max: number }> = {
+  // A zero gate is legitimate (take every box that is net-positive at all), but a
+  // negative one would mean "enter at a known loss", which is never intended.
+  minExpectedNetProfit: { min: 0, max: 1_000_000 },
+  safetyBuffer: { min: 0, max: 1_000_000 },
+};
+
+/** The current live values of the tunables. */
+export function readTuning(cfg: BoxConfig): BoxTuning {
+  return {
+    minExpectedNetProfit: cfg.minExpectedNetProfit,
+    safetyBuffer: cfg.safetyBuffer,
+  };
+}
+
+/**
+ * Validate a partial tuning patch.
+ *
+ * Returns the accepted (rounded, in-range) values, or an error message naming the
+ * offending field. Rejects rather than clamps: silently accepting ₹99,999,999 as
+ * an entry gate would look like it worked and then never trade again.
+ */
+export function validateTuning(
+  patch: Partial<Record<keyof BoxTuning, unknown>>,
+): { ok: true; values: Partial<BoxTuning> } | { ok: false; error: string } {
+  const values: Partial<BoxTuning> = {};
+  for (const key of Object.keys(BOX_TUNING_LIMITS) as (keyof BoxTuning)[]) {
+    const raw = patch[key];
+    if (raw === undefined || raw === null || raw === "") continue;
+    const v = Number(raw);
+    const { min, max } = BOX_TUNING_LIMITS[key];
+    if (!Number.isFinite(v)) {
+      return { ok: false, error: `${key} must be a number.` };
+    }
+    if (v < min || v > max) {
+      return { ok: false, error: `${key} must be between ₹${min} and ₹${max}.` };
+    }
+    values[key] = Math.round(v);
+  }
+  if (Object.keys(values).length === 0) {
+    return { ok: false, error: "Nothing to update — send minExpectedNetProfit and/or safetyBuffer." };
+  }
+  return { ok: true, values };
+}
+
+/**
+ * The Mongo `box_settings` key each tunable is persisted under.
+ *
+ * Stable strings, not the TS field names, so renaming a config field later cannot
+ * silently orphan a saved value.
+ */
+export const BOX_TUNING_KEYS: Record<keyof BoxTuning, string> = {
+  minExpectedNetProfit: "min_expected_net_profit",
+  safetyBuffer: "safety_buffer",
+};
 
 export function loadBoxConfig(): BoxConfig {
   return {
@@ -354,6 +467,10 @@ export function loadBoxConfig(): BoxConfig {
     publishIntervalMs: num("BOX_PUBLISH_INTERVAL_MS", 500),
     universeRefreshMs: num("BOX_UNIVERSE_REFRESH_MS", 60_000),
     indicativeRefreshMs: num("BOX_INDICATIVE_REFRESH_MS", 60_000),
+    indicativeDiscovery: bool("BOX_INDICATIVE_DISCOVERY", true),
+    // ~150 underlyings × 14 legs ≈ 2,100 tokens ≈ 5 chunked /quote requests a
+    // minute, comparable to what a running scanner already costs.
+    indicativeMaxUnderlyings: num("BOX_INDICATIVE_MAX_UNDERLYINGS", 150),
     maxSubscribedTokens: num("BOX_MAX_SUBSCRIBED_TOKENS", 2200),
     maxUnderlyings: num("BOX_MAX_UNDERLYINGS", 0),
     chargeCacheTtlMs: num("BOX_CHARGE_CACHE_TTL_MS", 30_000),
@@ -367,6 +484,9 @@ export function loadBoxConfig(): BoxConfig {
     pnlArchiveHour: clampHour(num("BOX_PNL_ARCHIVE_HOUR", 21), 21),
     pnlVerifyHours: hours("BOX_PNL_VERIFY_HOURS", [22, 23]),
     pnlArchiveDrainDelayMs: num("BOX_PNL_ARCHIVE_DRAIN_DELAY_MS", 50),
+
+    closedCacheEnabled: bool("BOX_CLOSED_CACHE_ENABLED", true),
+    closedCacheTtlSec: num("BOX_CLOSED_CACHE_TTL_SEC", 3 * 24 * 60 * 60),
   };
 }
 

@@ -18,12 +18,17 @@ import type { Instrument, KiteClient } from "../kite.js";
 import type { TickerHub } from "../hub.js";
 import type { Tick } from "../ticker.js";
 import {
+  BOX_TUNING_KEYS,
+  BOX_TUNING_LIMITS,
   clampStrikeLevel,
   configSnapshot,
   loadBoxConfig,
   prefilterGrossThreshold,
+  readTuning,
   requiredNetProfit,
+  validateTuning,
   type BoxConfig,
+  type BoxTuning,
 } from "./config.js";
 import { BoxChargeEstimator, buildEntryChargeLegs, type BoxChargeLeg, type PriceChargeGroupsFn } from "./charges.js";
 import { BoxChargeReconciler } from "./chargeReconciler.js";
@@ -52,8 +57,10 @@ import {
   isBoxDbEnabled,
   loadBoxDailyPnlTradeIds,
   loadBoxExecutionAttempts,
+  loadBoxSettings,
   loadBoxTradesClosedSince,
   loadOpenBoxTrades,
+  saveBoxSettings,
   serializeBoxTrade,
   setBoxChargeReconciliation,
   setBoxTradeMargin,
@@ -63,6 +70,7 @@ import {
   upsertBoxDailyPnl,
   type SerializedBoxTrade,
 } from "./repository.js";
+import { BoxClosedTradeCache, liteClosedTrade } from "./closedCache.js";
 import { BoxPnlCache } from "./pnlCache.js";
 import { BoxPnlArchiver, istDayStartMs } from "./pnlArchive.js";
 import type {
@@ -147,11 +155,38 @@ export class BoxEngine {
   private pnlCache: BoxPnlCache;
   private pnlArchiver: BoxPnlArchiver;
 
+  private closedCache: BoxClosedTradeCache;
+
   /** Running tally of trades CLOSED today, for the day-P&L view (no Mongo on read). */
   private closedTodayDay = "";
   private closedTodayCount = 0;
   private closedTodayNet = 0;
   private closedTodayGross = 0;
+  /** Total basket margin that today's closed boxes had blocked while they were on. */
+  private closedTodayMargin = 0;
+  /** How many of today's closed boxes never got a margin figure back from Zerodha. */
+  private closedTodayMarginUnknown = 0;
+  /**
+   * TODAY's closed trades, newest first — the Closed-trades tab's fast path.
+   *
+   * Held in process so the view costs nothing to read: seeded from Mongo at boot,
+   * appended to on every close, and mirrored to Redis so a restart mid-session
+   * refills it in one round trip instead of re-querying the whole closed book.
+   */
+  private closedTodayTrades: SerializedBoxTrade[] = [];
+  /**
+   * The IST day `closedTodayTrades` has actually been LOADED for, or null.
+   *
+   * Deliberately a day key rather than a boolean. A boolean flipped by the day-roll
+   * helper would mark the list authoritative whenever the day field merely became
+   * current — including the `"" → today` roll that happens on the first request
+   * after a FAILED boot seed. That would answer "no closed trades" from memory for
+   * the rest of the day without ever consulting Redis or Mongo: precisely the
+   * empty-Closed-tab bug this whole change exists to fix.
+   */
+  private closedTodayLoadedFor: string | null = null;
+  /** Where the in-process set last came from, surfaced for the operator. */
+  private closedTodaySource: "memory" | "redis" | "mongo" | "none" = "none";
   /** The directions the scanner builds candidates for. */
   private directions: readonly BoxDirection[];
   /**
@@ -164,6 +199,13 @@ export class BoxEngine {
   private strikeLevel: 1 | 2 | 3;
   /** Forces every window to rebuild on the next refresh (set by setStrikeLevel). */
   private forceWindowRebuild = false;
+  /**
+   * The CONFIGURED gross prefilter (MIN_BOX_GROSS_EDGE), before any gate-driven
+   * narrowing. Captured once at construction so applyTuning can re-derive the live
+   * prefilter from a fixed baseline instead of clamping the running value, which
+   * would only ever ratchet downwards.
+   */
+  private readonly baseMinGrossEdge: number;
 
   /** Underlying → its current seven-strike window. */
   private windows = new Map<string, BoxUnderlyingState>();
@@ -197,6 +239,9 @@ export class BoxEngine {
   private indicativePriced = 0;
   /** Positions whose margin fetch is currently in flight (dedupe guard). */
   private marginInFlight = new Set<string>();
+  /** Backfill rounds spent per position, so a hopeless one is not retried forever. */
+  private marginBackfillTries = new Map<string, number>();
+  private static readonly MAX_MARGIN_BACKFILLS = 5;
   /** Rolling ring of (receive time − exchange timestamp) samples, in ms. */
   private exchangeLagSamples: number[] = [];
   private exchangeLagCursor = 0;
@@ -213,6 +258,7 @@ export class BoxEngine {
     this.metrics = new BoxMetrics(this.cfg.metricsWindow);
     this.directions = this.cfg.enableShortBox ? BOX_DIRECTIONS : (["LONG_BOX"] as const);
     this.strikeLevel = this.cfg.defaultStrikeLevel;
+    this.baseMinGrossEdge = this.cfg.minGrossEdge;
 
     this.executionSim = new BoxExecutionSimulator({
       cfg: this.cfg,
@@ -340,6 +386,9 @@ export class BoxEngine {
       isFeedHealthy: () => this.isFeedHealthy(),
     });
 
+    // Read-path cache for today's closed trades (inert without Upstash).
+    this.closedCache = new BoxClosedTradeCache(this.cfg);
+
     // Live P&L cache + nightly archive (inert unless BOX_PNL_CACHE_ENABLED and
     // Upstash are both configured — see pnlArchive.ts).
     this.pnlCache = new BoxPnlCache(this.cfg);
@@ -376,6 +425,9 @@ export class BoxEngine {
     // Open the box database first (BOX_MONGODB_URI when set, otherwise the main
     // one) so the positions below are read from the right place.
     await initBoxConnection();
+    // Admin-saved thresholds override the env defaults, before anything can be
+    // judged against them.
+    await this.loadPersistedTuning();
     this.marketOpen = this.deps.isMarketOpen();
     this.scanner.setMarketOpen(this.marketOpen);
     try {
@@ -384,25 +436,39 @@ export class BoxEngine {
       console.warn("[Box] failed to adopt open positions:", err);
     }
     this.monitor.start();
-    // Seed the "closed today" tally from Mongo so the day-P&L view is correct
-    // immediately after a restart, then start the P&L cache + nightly archiver.
+    // Seed the "closed today" tally AND the closed-today trade list from Mongo, so
+    // both the day-P&L figures and the Closed-trades tab are correct and instant
+    // immediately after a restart. Then start the P&L cache + nightly archiver.
     await this.refreshClosedTodayFromDb().catch((err) =>
       console.warn("[Box] closed-today seed failed:", err),
     );
     this.pnlArchiver.start();
-    if (this.positions.size > 0) {
-      // Open positions need live books even with the scanner stopped.
-      this.ensureFeed();
+    // Open positions need live books even with the scanner stopped.
+    if (this.positions.size > 0) this.ensureFeed();
+    // Track market hours from boot, not only from RUN. Two things depend on it
+    // whether or not anyone presses RUN: the monitor's view of tradability, and
+    // the last-close view — which is the ONLY way to see how boxes were priced at
+    // the close, and used to be unreachable with the scanner stopped.
+    this.startMarketWatch();
+    // Exactly ONE universe pass at boot. refreshClosedMarketView performs its own,
+    // so calling refreshUniverse first as well would double the instrument, board
+    // and spot-seed fetches on every startup.
+    if (!this.marketOpen) {
+      await this.refreshClosedMarketView().catch((err) =>
+        console.warn("[Box] last-close view failed at boot:", err),
+      );
+    } else if (this.positions.size > 0) {
       await this.refreshUniverse().catch((err) =>
         console.warn("[Box] universe refresh failed at boot:", err),
       );
     }
     console.log(
       `[Box] engine ready — ${this.positions.size} open paper box position(s), ` +
-        `entry gate ₹${this.cfg.minGrossEdge} GROSS from the spread` +
+        `entry gate ₹${requiredNetProfit(this.cfg)} EXPECTED NET after every cost ` +
+        `(gross prefilter ₹${this.cfg.minGrossEdge})` +
         (this.cfg.minNetEdge > 0 ? ` (plus a ₹${this.cfg.minNetEdge} net floor)` : "") +
-        `, safety ₹${this.cfg.safetyBuffer} (reported, not gated), ` +
-        `freshness ${this.cfg.quoteMaxAgeMs}ms, ATM±${this.cfg.strikesEachSide}, ` +
+        `, safety ₹${this.cfg.safetyBuffer} (deducted inside that net figure), ` +
+        `freshness ${this.cfg.quoteMaxAgeMs}ms, ATM±${this.strikeLevel} of max ±${this.cfg.strikesEachSide}, ` +
         `market ${this.marketOpen ? "OPEN" : "CLOSED"}.`,
     );
   }
@@ -432,15 +498,172 @@ export class BoxEngine {
     console.log(`[Box] strike level set to ATM ±${next} — new discovery is limited to this window; open positions are unaffected.`);
     // Rebuild windows now if the feed is up; otherwise the next scheduled refresh
     // (or the next RUN) picks up the flag.
+    //
+    // The clear happens ONLY on the path that can rebuild. Clearing unconditionally
+    // would empty the page when Zerodha is disconnected, with nothing able to
+    // repopulate it — a control documented as affecting only new discovery should
+    // not be able to blank the view.
     if (this.deps.kite.getAccessToken()) {
       try {
+        // The published list describes the OLD window, so it has to go: leaving it
+        // up would show boxes at strikes that are no longer monitored, which is
+        // exactly the "nothing changes when I pick 2" symptom.
+        this.scanner.clearOpportunities();
         await this.refreshUniverse();
+        // Re-price the new candidate set immediately, so the change is visible at
+        // once instead of on the next tick (market open) or the next 60s indicative
+        // pass (market shut). With the exchange closed there are no ticks at all,
+        // so without this the list would simply stay empty.
+        if (this.marketOpen) this.scanner.refreshAll();
+        else await this.refreshIndicative();
       } catch (err) {
         this.lastError = err instanceof Error ? err.message : String(err);
       }
     }
     this.publish();
     return { ok: true, level: next };
+  }
+
+  /* ------------------------------ live tuning ------------------------------ */
+
+  /** The admin-tunable thresholds as they currently stand. */
+  getTuning(): BoxTuning {
+    return readTuning(this.cfg);
+  }
+
+  /**
+   * Apply persisted admin thresholds over the env defaults at boot.
+   *
+   * Best-effort: an unreachable settings store leaves the env-configured values in
+   * place rather than blocking the boot.
+   */
+  private async loadPersistedTuning(): Promise<void> {
+    const saved = await loadBoxSettings();
+    if (saved.size === 0) return;
+    const patch: Partial<Record<keyof BoxTuning, unknown>> = {};
+    for (const [field, key] of Object.entries(BOX_TUNING_KEYS) as [keyof BoxTuning, string][]) {
+      const value = saved.get(key);
+      if (value !== undefined) patch[field] = value;
+    }
+    const parsed = validateTuning(patch);
+    if (!parsed.ok) {
+      console.warn(`[Box] ignoring persisted settings — ${parsed.error}`);
+      return;
+    }
+    this.applyTuning(parsed.values);
+    console.log(
+      `[Box] applied saved thresholds: entry gate ₹${this.cfg.minExpectedNetProfit}, ` +
+        `safety ₹${this.cfg.safetyBuffer}.`,
+    );
+  }
+
+  /**
+   * Write validated tunables onto the live config.
+   *
+   * The gross prefilter is derived, never mutated in place. It is only ever a cheap
+   * LOWER bound (see config.ts) and must under-state the real requirement: leaving
+   * it at ₹1,200 while an admin lowered the gate to ₹800 would silently discard
+   * boxes that now qualify, making the gate change look inert.
+   *
+   * It is recomputed from the CONFIGURED baseline every time, which makes this
+   * idempotent: clamping in place would ratchet the prefilter down for the life of
+   * the process, so lowering the gate to ₹800 and putting it back to ₹1,200 would
+   * leave the prefilter at ₹800 — quietly running full qualification on candidates
+   * it used to reject, and freezing that drifted number onto every later trade's
+   * config snapshot.
+   */
+  private applyTuning(values: Partial<BoxTuning>): void {
+    if (values.minExpectedNetProfit !== undefined) {
+      this.cfg.minExpectedNetProfit = values.minExpectedNetProfit;
+    }
+    if (values.safetyBuffer !== undefined) {
+      this.cfg.safetyBuffer = values.safetyBuffer;
+    }
+    this.cfg.minGrossEdge = Math.min(this.baseMinGrossEdge, requiredNetProfit(this.cfg));
+  }
+
+  /**
+   * ADMIN control: set the entry gate and/or the safety buffer at runtime.
+   *
+   * Takes effect on the very next evaluation, and is persisted so it survives a
+   * restart. Affects only which NEW boxes qualify:
+   *
+   *   - positions ALREADY OPEN are never re-judged. Their exit rules are driven by
+   *     the edge they were entered on, and each carries the
+   *     `scanner_config_snapshot` of the settings it was actually taken under, so
+   *     yesterday's trades stay interpretable after today's change;
+   *   - the safety buffer is deducted INSIDE the expected-net figure the gate tests
+   *     (see math.ts), so raising it makes the gate strictly harder to clear —
+   *     it is part of the decision, not merely a reported number.
+   */
+  async setTuning(
+    patch: Partial<Record<keyof BoxTuning, unknown>>,
+    /** Who made the change, for the append-only ledger (e.g. the admin role). */
+    actor?: string,
+  ): Promise<{ ok: true; tuning: BoxTuning } | { ok: false; code: number; error: string }> {
+    const parsed = validateTuning(patch);
+    if (!parsed.ok) return { ok: false, code: 400, error: parsed.error };
+
+    const before = readTuning(this.cfg);
+    this.applyTuning(parsed.values);
+
+    // Persist AFTER applying but report a failure honestly: the admin must not be
+    // told a threshold was saved when it will revert on the next restart. The live
+    // values are rolled back so what is running matches what is stored — and
+    // because applyTuning re-derives the prefilter from a fixed baseline, restoring
+    // the two tunables restores the prefilter exactly too.
+    try {
+      const entries = new Map<string, number>();
+      for (const [field, key] of Object.entries(BOX_TUNING_KEYS) as [keyof BoxTuning, string][]) {
+        const value = parsed.values[field];
+        if (value !== undefined) entries.set(key, value);
+      }
+      await saveBoxSettings(entries);
+    } catch (err) {
+      this.applyTuning(before);
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, code: 503, error: `Could not save the settings: ${message}` };
+    }
+
+    console.log(
+      `[Box] thresholds updated${actor ? ` by ${actor}` : ""} — entry gate ` +
+        `₹${before.minExpectedNetProfit} → ₹${this.cfg.minExpectedNetProfit}, safety ` +
+        `₹${before.safetyBuffer} → ₹${this.cfg.safetyBuffer} ` +
+        `(gross prefilter ₹${this.cfg.minGrossEdge}). ` +
+        `New entries only — open positions are unaffected.`,
+    );
+
+    void appendBoxEvent({
+      event: "SCANNER_CONFIG",
+      candidate_key: "",
+      underlying: "",
+      expiry: "",
+      lower_strike: 0,
+      upper_strike: 0,
+      lot_size: 0,
+      quantity: 0,
+      safety_buffer: this.cfg.safetyBuffer,
+      detail:
+        `min_expected_net_profit=${this.cfg.minExpectedNetProfit} ` +
+        `safety_buffer=${this.cfg.safetyBuffer} min_gross_edge=${this.cfg.minGrossEdge}` +
+        (actor ? ` by=${actor}` : ""),
+    });
+
+    // Re-price the published list so the new gate is reflected: an opportunity's
+    // ELIGIBLE/WATCHING verdict is computed against it.
+    //
+    // NOT awaited on the closed-market path. The setting is already applied and
+    // persisted, and repricing after hours means a whole-universe REST quote pass —
+    // holding the admin's HTTP request open for it risks a proxy timeout reporting
+    // failure for a change that in fact succeeded.
+    if (this.marketOpen) {
+      this.scanner.refreshAll();
+    } else {
+      void this.refreshIndicative().catch(() => {/* view only */});
+    }
+    this.publish();
+
+    return { ok: true, tuning: readTuning(this.cfg) };
   }
 
   /** RUN: start discovering and opening new paper boxes. */
@@ -530,6 +753,12 @@ export class BoxEngine {
       quantity: 0,
       detail: `open_positions=${this.positions.size} (still monitored)`,
     });
+    // shrinkToOpenPositions has just cleared the published list. With the market
+    // shut, rebuild the read-only last-close view rather than leaving the operator
+    // staring at an empty page until the next 60s pass.
+    if (!this.marketOpen) {
+      void this.refreshClosedMarketView().catch(() => {/* view only */});
+    }
     this.publish();
   }
 
@@ -569,9 +798,17 @@ export class BoxEngine {
         if (open) {
           // Live books supersede the closing snapshot immediately.
           this.scanner.clearOpportunities();
-          this.scanner.refreshAll();
+          if (this.running) {
+            this.scanner.refreshAll();
+          } else {
+            // Discard the indicative-only windows built while the market was shut.
+            // They are priced from last close and nothing is streaming them, so
+            // keeping them would leave stale closing prices on screen during live
+            // hours — and leave candidates nothing will ever evaluate.
+            this.shrinkToOpenPositions();
+          }
         } else {
-          void this.refreshIndicative();
+          void this.refreshClosedMarketView();
         }
       }
     };
@@ -580,13 +817,37 @@ export class BoxEngine {
       this.marketTimer.unref?.();
     }
     if (!this.indicativeTimer) {
+      // NOT gated on `running`. The last-close view is a read-only view of how the
+      // session ended; refusing to build it unless discovery is on made the closing
+      // prices unreachable precisely when they are the only prices there are.
       this.indicativeTimer = setInterval(() => {
-        if (!this.running || this.marketOpen) return;
-        void this.refreshIndicative();
+        if (this.marketOpen) return;
+        void this.refreshClosedMarketView();
       }, this.cfg.indicativeRefreshMs);
       this.indicativeTimer.unref?.();
     }
     sync();
+  }
+
+  /**
+   * Build and price the last-close view while the exchange is shut.
+   *
+   * Two steps, because with the scanner stopped there may be nothing to price:
+   * `refreshUniverse` places the strike windows (and with `indicativeDiscovery` on
+   * it does so for the whole universe, not just underlyings carrying a position),
+   * then `refreshIndicative` prices them from last traded prices over REST.
+   *
+   * Costs no feed subscription: see the subscription gating in refreshUniverse.
+   */
+  private async refreshClosedMarketView(): Promise<void> {
+    if (this.marketOpen) return;
+    if (!this.deps.kite.getAccessToken()) return;
+    try {
+      await this.refreshUniverse();
+    } catch (err) {
+      this.lastError = err instanceof Error ? err.message : String(err);
+    }
+    await this.refreshIndicative();
   }
 
   /**
@@ -599,15 +860,25 @@ export class BoxEngine {
    */
   async refreshIndicative(): Promise<void> {
     if (!this.deps.kite.getAccessToken()) return;
-    const tokens = [...this.subscribedOptionTokens];
-    if (tokens.length === 0) return;
+    // Price every leg of every monitored WINDOW, not just the tokens that happen to
+    // be streaming. With discovery off the feed carries only open positions' legs,
+    // so keying off subscriptions meant the last-close view could see almost
+    // nothing — while the windows themselves were sitting right there. Position
+    // legs are unioned in so a leg that has aged out of its window is still priced.
+    const tokens = new Set<number>();
+    for (const state of this.windows.values()) {
+      for (const t of windowTokens(state)) tokens.add(t);
+    }
+    for (const t of this.subscribedOptionTokens) tokens.add(t);
+    if (tokens.size === 0) return;
     try {
       const all = await this.deps.getAllInstruments();
       const resolve = this.deps.makeIdResolver(all);
-      const ids = tokens
+      const ids = [...tokens]
         .map(resolve)
         .filter((s): s is string => typeof s === "string");
       if (ids.length === 0) return;
+      // Chunked at 500 identifiers per request inside the client.
       const quotes = await this.deps.kite.getQuoteFull(ids);
 
       // Only legs that traded in the LATEST session may be compared.
@@ -634,6 +905,16 @@ export class BoxEngine {
         lastPrices.set(q.instrument_token, q.last_price);
       }
 
+      // The market may have OPENED while those REST round trips were in flight. A
+      // whole-universe pass takes several requests, so one starting at 09:14:40 can
+      // land after 09:15 — after the open transition has already cleared the list
+      // for live books. Publishing here would put last-close prices on screen during
+      // live hours, undoing the very handler meant to prevent that.
+      if (this.marketOpen) {
+        console.log("[Box] discarding a last-close pass that finished after the open.");
+        return;
+      }
+
       this.indicativeSessionDay = sessionDay || null;
       this.indicativeStaleLegs = stale;
       this.indicativePriced = this.scanner.publishIndicative(lastPrices);
@@ -643,6 +924,10 @@ export class BoxEngine {
           `${lastPrices.size}/${quotes.length} legs traded in it (${stale} stale), ` +
           `${this.indicativePriced} box(es) with a coherent close.`,
       );
+      // Push it out now. With the scanner stopped there is no publish loop running,
+      // so without this the freshly priced view would sit unseen until something
+      // else happened to publish.
+      this.publish();
     } catch (err) {
       console.warn("[Box] indicative (last-close) refresh failed:", err);
     }
@@ -790,12 +1075,18 @@ export class BoxEngine {
   /* ------------------------------- universe ------------------------------- */
 
   /**
-   * Rebuild the scanned universe: nearest live expiry per underlying, the ATM±3
-   * window, its 21 candidates, and the subscription set.
+   * Rebuild the scanned universe: nearest live expiry per underlying, the ATM
+   * ±(active level) window, its candidate strike pairs, and the subscription set.
    *
    * Windows are only re-centred when the underlying has genuinely drifted (see
    * windowNeedsRebuild), so this can run on a timer without churning
    * subscriptions.
+   *
+   * TWO REASONS a window gets built, and they are not the same thing:
+   *   - to STREAM (discovery is on, or the underlying carries an open position):
+   *     costs a slice of the subscription budget;
+   *   - to LOOK AT while the exchange is shut (`indicativeDiscovery`): priced from
+   *     last-close prices over REST and subscribed to nothing.
    */
   async refreshUniverse(): Promise<void> {
     if (!this.deps.kite.getAccessToken()) return;
@@ -820,7 +1111,32 @@ export class BoxEngine {
     const wantOption = new Set<number>();
     const wantSpot = new Set<number>();
     const skipped: string[] = [];
+    /** Underlyings that have a live window after this pass (subscribed or not). */
+    const liveWindows = new Set<string>();
     let used = 0;
+
+    /**
+     * Whether windows are built for the whole universe.
+     *
+     * True while discovering, and ALSO while the market is shut with
+     * `indicativeDiscovery` on: with the exchange closed the windows are wanted
+     * purely to be priced from last-close prices and looked at, which costs REST
+     * calls but no feed subscription (see the gating below).
+     */
+    const discoveryAllowed =
+      this.running || (!this.marketOpen && this.cfg.indicativeDiscovery);
+    /** True when a window is wanted for STREAMING, not merely for the closed view. */
+    const streams = (symbol: string): boolean => this.running || mustKeep.has(symbol);
+    /**
+     * Indicative-only windows built this pass, against their own cap.
+     *
+     * They spend none of the subscription budget, so `budget` does not bound them.
+     * Without this counter a stopped engine after hours would hold a window and a
+     * full candidate set for every underlying with a chain, and re-quote the lot
+     * every minute until the market opened.
+     */
+    const indicativeCap = this.cfg.indicativeMaxUnderlyings;
+    let indicativeUsed = 0;
 
     const ordered = [
       ...this.board.filter((b) => mustKeep.has(b.symbol)),
@@ -840,9 +1156,9 @@ export class BoxEngine {
       const spot = this.spots.get(item.spot_token);
       const existing = this.windows.get(item.symbol);
 
-      // Discovery is off and this underlying carries no position → do not spend
-      // any of the token budget on it.
-      if (!this.running && !mustKeep.has(item.symbol)) continue;
+      // Nothing wants this underlying: discovery is off (and the market is open, so
+      // there is no closed view to build) and it carries no position.
+      if (!discoveryAllowed && !mustKeep.has(item.symbol)) continue;
 
       let state = existing;
       const needsBuild =
@@ -875,13 +1191,24 @@ export class BoxEngine {
 
       const tokens = windowTokens(state);
       // The budget counts the option legs plus the one underlying we need to keep
-      // the window centred.
+      // the window centred. It is a SUBSCRIPTION budget, so it only binds windows
+      // that will actually stream — an indicative-only window costs no slot.
       const cost = tokens.length + 1;
-      if (used + cost > budget && !mustKeep.has(item.symbol)) {
-        skipped.push(item.symbol);
-        continue;
+      if (streams(item.symbol)) {
+        if (used + cost > budget && !mustKeep.has(item.symbol)) {
+          skipped.push(item.symbol);
+          continue;
+        }
+        used += cost;
+      } else {
+        // Indicative-only: bounded by its own cap, not by the token budget.
+        if (indicativeCap > 0 && indicativeUsed >= indicativeCap) {
+          skipped.push(item.symbol);
+          continue;
+        }
+        indicativeUsed++;
       }
-      used += cost;
+      liveWindows.add(item.symbol);
 
       if (state !== existing) {
         this.windows.set(item.symbol, state);
@@ -900,8 +1227,14 @@ export class BoxEngine {
           }),
         );
       }
-      for (const t of tokens) wantOption.add(t);
-      wantSpot.add(item.spot_token);
+      // Only stream what is actually being traded or monitored. An indicative
+      // window built for the closed-market view is priced over REST, so it must not
+      // put the hub anywhere near its subscription budget — and must not still be
+      // subscribed when the market reopens with discovery still off.
+      if (streams(item.symbol)) {
+        for (const t of tokens) wantOption.add(t);
+        wantSpot.add(item.spot_token);
+      }
     }
 
     // Open positions' legs are subscribed unconditionally.
@@ -913,11 +1246,13 @@ export class BoxEngine {
     this.universeBuiltAt = now;
     this.applySubscriptions(wantOption, wantSpot);
     // Windows that dropped out of the universe must stop producing candidates.
+    // Keyed on what this pass actually built, NOT on the subscription set: an
+    // indicative window is deliberately unsubscribed, and testing `wantSpot` would
+    // therefore delete every window the closed-market view had just placed.
     for (const underlying of [...this.windows.keys()]) {
-      if (!wantSpot.has(this.windows.get(underlying)!.spot_token) && !mustKeep.has(underlying)) {
-        this.windows.delete(underlying);
-        this.scanner.removeUnderlying(underlying);
-      }
+      if (liveWindows.has(underlying) || mustKeep.has(underlying)) continue;
+      this.windows.delete(underlying);
+      this.scanner.removeUnderlying(underlying);
     }
     this.charges.prune();
   }
@@ -1378,12 +1713,28 @@ export class BoxEngine {
     if (!closed) return false;
 
     this.positions.remove(position.id);
+    this.marginBackfillTries.delete(position.id);
 
     // Fold the realised result into the running day-P&L tally.
     this.rollClosedTodayDay();
     this.closedTodayCount++;
     this.closedTodayNet += netPnl ?? 0;
     this.closedTodayGross += grossPnl ?? 0;
+    if (position.margin === null || position.margin === undefined) this.closedTodayMarginUnknown++;
+    else this.closedTodayMargin += position.margin;
+
+    const serialized = serializeBoxTrade(closed);
+    // Add to today's fast list and mirror it, so the Closed-trades tab shows this
+    // trade instantly and keeps showing it across a restart without a full-book
+    // Mongo query. The audit blobs are stripped for both: the list never renders
+    // them, and holding a session's worth of depth ladders in memory would cost
+    // tens of MB for data nothing reads. Fire-and-forget on Redis — the trade is
+    // already durably in Mongo, so a cache failure costs only the acceleration.
+    const lite = liteClosedTrade(serialized);
+    this.recordClosedToday(lite);
+    void this.closedCache
+      .writeTrade(this.closedTodayDay, lite)
+      .catch(() => {/* best-effort accelerator */});
 
     // Verify the exit charges asynchronously, exactly like the entry.
     if (exitCharges) {
@@ -1444,7 +1795,7 @@ export class BoxEngine {
       `[Box] PAPER EXIT ${directionLabel(position.direction ?? "LONG_BOX")} ${position.underlying} ` +
         `${position.lower_strike}→${position.upper_strike} ${reason} net ₹${netPnl ?? "?"}`,
     );
-    this.broadcast("exit", { trade: serializeBoxTrade(closed) });
+    this.broadcast("exit", { trade: serialized });
     this.maybeReleaseFeed();
     return true;
   }
@@ -1524,12 +1875,21 @@ export class BoxEngine {
    * previous process (opened before margin existed), an entry whose margin call
    * failed every retry, and a session that only came up after entry. Runs on the
    * slow market-watch timer, so it is nowhere near the hot path.
+   *
+   * BOUNDED per position. The market-watch timer now runs from boot rather than
+   * only while scanning, so an unbackfillable position (a delisted leg, say) would
+   * otherwise re-attempt its four-try margin call every 15 seconds for the entire
+   * life of the process. Margin is enrichment, not a trading input — after a few
+   * rounds it is left null and reported as unknown.
    */
   private backfillMissingMargins(): void {
     if (!this.deps.kite.getAccessToken()) return;
     for (const pos of this.positions.list()) {
       if (pos.margin !== null) continue;
       if (this.marginInFlight.has(pos.id)) continue;
+      const tried = this.marginBackfillTries.get(pos.id) ?? 0;
+      if (tried >= BoxEngine.MAX_MARGIN_BACKFILLS) continue;
+      this.marginBackfillTries.set(pos.id, tried + 1);
       void this.captureMargin(pos.id, pos.legs, pos.lot_size, pos.key, pos.direction ?? "LONG_BOX");
     }
   }
@@ -1645,7 +2005,15 @@ export class BoxEngine {
       /** The ACTIVE admin-selected level (1, 2 or 3), never above the cap. */
       strike_level: this.strikeLevel,
       max_strikes: this.strikeLevel * 2 + 1,
-      max_candidates_per_underlying: 21,
+      /**
+       * Strike PAIRS in the active window: C(n,2) for n = 2·level+1 strikes.
+       * ±3 → 7 strikes → 21 pairs, ±2 → 5 → 10, ±1 → 3 → 3. Was hard-coded at 21,
+       * which over-stated the monitored set at every level but the widest.
+       */
+      max_candidates_per_underlying: (() => {
+        const n = this.strikeLevel * 2 + 1;
+        return (n * (n - 1)) / 2;
+      })(),
       prefilter_gross_threshold: prefilterGrossThreshold(this.cfg),
       convergence_floor: this.cfg.convergenceFloor,
       convergence_pct: this.cfg.convergencePct,
@@ -1655,6 +2023,15 @@ export class BoxEngine {
       max_subscribed_tokens: this.cfg.maxSubscribedTokens,
       lots: 1,
       universe: "NSE F&O options only — F&O stocks + supported indices",
+      /** Whether the last-close view covers the whole universe with RUN off. */
+      indicative_discovery: this.cfg.indicativeDiscovery,
+      /** Whether today's closed trades are mirrored to Redis for a fast read. */
+      closed_cache_enabled: this.closedCache.enabled(),
+      /** The thresholds an admin may change from the UI, and their bounds. */
+      tunable: {
+        min_expected_net_profit: BOX_TUNING_LIMITS.minExpectedNetProfit,
+        safety_buffer: BOX_TUNING_LIMITS.safetyBuffer,
+      },
     };
   }
 
@@ -1742,29 +2119,150 @@ export class BoxEngine {
   private rollClosedTodayDay(): void {
     const today = this.deps.istDayKey();
     if (this.closedTodayDay !== today) {
+      const previous = this.closedTodayDay;
       this.closedTodayDay = today;
       this.closedTodayCount = 0;
       this.closedTodayNet = 0;
       this.closedTodayGross = 0;
+      this.closedTodayMargin = 0;
+      this.closedTodayMarginUnknown = 0;
+      // Yesterday's trades are history now: they belong to the Mongo-backed view,
+      // not to today's fast list.
+      this.closedTodayTrades = [];
+      // NOT marked loaded. A genuine midnight roll starts an empty day, but this
+      // same branch runs on the first request after a failed boot seed, where an
+      // empty list means "not read yet" and the read tiers must still be tried.
+      // Only a real load sets closedTodayLoadedFor.
+      this.closedTodayLoadedFor = previous === "" ? this.closedTodayLoadedFor : today;
+      this.closedTodaySource = "memory";
     }
   }
 
-  /** Seed the closed-today tally from Mongo (called at boot and on day roll). */
+  /** Put one just-closed trade at the head of today's fast list, de-duplicated. */
+  private recordClosedToday(trade: SerializedBoxTrade): void {
+    this.closedTodayTrades = [
+      trade,
+      ...this.closedTodayTrades.filter((t) => t.id !== trade.id),
+    ];
+    this.closedTodaySource = "memory";
+  }
+
+  /**
+   * Seed the closed-today tally AND today's fast trade list from Mongo (called at
+   * boot and on a day roll).
+   *
+   * This is the one full read of today's closed set; from here on the list is
+   * maintained incrementally, so the Closed-trades tab never queries Mongo again
+   * for today.
+   */
   private async refreshClosedTodayFromDb(): Promise<void> {
     const day = this.deps.istDayKey();
     const rows = await loadBoxTradesClosedSince(istDayStartMs(day));
     let count = 0;
     let net = 0;
     let gross = 0;
+    let margin = 0;
+    let marginUnknown = 0;
     for (const r of rows) {
       count++;
       net += r.realised_net_pnl ?? r.net_pnl ?? 0;
       gross += r.gross_pnl ?? 0;
+      if (r.margin === null || r.margin === undefined) marginUnknown++;
+      else margin += r.margin;
     }
     this.closedTodayDay = day;
     this.closedTodayCount = count;
     this.closedTodayNet = net;
     this.closedTodayGross = gross;
+    this.closedTodayMargin = margin;
+    this.closedTodayMarginUnknown = marginUnknown;
+
+    this.closedTodayTrades = rows.map((r) => liteClosedTrade(serializeBoxTrade(r)));
+    this.closedTodayLoadedFor = day;
+    this.closedTodaySource = "mongo";
+    // Mirror the seed so a later restart can skip this query entirely.
+    if (this.closedTodayTrades.length > 0) {
+      void this.closedCache
+        .writeTrades(day, this.closedTodayTrades)
+        .catch(() => {/* best-effort accelerator */});
+    }
+  }
+
+  /**
+   * TODAY's closed trades — the Closed-trades tab's fast path.
+   *
+   * Three tiers, fastest first:
+   *   1. in process (the normal case: seeded at boot, appended to on every close);
+   *   2. Redis (a restart mid-session: one round trip, no Mongo);
+   *   3. Mongo, narrowed to `closed_at >= IST midnight` (the fallback, and still
+   *      far cheaper than the whole-book query this replaced).
+   *
+   * Earlier days are deliberately NOT served here — they stay on the full-history
+   * route, where a slower load is acceptable.
+   */
+  async getClosedToday(): Promise<{
+    trades: SerializedBoxTrade[];
+    source: "memory" | "redis" | "mongo" | "none";
+    day: string;
+  }> {
+    this.rollClosedTodayDay();
+    const day = this.closedTodayDay;
+
+    if (this.closedTodayLoadedFor === day) {
+      return { trades: this.closedTodayTrades, source: this.closedTodaySource, day };
+    }
+
+    // Redis holds whatever was mirrored, which after a partially-applied pipeline
+    // may be a SUBSET of the day. Trust it only when it is at least as complete as
+    // the tally says the day is; otherwise fall through to Mongo, which is the one
+    // source that is definitionally complete.
+    try {
+      const cached = await this.closedCache.readDay(day);
+      if (cached.length > 0 && cached.length >= this.closedTodayCount) {
+        this.closedTodayTrades = cached;
+        this.closedTodayLoadedFor = day;
+        this.closedTodaySource = "redis";
+        return { trades: cached, source: "redis", day };
+      }
+      if (cached.length > 0) {
+        console.warn(
+          `[Box] closed-today cache holds ${cached.length} of ${this.closedTodayCount} ` +
+            `trade(s) for ${day} — falling back to Mongo.`,
+        );
+      }
+    } catch (err) {
+      console.warn("[Box] closed-today cache read failed:", err);
+    }
+
+    // The SAME query the boot seed uses: narrowed to today and deliberately
+    // UNLIMITED. A cap here could truncate the list while the tally kept counting,
+    // recreating the "the strip says 164, the tab shows fewer" disagreement.
+    const rows = await loadBoxTradesClosedSince(istDayStartMs(day));
+    const fromDb = rows.map((r) => liteClosedTrade(serializeBoxTrade(r)));
+
+    // Only ADOPT the database's answer if it is at least as complete as what is
+    // already held. With the box connection down this query returns [] rather than
+    // throwing, and overwriting the in-process list with that would DELETE trades
+    // closed in this session from the view — a cache miss must never lose data.
+    if (fromDb.length >= this.closedTodayTrades.length) {
+      this.closedTodayTrades = fromDb;
+      this.closedTodaySource = "mongo";
+      // Only trust it as "loaded for today" when the store was actually readable;
+      // otherwise leave the tiers to be retried on the next request.
+      if (isBoxDbEnabled()) this.closedTodayLoadedFor = day;
+      // Re-mirror, so the next restart gets the fast path back.
+      if (fromDb.length > 0) {
+        void this.closedCache
+          .writeTrades(day, fromDb)
+          .catch(() => {/* best-effort accelerator */});
+      }
+    }
+    return { trades: this.closedTodayTrades, source: this.closedTodaySource, day };
+  }
+
+  /** Whether the Redis accelerator for today's closed trades is live. */
+  isClosedCacheEnabled(): boolean {
+    return this.closedCache.enabled();
   }
 
   /**
@@ -1778,6 +2276,8 @@ export class BoxEngine {
     let openNet = 0;
     let openGross = 0;
     let openCount = 0;
+    let openMargin = 0;
+    let openMarginUnknown = 0;
     for (const pos of this.positions.list()) {
       openCount++;
       const m = pos.metrics;
@@ -1785,6 +2285,11 @@ export class BoxEngine {
         openNet += m.current_net_pnl ?? 0;
         openGross += m.gross_pnl_if_closed_now ?? 0;
       }
+      // Zerodha's basket margin for the four legs, captured just after entry. Null
+      // when that call never succeeded, which must be reported rather than counted
+      // as zero — otherwise a failed margin fetch silently understates the total.
+      if (pos.margin === null || pos.margin === undefined) openMarginUnknown++;
+      else openMargin += pos.margin;
     }
     const cachedSummary = this.pnlArchiver.getLastSummary();
     return {
@@ -1798,6 +2303,22 @@ export class BoxEngine {
       /** Open running net + today's realised net — the day's running total (₹). */
       total_net_pnl: round2(openNet + this.closedTodayNet),
       total_gross_pnl: round2(openGross + this.closedTodayGross),
+      /**
+       * MARGIN DEPLOYED TODAY (₹) — the basket margin Zerodha blocked for these
+       * boxes, summed.
+       *
+       * `open_margin_used` is currently blocked; `closed_margin_used` is what
+       * today's already-closed boxes had blocked while they were on. Their sum is
+       * the margin the day's box trading consumed in total — note it is a SUM over
+       * the day, not a peak concurrent figure: boxes that opened and closed at
+       * different times never held their margin simultaneously, so the total is an
+       * upper bound on what was blocked at any one instant.
+       */
+      open_margin_used: round2(openMargin),
+      closed_margin_used: round2(this.closedTodayMargin),
+      total_margin_used: round2(openMargin + this.closedTodayMargin),
+      /** Boxes whose margin call never returned, so they are absent from the sums. */
+      margin_unknown_count: openMarginUnknown + this.closedTodayMarginUnknown,
       /** Whether the Redis P&L cache is actively mirroring this figure. */
       cache_enabled: this.pnlCache.enabled(),
       last_cached_at: cachedSummary ? cachedSummary.updated_at : null,

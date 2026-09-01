@@ -12,6 +12,7 @@ import { isBoxConnectionReady } from "../db.js";
 import {
   BoxDailyPnl,
   BoxExecutionAttempt,
+  BoxSetting,
   BoxTrade,
   BoxTradeEvent,
   isBoxEventLedgerEnabled,
@@ -19,6 +20,7 @@ import {
   type BoxExecutionAttemptRecord,
   type BoxTradeRecord,
   type IBoxDailyPnl,
+  type IBoxSetting,
 } from "./model.js";
 import type {
   BoxChargeReconciliation,
@@ -83,9 +85,36 @@ export async function loadBoxTrades(limit = 300): Promise<BoxTradeRecord[]> {
     .lean<BoxTradeRecord[]>();
 }
 
-export async function loadClosedBoxTrades(limit = 300): Promise<BoxTradeRecord[]> {
+/**
+ * The non-open statuses, listed explicitly rather than as `{$ne: "open"}`.
+ *
+ * This is what lets the `{status: 1, closed_at: -1}` index actually SERVE the
+ * `closed_at` sort. A `$ne` expands to two open-ended ranges, so the planner
+ * cannot produce sorted output from the index and falls back to a blocking
+ * in-memory sort — which is what made this query fail outright (Mongo's 32 MB sort
+ * limit) once the closed book grew, surfacing as an EMPTY Closed-trades tab.
+ * Equality points let the planner walk one interval per status and merge them in
+ * sorted order, so the sort is index-driven and cannot blow up.
+ *
+ * Equivalent to `$ne: "open"`: the schema's status enum is exactly
+ * open | closed | error, and the field is defaulted, so every document has one.
+ */
+const CLOSED_STATUSES = ["closed", "error"] as const;
+
+/**
+ * Closed (and errored) trades, newest-closed first.
+ *
+ * `sinceMs` narrows to trades closed at or after that instant (used for the
+ * "today only" view).
+ */
+export async function loadClosedBoxTrades(
+  limit = 300,
+  sinceMs?: number,
+): Promise<BoxTradeRecord[]> {
   if (!isBoxDbEnabled()) return [];
-  return BoxTrade.find({ status: { $ne: "open" } })
+  const filter: Record<string, unknown> = { status: { $in: CLOSED_STATUSES } };
+  if (sinceMs !== undefined) filter.closed_at = { $gte: new Date(sinceMs) };
+  return BoxTrade.find(filter)
     .sort({ closed_at: -1, opened_at: -1 })
     .limit(limit)
     .lean<BoxTradeRecord[]>();
@@ -328,7 +357,12 @@ export async function loadBoxExecutionAttempts(
  */
 export async function loadBoxTradesClosedSince(sinceMs: number): Promise<BoxTradeRecord[]> {
   if (!isBoxDbEnabled()) return [];
-  return BoxTrade.find({ status: { $ne: "open" }, closed_at: { $gte: new Date(sinceMs) } })
+  return BoxTrade.find({
+    // Equality points, not $ne — see CLOSED_STATUSES: this is what lets the
+    // {status, closed_at} index serve the sort instead of a blocking in-memory one.
+    status: { $in: CLOSED_STATUSES },
+    closed_at: { $gte: new Date(sinceMs) },
+  })
     .sort({ closed_at: -1 })
     .lean<BoxTradeRecord[]>();
 }
@@ -379,4 +413,60 @@ export async function loadBoxEvents(limit = 200): Promise<IBoxTradeEvent[]> {
   } catch {
     return [];
   }
+}
+
+/* ------------------------------ box settings ------------------------------ */
+
+/**
+ * Every persisted admin threshold, as `key -> value`.
+ *
+ * Read once at boot. Returns an empty map when the box database is unavailable so
+ * the engine simply keeps its env-configured defaults — a settings store that is
+ * briefly unreachable must not stop the module from booting.
+ */
+export async function loadBoxSettings(): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (!isBoxDbEnabled()) return out;
+  try {
+    const rows = await BoxSetting.find().lean<IBoxSetting[]>();
+    for (const row of rows) {
+      if (typeof row.value === "number" && Number.isFinite(row.value)) {
+        out.set(row._id, row.value);
+      }
+    }
+  } catch (err) {
+    console.warn("[Box] failed to load persisted settings:", err);
+  }
+  return out;
+}
+
+/**
+ * Upsert admin thresholds.
+ *
+ * Throws on failure — unlike most writes here this one is NOT best-effort: the
+ * admin is told the value was saved, so a silent failure would have the UI showing
+ * a threshold that reverts on the next restart.
+ *
+ * One `bulkWrite`, not N independent upserts under `Promise.all`. With separate
+ * writes a partial failure rejects the caller (which rolls the live values back)
+ * while leaving Mongo holding half the change — which the next boot would then load
+ * as though it had been intended. A single batched command keeps "what was saved"
+ * and "what is running" from diverging across a restart.
+ */
+export async function saveBoxSettings(entries: Map<string, number>): Promise<void> {
+  if (!isBoxDbEnabled()) {
+    throw new Error("Box persistence is not configured, so settings cannot be saved.");
+  }
+  if (entries.size === 0) return;
+  const now = new Date();
+  await BoxSetting.bulkWrite(
+    [...entries].map(([key, value]) => ({
+      updateOne: {
+        filter: { _id: key },
+        update: { $set: { value, updated_at: now } },
+        upsert: true,
+      },
+    })),
+    { ordered: false },
+  );
 }

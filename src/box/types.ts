@@ -996,6 +996,8 @@ export type BoxEventType =
   | "EXECUTION_ABORTED"
   | "SCANNER_STARTED"
   | "SCANNER_STOPPED"
+  /** An admin changed a live threshold (entry gate / safety buffer). */
+  | "SCANNER_CONFIG"
   | "ERROR";
 
 /** One immutable decision snapshot in the box ledger. */
