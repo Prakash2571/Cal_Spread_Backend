@@ -169,21 +169,57 @@ analytics, schema and collections are untouched, and box positions live in their
 >   not tick is still valid; an in-flight move during the latency is used automatically; a book that
 >   has aged past the trust window, or is missing, is rejected. There is **no invented slippage
 >   percentage** — slippage is measured against the detection touch.
-> - **`paper_legging`** models **four genuinely independent orders**, each with its own lifecycle
->   (`CREATED → SUBMITTED → IN_FLIGHT → PENDING → FILLED / TIMED_OUT / FAILED`) and its own
->   timestamps. There is **no common snapshot**: each order arrives, tries the latest valid resting
->   book, and if it cannot fill the whole lot it **rests as `PENDING`** until a later depth update
->   fills it — or until `arrival_at + BOX_LEG_TIMEOUT_MS`, which is an **arrival-relative** deadline,
->   not a detection-relative one. Pending orders are woken by the quote store's subscription, so a
->   fill is stamped with the **tick's own timestamp**. Legs therefore land at different instants,
->   which is what makes legging risk measurable: `first_to_last_fill_ms` is literally
->   `max(fill_at) − min(fill_at)` (0 when they fill together), reported alongside
+> - **`paper_legging`** — the **recommended realism mode** — models **four genuinely independent
+>   orders**, each with its own lifecycle
+>   (`CREATED → SUBMITTED → IN_FLIGHT → PENDING → PARTIALLY_FILLED → FILLED /
+>   TIMED_OUT / CANCELLED / FAILED / UNWOUND / UNWIND_FAILED`) and its own timestamps and order id.
+>   There is **no common snapshot**: each order arrives, walks the latest valid resting book **within
+>   its own limit price** (see *Executable order pricing* below), fills as much as it can, and rests
+>   the remainder as `PENDING` / `PARTIALLY_FILLED` until a later depth update completes it — or until
+>   `arrival_at + BOX_LEG_TIMEOUT_MS`, an **arrival-relative** deadline. Pending orders are woken by
+>   the quote store's subscription, so a fill is stamped with the **tick's own timestamp**. Legs land
+>   at different instants, which is what makes legging risk measurable: `first_to_last_fill_ms` is
+>   literally `max(fill_at) − min(fill_at)` (0 when they fill together), reported alongside
 >   `decision_to_first_fill_ms` / `decision_to_last_fill_ms`, and `exposure_duration_ms` measures how
->   long the position was one-sided (first fill → complete box, or → unwind). If all four fill a box
->   is opened; if some fill and others do not, the filled
->   legs are **emergency-unwound** at the current opposite touch and the **legging loss** (partial
->   entry charges + unwind charges + adverse round-trip) is booked to a separate
->   `box_execution_attempts` collection so failed executions never vanish from the strategy P&L.
+>   long the position was one-sided. If all four fill a box is opened (qualified on the **actual
+>   average fill prices**); if some fill and others do not, the filled legs are **emergency-unwound**
+>   through the *same order lifecycle* and the **legging loss** (partial-entry charges + unwind
+>   charges + adverse round-trip) is booked to a separate `box_execution_attempts` collection so
+>   failed executions never vanish from the strategy P&L. **Exits** use the same independent-order
+>   model (`simulateLeggingExit`): a partial exit leaves visible **residual exposure** rather than a
+>   fabricated clean close.
+>
+> **Executable order pricing (marketable limit, not a market order).** In `paper_legging` an order
+> does not consume whatever the book shows on arrival. It carries a LIMIT a bounded number of ticks
+> past the reference touch — `BUY limit = ask + chase×tick`, `SELL limit = bid − chase×tick` — and
+> the book is **walked only down to that limit**. A move within the band fills (possibly across
+> several depth levels, at the quantity-weighted average); a runaway move past the limit is
+> **refused**, so the order rests instead of chasing. Entries use `BOX_LEG_MAX_CHASE_TICKS`;
+> emergency unwinds use the wider `BOX_UNWIND_MAX_CHASE_TICKS` because flattening matters more than
+> price. The real instrument tick size is used where available.
+>
+> **Conservative queue approximation.** Being *at* the touch is not being *first* at the touch, and
+> level-2 depth cannot reveal NSE order-level queue priority. So with `BOX_QUEUE_MODEL=haircut`
+> (default) only `floor(displayed × (1 − BOX_QUEUE_LIQUIDITY_HAIRCUT_PCT/100))` of each displayed
+> level is treated as executable for us; `BOX_QUEUE_MODEL=none` uses the raw displayed quantity as an
+> optimistic baseline. Displayed and effective quantities are both recorded on every fill slice. This
+> is **deterministic and transparent — NOT a reconstruction of true queue position**, which cannot be
+> derived from the data we have.
+>
+> **Four-leg temporal coherence.** Each candidate records receive-time and (where the feed supplies
+> exchange timestamps) exchange-time dispersion across the four legs, per-leg feed latency, and how
+> many books changed during the decision latency. When all four legs carry a valid exchange timestamp
+> and their dispersion exceeds `BOX_MAX_CROSS_LEG_EXCHANGE_DISPERSION_MS`, the candidate is rejected
+> as `cross_leg_time_skew` (they are not a coherent cross-section). A missing exchange timestamp is
+> never itself grounds for rejection — the receive-time freshness gate stands.
+>
+> **Residual exposure & durability.** Exposure the engine cannot resolve to flat — a partial entry
+> that could not be fully unwound, a failed unwind, a partial exit — is recorded as
+> `ResidualLegExposure` and **never treated as flat**. Once a simulated fill is owned, a Mongo insert
+> failure does not discard it: the fill is retained and re-persisted with bounded backoff, and the
+> engine reports `degraded` in `/api/box/status` until it succeeds. On startup the engine re-adopts
+> open positions **and** unresolved residual exposure, so an interrupted execution is resumed whether
+> or not RUN is pressed.
 >
 > **Abort after a 4/4 fill.** A dislocation can decay *while the orders are in flight*. If all four
 > legs fill but the economics recomputed on the **executed** prices no longer clear the gate (say
@@ -471,6 +507,12 @@ Every threshold is env-overridable; the defaults are the shipped specification.
 | `BOX_LEG_EXECUTION_MODE` | `parallel` | `paper_legging` leg submission: `parallel` or `sequential` |
 | `BOX_LEG_TIMEOUT_MS` | `500` | `paper_legging` per-leg rest time before it is deemed unfilled |
 | `BOX_LEG_UNWIND_LATENCY_MS` | `150` | Simulated latency of the emergency unwind of partial fills |
+| `BOX_LEG_MAX_CHASE_TICKS` | `2` | `paper_legging` entry marketable-limit chase, in ticks past the reference touch |
+| `BOX_UNWIND_MAX_CHASE_TICKS` | `5` | Wider chase band (ticks) for an emergency unwind — flattening over price |
+| `BOX_DEFAULT_TICK_SIZE` | `0.05` | Fallback tick size (₹) when the instrument dump has none |
+| `BOX_QUEUE_MODEL` | `haircut` | `haircut` (conservative, only part of displayed depth is ours) or `none` (raw displayed) |
+| `BOX_QUEUE_LIQUIDITY_HAIRCUT_PCT` | `30` | % of each displayed level assumed queued ahead of us (haircut model) |
+| `BOX_MAX_CROSS_LEG_EXCHANGE_DISPERSION_MS` | `250` | Reject a candidate whose four legs' exchange timestamps span more than this (0 disables) |
 | `BOX_EXIT_USE_REALISABLE` | `true` | Judge the auto-exit profit floor on realisable net (touch net − exit-slippage allowance) pre-execution; the final check uses the actual executed price |
 | `BOX_STT_ROUND_NEAREST_RUPEE` | `true` | Round the STT head to the nearest rupee, as the contract note does |
 | `BOX_IPFT_PER_CRORE` | `0` | NSE IPFT expressed as ₹ per crore of premium (folded into the exchange head) |
@@ -630,3 +672,31 @@ The service starts and the rest keeps working.
   reconstructed.
 - Today's per-minute aggregate cache (`/api/option-oi-series`) is memory-only, so it restarts
   empty even when Redis is configured. The chart frames are unaffected.
+
+### Box paper execution — what `paper_legging` still cannot reproduce
+
+Even the `paper_legging` model, with marketable-limit pricing, depth walking, partial fills and a
+queue haircut, is **not** equivalent to live Zerodha → NSE execution. It cannot derive from
+WebSocket level-2 data:
+
+- **True exchange queue position.** The haircut is a deterministic *approximation* of the queue
+  ahead of us, not the real order-level priority NSE maintains. Two orders at the same price do not
+  fill pro-rata by displayed size.
+- **Broker/RMS latency and acknowledgements.** Real orders traverse Zerodha's OMS/RMS, receive
+  acknowledgements, and can be delayed or throttled. The simulator models a single configurable
+  network latency, not this pipeline.
+- **Real broker rejects** (margin, freeze-quantity, price-band, circuit, OI limit, RMS blocks).
+- **Exchange order priority and matching** (price-time priority, iceberg/hidden orders, auction and
+  pre-open behaviour).
+- **Hidden / transient liquidity.** Depth flickers between our snapshots; quantity shown may vanish
+  or appear in microseconds we never observe.
+- **Network jitter and packet loss**, and the second-resolution exchange timestamps Kite provides
+  (fine for coherence gating, too coarse for microsecond sequencing).
+- **Market impact** of our own order, and the reaction of other participants to it.
+
+Because of these, a `paper_legging` result is a *conservative, honest lower bound on execution
+quality given the data we can see* — useful for shadow-testing and calibration, **not** a promise of
+live fills. A **partial `paper_legging` exit** is additionally a known simplification: it is recorded
+as residual exposure and retried as a full close rather than modelled as a per-leg partial-close
+ledger (the intended trade size is one lot). Never read "the tests pass" or "not degraded" as
+"production-ready".
