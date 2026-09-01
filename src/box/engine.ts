@@ -185,8 +185,6 @@ export class BoxEngine {
    * empty-Closed-tab bug this whole change exists to fix.
    */
   private closedTodayLoadedFor: string | null = null;
-  /** Where the in-process set last came from, surfaced for the operator. */
-  private closedTodaySource: "memory" | "redis" | "mongo" | "none" = "none";
   /** The directions the scanner builds candidates for. */
   private directions: readonly BoxDirection[];
   /**
@@ -216,6 +214,8 @@ export class BoxEngine {
   private subscribedOptionTokens = new Set<number>();
   private subscribedSpotTokens = new Set<number>();
   private skippedForBudget: string[] = [];
+  /** Left out of the last-close preview by its own cap, not by the feed budget. */
+  private skippedForIndicativeCap: string[] = [];
 
   private releaseRetainer: (() => void) | null = null;
   private removeTickListener: (() => void) | null = null;
@@ -1111,6 +1111,14 @@ export class BoxEngine {
     const wantOption = new Set<number>();
     const wantSpot = new Set<number>();
     const skipped: string[] = [];
+    /**
+     * Skipped for the INDICATIVE cap, kept apart from the token-budget list.
+     *
+     * Two different reasons a symbol is left out, and conflating them made the UI
+     * blame the live-feed token budget for exclusions that had nothing to do with
+     * it — while the market was shut and nothing was streaming at all.
+     */
+    const skippedIndicative: string[] = [];
     /** Underlyings that have a live window after this pass (subscribed or not). */
     const liveWindows = new Set<string>();
     let used = 0;
@@ -1203,7 +1211,7 @@ export class BoxEngine {
       } else {
         // Indicative-only: bounded by its own cap, not by the token budget.
         if (indicativeCap > 0 && indicativeUsed >= indicativeCap) {
-          skipped.push(item.symbol);
+          skippedIndicative.push(item.symbol);
           continue;
         }
         indicativeUsed++;
@@ -1243,6 +1251,7 @@ export class BoxEngine {
     // The forced rebuild (from a strike-level change) has now been applied.
     this.forceWindowRebuild = false;
     this.skippedForBudget = skipped;
+    this.skippedForIndicativeCap = skippedIndicative;
     this.universeBuiltAt = now;
     this.applySubscriptions(wantOption, wantSpot);
     // Windows that dropped out of the universe must stop producing candidates.
@@ -2085,6 +2094,14 @@ export class BoxEngine {
       day_pnl: this.computeDayPnl(),
       skipped_for_budget: this.skippedForBudget.length,
       skipped_symbols: this.skippedForBudget.slice(0, 25),
+      /**
+       * Left out of the LAST-CLOSE PREVIEW by its own cap
+       * (BOX_INDICATIVE_MAX_UNDERLYINGS) — a display limit while the market is
+       * shut, unrelated to the live-feed token budget above.
+       */
+      skipped_indicative_cap: this.skippedForIndicativeCap.length,
+      skipped_indicative_symbols: this.skippedForIndicativeCap.slice(0, 25),
+      indicative_max_underlyings: this.cfg.indicativeMaxUnderlyings,
       scanner: {
         ...scanner,
         // Execution simulation headline figures the operator watches.
@@ -2134,7 +2151,6 @@ export class BoxEngine {
       // empty list means "not read yet" and the read tiers must still be tried.
       // Only a real load sets closedTodayLoadedFor.
       this.closedTodayLoadedFor = previous === "" ? this.closedTodayLoadedFor : today;
-      this.closedTodaySource = "memory";
     }
   }
 
@@ -2144,7 +2160,6 @@ export class BoxEngine {
       trade,
       ...this.closedTodayTrades.filter((t) => t.id !== trade.id),
     ];
-    this.closedTodaySource = "memory";
   }
 
   /**
@@ -2179,7 +2194,6 @@ export class BoxEngine {
 
     this.closedTodayTrades = rows.map((r) => liteClosedTrade(serializeBoxTrade(r)));
     this.closedTodayLoadedFor = day;
-    this.closedTodaySource = "mongo";
     // Mirror the seed so a later restart can skip this query entirely.
     if (this.closedTodayTrades.length > 0) {
       void this.closedCache
@@ -2208,8 +2222,12 @@ export class BoxEngine {
     this.rollClosedTodayDay();
     const day = this.closedTodayDay;
 
+    // Answered from the warm in-process list: no database, no Redis, no I/O.
+    // Reported as "memory" because that is the tier that served THIS request —
+    // reporting the provenance of the list instead would label every read after a
+    // boot seed as "mongo" while it was in fact costing nothing.
     if (this.closedTodayLoadedFor === day) {
-      return { trades: this.closedTodayTrades, source: this.closedTodaySource, day };
+      return { trades: this.closedTodayTrades, source: "memory", day };
     }
 
     // Redis holds whatever was mirrored, which after a partially-applied pipeline
@@ -2221,7 +2239,6 @@ export class BoxEngine {
       if (cached.length > 0 && cached.length >= this.closedTodayCount) {
         this.closedTodayTrades = cached;
         this.closedTodayLoadedFor = day;
-        this.closedTodaySource = "redis";
         return { trades: cached, source: "redis", day };
       }
       if (cached.length > 0) {
@@ -2246,7 +2263,6 @@ export class BoxEngine {
     // closed in this session from the view — a cache miss must never lose data.
     if (fromDb.length >= this.closedTodayTrades.length) {
       this.closedTodayTrades = fromDb;
-      this.closedTodaySource = "mongo";
       // Only trust it as "loaded for today" when the store was actually readable;
       // otherwise leave the tiers to be retried on the next request.
       if (isBoxDbEnabled()) this.closedTodayLoadedFor = day;
@@ -2257,7 +2273,7 @@ export class BoxEngine {
           .catch(() => {/* best-effort accelerator */});
       }
     }
-    return { trades: this.closedTodayTrades, source: this.closedTodaySource, day };
+    return { trades: this.closedTodayTrades, source: "mongo", day };
   }
 
   /** Whether the Redis accelerator for today's closed trades is live. */

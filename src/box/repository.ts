@@ -102,7 +102,29 @@ export async function loadBoxTrades(limit = 300): Promise<BoxTradeRecord[]> {
 const CLOSED_STATUSES = ["closed", "error"] as const;
 
 /**
- * Closed (and errored) trades, newest-closed first.
+ * Fields excluded from LIST queries: the execution-audit blobs.
+ *
+ * `entry_execution`, `entry_legging` and `exit_execution` are Mixed audit records
+ * holding per-leg depth snapshots, and every leg carries its own entry/exit depth
+ * ladder on top. They are the bulk of a document — tens of KB each against ~2 KB
+ * of actual trade — and NO list view renders any of them (the frontend's `BoxTrade`
+ * type does not even declare them).
+ *
+ * Dragging them along made the full history response tens of megabytes, which is
+ * slow to fetch, slow to serialize and slow to parse: enough to trip a gateway
+ * timeout (observed as HTTP 504) and leave earlier days permanently unreachable.
+ * The full documents remain in Mongo for any audit that needs them.
+ */
+const LIST_EXCLUDE_AUDIT = {
+  entry_execution: 0,
+  entry_legging: 0,
+  exit_execution: 0,
+  "legs.entry_depth": 0,
+  "legs.exit_depth": 0,
+} as const;
+
+/**
+ * Closed (and errored) trades, newest-closed first, WITHOUT the audit blobs.
  *
  * `sinceMs` narrows to trades closed at or after that instant (used for the
  * "today only" view).
@@ -115,6 +137,7 @@ export async function loadClosedBoxTrades(
   const filter: Record<string, unknown> = { status: { $in: CLOSED_STATUSES } };
   if (sinceMs !== undefined) filter.closed_at = { $gte: new Date(sinceMs) };
   return BoxTrade.find(filter)
+    .select(LIST_EXCLUDE_AUDIT)
     .sort({ closed_at: -1, opened_at: -1 })
     .limit(limit)
     .lean<BoxTradeRecord[]>();
@@ -363,6 +386,9 @@ export async function loadBoxTradesClosedSince(sinceMs: number): Promise<BoxTrad
     status: { $in: CLOSED_STATUSES },
     closed_at: { $gte: new Date(sinceMs) },
   })
+    // Every caller (the day tally, the P&L archive inputs, today's trade list)
+    // reads only scalar fields, so the audit blobs are pure weight here too.
+    .select(LIST_EXCLUDE_AUDIT)
     .sort({ closed_at: -1 })
     .lean<BoxTradeRecord[]>();
 }
