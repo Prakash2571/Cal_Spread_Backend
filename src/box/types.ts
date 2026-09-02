@@ -881,6 +881,20 @@ export interface PaperLeggingExecutionRecord {
   temporal: BoxTemporalCoherence | null;
   /* ---- residual exposure: outstanding simulated contracts, if any ---- */
   residual_exposure: ResidualLegExposure[];
+  /* ---- partial-quantity accounting (exits / residual flattening) ---- */
+  /**
+   * How many role-orders were actually SUBMITTED this run. On an entry this is
+   * always 4; on a partial exit or a residual flatten it is only the roles that
+   * still had outstanding quantity, so internal correctness logic must NOT assume
+   * "/4". `filled_leg_count` still means the submitted orders that FULLY filled.
+   */
+  submitted_leg_count: number;
+  /** Submitted role-orders that completely filled their requested quantity. */
+  fully_closed_role_count: number;
+  /** Submitted role-orders left with outstanding quantity after this run. */
+  remaining_role_count: number;
+  /** Quantity actually closed/filled per role this run (absent roles = 0). */
+  fills_by_role: Partial<Record<BoxLegRole, number>>;
   failure_reason: BoxExecutionFailureReason | null;
   failure_detail: string | null;
 }
@@ -998,6 +1012,50 @@ export interface BoxDepthSnapshot {
 
 export type BoxTradeStatus = "open" | "closed" | "error";
 
+/**
+ * Whether an open position is still a complete four-leg box, or has been PARTIALLY
+ * exited so that fewer than four roles still carry quantity.
+ *
+ *   "BOX"              all four roles hold their full lot — normal box convergence
+ *                      arithmetic describes it.
+ *   "PARTIALLY_EXITED" at least one role has been (partly) closed, so the residual
+ *                      is NOT a whole box: the engine prioritises flattening the
+ *                      remaining exposure rather than waiting for a convergence
+ *                      signal that no longer describes the position.
+ */
+export type BoxPositionState = "BOX" | "PARTIALLY_EXITED";
+
+/**
+ * One durable record of an exit ATTEMPT against a position.
+ *
+ * A box may be closed across several attempts (some legs fill, others fail and are
+ * retried). Each attempt appends one of these so the full exit audit — what closed,
+ * when, at what cost, and what remained — is never overwritten. Kept deliberately
+ * light (no depth ladders) so it can ride on the trade document; the full per-leg
+ * legging audit stays in the Mixed `exit_legging` blob, projected out of list
+ * views.
+ */
+export interface IBoxExitAttempt {
+  attempt_id: string;
+  /** "auto" (monitor) or "manual" (operator). */
+  origin: "auto" | "manual";
+  reason: BoxExitReason;
+  detected_at: Date;
+  completed_at: Date;
+  /** Quantity closed per role in THIS attempt (absent roles closed nothing). */
+  fills_by_role: Partial<Record<BoxLegRole, number>>;
+  /** Weighted-average fill price per role in this attempt. */
+  avg_price_by_role: Partial<Record<BoxLegRole, number>>;
+  /** Charges billed for the orders that actually filled in this attempt (₹). */
+  charges_total: number;
+  /** Realised gross P&L booked by the quantity closed in this attempt (₹). */
+  gross_pnl: number | null;
+  /** Per-role remaining quantity AFTER this attempt was applied. */
+  remaining_after: Partial<Record<BoxLegRole, number>>;
+  submitted_leg_count: number;
+  filled_leg_count: number;
+}
+
 export type BoxExitReason =
   | "EDGE_CONVERGED"
   | "PROFIT_CAPTURE"
@@ -1067,6 +1125,21 @@ export interface IBoxTrade {
   quantity: number;
 
   status: BoxTradeStatus;
+
+  /**
+   * EXACT per-role open quantity. At entry every role holds one lot; a partial
+   * exit decrements only the roles it closed. This is the authoritative record of
+   * what is still on our book, so a retry never re-closes a flat leg. OPTIONAL: a
+   * document written before per-role state existed has none, and startup adoption
+   * defaults every role to `quantity` (a full, un-exited box).
+   */
+  remaining_qty_by_role?: Partial<Record<BoxLegRole, number>> | null;
+  /** "BOX" (whole) or "PARTIALLY_EXITED". Absent on old docs → treated as "BOX". */
+  position_state?: BoxPositionState | null;
+  /** Every exit attempt against this trade, appended (never overwritten). */
+  exit_attempts?: IBoxExitAttempt[] | null;
+  /** Running total of exit-side charges across all attempts (₹). */
+  cumulative_exit_charges?: number | null;
 
   legs: IBoxLeg[];
 

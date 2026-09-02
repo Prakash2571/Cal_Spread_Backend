@@ -122,6 +122,11 @@ const LIST_EXCLUDE_AUDIT = {
   // The independent-order exit audit is the same kind of fat Mixed blob as the
   // others and no list view renders it, so it is projected out here too.
   exit_legging: 0,
+  // Per-attempt exit audit can accumulate several attempts' worth of per-leg data;
+  // no list view renders it, so keep it out of bulk queries too. The small scalar
+  // fields (remaining_qty_by_role, position_state, cumulative_exit_charges) are
+  // left in — they are cheap and useful for a partial-position row.
+  exit_attempts: 0,
   "legs.entry_depth": 0,
   "legs.exit_depth": 0,
 } as const;
@@ -245,6 +250,53 @@ export async function closeBoxTrade(
     { new: true },
   ).lean<BoxTradeRecord>();
   return updated ?? null;
+}
+
+/**
+ * Durably record a PARTIAL exit in ONE atomic document update.
+ *
+ * A partial exit is a real, irreversible execution event: some quantity closed,
+ * some remains. It must be persisted BEFORE the monitor treats the execution as
+ * clean, so a crash cannot resurrect the already-closed quantity. This is a single
+ * `$set` (never several independent writes that could leave the position
+ * half-updated), guarded on `status: "open"` so it cannot race a close.
+ *
+ * The trade stays OPEN — a partial exit is not a closed box; only `remaining_qty_
+ * by_role` all-zero closes it (see closeBoxTrade / the monitor).
+ */
+export async function applyBoxPartialExit(
+  id: string,
+  patch: {
+    remaining_qty_by_role: Record<string, number>;
+    position_state: "BOX" | "PARTIALLY_EXITED";
+    cumulative_exit_charges: number;
+    /** The full append-only attempt array (set whole, so no $push-onto-null). */
+    exit_attempts: unknown[];
+    /** Outstanding residual exposure after this attempt, or null when none. */
+    residual_exposure: unknown[] | null;
+    /** Latest per-leg exit legging audit (Mixed). */
+    exit_legging: unknown | null;
+    current_remaining_edge?: number | null;
+  },
+): Promise<boolean> {
+  if (!isBoxDbEnabled() || !isValidBoxId(id)) return false;
+  const res = await BoxTrade.updateOne(
+    { _id: id, status: "open" },
+    {
+      $set: {
+        remaining_qty_by_role: patch.remaining_qty_by_role,
+        position_state: patch.position_state,
+        cumulative_exit_charges: patch.cumulative_exit_charges,
+        exit_attempts: patch.exit_attempts,
+        residual_exposure: patch.residual_exposure,
+        exit_legging: patch.exit_legging,
+        ...(patch.current_remaining_edge !== undefined
+          ? { current_remaining_edge: patch.current_remaining_edge }
+          : {}),
+      },
+    },
+  );
+  return (res.matchedCount ?? 0) > 0;
 }
 
 /** Mark a trade as errored without closing it (kept visible for the operator). */
@@ -404,11 +456,41 @@ export async function resolveBoxExecutionAttempt(id: string): Promise<void> {
   try {
     await BoxExecutionAttempt.updateOne(
       { _id: id },
-      { $set: { resolved: true, residual_exposure: null } },
+      { $set: { resolved: true, residual_exposure: [] } },
     );
   } catch (err) {
     console.warn("[Box] failed to mark execution attempt resolved:", id, err);
   }
+}
+
+/**
+ * Persist the STILL-OUTSTANDING residual after a partial flatten, idempotently.
+ *
+ * When `residual` is empty the attempt is resolved; otherwise the remaining
+ * exposure is written back so a later flatten (or a restart) works only what is
+ * left — never the quantity already flattened.
+ */
+export async function updateBoxExecutionAttemptResidual(
+  id: string,
+  residual: unknown[],
+  cumulativeUnwindCharges?: number,
+): Promise<void> {
+  if (!isBoxDbEnabled() || !isValidBoxId(id)) return;
+  const resolved = residual.length === 0;
+  const set: Record<string, unknown> = {
+    residual_exposure: resolved ? [] : residual,
+    resolved,
+  };
+  if (cumulativeUnwindCharges !== undefined) set.unwind_charges = round2Repo(cumulativeUnwindCharges);
+  try {
+    await BoxExecutionAttempt.updateOne({ _id: id }, { $set: set });
+  } catch (err) {
+    console.warn("[Box] failed to update execution attempt residual:", id, err);
+  }
+}
+
+function round2Repo(v: number): number {
+  return Math.round(v * 100) / 100;
 }
 
 /* ----------------------------- daily P&L archive -------------------------- */

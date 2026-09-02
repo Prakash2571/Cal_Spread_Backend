@@ -248,7 +248,21 @@ export class BoxMetrics {
     cross_leg_skew_rejects: 0,
     queue_haircut_rejects: 0,
     limit_price_rejects: 0,
+    // Partial-exit / residual-flatten lifecycle.
+    partial_exit_attempts: 0,
+    partial_exit_filled_qty: 0,
+    partial_exit_retries: 0,
+    residual_flatten_attempts: 0,
+    residual_flatten_partial: 0,
+    residual_flatten_success: 0,
+    residual_flatten_failure: 0,
+    manual_legging_exits: 0,
+    invariant_failures: 0,
   };
+  /** Highest partial-exit remaining-role count seen (bounded gauge, not a sum). */
+  private partialExitRemainingRoles = 0;
+  /** Filled-position fills owned but not yet durably persisted (gauge). */
+  private pendingUnpersistedFills = 0;
   /** Failure reason → count. A small, fixed key space, so this cannot grow. */
   private failures = new Map<string, number>();
   /** Which leg role most often fails to fill under legging. Fixed 4-key space. */
@@ -402,6 +416,43 @@ export class BoxMetrics {
     this.counters.limit_price_rejects++;
   }
 
+  /* ---- partial-exit / residual-flatten lifecycle ---- */
+  recordPartialExitAttempt(): void {
+    this.counters.partial_exit_attempts++;
+  }
+  recordPartialExitFilledQty(qty: number): void {
+    if (qty > 0) this.counters.partial_exit_filled_qty += Math.round(qty);
+  }
+  recordPartialExitRetry(): void {
+    this.counters.partial_exit_retries++;
+  }
+  recordPartialExitRemainingRoles(count: number): void {
+    if (count > this.partialExitRemainingRoles) this.partialExitRemainingRoles = count;
+  }
+  recordResidualFlattenAttempt(): void {
+    this.counters.residual_flatten_attempts++;
+  }
+  recordResidualFlattenPartial(): void {
+    this.counters.residual_flatten_partial++;
+  }
+  recordResidualFlattenSuccess(): void {
+    this.counters.residual_flatten_success++;
+  }
+  recordResidualFlattenFailure(): void {
+    this.counters.residual_flatten_failure++;
+  }
+  recordManualLeggingExit(): void {
+    this.counters.manual_legging_exits++;
+  }
+  /** An impossible state (e.g. attempted over-close) was caught and prevented. */
+  recordInvariantFailure(): void {
+    this.counters.invariant_failures++;
+  }
+  /** Set the current count of owned-but-unpersisted fills (a gauge, not a counter). */
+  setPendingUnpersistedFills(n: number): void {
+    this.pendingUnpersistedFills = Math.max(0, Math.round(n));
+  }
+
   /** Expected net at entry minus the realised net of the closed trade (₹). */
   recordRealisedVsExpected(diff: number): void {
     this.expectedVsRealised.push(diff);
@@ -470,6 +521,18 @@ export class BoxMetrics {
         /** Orders that could not fill within the limit / after the queue haircut. */
         limit_price_rejects: c.limit_price_rejects,
         queue_haircut_rejects: c.queue_haircut_rejects,
+        /** Partial-exit / residual-flatten lifecycle. */
+        partial_exit_attempts: c.partial_exit_attempts,
+        partial_exit_filled_qty: c.partial_exit_filled_qty,
+        partial_exit_retries: c.partial_exit_retries,
+        partial_exit_max_remaining_roles: this.partialExitRemainingRoles,
+        residual_flatten_attempts: c.residual_flatten_attempts,
+        residual_flatten_partial: c.residual_flatten_partial,
+        residual_flatten_success: c.residual_flatten_success,
+        residual_flatten_failure: c.residual_flatten_failure,
+        manual_legging_exits: c.manual_legging_exits,
+        invariant_failures: c.invariant_failures,
+        pending_unpersisted_fills: this.pendingUnpersistedFills,
         /** Dispersion of the fills: max(fill_at) − min(fill_at). */
         first_to_last_fill_ms: this.firstToLastFill.summary(),
         /** Detection → first fill, and detection → last fill. */

@@ -45,12 +45,13 @@ import {
   type BoxChainIndex,
 } from "./instruments.js";
 import { buildCandidates, round2 } from "./math.js";
-import { BoxPositionBook, type BoxOpenPosition } from "./positions.js";
+import { BoxPositionBook, fullLotByRole, isBoxPositionFlat, outstandingRoles, type BoxOpenPosition } from "./positions.js";
 import { BoxPositionMonitor } from "./positionMonitor.js";
 import { BoxQuoteStore, SpotStore } from "./quotes.js";
 import { initBoxConnection } from "../db.js";
 import {
   appendBoxEvent,
+  applyBoxPartialExit,
   closeBoxTrade,
   insertBoxExecutionAttempt,
   insertBoxTrade,
@@ -62,6 +63,7 @@ import {
   loadOpenBoxTrades,
   loadUnresolvedBoxExecutionAttempts,
   resolveBoxExecutionAttempt,
+  updateBoxExecutionAttemptResidual,
   saveBoxSettings,
   serializeBoxTrade,
   setBoxChargeReconciliation,
@@ -100,6 +102,7 @@ import {
   type BoxOptionInstrument,
   type BoxUnderlyingState,
   type IBoxExecutionAttempt,
+  type IBoxExitAttempt,
   type IBoxLeg,
   type IBoxTrade,
   type PaperLeggingExecutionRecord,
@@ -267,17 +270,16 @@ export class BoxEngine {
   /** How many synchronous insert attempts one fill gets before it is retained. */
   private static readonly PERSIST_RETRY_ATTEMPTS = 3;
   /**
-   * True when something the engine OWNS (a filled box, or residual exposure) could
-   * not be persisted/flattened and is being retried. Surfaced in /api/box/status
-   * so a degraded run is never mistaken for a clean one.
-   */
-  private degraded = false;
-  /**
    * Outstanding residual exposure the engine is still trying to flatten, keyed by
    * the execution-attempt id it belongs to. Rebuilt at startup from unresolved
    * attempts, so an interrupted unwind is resumed whether or not RUN is pressed.
    */
   private residualByAttempt = new Map<string, ResidualLegExposure[]>();
+  /** Attempt ids whose residual is being flattened right now (concurrency guard). */
+  private residualFlattenInFlight = new Set<string>();
+  /** Bounded watchdog that works outstanding residuals; runs only while any exist. */
+  private residualFlattenTimer: NodeJS.Timeout | null = null;
+  private static readonly RESIDUAL_FLATTEN_MS = 2_000;
 
   constructor(private deps: BoxEngineDeps) {
     this.cfg = loadBoxConfig();
@@ -369,7 +371,9 @@ export class BoxEngine {
       localCharges: this.localCharges,
       executionSim: this.executionSim,
       positions: this.positions,
+      metrics: this.metrics,
       closePaperTrade: (args) => this.closePaperTrade(args),
+      persistPartialExit: (args) => this.persistPartialExit(args),
       persistLive: (pos) =>
         updateBoxTradeLive(pos.id, {
           current_remaining_edge: pos.metrics?.remaining_edge ?? null,
@@ -810,7 +814,14 @@ export class BoxEngine {
     this.monitor.stop();
     this.metrics.stopSampling();
     this.pnlArchiver.stop();
-    for (const t of [this.marketTimer, this.indicativeTimer, this.publishTimer, this.universeTimer, this.ownedRetryTimer]) {
+    for (const t of [
+      this.marketTimer,
+      this.indicativeTimer,
+      this.publishTimer,
+      this.universeTimer,
+      this.ownedRetryTimer,
+      this.residualFlattenTimer,
+    ]) {
       if (t) clearInterval(t);
     }
     this.marketTimer = null;
@@ -818,6 +829,7 @@ export class BoxEngine {
     this.publishTimer = null;
     this.universeTimer = null;
     this.ownedRetryTimer = null;
+    this.residualFlattenTimer = null;
     if (this.removeTickListener) {
       this.removeTickListener();
       this.removeTickListener = null;
@@ -1467,13 +1479,12 @@ export class BoxEngine {
     };
     const attemptId = await insertBoxExecutionAttempt(attempt);
     if (residual.length > 0) {
-      // Track the outstanding exposure so it is never lost, and mark the run
-      // degraded. The id lets a later flatten mark this attempt resolved.
-      this.residualByAttempt.set(attemptId ?? `local:${candidate.key}:${Date.now()}`, residual);
-      this.degraded = true;
+      // Track the outstanding exposure so it is never lost, and start the flatten
+      // loop. The id lets a later flatten mark this attempt resolved.
+      this.registerResidual(attemptId ?? `local:${candidate.key}:${Date.now()}`, residual);
       console.warn(
         `[Box] ${residual.length} residual simulated leg(s) left OUTSTANDING by ${candidate.key} ` +
-          `(could not be flattened) — recorded and will be retried.`,
+          `(could not be flattened) — recorded and being worked by the flatten loop.`,
       );
     }
 
@@ -1585,6 +1596,11 @@ export class BoxEngine {
       lot_size: candidate.lot_size,
       quantity: candidate.lot_size,
       status: "open",
+      // A freshly entered box holds one lot on every role and is a whole box.
+      remaining_qty_by_role: fullLotByRole(candidate.lot_size),
+      position_state: "BOX",
+      exit_attempts: [],
+      cumulative_exit_charges: 0,
       legs,
       box_width: candidate.box_width,
       margin: null,
@@ -1680,6 +1696,10 @@ export class BoxEngine {
       opened_at: Date.now(),
       legs: candidate.legs,
       entry_prices: entryPrices,
+      remaining_qty_by_role: fullLotByRole(candidate.lot_size),
+      position_state: "BOX",
+      cumulative_exit_charges: 0,
+      exit_attempts: [],
       metrics: null,
       exit_blocked_reason: null,
       expiry_safety: false,
@@ -1740,6 +1760,50 @@ export class BoxEngine {
     return id;
   }
 
+  /**
+   * Durably mirror a PARTIAL exit to Mongo in one atomic update.
+   *
+   * The in-memory position has already been decremented; this persists the exact
+   * remaining-per-role state, the appended attempt audit, the cumulative exit
+   * charges and any residual — so a crash cannot resurrect the closed quantity.
+   */
+  private async persistPartialExit(args: {
+    position: BoxOpenPosition;
+    residual: ResidualLegExposure[];
+    legging: PaperLeggingExecutionRecord;
+  }): Promise<boolean> {
+    const { position, residual, legging } = args;
+    const ok = await applyBoxPartialExit(position.id, {
+      remaining_qty_by_role: position.remaining_qty_by_role,
+      position_state: position.position_state,
+      cumulative_exit_charges: position.cumulative_exit_charges,
+      exit_attempts: position.exit_attempts,
+      residual_exposure: residual.length > 0 ? residual : null,
+      exit_legging: legging,
+      current_remaining_edge: position.metrics?.remaining_edge ?? null,
+    });
+    if (ok) {
+      void appendBoxEvent({
+        event: "EXIT_SKIPPED_LIQUIDITY",
+        trade_id: position.id,
+        candidate_key: position.key,
+        underlying: position.underlying,
+        expiry: position.expiry,
+        direction: position.direction ?? "LONG_BOX",
+        lower_strike: position.lower_strike,
+        upper_strike: position.upper_strike,
+        lot_size: position.lot_size,
+        quantity: position.quantity,
+        execution_mode: this.cfg.executionMode,
+        reason: "partial_exit",
+        detail:
+          `partial exit persisted — remaining ` +
+          BOX_LEG_ROLES.map((r) => `${r}:${position.remaining_qty_by_role[r]}`).join(" "),
+      });
+    }
+    return ok;
+  }
+
   /** Persist a paper exit at the executed touch. */
   private async closePaperTrade(args: {
     position: BoxOpenPosition;
@@ -1751,17 +1815,35 @@ export class BoxEngine {
     legging?: PaperLeggingExecutionRecord | null;
     /** Residual exposure a partial exit left behind, if any. */
     residual?: ResidualLegExposure[] | null;
+    /**
+     * CUMULATIVE realised gross across every exit attempt (paper_legging multi-
+     * attempt close). When provided it is authoritative — a box closed across
+     * several partial attempts cannot be priced from a single final snapshot.
+     */
+    grossPnlOverride?: number | null;
+    /** CUMULATIVE exit charges across every attempt (entry + this = total). */
+    exitChargesTotalOverride?: number | null;
+    /** The full append-only exit-attempt audit to persist on the closed trade. */
+    exitAttempts?: IBoxExitAttempt[] | null;
   }): Promise<boolean> {
     const { position, metrics, exitCharges, reason, execution } = args;
     const byRole = new Map(metrics.legs.map((l) => [l.role, l]));
     const execByRole = new Map((execution?.legs ?? []).map((l) => [l.role, l]));
 
-    const exitChargesTotal = exitCharges ? round2(exitCharges.total) : metrics.estimated_exit_charges;
+    const exitChargesTotal =
+      args.exitChargesTotalOverride !== undefined && args.exitChargesTotalOverride !== null
+        ? round2(args.exitChargesTotalOverride)
+        : exitCharges
+          ? round2(exitCharges.total)
+          : metrics.estimated_exit_charges;
     const totalCharges =
       position.entry_charges_total === null || exitChargesTotal === null
         ? null
         : round2(position.entry_charges_total + exitChargesTotal);
-    const grossPnl = metrics.gross_pnl_if_closed_now;
+    const grossPnl =
+      args.grossPnlOverride !== undefined && args.grossPnlOverride !== null
+        ? round2(args.grossPnlOverride)
+        : metrics.gross_pnl_if_closed_now;
     const netPnl =
       grossPnl === null || totalCharges === null ? null : round2(grossPnl - totalCharges);
 
@@ -1776,6 +1858,12 @@ export class BoxEngine {
       exit_execution: execution,
       exit_legging: args.legging ?? null,
       residual_exposure: args.residual && args.residual.length > 0 ? args.residual : null,
+      // A closed box is flat on every role, and carries its full exit-attempt audit
+      // and cumulative exit charges.
+      remaining_qty_by_role: fullLotByRole(0),
+      position_state: "BOX",
+      cumulative_exit_charges: exitChargesTotal,
+      ...(args.exitAttempts ? { exit_attempts: args.exitAttempts } : {}),
       exit_charge_reconciliation: exitCharges
         ? {
             status: "pending",
@@ -2076,6 +2164,14 @@ export class BoxEngine {
       opened_at: doc.opened_at.getTime(),
       legs,
       entry_prices: entryPrices,
+      // Restore EXACT outstanding quantity per role. A document written before
+      // per-role state existed has none, so default every role to the full lot —
+      // a whole, un-exited box (never destructive). A partially-closed trade
+      // therefore resumes with ONLY its true outstanding exposure.
+      remaining_qty_by_role: this.remainingByRoleFromDoc(doc),
+      position_state: doc.position_state ?? "BOX",
+      cumulative_exit_charges: doc.cumulative_exit_charges ?? 0,
+      exit_attempts: Array.isArray(doc.exit_attempts) ? doc.exit_attempts : [],
       metrics: null,
       exit_blocked_reason: doc.exit_blocked_reason,
       expiry_safety: doc.expiry_safety,
@@ -2084,6 +2180,21 @@ export class BoxEngine {
       config: doc.scanner_config_snapshot,
     });
     return true;
+  }
+
+  /**
+   * Per-role remaining quantity from a stored document, defaulting to a full lot
+   * on every role when the field is absent (old documents) or malformed. Never
+   * returns a quantity above the trade's lot size or below zero.
+   */
+  private remainingByRoleFromDoc(doc: BoxTradeRecord): Record<BoxLegRole, number> {
+    const stored = doc.remaining_qty_by_role ?? null;
+    const out = {} as Record<BoxLegRole, number>;
+    for (const role of BOX_LEG_ROLES) {
+      const raw = stored && typeof stored[role] === "number" ? (stored[role] as number) : doc.quantity;
+      out[role] = Math.max(0, Math.min(doc.quantity, Math.round(raw)));
+    }
+    return out;
   }
 
   /* ----------------------- execution durability --------------------------- */
@@ -2122,7 +2233,7 @@ export class BoxEngine {
    */
   private retainOwnedExecution(payload: IBoxTrade, key: string): void {
     this.pendingPersists.push({ payload, key, attempts: BoxEngine.PERSIST_RETRY_ATTEMPTS });
-    this.degraded = true;
+    this.metrics.setPendingUnpersistedFills(this.pendingPersists.length);
     // Hold the strike-pair reservation so no new tick can open a DUPLICATE box for
     // this key while the fill is unpersisted (the Mongo unique index cannot help
     // yet — nothing is persisted). The scanner releases the reservation right after
@@ -2144,7 +2255,6 @@ export class BoxEngine {
         clearInterval(this.ownedRetryTimer);
         this.ownedRetryTimer = null;
       }
-      if (this.residualByAttempt.size === 0) this.degraded = false;
       return;
     }
     const still: { payload: IBoxTrade; key: string; attempts: number }[] = [];
@@ -2167,7 +2277,11 @@ export class BoxEngine {
       }
     }
     this.pendingPersists = still;
-    if (this.pendingPersists.length === 0 && this.residualByAttempt.size === 0) this.degraded = false;
+    this.metrics.setPendingUnpersistedFills(this.pendingPersists.length);
+    if (this.pendingPersists.length === 0 && this.ownedRetryTimer) {
+      clearInterval(this.ownedRetryTimer);
+      this.ownedRetryTimer = null;
+    }
   }
 
   /* --------------------- residual-exposure reconciliation ------------------ */
@@ -2186,16 +2300,14 @@ export class BoxEngine {
     for (const a of attempts) {
       const residual = (a.residual_exposure ?? []) as ResidualLegExposure[];
       if (!Array.isArray(residual) || residual.length === 0) continue;
-      this.residualByAttempt.set(a._id.toString(), residual);
+      this.registerResidual(a._id.toString(), residual);
       total += residual.length;
     }
     if (total > 0) {
-      this.degraded = true;
       console.warn(
         `[Box] ${total} residual simulated leg(s) across ${this.residualByAttempt.size} attempt(s) ` +
-          `were outstanding at boot — they will be flattened when the feed is healthy.`,
+          `were outstanding at boot — the flatten loop will work them when the feed is healthy.`,
       );
-      if (this.positions.size === 0) this.ensureFeed(); // need books to flatten
     }
   }
 
@@ -2204,6 +2316,84 @@ export class BoxEngine {
     let n = 0;
     for (const legs of this.residualByAttempt.values()) n += legs.length;
     return n;
+  }
+
+  /** Register outstanding residual exposure and make sure the flatten loop runs. */
+  private registerResidual(attemptId: string, residual: ResidualLegExposure[]): void {
+    if (residual.length === 0) {
+      this.residualByAttempt.delete(attemptId);
+    } else {
+      this.residualByAttempt.set(attemptId, residual);
+      this.ensureFeed(); // outstanding exposure needs live books to flatten
+      this.ensureResidualFlattenTimer();
+    }
+  }
+
+  private ensureResidualFlattenTimer(): void {
+    if (this.residualFlattenTimer) return;
+    this.residualFlattenTimer = setInterval(() => void this.flattenResiduals(), BoxEngine.RESIDUAL_FLATTEN_MS);
+    this.residualFlattenTimer.unref?.();
+  }
+
+  /**
+   * THE RESIDUAL-FLATTENING RUNTIME LOOP.
+   *
+   * Independent of RUN/STOP: outstanding simulated exposure is the engine's
+   * responsibility to flatten, exactly like an open position. It runs only while
+   * the market is open and the feed is healthy, works each attempt at most once at
+   * a time (in-flight guard), sizes each order to the EXACT remaining quantity
+   * (never re-sending flattened quantity), persists the shrunken residual
+   * immediately, and resolves the attempt when it reaches zero. When nothing is
+   * outstanding the timer stops and degraded clears.
+   */
+  private async flattenResiduals(): Promise<void> {
+    if (this.residualByAttempt.size === 0) {
+      if (this.residualFlattenTimer) {
+        clearInterval(this.residualFlattenTimer);
+        this.residualFlattenTimer = null;
+      }
+      return;
+    }
+    if (!this.marketOpen || !this.isFeedHealthy()) return; // cannot execute now; residual is kept
+
+    for (const [attemptId, residual] of [...this.residualByAttempt]) {
+      if (this.residualFlattenInFlight.has(attemptId)) continue; // no concurrent flatten
+      this.residualFlattenInFlight.add(attemptId);
+      this.metrics.recordResidualFlattenAttempt();
+      try {
+        const res = await this.executionSim.flattenResidual({ residual, keyPrefix: attemptId });
+        if (res.remaining.length === 0) {
+          this.residualByAttempt.delete(attemptId);
+          await resolveBoxExecutionAttempt(attemptId);
+          this.metrics.recordResidualFlattenSuccess();
+          console.log(`[Box] residual exposure for attempt ${attemptId} fully flattened.`);
+        } else {
+          // Some (or none) flattened — persist ONLY what remains, so a retry never
+          // re-sends the quantity already flattened.
+          const sumQty = (legs: ResidualLegExposure[]): number => legs.reduce((s, r) => s + r.quantity, 0);
+          const flattenedAny = sumQty(res.remaining) < sumQty(residual);
+          this.residualByAttempt.set(attemptId, res.remaining);
+          await updateBoxExecutionAttemptResidual(attemptId, res.remaining);
+          if (flattenedAny) this.metrics.recordResidualFlattenPartial();
+          else this.metrics.recordResidualFlattenFailure();
+        }
+      } catch (err) {
+        this.metrics.recordResidualFlattenFailure();
+        console.warn(`[Box] residual flatten failed for attempt ${attemptId}:`, err);
+      } finally {
+        this.residualFlattenInFlight.delete(attemptId);
+      }
+    }
+
+    if (this.residualByAttempt.size === 0 && this.residualFlattenTimer) {
+      clearInterval(this.residualFlattenTimer);
+      this.residualFlattenTimer = null;
+    }
+  }
+
+  /** Authoritative degraded verdict, derived from actual ownership risk. */
+  private computeDegraded(): boolean {
+    return this.pendingPersists.length > 0 || this.residualByAttempt.size > 0;
   }
 
   /* --------------------------------- views -------------------------------- */
@@ -2321,9 +2511,13 @@ export class BoxEngine {
        * exposure from a failed unwind). A clean run reports false. Never hidden —
        * "tests pass" must never be read as "flat and healthy" when it is not.
        */
-      degraded: this.degraded,
+      degraded: this.computeDegraded(),
+      pending_unpersisted_fills: this.pendingPersists.length,
       owned_unpersisted: this.pendingPersists.length,
+      residual_exposure_count: this.residualByAttempt.size,
       residual_exposure_legs: this.residualLegCount(),
+      residual_flatten_in_flight: this.residualFlattenInFlight.size,
+      partially_exited_positions: this.positions.list().filter((p) => p.position_state === "PARTIALLY_EXITED").length,
       /** Running day P&L: open positions' current net + today's realised net. */
       day_pnl: this.computeDayPnl(),
       skipped_for_budget: this.skippedForBudget.length,

@@ -265,6 +265,15 @@ const boxTradeSchema = new mongoose.Schema<IBoxTrade>(
     // views never render (see LIST_EXCLUDE_AUDIT).
     exit_legging: { type: mongoose.Schema.Types.Mixed, default: null },
     residual_exposure: { type: mongoose.Schema.Types.Mixed, default: null },
+    // EXACT per-role open quantity, the position state, the cumulative exit-charge
+    // tally and the append-only per-attempt exit audit. All optional/Mixed so every
+    // document written before partial-exit accounting existed keeps loading (startup
+    // adoption defaults a missing map to a full lot on every role). `exit_attempts`
+    // is an audit blob and is projected out of list views (see LIST_EXCLUDE_AUDIT).
+    remaining_qty_by_role: { type: mongoose.Schema.Types.Mixed, default: null },
+    position_state: { type: String, enum: ["BOX", "PARTIALLY_EXITED", null], default: null },
+    exit_attempts: { type: mongoose.Schema.Types.Mixed, default: null },
+    cumulative_exit_charges: { type: Number, default: null },
 
     opened_at: { type: Date, default: () => new Date() },
 
