@@ -38,6 +38,9 @@ export class TickerHub {
   private retainers = new Set<object>();
   /** Headless tick consumers (the box quote store). */
   private tickListeners = new Set<(ticks: Tick[]) => void>();
+  /** Consumers that must invalidate stale books on every socket generation. */
+  private connectionListeners = new Set<(connected: boolean) => void>();
+  private connected = false;
   /** Last tick seen per token, so new clients get an instant snapshot. */
   private latest = new Map<number, Tick>();
   /** When each token's live tick was last received (for freshness checks). */
@@ -144,9 +147,21 @@ export class TickerHub {
     };
   }
 
-  /** True when the upstream socket is currently connected. */
+  /**
+   * Observe socket generations. The current state is delivered immediately so a
+   * late subscriber cannot treat books cached before it attached as warm.
+   */
+  addConnectionListener(fn: (connected: boolean) => void): () => void {
+    this.connectionListeners.add(fn);
+    fn(this.connected);
+    return () => {
+      this.connectionListeners.delete(fn);
+    };
+  }
+
+  /** True when the upstream socket has completed its WebSocket handshake. */
   isConnected(): boolean {
-    return this.handle !== null;
+    return this.connected;
   }
 
   /** How many instrument tokens are currently subscribed upstream. */
@@ -162,16 +177,31 @@ export class TickerHub {
     for (const t of fresh) this.subscribed.add(t);
 
     if (!this.handle) {
-      this.handle = connectTicker({
+      let handle: TickerHandle;
+      handle = connectTicker({
         apiKey,
         accessToken,
         tokens: [...this.subscribed],
-        onTick: (ticks) => this.broadcast(ticks),
-        onError: (message) => this.fail(message),
+        onTick: (ticks) => {
+          if (this.handle !== handle) return;
+          this.broadcast(ticks);
+        },
+        onOpen: () => {
+          if (this.handle !== handle) return;
+          this.notifyConnection(true);
+        },
+        onError: (message) => {
+          if (this.handle !== handle) return;
+          this.fail(message);
+        },
         onClose: () => {
+          // Ignore a late close from a superseded socket generation.
+          if (this.handle !== handle) return;
           this.handle = null;
+          this.notifyConnection(false);
         },
       });
+      this.handle = handle;
     } else if (fresh.length) {
       this.handle.subscribe(fresh);
     }
@@ -270,9 +300,23 @@ export class TickerHub {
     this.stop();
   }
 
+  private notifyConnection(connected: boolean): void {
+    if (this.connected === connected) return;
+    this.connected = connected;
+    for (const listener of this.connectionListeners) {
+      try {
+        listener(connected);
+      } catch (err) {
+        console.warn("[Hub] connection listener failed:", err);
+      }
+    }
+  }
+
   private stop(): void {
-    this.handle?.close();
+    const handle = this.handle;
     this.handle = null;
+    handle?.close();
+    this.notifyConnection(false);
     this.subscribed.clear();
     this.latest.clear();
   }

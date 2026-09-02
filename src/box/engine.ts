@@ -236,6 +236,7 @@ export class BoxEngine {
 
   private releaseRetainer: (() => void) | null = null;
   private removeTickListener: (() => void) | null = null;
+  private removeConnectionListener: (() => void) | null = null;
   private universeTimer: NodeJS.Timeout | null = null;
   private publishTimer: NodeJS.Timeout | null = null;
 
@@ -272,9 +273,9 @@ export class BoxEngine {
 
   /* ------------------------- execution durability ------------------------- */
   /**
-   * Simulated boxes whose four legs FILLED but whose Mongo insert has not yet
-   * succeeded. Retained so a fill is NEVER silently erased when persistence is
-   * temporarily unavailable; drained by a slow background retry. See openPaperTrade.
+   * Boxes whose four legs filled but whose trade-projection insert has not yet
+   * succeeded. Retained so a broker-confirmed or simulated fill is never erased
+   * when persistence is temporarily unavailable; drained by a slow retry loop.
    */
   private pendingPersists: { payload: IBoxTrade; key: string; attempts: number; preallocatedId?: string }[] = [];
   private ownedRetryTimer: NodeJS.Timeout | null = null;
@@ -509,6 +510,7 @@ export class BoxEngine {
   async boot(): Promise<void> {
     if (this.started) return;
     this.started = true;
+    try {
     // Open the box database first (BOX_MONGODB_URI when set, otherwise the main
     // one) so the positions below are read from the right place.
     await initBoxConnection();
@@ -607,7 +609,7 @@ export class BoxEngine {
       );
     }
     console.log(
-      `[Box] engine ready — ${this.positions.size} open paper box position(s), ` +
+      `[Box] engine ready — ${this.positions.size} open box position(s), ` +
         `entry gate ₹${requiredNetProfit(this.cfg)} EXPECTED NET after every cost ` +
         `(gross prefilter ₹${this.cfg.minGrossEdge})` +
         (this.cfg.minNetEdge > 0 ? ` (plus a ₹${this.cfg.minNetEdge} net floor)` : "") +
@@ -615,6 +617,11 @@ export class BoxEngine {
         `freshness ${this.cfg.quoteMaxAgeMs}ms, ATM±${this.strikeLevel} of max ±${this.cfg.strikesEachSide}, ` +
         `market ${this.marketOpen ? "OPEN" : "CLOSED"}.`,
     );
+    } catch (error) {
+      // A failed live boot must be retryable after Mongo/session recovery.
+      this.started = false;
+      throw error;
+    }
   }
 
   /** The active strikes-each-side level (1, 2 or 3). */
@@ -1007,6 +1014,10 @@ export class BoxEngine {
     this.ownedRetryTimer = null;
     this.residualFlattenTimer = null;
     this.orderManager?.dispose();
+    if (this.removeConnectionListener) {
+      this.removeConnectionListener();
+      this.removeConnectionListener = null;
+    }
     if (this.removeTickListener) {
       this.removeTickListener();
       this.removeTickListener = null;
@@ -1032,7 +1043,7 @@ export class BoxEngine {
       // so nothing else would ever notice.
       const healthy = this.isFeedHealthy();
       if (healthy !== this.feedHealthy) {
-        if (!healthy && this.feedHealthy) this.feedGeneration++;
+        if (!healthy && this.feedHealthy) this.invalidateFeedGeneration();
         this.feedHealthy = healthy;
         this.scanner.setFeedHealthy(healthy);
         this.orderManager?.setFeedHealthy(healthy);
@@ -1190,11 +1201,16 @@ export class BoxEngine {
     }
   }
 
-  /** Attach to the shared feed (tick listener + retainer + publish loop). */
+  /** Attach to the shared feed (tick/lifecycle listeners + retainer + publish loop). */
   private ensureFeed(): void {
     if (!this.removeTickListener) {
       this.removeTickListener = this.deps.tickerHub.addTickListener((ticks) =>
         this.onTicks(ticks),
+      );
+    }
+    if (!this.removeConnectionListener) {
+      this.removeConnectionListener = this.deps.tickerHub.addConnectionListener(() =>
+        this.invalidateFeedGeneration(),
       );
     }
     if (!this.releaseRetainer) {
@@ -1209,18 +1225,31 @@ export class BoxEngine {
   /** Let the feed go when neither discovery nor any open position needs it. */
   private maybeReleaseFeed(): void {
     if (this.running || this.positions.size > 0) return;
-    if (this.releaseRetainer) {
-      this.releaseRetainer();
-      this.releaseRetainer = null;
+    if (this.removeConnectionListener) {
+      this.removeConnectionListener();
+      this.removeConnectionListener = null;
     }
     if (this.removeTickListener) {
       this.removeTickListener();
       this.removeTickListener = null;
     }
+    if (this.releaseRetainer) {
+      this.releaseRetainer();
+      this.releaseRetainer = null;
+    }
     if (this.publishTimer && this.sseClients.size === 0) {
       clearInterval(this.publishTimer);
       this.publishTimer = null;
     }
+  }
+
+  /** Every socket open/close creates a fresh book generation. */
+  private invalidateFeedGeneration(): void {
+    this.feedGeneration++;
+    this.tokenFeedGeneration.clear();
+    this.feedHealthy = false;
+    this.scanner.setFeedHealthy(false);
+    this.orderManager?.setFeedHealthy(false);
   }
 
   /* --------------------------- market-data intake -------------------------- */
@@ -2333,7 +2362,7 @@ export class BoxEngine {
     const open = await loadOpenBoxTrades();
     if (open.length === 0) return;
     for (const doc of open) this.adoptDoc(doc);
-    console.log(`[Box] adopted ${this.positions.size} open paper box position(s).`);
+    console.log(`[Box] adopted ${this.positions.size} open box position(s).`);
   }
 
   /**
@@ -3388,6 +3417,7 @@ export class BoxEngine {
 
   /** Called when the Zerodha session dies: drop live state, keep positions. */
   onSessionLost(): void {
+    this.invalidateFeedGeneration();
     this.quotes.clear();
     this.spots.clear();
     this.scanner.clearOpportunities();

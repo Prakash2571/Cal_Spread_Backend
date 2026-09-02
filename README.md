@@ -149,18 +149,26 @@ the charge fields left null and the UI saying so rather than implying a free tra
 
 ---
 
-## 7. Box arbitrage (paper trading)
+## 7. Box arbitrage (paper by default, live only when explicitly armed)
 
 An **independent** module in `src/box/`. It shares this app's Kite session, WebSocket, instrument
 cache and charge estimator, and shares nothing else: the calendar engine's calculations, captures,
 analytics, schema and collections are untouched, and box positions live in their own collections
 (`box_trades`, `box_trade_events`) — optionally in their own **database** via `BOX_MONGODB_URI`.
 
+Paper execution remains the default. Live execution exists behind two independent deployment gates:
+`BOX_EXECUTION_MODE=live` **and** `BOX_LIVE_TRADING_ENABLED=true`. It also starts with all in-memory
+entry/order/flatten controls disarmed, requires a ready Mongo journal and current Kite session, and
+uses bounded LIMIT orders only. Unknown execution modes fail closed. Operators must read
+[`src/box/LIVE_EXECUTION.md`](src/box/LIVE_EXECUTION.md) before enabling either gate; it documents
+reconciliation, exact partial-fill recovery, health blockers, full-admin controls, and incident
+operations.
+
 > ### Paper execution — read this before trusting a number
 >
-> **This module never places a real order.** No Zerodha order-placement API is called anywhere in
-> it. Every fill is simulated and stored with an `execution_mode` of `paper_latency` (default),
-> `paper_touch`, or `paper_legging`.
+> In the three paper modes, every fill is simulated and stored with an `execution_mode` of
+> `paper_latency` (default), `paper_touch`, or `paper_legging`; no paper-mode path places a broker
+> order.
 >
 > - **`paper_touch`** assumes all four one-lot legs were simultaneously executable at the touch in
 >   the detection snapshot. Optimistic, kept for comparison.
@@ -500,7 +508,13 @@ Every threshold is env-overridable; the defaults are the shipped specification.
 | `BOX_MIN_EXPECTED_NET_PROFIT` | `1200` | **The entry gate**: minimum expected NET profit (₹) after every cost |
 | `MIN_BOX_GROSS_EDGE` | `1200` | Cheap gross prefilter (₹) — never the decision |
 | `MIN_BOX_NET_EDGE` | `0` | Legacy *additional* net floor (₹). `>0` raises the effective gate |
-| `BOX_EXECUTION_MODE` | `paper_latency` | `paper_latency`, `paper_touch`, or `paper_legging` (four independent orders) |
+| `BOX_EXECUTION_MODE` | `paper_latency` | `paper_latency`, `paper_touch`, `paper_legging`, or explicitly gated `live`; unknown values fail closed |
+| `BOX_LIVE_TRADING_ENABLED` | `false` | Independent deployment kill switch; live requires this and `BOX_EXECUTION_MODE=live` |
+| `BOX_LIVE_MAX_OPEN_BOXES` | `1` | Live maximum open Box projections |
+| `BOX_LIVE_MAX_CONCURRENT_EXECUTIONS` | `1` | Live broker-operation concurrency; role orders queue by safety priority |
+| `BOX_LIVE_MAX_RESIDUAL_LEGS` | `1` | Live residual-leg circuit-breaker limit |
+| `BOX_LIVE_RECONCILE_INTERVAL_MS` | `60000` | Low-frequency broker order/position reconciliation cadence |
+| `BOX_LIVE_FEED_RECONNECT_WARMUP_MS` | `5000` | Quiet period after reconnect, in addition to current-generation leg ticks |
 | `BOX_SIMULATED_LATENCY_MS` | `250` | Simulated order-send → exchange arrival delay |
 | `BOX_SIMULATED_DECISION_MS` | `40` | Simulated internal decision time before an order is "sent" |
 | `BOX_EXECUTION_MAX_WAIT_MS` | `1500` | Bound on how long the simulator waits to reach the arrival instant |

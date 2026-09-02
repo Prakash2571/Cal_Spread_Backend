@@ -335,8 +335,8 @@ export class BoxPositionMonitor {
     }
 
     // RECOVERY means broker attribution/quantity is not yet trusted. Never feed it
-    // into ordinary box convergence or paper flattening; OrderManager reconciliation
-    // owns it once live engine integration is wired.
+    // into ordinary box convergence or automatic flattening; OrderManager
+    // reconciliation owns broker-authoritative recovery.
     if (pos.position_state === "RECOVERY") {
       const detail = "position is in RECOVERY and requires broker order/position reconciliation";
       pos.exit_blocked_reason = detail;

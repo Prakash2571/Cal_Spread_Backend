@@ -1,5 +1,6 @@
 import type { BrokerOrder, BrokerOrderRequest } from "./brokerAdapter.js";
 import { BrokerAmbiguousSubmitError, boxClientOrderId } from "./brokerAdapter.js";
+import { OrderPersistenceAfterFillError, type BoxOrderManager } from "./orderManager.js";
 import type { BoxConfig } from "./config.js";
 import type {
   BoxEntryExecutionResult,
@@ -9,7 +10,6 @@ import type {
 } from "./executionSimulator.js";
 import { entrySideFor, exitSideFor, round2 } from "./math.js";
 import { buildOrderPricing, touchPrice, walkDepth } from "./orderPricing.js";
-import type { BoxOrderManager } from "./orderManager.js";
 import { outstandingRoles, type BoxOpenPosition } from "./positions.js";
 import type { BoxQuoteStore } from "./quotes.js";
 import {
@@ -110,7 +110,9 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
 
     const settled = await Promise.allSettled(requests.map((request) => manager.submit(request)));
     const orders = ordersFromSettled(settled);
-    const uncertain = settled.some((item) => item.status === "rejected" && /unknown|ambiguous|reconcil/i.test(errorMessage(item.reason))) ||
+    const uncertain = settled.some((item) => item.status === "rejected" &&
+      (item.reason instanceof OrderPersistenceAfterFillError ||
+        /unknown|ambiguous|reconcil/i.test(errorMessage(item.reason)))) ||
       orders.some((order) => order.state === "UNKNOWN" || order.state === "RECONCILIATION_REQUIRED");
     if (uncertain) {
       manager.invariantViolation(`live entry ${attemptId} has uncertain broker terminal quantity`);
@@ -227,7 +229,12 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           phase: "unwind",
         })));
       } catch (error) {
-        if (/unknown|ambiguous|reconcil/i.test(errorMessage(error))) manager.invariantViolation(`residual ${args.keyPrefix} uncertain`);
+        if (error instanceof OrderPersistenceAfterFillError) {
+          orders.push(error.order);
+          manager.invariantViolation(`residual ${args.keyPrefix} filled but its durable snapshot failed`);
+        } else if (/unknown|ambiguous|reconcil/i.test(errorMessage(error))) {
+          manager.invariantViolation(`residual ${args.keyPrefix} uncertain`);
+        }
       }
     }
     const flattened: Partial<Record<BoxLegRole, number>> = {};
@@ -338,6 +345,9 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           phase: "unwind",
         })));
       } catch (error) {
+        if (error instanceof OrderPersistenceAfterFillError) {
+          unwinds.push(error.order);
+        }
         manager.invariantViolation(`protective unwind failed for ${order.client_order_id}: ${errorMessage(error)}`);
       }
     }
@@ -548,7 +558,10 @@ function residualAfterUnwind(entries: BrokerOrder[], unwinds: BrokerOrder[]): Re
 function ordersFromSettled(results: PromiseSettledResult<BrokerOrder>[]): BrokerOrder[] {
   return results.flatMap((result) => {
     if (result.status === "fulfilled") return [result.value];
-    return result.reason instanceof BrokerAmbiguousSubmitError && result.reason.order
+    if (result.reason instanceof BrokerAmbiguousSubmitError && result.reason.order) {
+      return [result.reason.order];
+    }
+    return result.reason instanceof OrderPersistenceAfterFillError
       ? [result.reason.order]
       : [];
   });

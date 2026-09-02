@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { CentralBoxExecutionGateway } from "../../dist/box/executionGateway.js";
-import { exitSideFor } from "../../dist/box/math.js";
+import { OrderPersistenceAfterFillError } from "../../dist/box/orderManager.js";
+import { entrySideFor, exitSideFor } from "../../dist/box/math.js";
 import { BoxQuoteStore } from "../../dist/box/quotes.js";
 import {
   cfg,
@@ -80,10 +81,10 @@ function liveHarness({ fillByRole = {} } = {}) {
   return { candidate, quotes, submitted, violations, manager, gateway, now };
 }
 
-function detectionLegs(candidate, quotes) {
+function detectionLegs(candidate, quotes, sideFor = exitSideFor) {
   return ROLES.map((role) => {
     const inst = candidate.legs[role];
-    const side = exitSideFor(role, candidate.direction);
+    const side = sideFor(role, candidate.direction);
     const quote = quotes.get(inst.token);
     return {
       role,
@@ -220,4 +221,119 @@ test("paper gateway delegation remains byte-for-byte unchanged", async () => {
   assert.equal(gateway.estimateExecutableExit(args, 123), values.estimate);
   assert.equal(await gateway.flattenResidual(args), values.flatten);
   assert.equal(calls.every((call) => call[1] === args), true, "paper arguments are delegated by identity without rewriting");
+});
+
+
+test("entry quarantine preserves a confirmed fill whose Mongo snapshot update failed", async () => {
+  const h = liveHarness();
+  h.manager.submit = async (req) => {
+    h.submitted.push(structuredClone(req));
+    if (req.role === "k1_ce") {
+      throw new OrderPersistenceAfterFillError(
+        brokerOrder(req, req.quantity),
+        new Error("mongo unavailable after broker fill"),
+      );
+    }
+    throw new Error("entry gate closed while queued");
+  };
+  const detection = {
+    candidate: h.candidate,
+    at: h.now,
+    legs: detectionLegs(h.candidate, h.quotes, entrySideFor),
+  };
+
+  const result = await h.gateway.simulateLeggingEntry({
+    candidate: h.candidate,
+    detection,
+    qualify: () => { throw new Error("uncertain entry must never reach economics"); },
+    stillWanted: () => true,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.legging.residual_exposure.length, 1);
+  assert.equal(result.legging.residual_exposure[0].role, "k1_ce");
+  assert.equal(result.legging.residual_exposure[0].quantity, h.candidate.lot_size);
+  assert.equal(result.legging.legs[0].fill_qty, h.candidate.lot_size);
+  assert.equal(h.violations.some((reason) => reason.includes("uncertain broker terminal quantity")), true);
+});
+
+
+test("exit audit preserves confirmed quantity when its Mongo snapshot update fails", async () => {
+  const h = liveHarness();
+  h.manager.submit = async (req) => {
+    h.submitted.push(structuredClone(req));
+    throw new OrderPersistenceAfterFillError(brokerOrder(req, req.quantity), new Error("mongo down"));
+  };
+  const position = positionFrom(h.candidate, {
+    id: "exit-persistence-loss",
+    remaining_qty_by_role: { k1_ce: 35, k2_ce: 0, k2_pe: 0, k1_pe: 0 },
+    position_state: "PARTIALLY_EXITED",
+  });
+
+  const result = await h.gateway.simulateLeggingExit({
+    position,
+    detectionLegs: detectionLegs(h.candidate, h.quotes),
+    detectedAt: h.now,
+    stillWanted: () => true,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.record.fills_by_role.k1_ce, 35);
+  assert.equal(result.legs[0].qty_at_touch, 35);
+  assert.equal(h.violations.some((reason) => reason.includes("uncertain broker terminal quantity")), true);
+});
+
+test("residual flatten applies a confirmed reduction even when its snapshot persistence fails", async () => {
+  const h = liveHarness();
+  h.manager.submit = async (req) => {
+    h.submitted.push(structuredClone(req));
+    throw new OrderPersistenceAfterFillError(brokerOrder(req, req.quantity), new Error("mongo down"));
+  };
+  const inst = h.candidate.legs.k1_ce;
+  const result = await h.gateway.flattenResidual({
+    keyPrefix: "residual-persistence-loss",
+    residual: [{
+      token: inst.token,
+      tradingsymbol: inst.tradingsymbol,
+      exchange: inst.exchange,
+      role: "k1_ce",
+      side: "BUY",
+      quantity: 35,
+      average_price: 100,
+      source: "partial_entry",
+      created_at: h.now,
+    }],
+  });
+
+  assert.equal(result.flattened_by_role.k1_ce, 35);
+  assert.deepEqual(result.remaining, []);
+  assert.equal(h.violations.some((reason) => reason.includes("durable snapshot failed")), true);
+});
+
+test("protective unwind retains a confirmed reduction after persistence loss", async () => {
+  const h = liveHarness();
+  h.manager.submit = async (req) => {
+    h.submitted.push(structuredClone(req));
+    if (req.purpose === "EMERGENCY_RESIDUAL") {
+      throw new OrderPersistenceAfterFillError(brokerOrder(req, req.quantity), new Error("mongo down"));
+    }
+    return brokerOrder(req, req.role === "k1_ce" ? req.quantity : 0);
+  };
+  const detection = {
+    candidate: h.candidate,
+    at: h.now,
+    legs: detectionLegs(h.candidate, h.quotes, entrySideFor),
+  };
+
+  const result = await h.gateway.simulateLeggingEntry({
+    candidate: h.candidate,
+    detection,
+    qualify: () => { throw new Error("incomplete entry must unwind before economics"); },
+    stillWanted: () => true,
+  });
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.legging.residual_exposure, []);
+  assert.equal(result.legging.legs.find((leg) => leg.role === "k1_ce").unwound_qty, h.candidate.lot_size);
+  assert.equal(h.violations.some((reason) => reason.includes("protective unwind failed")), true);
 });

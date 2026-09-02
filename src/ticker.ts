@@ -56,6 +56,7 @@ interface ConnectOptions {
   accessToken: string;
   tokens: number[];
   onTick: (ticks: Tick[]) => void;
+  onOpen?: () => void;
   onError?: (message: string) => void;
   onClose?: () => void;
 }
@@ -84,6 +85,7 @@ export function connectTicker(opts: ConnectOptions): TickerHandle {
     isOpen = true;
     sendSubscribe(pendingTokens);
     pendingTokens = [];
+    opts.onOpen?.();
   };
 
   ws.onmessage = (ev: MessageEvent) => {

@@ -490,18 +490,20 @@ export async function findBoxOrderIntentByBrokerId(
   return BoxOrderIntent.findOne({ broker_order_id: brokerOrderId }).lean<BoxOrderIntentRecord>();
 }
 
-export async function loadNonterminalBoxOrderIntents(
-  limit = 500,
-): Promise<BoxOrderIntentRecord[]> {
-  if (!isBoxDbEnabled()) return [];
+export async function loadNonterminalBoxOrderIntents(): Promise<BoxOrderIntentRecord[]> {
+  if (!isBoxDbEnabled()) {
+    throw new Error("Box persistence is unavailable while loading nonterminal live order intents.");
+  }
+  // Safety-critical reconciliation must never silently omit an unresolved row.
   return BoxOrderIntent.find({ state: { $in: NONTERMINAL_ORDER_STATES } })
     .sort({ updated_at: 1 })
-    .limit(limit)
     .lean<BoxOrderIntentRecord[]>();
 }
 
 export async function loadOwnedBoxOrderIntents(): Promise<BoxOrderIntentRecord[]> {
-  if (!isBoxDbEnabled()) return [];
+  if (!isBoxDbEnabled()) {
+    throw new Error("Box persistence is unavailable while loading owned live order intents.");
+  }
   // Never truncate one side of an entry/exit history: crash-recovery net exposure
   // must be derived from the complete durable BOX-intent ledger.
   return BoxOrderIntent.find({ broker_mode: "live" })
@@ -724,7 +726,9 @@ export async function loadBoxLiveRiskSeed(sinceMs: number): Promise<{
   rejects: number;
   consecutiveFailures: number;
 }> {
-  if (!isBoxDbEnabled()) return { realisedPnl: 0, rejects: 0, consecutiveFailures: 0 };
+  if (!isBoxDbEnabled()) {
+    throw new Error("Box persistence is unavailable while loading the live daily-risk seed.");
+  }
   const [trades, attempts, rejectedCount, recentIntents] = await Promise.all([
     BoxTrade.find({ closed_at: { $gte: new Date(sinceMs) } })
       .select({ realised_net_pnl: 1, net_pnl: 1 })

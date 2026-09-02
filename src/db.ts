@@ -347,7 +347,7 @@ export async function appendTradeLog(entry: ITradeLog): Promise<void> {
 //
 //  Box positions are a different strategy with a four-leg shape, so they get
 //  their own collections — and optionally their own DATABASE via BOX_MONGODB_URI,
-//  which keeps the paper-trading book completely separate from the live calendar
+//  which keeps the Box strategy book completely separate from the calendar
 //  trade book. With the variable unset everything falls back to MONGODB_URI.
 // ============================================================================
 
@@ -368,7 +368,7 @@ export async function initBoxConnection(): Promise<void> {
   if (!boxConnection) {
     if (!MONGODB_URI) {
       console.warn(
-        "BOX_MONGODB_URI and MONGODB_URI are both unset — box paper trades cannot be stored, so the box scanner will refuse to start.",
+        "BOX_MONGODB_URI and MONGODB_URI are both unset — Box trades cannot be stored, so the Box scanner will refuse to start.",
       );
       return;
     }

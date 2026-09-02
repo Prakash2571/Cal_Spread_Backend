@@ -36,6 +36,21 @@ export interface OrderIntentPersistence {
   findByBrokerId(brokerOrderId: string): Promise<IBoxOrderIntent | null>;
 }
 
+/**
+ * The broker owns this fill, but Mongo could not accept its terminal snapshot.
+ * Carrying the broker snapshot prevents callers from accidentally treating the
+ * rejected promise as an unfilled order and dropping irreversible exposure.
+ */
+export class OrderPersistenceAfterFillError extends Error {
+  constructor(
+    readonly order: BrokerOrder,
+    readonly causeValue: unknown,
+  ) {
+    super(`Persistence failed after confirmed fill ${order.client_order_id}.`);
+    this.name = "OrderPersistenceAfterFillError";
+  }
+}
+
 export interface OrderManagerControls {
   entryEnabled: boolean;
   liveOrderEnabled: boolean;
@@ -221,16 +236,17 @@ export class BoxOrderManager {
     };
   }
 
-  /** Reconcile immediately at startup, then at a low-frequency single-flight cadence. */
+  /** Reconcile immediately at startup and keep retrying at a low-frequency cadence. */
   async start(): Promise<OrderManagerReconcileReport> {
-    const report = await this.reconcile();
+    // Arm the retry loop before the first pass: a transient startup failure must
+    // not silently disable reconciliation for the rest of the process lifetime.
     if (!this.disposed && this.reconcileTimer === null) {
       this.reconcileTimer = setInterval(() => {
         void this.reconcile().catch(() => undefined);
       }, Math.max(5_000, this.deps.limits.reconcileIntervalMs));
       this.reconcileTimer.unref?.();
     }
-    return report;
+    return this.reconcile();
   }
 
   setControls(patch: Partial<OrderManagerControls>): void {
@@ -478,6 +494,15 @@ export class BoxOrderManager {
     ) {
       const action = this.queue.shift();
       if (!action) return;
+      const blocked = this.queuedActionBlockReason(action);
+      if (blocked) {
+        if (action.kind === "submit") {
+          this.activeClientIds.delete(action.request.client_order_id);
+          this.releaseReservation(action.request.client_order_id);
+        }
+        action.reject(new Error(blocked));
+        continue;
+      }
       this.inFlight++;
       const execution = action.kind === "submit"
         ? this.execute(action)
@@ -494,6 +519,33 @@ export class BoxOrderManager {
         this.pump();
       });
     }
+  }
+
+  /** Re-check mutable gates at the last safe point before any broker mutation. */
+  private queuedActionBlockReason(action: QueueAction): string | null {
+    if (action.kind === "cancel") {
+      return this.canManageExposure() ? null : "OrderManager exposure management was disabled while cancellation was queued.";
+    }
+    const { request } = action;
+    if (request.purpose === "ENTRY") {
+      if (!this.canEnter()) return "OrderManager entry controls or limits closed while order was queued.";
+      if (request.quantity > this.deps.limits.maxOpenLegQuantity ||
+          this.grossOpenLegQuantity + this.reservedEntryQuantity > this.deps.limits.maxGrossOpenLegQuantity) {
+        return "Order exceeded live quantity limits while queued.";
+      }
+      return null;
+    }
+    if (!this.canManageExposure()) {
+      return "OrderManager exposure management was disabled while order was queued.";
+    }
+    if (request.purpose === "PROTECTIVE_CANCEL") return null;
+    const symbol = `${request.exchange}:${request.tradingsymbol}`;
+    const net = this.attributedBoxPositions.get(symbol) ?? 0;
+    const correctSide = (net > 0 && request.side === "SELL") || (net < 0 && request.side === "BUY");
+    const reserved = this.reservedReductionsBySymbol.get(symbol) ?? 0;
+    return request.quantity <= this.deps.limits.maxOpenLegQuantity && correctSide && reserved <= Math.abs(net)
+      ? null
+      : "Attributed exposure changed while reduction was queued.";
   }
 
   private async executeCancel(action: CancelQueueAction): Promise<void> {
@@ -586,12 +638,25 @@ export class BoxOrderManager {
     this.health.reconciliation = "running";
     this.safeAttributedReductionReady = false;
     try {
-      const intents = await this.deps.persistence.loadNonterminal();
-      const ownedIntents = this.deps.persistence.loadOwned
-        ? await this.deps.persistence.loadOwned()
-        : intents;
-      for (const intent of ownedIntents) this.knownIntents.set(intent.client_order_id, intent);
-      this.health.persistence = "healthy";
+      let loadedNonterminalIntents: IBoxOrderIntent[];
+      let loadedOwnedIntents: IBoxOrderIntent[];
+      try {
+        loadedNonterminalIntents = await this.deps.persistence.loadNonterminal();
+        loadedOwnedIntents = this.deps.persistence.loadOwned
+          ? await this.deps.persistence.loadOwned()
+          : loadedNonterminalIntents;
+        this.health.persistence = "healthy";
+      } catch (error) {
+        this.health.persistence = "unhealthy";
+        throw error;
+      }
+      const nonterminalByClient = new Map(
+        loadedNonterminalIntents.map((intent) => [intent.client_order_id, intent]),
+      );
+      const ownedByClient = new Map(
+        loadedOwnedIntents.map((intent) => [intent.client_order_id, intent]),
+      );
+      for (const intent of loadedOwnedIntents) this.knownIntents.set(intent.client_order_id, intent);
       const brokerHealth = await (this.deps.adapter.health?.() ?? Promise.resolve(null));
       this.health.broker_auth = brokerHealth === null || brokerHealth.authenticated ? "healthy" : "unhealthy";
       let brokerOrders: BrokerOrder[];
@@ -610,35 +675,15 @@ export class BoxOrderManager {
         this.health.broker_positions_api = "unhealthy";
         throw error;
       }
-      if (this.lastReconciledAt === null) {
-        this.reservations.clear();
-        this.reservedEntryQuantity = 0;
-        this.reductionReservations.clear();
-        this.reservedReductionsBySymbol.clear();
-        this.reservedReductionQuantity = 0;
-        for (const intent of intents) {
-          const remaining = Math.max(0, intent.quantity - intent.filled_quantity);
-          if (remaining === 0) continue;
-          if (intent.purpose === "ENTRY") {
-            this.reservations.set(intent.client_order_id, remaining);
-            this.reservedEntryQuantity += remaining;
-          } else if (intent.purpose !== "PROTECTIVE_CANCEL") {
-            const symbol = `${intent.exchange}:${intent.tradingsymbol}`;
-            this.reductionReservations.set(intent.client_order_id, { symbol, quantity: remaining });
-            this.reservedReductionsBySymbol.set(symbol, (this.reservedReductionsBySymbol.get(symbol) ?? 0) + remaining);
-            this.reservedReductionQuantity += remaining;
-          }
-        }
-      }
-      const byClient = new Map(ownedIntents.map((intent) => [intent.client_order_id, intent]));
+      const byClient = ownedByClient;
       const byBroker = new Map(
-        ownedIntents
+        loadedOwnedIntents
           .filter((intent): intent is IBoxOrderIntent & { broker_order_id: string } => Boolean(intent.broker_order_id))
           .map((intent) => [intent.broker_order_id, intent]),
       );
       // A tag is attribution-safe only when exactly one durable intent owns it.
       const byTag = new Map<string, IBoxOrderIntent | null>();
-      for (const intent of ownedIntents) {
+      for (const intent of loadedOwnedIntents) {
         if (!intent.broker_tag) continue;
         byTag.set(intent.broker_tag, byTag.has(intent.broker_tag) ? null : intent);
       }
@@ -679,7 +724,10 @@ export class BoxOrderManager {
           const attributed = this.deps.adapter.adoptOrder
             ? await this.deps.adapter.adoptOrder(intent, order)
             : { ...order, client_order_id: intent.client_order_id };
-          await this.persistOrder(intent, attributed, "broker reconciliation snapshot");
+          const updated = await this.persistOrder(intent, attributed, "broker reconciliation snapshot");
+          ownedByClient.set(updated.client_order_id, updated);
+          if (isBrokerOrderTerminal(updated.state)) nonterminalByClient.delete(updated.client_order_id);
+          else nonterminalByClient.set(updated.client_order_id, updated);
         } catch (error) {
           if (intent.trade_id) affectedTradeIds.add(intent.trade_id);
           identityMismatchSymbols.add(`${intent.exchange}:${intent.tradingsymbol}`);
@@ -689,27 +737,51 @@ export class BoxOrderManager {
       }
 
       const missingAtBroker: string[] = [];
-      for (const intent of intents) {
-        this.knownIntents.set(intent.client_order_id, intent);
+      for (const intent of loadedNonterminalIntents) {
         if (matchedClients.has(intent.client_order_id)) continue;
         missingAtBroker.push(intent.client_order_id);
         if (intent.trade_id) affectedTradeIds.add(intent.trade_id);
         if (intent.state !== "CREATED") {
-          await this.transition(
+          const updated = await this.transition(
             intent,
             "RECONCILIATION_REQUIRED",
             intent.broker_order_id,
             "durable nonterminal intent not found in broker order list; no resubmit",
           );
+          nonterminalByClient.set(updated.client_order_id, updated);
+          ownedByClient.set(updated.client_order_id, updated);
         }
         this.recoveryActive = true;
         this.trip(`durable nonterminal intent missing at broker: ${intent.client_order_id}`);
       }
 
+      const reconciledNonterminalIntents = [...nonterminalByClient.values()];
+      const reconciledOwnedIntents = [...ownedByClient.values()];
+      if (this.lastReconciledAt === null) {
+        this.reservations.clear();
+        this.reservedEntryQuantity = 0;
+        this.reductionReservations.clear();
+        this.reservedReductionsBySymbol.clear();
+        this.reservedReductionQuantity = 0;
+        for (const intent of reconciledNonterminalIntents) {
+          const remaining = Math.max(0, intent.quantity - intent.filled_quantity);
+          if (remaining === 0) continue;
+          if (intent.purpose === "ENTRY") {
+            this.reservations.set(intent.client_order_id, remaining);
+            this.reservedEntryQuantity += remaining;
+          } else if (intent.purpose !== "PROTECTIVE_CANCEL") {
+            const symbol = `${intent.exchange}:${intent.tradingsymbol}`;
+            this.reductionReservations.set(intent.client_order_id, { symbol, quantity: remaining });
+            this.reservedReductionsBySymbol.set(symbol, (this.reservedReductionsBySymbol.get(symbol) ?? 0) + remaining);
+            this.reservedReductionQuantity += remaining;
+          }
+        }
+      }
+
       const intentNetBySymbol = new Map<string, number>();
       const tradeRoleNet = new Map<string, number>();
       const ownedSymbols = new Set<string>();
-      for (const intent of ownedIntents) {
+      for (const intent of reconciledOwnedIntents) {
         const symbol = `${intent.exchange}:${intent.tradingsymbol}`;
         ownedSymbols.add(symbol);
         if (intent.filled_quantity <= 0) continue;
@@ -721,7 +793,7 @@ export class BoxOrderManager {
         }
       }
       const remainingByTrade: Record<string, Partial<Record<BoxLegRole, number>>> = {};
-      for (const intent of ownedIntents) {
+      for (const intent of reconciledOwnedIntents) {
         if (!intent.trade_id) continue;
         const roles = remainingByTrade[intent.trade_id] ?? {};
         roles[intent.role] = Math.abs(tradeRoleNet.get(`${intent.trade_id}:${intent.role}`) ?? 0);
@@ -751,15 +823,15 @@ export class BoxOrderManager {
         const actual = brokerBySymbol.get(symbol) ?? 0;
         if (expected !== actual && (expected !== 0 || ownedSymbols.has(symbol))) {
           positionMismatches.push({ symbol, expected, actual });
-          for (const intent of intents) {
+          for (const intent of reconciledOwnedIntents) {
             if (`${intent.exchange}:${intent.tradingsymbol}` === symbol && intent.trade_id) affectedTradeIds.add(intent.trade_id);
           }
           this.recoveryActive = true;
           this.trip(`broker-position mismatch for attributed Box symbol ${symbol}: expected ${expected}, actual ${actual}`);
         }
       }
-      this.unknownOrders = intents.filter((intent) => RECONCILE_STATES.has(intent.state)).length;
-      for (const intent of intents) {
+      this.unknownOrders = reconciledNonterminalIntents.filter((intent) => RECONCILE_STATES.has(intent.state)).length;
+      for (const intent of reconciledNonterminalIntents) {
         if (RECONCILE_STATES.has(intent.state) && intent.trade_id) affectedTradeIds.add(intent.trade_id);
       }
       this.orphanOrders = orphans.map(cloneOrder);
@@ -838,6 +910,7 @@ export class BoxOrderManager {
       if (order.filled_quantity > 0) {
         this.trip(`persistence lost after confirmed fill ${order.client_order_id}`);
         this.deps.onPersistenceLossAfterFill?.(order, error);
+        throw new OrderPersistenceAfterFillError(order, error);
       }
       throw error;
     }

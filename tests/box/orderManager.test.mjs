@@ -2,7 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { BrokerAmbiguousSubmitError } from "../../dist/box/brokerAdapter.js";
-import { BoxOrderManager } from "../../dist/box/orderManager.js";
+import {
+  BoxOrderManager,
+  OrderPersistenceAfterFillError,
+} from "../../dist/box/orderManager.js";
 
 const ROLES = ["k1_ce", "k2_ce", "k2_pe", "k1_pe"];
 const immutable = [
@@ -383,4 +386,141 @@ test("restart loads nonterminal work and reconstructs only the unfilled reservat
   const h = await managerHarness({ persistence, adapter });
   assert.equal(h.manager.status().reservedEntryQuantity, 35, "75 requested - 40 cumulatively filled = 35 reserved after restart");
   assert.equal(h.manager.status().unknownOrders, 0);
+});
+
+
+test("confirmed broker fills remain attached when their durable snapshot update fails", async () => {
+  class FailingAfterFillPersistence extends MemoryPersistence {
+    async update(clientOrderId, patch, audit) {
+      if (patch.filled_quantity > 0) throw new Error("mongo unavailable after fill");
+      return super.update(clientOrderId, patch, audit);
+    }
+  }
+  const persistence = new FailingAfterFillPersistence();
+  const h = await managerHarness({ persistence });
+  const req = request({ attempt_id: "fill-persistence-loss" });
+
+  await assert.rejects(
+    () => h.manager.submit(req),
+    (error) => {
+      assert.equal(error instanceof OrderPersistenceAfterFillError, true);
+      assert.equal(error.order.client_order_id, req.client_order_id);
+      assert.equal(error.order.filled_quantity, 75);
+      return true;
+    },
+  );
+  assert.equal(h.manager.status().health.persistence, "unhealthy");
+  assert.equal(h.manager.status().circuitBreaker.tripped, true);
+});
+
+test("queued entries re-check runtime controls before broker submission", async () => {
+  let release;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  let first = true;
+  const adapter = fakeAdapter({
+    submit: async (req) => {
+      if (first) { first = false; await blocked; }
+      return orderFrom(req);
+    },
+  });
+  const h = await managerHarness({ adapter });
+  const firstOrder = h.manager.submit(request({ role: "k1_ce", attempt_id: "active-before-disable" }));
+  await tick();
+  const queued = ROLES.slice(1).map((role) =>
+    h.manager.submit(request({ role, attempt_id: "queued-before-disable" })),
+  );
+  h.manager.setControls({ entryEnabled: false, liveOrderEnabled: false });
+  release();
+
+  const results = await Promise.allSettled([firstOrder, ...queued]);
+  assert.equal(results[0].status, "fulfilled", "already-submitted broker work is observed to completion");
+  assert.equal(results.slice(1).every((item) => item.status === "rejected"), true);
+  assert.equal(adapter.calls.filter(([name]) => name === "submit").length, 1);
+  assert.equal(h.manager.status().queued, 0);
+  assert.equal(h.manager.status().reservedEntryQuantity, 0);
+});
+
+test("reconciliation derives exact exposure from the adopted broker snapshot in the same pass", async () => {
+  const entryReq = request({ trade_id: "restart-exact", attempt_id: "entry", side: "BUY" });
+  const exitReq = request({
+    trade_id: "restart-exact",
+    attempt_id: "exit",
+    purpose: "EXIT",
+    phase: "exit",
+    side: "SELL",
+    tradingsymbol: entryReq.tradingsymbol,
+    token: entryReq.token,
+  });
+  const entryIntent = intentFrom(entryReq, "COMPLETE", 75);
+  const exitIntent = intentFrom(exitReq, "PARTIALLY_FILLED", 40);
+  const entryOrder = orderFrom(entryReq, { state: "COMPLETE", filled_quantity: 75 });
+  const completedExit = orderFrom(exitReq, { state: "COMPLETE", filled_quantity: 75 });
+  const persistence = new MemoryPersistence([entryIntent, exitIntent]);
+  const adapter = fakeAdapter({
+    orders: [entryOrder, completedExit],
+    listOrders: () => [clone(entryOrder), clone(completedExit)],
+    positions: [],
+  });
+  const h = await managerHarness({ persistence, adapter, reconcile: false });
+
+  const report = await h.manager.reconcile();
+  assert.equal(report.positionMismatches.length, 0);
+  assert.equal(report.remainingByTrade["restart-exact"].k1_ce, 0);
+  assert.equal(h.manager.status().health.reconciliation_complete, true);
+  assert.equal(h.manager.status().reservedReductionQuantity, 0);
+});
+
+test("feed reconnect warm-up blocks entry until its deterministic deadline", async () => {
+  let now = 10_000;
+  const manager = new BoxOrderManager({
+    adapter: fakeAdapter(),
+    persistence: new MemoryPersistence(),
+    limits: limits({ feedReconnectWarmupMs: 5_000 }),
+    controls: { entryEnabled: true, liveOrderEnabled: true, emergencyFlatten: false },
+    clock: { now: () => now },
+    istDayKey: () => "2026-09-02",
+  });
+  manager.seedLimits({ tradingDay: "2026-09-02" });
+  await manager.reconcile();
+  manager.setFeedHealthy(false);
+  manager.setFeedHealthy(true);
+
+  assert.equal(manager.status().health.feed, "warming");
+  assert.equal(manager.canEnter(), false);
+  now += 4_999;
+  assert.equal(manager.canEnter(), false);
+  now += 1;
+  assert.equal(manager.status().health.feed, "healthy");
+  assert.equal(manager.canEnter(), true);
+});
+
+
+test("startup reconciliation failure keeps the retry timer armed and persistence unhealthy", async () => {
+  class FlakyPersistence extends MemoryPersistence {
+    failLoads = true;
+    async loadNonterminal() {
+      if (this.failLoads) throw new Error("mongo read unavailable");
+      return super.loadNonterminal();
+    }
+  }
+  const persistence = new FlakyPersistence();
+  const manager = new BoxOrderManager({
+    adapter: fakeAdapter(),
+    persistence,
+    limits: limits(),
+    controls: { entryEnabled: true, liveOrderEnabled: true, emergencyFlatten: false },
+    istDayKey: () => "2026-09-02",
+  });
+  manager.seedLimits({ tradingDay: "2026-09-02" });
+  manager.setFeedHealthy(true);
+
+  await assert.rejects(() => manager.start(), /mongo read unavailable/);
+  assert.notEqual(manager.reconcileTimer, null, "periodic reconciliation remains armed after initial failure");
+  assert.equal(manager.status().health.persistence, "unhealthy");
+  assert.equal(manager.status().health.reconciliation_complete, false);
+
+  persistence.failLoads = false;
+  await manager.reconcile();
+  assert.equal(manager.status().health.persistence, "healthy");
+  manager.dispose();
 });

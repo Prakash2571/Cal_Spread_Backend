@@ -1228,7 +1228,7 @@ export interface BoxScannerConfigSnapshot {
   max_cross_leg_exchange_dispersion_ms?: number;
 }
 
-/** A persisted box paper trade. */
+/** A persisted Box strategy trade (paper or explicitly gated live). */
 export interface IBoxTrade {
   execution_mode: ExecutionMode;
 
