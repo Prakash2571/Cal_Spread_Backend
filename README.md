@@ -696,7 +696,16 @@ WebSocket level-2 data:
 
 Because of these, a `paper_legging` result is a *conservative, honest lower bound on execution
 quality given the data we can see* — useful for shadow-testing and calibration, **not** a promise of
-live fills. A **partial `paper_legging` exit** is additionally a known simplification: it is recorded
-as residual exposure and retried as a full close rather than modelled as a per-leg partial-close
-ledger (the intended trade size is one lot). Never read "the tests pass" or "not degraded" as
-"production-ready".
+live fills. Never read "the tests pass" or "not degraded" as "production-ready".
+
+**Partial exits are modelled exactly, not simplified.** Every open box carries per-role remaining
+quantity (`remaining_qty_by_role`). A `paper_legging` exit sizes each closing order from that exact
+outstanding quantity — so a role already flat is never re-closed and a partial close can never become
+reverse exposure. A partial exit decrements the per-role remaining, is persisted atomically before
+the execution is treated as clean (a crash cannot resurrect closed quantity), appends to an
+`exit_attempts` audit, and accumulates charges/realised-gross; the box is `closed` only once **every
+role is flat**. A partially-exited position is worked to flat (prioritising cleanup over convergence),
+and residual exposure from a failed unwind is flattened by a runtime loop that runs independently of
+RUN/STOP whenever the market is open and the feed is healthy. Manual and automatic closes share one
+code path and differ only in the exit reason; a manual close reports partial execution honestly
+rather than pretending nothing happened.
