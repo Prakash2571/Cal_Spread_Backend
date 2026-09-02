@@ -181,6 +181,15 @@ export class BoxEngine {
   private closedTodayGross = 0;
   /** Total basket margin that today's closed boxes had blocked while they were on. */
   private closedTodayMargin = 0;
+  /**
+   * Highest OPEN basket margin observed at any status sample since process start.
+   *
+   * Sampled, not continuously integrated: it can only reflect margin levels that
+   * actually coincided with a status read (or SSE publish), so it is a lower bound
+   * on the true peak, never an invented figure. Null until a first open-margin
+   * sample exists, and never backfilled from history that predates this process.
+   */
+  private peakConcurrentMargin: number | null = null;
   /** How many of today's closed boxes never got a margin figure back from Zerodha. */
   private closedTodayMarginUnknown = 0;
   /**
@@ -3120,6 +3129,11 @@ export class BoxEngine {
       if (pos.margin === null || pos.margin === undefined) openMarginUnknown++;
       else openMargin += pos.margin;
     }
+    // A same-instant sample of concurrently-blocked margin — the only honest input
+    // to a peak. Never fabricated for periods before this process was running.
+    if (openMargin > 0 && (this.peakConcurrentMargin === null || openMargin > this.peakConcurrentMargin)) {
+      this.peakConcurrentMargin = openMargin;
+    }
     const cachedSummary = this.pnlArchiver.getLastSummary();
     return {
       day: this.closedTodayDay,
@@ -3145,7 +3159,16 @@ export class BoxEngine {
        */
       open_margin_used: round2(openMargin),
       closed_margin_used: round2(this.closedTodayMargin),
+      /** @deprecated Kept for existing dashboards: identical to cumulative_trade_margin. */
       total_margin_used: round2(openMargin + this.closedTodayMargin),
+      /** Explicit SUM over the day — never a concurrent/peak figure. See total_margin_used. */
+      cumulative_trade_margin: round2(openMargin + this.closedTodayMargin),
+      /**
+       * Highest OPEN margin actually observed at any sampled instant since this
+       * process started. Null until a first open-margin sample exists; never
+       * reconstructed for time before the process was running.
+       */
+      peak_concurrent_margin: this.peakConcurrentMargin === null ? null : round2(this.peakConcurrentMargin),
       /** Boxes whose margin call never returned, so they are absent from the sums. */
       margin_unknown_count: openMarginUnknown + this.closedTodayMarginUnknown,
       /** Whether the Redis P&L cache is actively mirroring this figure. */

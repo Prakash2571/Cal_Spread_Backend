@@ -368,6 +368,8 @@ export interface BoxLegEvaluation {
   ask: number;
   ask_qty: number;
   quote_at: number | null;
+  /** Exchange publication timestamp for this immutable WS book, when supplied. */
+  exchange_at?: number | null;
   /** WS sequence of the exact immutable book used for this leg. */
   quote_version?: number | null;
   /**
@@ -592,11 +594,15 @@ export interface BoxExecutionLeg {
   detected_qty: number;
   detected_quote_version: number | null;
   detected_quote_at: number | null;
+  detected_exchange_at?: number | null;
+  /** Full immutable book from detection, including bid/ask/qty/depth. */
+  detected_depth?: BoxDepthSnapshot | null;
   /** The touch from the first WS book at/after the simulated arrival. */
   executed_price: number | null;
   executed_qty: number;
   executed_quote_version: number | null;
   executed_quote_at: number | null;
+  executed_exchange_at?: number | null;
   /**
    * Cost of the move, per unit: positive means the market moved AGAINST us
    * (paying more on a BUY, receiving less on a SELL).

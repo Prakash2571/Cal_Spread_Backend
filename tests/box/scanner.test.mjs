@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import { BoxScanner } from "../../dist/box/scanner.js";
 import { BoxChargeEstimator } from "../../dist/box/charges.js";
 import { BoxExecutionSimulator } from "../../dist/box/executionSimulator.js";
+import { BoxMetrics } from "../../dist/box/metrics.js";
 import { BoxPositionBook } from "../../dist/box/positions.js";
 import { BoxQuoteStore } from "../../dist/box/quotes.js";
 import {
@@ -42,11 +43,13 @@ function harness({
   let feedOk = feedHealthy;
   let mktOpen = marketOpen;
   let scanner;
+  const metrics = new BoxMetrics(conf.metricsWindow);
   const executionSim = new BoxExecutionSimulator({
     cfg: conf,
     quotes,
     isMarketOpen: () => mktOpen,
     isFeedHealthy: () => feedOk,
+    metrics,
   });
   const charges = new BoxChargeEstimator(chargeStub({ entryTotal, exitTotal }).fn, conf);
 
@@ -59,6 +62,7 @@ function harness({
     localCharges,
     executionSim,
     positions,
+    metrics,
     openPaperTrade: async (args) => {
       opened.push(args);
       positions.add({
@@ -103,6 +107,7 @@ function harness({
     positions,
     charges,
     localCharges,
+    metrics,
     opened,
     events,
     seedGood,
@@ -495,4 +500,434 @@ test("a box already open is published as OPEN", async () => {
   h.scanner.onTokensUpdated(tokens);
   const opp = h.scanner.listOpportunities(50).find((o) => o.key === h.candidate.key);
   assert.equal(opp.status, "OPEN");
+});
+
+
+/* --------------------- logical-attempt execution metrics ------------------ */
+
+test("a successful open counts exactly ONE logical attempt with attempted === completed", async () => {
+  const h = harness();
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+  await settle();
+
+  assert.equal(h.opened.length, 1);
+  const snap = h.metrics.snapshot();
+  assert.equal(snap.execution.attempted, 1);
+  assert.equal(snap.execution.completed, 1, "an immediate atomic fill is its own terminal state");
+  assert.equal(snap.execution.successful, 1);
+  assert.equal(snap.execution.failed, 0);
+  assert.equal(snap.execution.partial_recovered, 0);
+  assert.equal(snap.execution.partial_unresolved, 0);
+  assert.equal(snap.execution.aborted, 0);
+  assert.equal(
+    snap.execution.completed,
+    snap.execution.successful +
+      snap.execution.failed +
+      snap.execution.partial_recovered +
+      snap.execution.partial_unresolved +
+      snap.execution.aborted,
+    "completed must equal the sum of every mutually exclusive terminal outcome",
+  );
+  assert.equal(snap.execution.success_rate, 1);
+  assert.equal(snap.execution.failure_rate, 0);
+});
+
+test("a rejected entry counts one logical attempt with a FAILED terminal state, never inflating attempted beyond completed", async () => {
+  // The pipeline is dispatched (it clears the LOCAL pre-check), but an adverse
+  // move DURING the simulated latency removes the net edge by arrival, so the
+  // execution snapshot itself refuses the fill — this must still register as one
+  // resolved parent attempt, not a silent pre-dispatch skip.
+  const h = harness({
+    config: { executionMode: "paper_latency", simulatedDecisionMs: 0, simulatedLatencyMs: 60, executionMaxWaitMs: 200, executionPollMs: 5 },
+  });
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+
+  const at = Date.now();
+  const worse = quotesFor(h.candidate, { k1_ce: { ask: 360, askQty: 150 } }, { at });
+  for (const [token, q] of worse) {
+    h.quotes.applyTicks([{ token, last_price: q.last, bid: q.bid, ask: q.ask, bids: q.bids, asks: q.asks }], at);
+  }
+  await new Promise((r) => setTimeout(r, 220));
+
+  assert.equal(h.opened.length, 0);
+  const snap = h.metrics.snapshot();
+  assert.equal(snap.execution.attempted, 1);
+  assert.equal(snap.execution.completed, 1);
+  assert.equal(snap.execution.failed, 1);
+  assert.equal(snap.execution.successful, 0);
+  assert.ok(snap.execution.attempted >= snap.execution.completed);
+  assert.ok(
+    "below_expected_net_profit" in snap.execution.rejection_categories ||
+      "edge_disappeared" in snap.execution.rejection_categories,
+  );
+});
+
+test("candidates that never clear prefilter/qualification do not create a logical attempt", async () => {
+  const h = harness();
+  const tokens = h.seedGood({ k1_ce: { ask: 320 } }); // well under the gross prefilter
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+  await settle();
+
+  const snap = h.metrics.snapshot();
+  assert.equal(snap.execution.attempted, 0, "a pre-dispatch reject is not a strategy attempt");
+  assert.equal(snap.execution.completed, 0);
+});
+
+test("retries recorded on the metrics object never change the attempted denominator", async () => {
+  const h = harness();
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+
+  // Simulate internal leg-level retries that happen inside one logical attempt.
+  h.metrics.recordLogicalRetry();
+  h.metrics.recordLogicalRetry();
+  h.metrics.recordLogicalRetry();
+
+  h.scanner.onTokensUpdated(tokens);
+  await settle();
+
+  const snap = h.metrics.snapshot();
+  assert.equal(snap.execution.attempted, 1, "retries must never inflate the parent attempt count");
+  assert.equal(snap.execution.retries, 3);
+});
+
+
+/* --------------- paper_latency: deterioration / slippage scenarios -------- */
+
+/**
+ * Deterioration vs. arrival-book execution slippage are DIFFERENT numbers:
+ *
+ *   decision deterioration = detection expected net − realised expected net
+ *     (a strategy/latency-quality measurement: did the mispricing decay?)
+ *   arrival execution slippage = fill price vs. the ARRIVAL book the order
+ *     actually executed against (an execution-quality measurement)
+ *
+ * paper_latency prices the fill exactly from the captured arrival book, so its
+ * arrival-book slippage is deterministically zero — these tests pin the
+ * deterioration number instead, and assert the zero slippage is not confused
+ * with "no measurement".
+ */
+
+function latencyHarness(config = {}) {
+  return harness({
+    entryTotal: 0,
+    exitTotal: 0,
+    config: {
+      executionMode: "paper_latency",
+      simulatedDecisionMs: 0,
+      simulatedLatencyMs: 60,
+      executionMaxWaitMs: 200,
+      executionPollMs: 5,
+      safetyBuffer: 0,
+      minExpectedNetProfit: 1000,
+      minGrossEdge: 500,
+      ...config,
+    },
+  });
+}
+
+test("1. detection ₹1,875 net worsens to ₹1,500 by arrival: fills, and deterioration is exactly ₹375", async () => {
+  const h = latencyHarness();
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+
+  // K1 CE ask worsens 300 → 305 during latency: cost 175 → 180, gross 1875 → 1500.
+  const at = Date.now();
+  for (const [token, q] of quotesFor(h.candidate, { k1_ce: { ask: 305, askQty: 150 } }, { at })) {
+    h.quotes.applyTicks([{ token, last_price: q.last, bid: q.bid, ask: q.ask, bids: q.bids, asks: q.asks }], at);
+  }
+  await new Promise((r) => setTimeout(r, 220));
+
+  assert.equal(h.opened.length, 1, "1500 net still clears the ₹1,000 gate");
+  const snap = h.metrics.snapshot();
+  assert.equal(snap.execution.attempted, 1);
+  assert.equal(snap.execution.successful, 1);
+  assert.equal(snap.execution.decision_deterioration.last, 375);
+});
+
+test("2. detection ₹1,875 net collapses to ₹900 by arrival: refused, and the loss is booked as a FAILED terminal attempt", async () => {
+  const h = latencyHarness();
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+
+  // Cost 175 → 188 (gross 1875 → 900), below the ₹1,000 gate.
+  const at = Date.now();
+  for (const [token, q] of quotesFor(h.candidate, { k1_ce: { ask: 313, askQty: 150 } }, { at })) {
+    h.quotes.applyTicks([{ token, last_price: q.last, bid: q.bid, ask: q.ask, bids: q.bids, asks: q.asks }], at);
+  }
+  await new Promise((r) => setTimeout(r, 220));
+
+  assert.equal(h.opened.length, 0);
+  const snap = h.metrics.snapshot();
+  assert.equal(snap.execution.attempted, 1);
+  assert.equal(snap.execution.completed, 1);
+  assert.equal(snap.execution.failed, 1);
+  assert.ok("below_expected_net_profit" in snap.execution.rejection_categories);
+});
+
+test("3. an unchanged arrival book fills with zero deterioration AND zero execution slippage — not 'no measurement'", async () => {
+  const h = latencyHarness();
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+  await new Promise((r) => setTimeout(r, 220));
+
+  assert.equal(h.opened.length, 1);
+  const snap = h.metrics.snapshot();
+  assert.equal(snap.execution.decision_deterioration.last, 0);
+  assert.equal(snap.execution.execution_slippage.last, 0, "a genuine zero, distinct from an absent sample");
+  assert.equal(snap.execution.execution_slippage.samples, 1, "the sample WAS recorded, it just happens to be zero");
+});
+
+test("4. quantity vanishing from the arrival book is refused as insufficient_quantity, not silently retried as a new attempt", async () => {
+  const h = latencyHarness();
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+
+  // K2 CE (a SELL leg → needs a bid) shows only 10 lots at arrival — one lot (75)
+  // still cannot walk to a full fill within the marketable-limit band.
+  const at = Date.now();
+  for (const [token, q] of quotesFor(h.candidate, { k2_ce: { bid: 220, bidQty: 10, ask: 221, askQty: 150 } }, { at })) {
+    h.quotes.applyTicks([{ token, last_price: q.last, bid: q.bid, ask: q.ask, bids: q.bids, asks: q.asks }], at);
+  }
+  await new Promise((r) => setTimeout(r, 220));
+
+  assert.equal(h.opened.length, 0);
+  const snap = h.metrics.snapshot();
+  assert.equal(snap.execution.attempted, 1, "one strategy decision, whatever the internal book-walk did");
+  assert.equal(snap.execution.completed, 1);
+  assert.ok("insufficient_quantity" in snap.execution.rejection_categories);
+});
+
+test("5. a leg stale by arrival is refused as missing_book, counted as one resolved FAILED attempt", async () => {
+  const h = latencyHarness({ quoteMaxAgeMs: 30 });
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+  await new Promise((r) => setTimeout(r, 220));
+
+  assert.equal(h.opened.length, 0);
+  const snap = h.metrics.snapshot();
+  assert.equal(snap.execution.attempted, 1);
+  assert.equal(snap.execution.completed, 1);
+  assert.equal(snap.execution.failed, 1);
+  assert.ok("missing_book" in snap.execution.rejection_categories);
+});
+
+test("6. cross-leg exchange-timestamp incoherence under paper_legging refuses the candidate as one resolved FAILED attempt", async () => {
+  const h = harness({
+    entryTotal: 0,
+    exitTotal: 0,
+    config: {
+      executionMode: "paper_legging",
+      simulatedDecisionMs: 0,
+      simulatedLatencyMs: 10,
+      executionMaxWaitMs: 200,
+      executionPollMs: 5,
+      safetyBuffer: 0,
+      minExpectedNetProfit: 500,
+      minGrossEdge: 500,
+      maxCrossLegExchangeDispersionMs: 50,
+    },
+  });
+  const now = Date.now();
+  // All four legs carry a valid exchange timestamp, but wildly dispersed —
+  // K1 CE is 500ms stale relative to the other three at detection.
+  const map = quotesFor(h.candidate, {}, { at: now });
+  for (const [token, q] of map) {
+    const isSkewed = token === h.candidate.legs.k1_ce.token;
+    h.quotes.applyTicks(
+      [{
+        token,
+        last_price: q.last,
+        bid: q.bid,
+        ask: q.ask,
+        bids: q.bids,
+        asks: q.asks,
+        exchange_ts: isSkewed ? now - 500 : now,
+      }],
+      now,
+    );
+  }
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated([...map.keys()]);
+  await new Promise((r) => setTimeout(r, 60));
+
+  assert.equal(h.opened.length, 0, "an incoherent cross-sectional snapshot is never auto-entered");
+  const snap = h.metrics.snapshot();
+  assert.equal(snap.execution.attempted, 1);
+  assert.equal(snap.execution.completed, 1);
+  assert.equal(snap.execution.failed, 1);
+  assert.ok("cross_leg_time_skew" in snap.execution.rejection_categories);
+});
+
+
+/* --------------------- immutable detection/arrival snapshots -------------- */
+
+test("the persisted execution audit's detection depth survives later WS ticks unchanged", async () => {
+  const h = latencyHarness();
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+  await new Promise((r) => setTimeout(r, 220));
+
+  assert.equal(h.opened.length, 1);
+  const execution = h.opened[0].execution;
+  const k1 = execution.legs.find((l) => l.role === "k1_ce");
+  const snapshotAsk = k1.detected_depth?.asks?.[0]?.price ?? k1.detected_price;
+
+  // A later, unrelated tick must never reach back and mutate the audit record
+  // already returned from the fill.
+  const later = Date.now() + 5_000;
+  h.quotes.applyTicks(
+    [{ token: h.candidate.legs.k1_ce.token, last_price: 999, bid: 500, ask: 999, bids: [{ price: 500, qty: 1, orders: 1 }], asks: [{ price: 999, qty: 1, orders: 1 }] }],
+    later,
+  );
+
+  const stillSnapshotAsk = k1.detected_depth?.asks?.[0]?.price ?? k1.detected_price;
+  assert.equal(stillSnapshotAsk, snapshotAsk, "the stored detection snapshot is immutable");
+  assert.notEqual(h.quotes.get(h.candidate.legs.k1_ce.token).ask, snapshotAsk, "the live store DID move on");
+});
+
+
+/* -------------- regression: abort-after-fill classification / no double-count ------------- */
+
+test("a 4/4 legging fill that fails final re-qualification is ABORTED, never PARTIAL_RECOVERED", async () => {
+  // A gate set just ₹5 below the detection net (1425): pre-dispatch qualifies,
+  // but ANY in-flight adverse tick — even one that still fills within the
+  // marketable-limit chase band — drops the EXECUTED net below the gate. All
+  // four legs fill (each within its own limit), then the re-qualification on
+  // the executed prices fails: the true abort-after-fill case.
+  const h = harness({
+    config: {
+      executionMode: "paper_legging",
+      simulatedDecisionMs: 0,
+      simulatedLatencyMs: 30,
+      executionMaxWaitMs: 200,
+      executionPollMs: 5,
+      minExpectedNetProfit: 1420,
+    },
+  });
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+
+  // K1 CE ask worsens by exactly the 2-tick default chase band (₹0.10) — the
+  // leg still fills at its limit, but the ₹7.50 cost (0.10 × lot 75) is enough
+  // to push the executed net from ₹1,425 to ₹1,417.50, under the ₹1,420 gate.
+  const at = Date.now();
+  for (const [token, q] of quotesFor(h.candidate, { k1_ce: { ask: 300.1, askQty: 150 } }, { at })) {
+    h.quotes.applyTicks([{ token, last_price: q.last, bid: q.bid, ask: q.ask, bids: q.bids, asks: q.asks }], at);
+  }
+  // The four fills, the re-qualification failure and the emergency unwind of all
+  // four legs all happen after the simulated arrival — allow enough real time.
+  await new Promise((r) => setTimeout(r, 400));
+
+  assert.equal(h.opened.length, 0, "no box may be opened");
+  const snap = h.metrics.snapshot();
+  assert.equal(snap.execution.attempted, 1);
+  assert.equal(snap.execution.completed, 1);
+  assert.equal(snap.execution.aborted, 1, "a clean 4/4-then-reversed fill must count as ABORTED");
+  assert.equal(snap.execution.partial_recovered, 0, "must NOT be mislabelled as a clean recovery");
+  assert.equal(snap.execution.failed, 0);
+  assert.equal(snap.execution.partial_unresolved, 0);
+});
+
+test("decision_to_fill_ms is pushed exactly once per successful atomic fill, not twice", async () => {
+  const h = harness();
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+  await settle();
+
+  assert.equal(h.opened.length, 1);
+  const snap = h.metrics.snapshot();
+  assert.equal(snap.execution.decision_to_fill_ms.samples, 1, "one fill must contribute exactly one sample");
+  assert.equal(snap.execution.entry_slippage.samples, 1);
+});
+
+test("decision_to_fill_ms is pushed exactly once per successful legging (4/4) fill", async () => {
+  const h = harness({
+    config: { executionMode: "paper_legging", simulatedDecisionMs: 0, simulatedLatencyMs: 10, executionMaxWaitMs: 200, executionPollMs: 5 },
+  });
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+  await new Promise((r) => setTimeout(r, 60));
+
+  assert.equal(h.opened.length, 1);
+  const snap = h.metrics.snapshot();
+  assert.equal(snap.execution.decision_to_fill_ms.samples, 1, "one 4/4 fill must contribute exactly one sample");
+});
+
+test("a real leg-level retry (a resting/partial order filled again on a later tick) increments retries in production", async () => {
+  const h = harness({
+    config: { executionMode: "paper_legging", simulatedDecisionMs: 0, simulatedLatencyMs: 10, executionMaxWaitMs: 400, executionPollMs: 5 },
+  });
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+
+  // K1 CE (a BUY leg) shows nothing executable at arrival, then a fillable ask
+  // appears afterwards — the SAME order is retried on the later tick, not
+  // resubmitted as a new strategy attempt.
+  await new Promise((r) => setTimeout(r, 5));
+  const emptyAt = Date.now();
+  for (const [token, q] of quotesFor(h.candidate, { k1_ce: { bid: 299, bidQty: 150, ask: 0, askQty: 0 } }, { at: emptyAt })) {
+    h.quotes.applyTicks([{ token, last_price: q.last, bid: q.bid, ask: q.ask, bids: q.bids, asks: q.asks }], emptyAt);
+  }
+  await new Promise((r) => setTimeout(r, 40));
+  const laterAt = Date.now();
+  for (const [token, q] of quotesFor(h.candidate, {}, { at: laterAt })) {
+    h.quotes.applyTicks([{ token, last_price: q.last, bid: q.bid, ask: q.ask, bids: q.bids, asks: q.asks }], laterAt);
+  }
+  await new Promise((r) => setTimeout(r, 300));
+
+  const snap = h.metrics.snapshot();
+  assert.ok(snap.execution.retries >= 1, "a real per-order retry must be observable in the shipped stat");
+  assert.equal(snap.execution.attempted, 1, "the retry must never inflate the parent attempt count");
+});
+
+
+test("a real leg-level retry is also observable under sequential leg execution mode", async () => {
+  const h = harness({
+    config: {
+      executionMode: "paper_legging",
+      legExecutionMode: "sequential",
+      simulatedDecisionMs: 0,
+      simulatedLatencyMs: 10,
+      executionMaxWaitMs: 400,
+      executionPollMs: 5,
+    },
+  });
+  const tokens = h.seedGood();
+  h.scanner.setDiscovering(true);
+  h.scanner.onTokensUpdated(tokens);
+
+  // The FIRST leg released (k1_ce, a BUY) shows nothing executable at arrival,
+  // then a fillable ask appears afterwards — retried on the later tick, still
+  // within its own order, before the next leg is ever released.
+  await new Promise((r) => setTimeout(r, 5));
+  const emptyAt = Date.now();
+  for (const [token, q] of quotesFor(h.candidate, { k1_ce: { bid: 299, bidQty: 150, ask: 0, askQty: 0 } }, { at: emptyAt })) {
+    h.quotes.applyTicks([{ token, last_price: q.last, bid: q.bid, ask: q.ask, bids: q.bids, asks: q.asks }], emptyAt);
+  }
+  await new Promise((r) => setTimeout(r, 30));
+  const laterAt = Date.now();
+  for (const [token, q] of quotesFor(h.candidate, {}, { at: laterAt })) {
+    h.quotes.applyTicks([{ token, last_price: q.last, bid: q.bid, ask: q.ask, bids: q.bids, asks: q.asks }], laterAt);
+  }
+  await new Promise((r) => setTimeout(r, 500));
+
+  const snap = h.metrics.snapshot();
+  assert.ok(snap.execution.retries >= 1, "sequential mode must also surface a genuine per-order retry");
+  assert.equal(snap.execution.attempted, 1, "the retry must never inflate the parent attempt count in sequential mode either");
 });

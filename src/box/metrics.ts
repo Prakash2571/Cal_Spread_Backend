@@ -218,15 +218,36 @@ export class BoxMetrics {
   readonly exposureDuration: RingBuffer;
   /** Expected net at entry minus the eventual realised net of the closed trade (₹). */
   readonly expectedVsRealised: RingBuffer;
+  /** Detection expected net minus the realised entry net at actual fill prices (₹). */
+  readonly decisionDeterioration: RingBuffer;
+  /** Arrival-book execution slippage (₹): BUY fill−arrival, SELL arrival−fill, × filled qty. */
+  readonly arrivalExecutionSlippage: RingBuffer;
+  /** Detection → decision, decision → order send, and transport/fill components (ms). */
+  readonly detectionToDecision: RingBuffer;
+  readonly decisionToOrderSend: RingBuffer;
+  readonly orderLatency: RingBuffer;
+  readonly orderSendToAck: RingBuffer;
+  readonly ackToFill: RingBuffer;
 
   readonly evaluations = new RateMeter(60);
   readonly wsUpdates = new RateMeter(60);
   readonly ticks = new RateMeter(60);
 
   private counters = {
+    // Legacy simulator/event counters. Kept for the detailed legging diagnostics
+    // below, but never used as the execution-health denominator.
     executions_attempted: 0,
     executions_filled: 0,
     executions_failed: 0,
+    // Mutually exclusive parent ENTRY attempt lifecycle.
+    logical_attempted: 0,
+    logical_success: 0,
+    logical_partial_recovered: 0,
+    logical_partial_unresolved: 0,
+    logical_failed: 0,
+    logical_aborted: 0,
+    logical_retries: 0,
+    logical_terminal_conflicts: 0,
     reconciliations: 0,
     reconciliation_failures: 0,
     reconciliation_warnings: 0,
@@ -267,6 +288,10 @@ export class BoxMetrics {
   private failures = new Map<string, number>();
   /** Which leg role most often fails to fill under legging. Fixed 4-key space. */
   private leggingFailedRoles = new Map<string, number>();
+  /** Active parent attempts. Removed on terminal outcome, so this map stays bounded. */
+  private logicalAttempts = new Map<string, true>();
+  /** Fixed taxonomy only; parent terminal rejections never include exit diagnostics. */
+  private logicalRejections = new Map<string, number>();
 
   constructor(window = 500) {
     this.receiveToEvaluation = new RingBuffer(window);
@@ -283,6 +308,13 @@ export class BoxMetrics {
     this.lastFillLatency = new RingBuffer(window);
     this.exposureDuration = new RingBuffer(window);
     this.expectedVsRealised = new RingBuffer(window);
+    this.decisionDeterioration = new RingBuffer(window);
+    this.arrivalExecutionSlippage = new RingBuffer(window);
+    this.detectionToDecision = new RingBuffer(window);
+    this.decisionToOrderSend = new RingBuffer(window);
+    this.orderLatency = new RingBuffer(window);
+    this.orderSendToAck = new RingBuffer(window);
+    this.ackToFill = new RingBuffer(window);
   }
 
   startSampling(): void {
@@ -297,10 +329,71 @@ export class BoxMetrics {
     this.counters.executions_attempted++;
   }
 
-  recordExecutionFilled(slippage: number, decisionToFillMs: number | null): void {
+  /** Start exactly one parent ENTRY attempt. Repeated starts/retries never inflate it. */
+  beginLogicalAttempt(attemptId: string): boolean {
+    if (this.logicalAttempts.has(attemptId)) return false;
+    this.logicalAttempts.set(attemptId, true);
+    this.counters.logical_attempted++;
+    return true;
+  }
+
+  /** An internal leg/order retry; explicitly not a new strategy attempt. */
+  recordLogicalRetry(): void {
+    this.counters.logical_retries++;
+  }
+
+  /**
+   * Finish a parent ENTRY attempt once. Conflicting duplicate terminals are ignored
+   * and exposed as a diagnostic rather than corrupting the visible denominator.
+   */
+  finishLogicalAttempt(
+    attemptId: string,
+    outcome: "SUCCESS" | "FAILED" | "PARTIAL_RECOVERED" | "PARTIAL_UNRESOLVED" | "ABORTED",
+    reason?: string | null,
+    observations?: {
+      decisionDeterioration?: number | null;
+      arrivalExecutionSlippage?: number | null;
+      detectionToDecisionMs?: number | null;
+      decisionToOrderSendMs?: number | null;
+      orderLatencyMs?: number | null;
+      orderSendToAckMs?: number | null;
+      ackToFillMs?: number | null;
+      decisionToFillMs?: number | null;
+    },
+  ): boolean {
+    if (!this.logicalAttempts.delete(attemptId)) {
+      this.counters.logical_terminal_conflicts++;
+      return false;
+    }
+    switch (outcome) {
+      case "SUCCESS": this.counters.logical_success++; break;
+      case "FAILED": this.counters.logical_failed++; break;
+      case "PARTIAL_RECOVERED": this.counters.logical_partial_recovered++; break;
+      case "PARTIAL_UNRESOLVED": this.counters.logical_partial_unresolved++; break;
+      case "ABORTED": this.counters.logical_aborted++; break;
+    }
+    if (reason) this.logicalRejections.set(reason, (this.logicalRejections.get(reason) ?? 0) + 1);
+    if (observations) {
+      this.decisionDeterioration.push(observations.decisionDeterioration ?? Number.NaN);
+      this.arrivalExecutionSlippage.push(observations.arrivalExecutionSlippage ?? Number.NaN);
+      this.detectionToDecision.push(observations.detectionToDecisionMs ?? Number.NaN);
+      this.decisionToOrderSend.push(observations.decisionToOrderSendMs ?? Number.NaN);
+      this.orderLatency.push(observations.orderLatencyMs ?? Number.NaN);
+      this.orderSendToAck.push(observations.orderSendToAckMs ?? Number.NaN);
+      this.ackToFill.push(observations.ackToFillMs ?? Number.NaN);
+      this.decisionToFill.push(observations.decisionToFillMs ?? Number.NaN);
+    }
+    return true;
+  }
+
+  recordExecutionFilled(slippage: number, _decisionToFillMs: number | null): void {
     this.counters.executions_filled++;
     this.entrySlippage.push(slippage);
-    if (decisionToFillMs !== null) this.decisionToFill.push(decisionToFillMs);
+    // decisionToFill is now written EXCLUSIVELY by finishLogicalAttempt (the
+    // parent-attempt terminal call scanner.ts always makes) — pushing it here too
+    // would double-count every successful fill into the same ring buffer, since
+    // every call site of recordExecutionFilled is already wrapped by exactly one
+    // finishLogicalAttempt call in production.
   }
 
   recordExecutionFailed(reason: string): void {
@@ -469,25 +562,55 @@ export class BoxMetrics {
 
   /** The whole published view. Cold path: percentiles are computed here. */
   snapshot(at = Date.now()) {
-    const attempted = this.counters.executions_attempted;
-    const failed = this.counters.executions_failed;
+    const attempted = this.counters.logical_attempted;
+    const successful = this.counters.logical_success;
+    const failed = this.counters.logical_failed;
+    const partialRecovered = this.counters.logical_partial_recovered;
+    const partialUnresolved = this.counters.logical_partial_unresolved;
+    const aborted = this.counters.logical_aborted;
+    const completed = successful + failed + partialRecovered + partialUnresolved + aborted;
     const c = this.counters;
     const leggingTotal =
       c.legging_4_of_4 + c.legging_3_of_4 + c.legging_2_of_4 + c.legging_1_of_4 + c.legging_0_of_4;
     const rate = (n: number) => (leggingTotal > 0 ? Math.round((n / leggingTotal) * 10000) / 10000 : 0);
     return {
       execution: {
+        /** Parent strategy attempts. Internal order/leg retries are excluded. */
         attempted,
-        filled: this.counters.executions_filled,
+        completed,
+        successful,
+        partial_recovered: partialRecovered,
+        partial_unresolved: partialUnresolved,
         failed,
-        failure_rate: attempted > 0 ? Math.round((failed / attempted) * 10000) / 10000 : 0,
-        failures_by_reason: Object.fromEntries(this.failures),
-        /** ₹ of slippage versus the detected touch, entry side. */
+        aborted,
+        retries: c.logical_retries,
+        /** Compatibility alias: successful full-box opens. */
+        filled: successful,
+        /** Failures that left material exposure unresolved, over completed attempts. */
+        failure_rate: completed > 0 ? Math.round(((failed + partialUnresolved) / completed) * 10000) / 10000 : 0,
+        success_rate: completed > 0 ? Math.round((successful / completed) * 10000) / 10000 : 0,
+        rejection_categories: Object.fromEntries(this.logicalRejections),
+        /** Compatibility alias; now contains only parent-entry rejection categories. */
+        failures_by_reason: Object.fromEntries(this.logicalRejections),
+        /** Detection expected net − realised entry net at fill prices; positive is worse. */
+        decision_deterioration: this.decisionDeterioration.summary(),
+        /** Arrival-book fill cost; zero is valid when fills match the arrival book. */
+        execution_slippage: this.arrivalExecutionSlippage.summary(),
+        /** Legacy detection-touch comparison retained for historical dashboards. */
         entry_slippage: this.entrySlippage.summary(),
         exit_slippage: this.exitSlippage.summary(),
-        /** Detection → simulated fill, in ms. */
+        /** Detection → actual fill. */
         decision_to_fill_ms: this.decisionToFill.summary(),
         qualification_to_fill_ms: this.qualificationToFill.summary(),
+        latency: {
+          detection_to_decision_ms: this.detectionToDecision.summary(),
+          decision_to_order_send_ms: this.decisionToOrderSend.summary(),
+          simulated_or_real_order_latency_ms: this.orderLatency.summary(),
+          order_send_to_ack_ms: this.orderSendToAck.summary(),
+          ack_to_fill_ms: this.ackToFill.summary(),
+          detection_to_fill_ms: this.decisionToFill.summary(),
+        },
+        terminal_conflicts: c.logical_terminal_conflicts,
       },
       legging: {
         outcomes: {
