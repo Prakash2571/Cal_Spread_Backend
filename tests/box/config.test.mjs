@@ -13,19 +13,36 @@ import assert from "node:assert/strict";
 
 import { loadBoxConfig } from "../../dist/box/config.js";
 
-/** Run `fn` with BOX_EXECUTION_MODE set, always restoring the previous value. */
-function withMode(value, fn) {
-  const key = "BOX_EXECUTION_MODE";
-  const had = Object.prototype.hasOwnProperty.call(process.env, key);
-  const prev = process.env[key];
-  if (value === undefined) delete process.env[key];
-  else process.env[key] = value;
+/**
+ * Run with an isolated Box execution environment. `loadBoxConfig` reads env at
+ * call time, so the single cached ESM import is safe; restoring both keys in a
+ * finally block also keeps concurrently-loaded test modules uncontaminated.
+ */
+function withExecutionEnv({ mode, liveEnabled }, fn) {
+  const values = {
+    BOX_EXECUTION_MODE: mode,
+    BOX_LIVE_TRADING_ENABLED: liveEnabled,
+  };
+  const previous = new Map();
+  for (const [key, value] of Object.entries(values)) {
+    previous.set(key, Object.prototype.hasOwnProperty.call(process.env, key)
+      ? { present: true, value: process.env[key] }
+      : { present: false });
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   try {
     return fn();
   } finally {
-    if (had) process.env[key] = prev;
-    else delete process.env[key];
+    for (const [key, old] of previous) {
+      if (old.present) process.env[key] = old.value;
+      else delete process.env[key];
+    }
   }
+}
+
+function withMode(mode, fn) {
+  return withExecutionEnv({ mode, liveEnabled: undefined }, fn);
 }
 
 test("BOX_EXECUTION_MODE=paper_legging is accepted (never silently downgraded)", () => {
@@ -50,22 +67,47 @@ test("the mode parser is case- and whitespace-insensitive", () => {
   }
 });
 
-test("an unknown or empty mode falls back to the paper_latency default", () => {
-  for (const raw of ["", "   ", "live", "paper", "paper_legging_v2", "nonsense"]) {
-    withMode(raw, () => {
-      assert.equal(loadBoxConfig().executionMode, "paper_latency", `failed for ${JSON.stringify(raw)}`);
+test("unset or blank mode keeps the paper_latency default with live disabled", () => {
+  for (const mode of [undefined, "", "   "]) {
+    withExecutionEnv({ mode, liveEnabled: undefined }, () => {
+      const config = loadBoxConfig();
+      assert.equal(config.executionMode, "paper_latency");
+      assert.equal(config.liveTradingEnabled, false);
     });
   }
-  withMode(undefined, () => {
-    assert.equal(loadBoxConfig().executionMode, "paper_latency");
+});
+
+test("unknown BOX_EXECUTION_MODE values fail closed", () => {
+  for (const mode of ["paper", "real", "zerodha", "paper_legging_v2", "nonsense"]) {
+    withExecutionEnv({ mode, liveEnabled: undefined }, () => {
+      assert.throws(() => loadBoxConfig(), /invalid BOX_EXECUTION_MODE/);
+    });
+  }
+});
+
+test("live mode is rejected when the independent live gate is absent or false", () => {
+  for (const liveEnabled of [undefined, "", "false", "0", "no"]) {
+    withExecutionEnv({ mode: "live", liveEnabled }, () => {
+      assert.throws(
+        () => loadBoxConfig(),
+        /BOX_EXECUTION_MODE=live requires BOX_LIVE_TRADING_ENABLED=true/,
+      );
+    });
+  }
+});
+
+test("live mode loads only when BOX_LIVE_TRADING_ENABLED=true", () => {
+  withExecutionEnv({ mode: " LiVe ", liveEnabled: "true" }, () => {
+    const config = loadBoxConfig();
+    assert.equal(config.executionMode, "live");
+    assert.equal(config.liveTradingEnabled, true);
   });
 });
 
-test("live order placement can never be configured", () => {
-  for (const raw of ["live", "real", "zerodha", "LIVE"]) {
-    withMode(raw, () => {
-      const mode = loadBoxConfig().executionMode;
-      assert.ok(mode.startsWith("paper_"), `${raw} must not select a non-paper mode (got ${mode})`);
+test("paper modes are unchanged even when the live gate is false", () => {
+  for (const mode of ["paper_touch", "paper_latency", "paper_legging"]) {
+    withExecutionEnv({ mode, liveEnabled: "false" }, () => {
+      assert.equal(loadBoxConfig().executionMode, mode);
     });
   }
 });

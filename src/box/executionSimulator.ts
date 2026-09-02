@@ -242,6 +242,16 @@ export class BoxExecutionSimulator {
     const { candidate, detection } = args;
     const key = candidate.key;
 
+    // Live execution is owned by OrderManager. Until the engine is explicitly
+    // integrated with it, never let `live` fall through to a paper fill model.
+    if (this.mode === "live") {
+      return this.refuse(
+        detection,
+        "discovery_stopped",
+        "live OrderManager is not integrated with BoxExecutionSimulator; refusing a paper fallback",
+      );
+    }
+
     if (this.inFlight.has(key)) {
       return this.refuse(detection, "duplicate", "an execution pipeline is already running for this candidate");
     }
@@ -1227,6 +1237,15 @@ export class BoxExecutionSimulator {
     const { position, detectionLegs } = args;
     const key = `exit:${position.id}`;
     const direction = position.direction ?? "LONG_BOX";
+
+    if (this.mode === "live") {
+      return this.refuseLegs(
+        detectionLegs,
+        args.detectedAt,
+        "discovery_stopped",
+        "live OrderManager is not integrated with BoxExecutionSimulator; refusing a paper fallback",
+      );
+    }
 
     if (this.inFlight.has(key)) {
       return this.refuseLegs(detectionLegs, args.detectedAt, "duplicate", "an exit pipeline is already running for this position");

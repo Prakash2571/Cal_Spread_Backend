@@ -20,6 +20,7 @@ import type {
   BoxDepthLevel,
   BoxDepthSnapshot,
   IBoxExecutionAttempt,
+  IBoxOrderIntent,
   BoxEventLeg,
   BoxLegCharges,
   IBoxLeg,
@@ -184,9 +185,32 @@ const scannerConfigSchema = new mongoose.Schema(
     min_exit_net_pnl: { type: Number, default: 0 },
     profit_capture_pct: { type: Number, default: 0 },
     min_captured_pct: { type: Number, default: 0 },
-    execution_mode: { type: String, default: "paper_touch" },
+    execution_mode: {
+      type: String,
+      enum: ["paper_touch", "paper_latency", "paper_legging", "live"],
+      default: "paper_touch",
+    },
     simulated_decision_ms: { type: Number, default: 0 },
     simulated_latency_ms: { type: Number, default: 0 },
+    live_trading_enabled: { type: Boolean, default: null },
+    live_reconcile_interval_ms: { type: Number, default: null },
+    live_feed_reconnect_warmup_ms: { type: Number, default: null },
+    live_max_open_boxes: { type: Number, default: null },
+    live_max_concurrent_executions: { type: Number, default: null },
+    live_max_residual_legs: { type: Number, default: null },
+    live_daily_loss_limit: { type: Number, default: null },
+    live_reject_limit: { type: Number, default: null },
+    live_consecutive_failure_limit: { type: Number, default: null },
+    live_max_open_leg_quantity: { type: Number, default: null },
+    live_max_gross_open_leg_quantity: { type: Number, default: null },
+    live_http_timeout_ms: { type: Number, default: null },
+    live_ack_timeout_ms: { type: Number, default: null },
+    live_working_timeout_ms: { type: Number, default: null },
+    live_partial_timeout_ms: { type: Number, default: null },
+    live_cancel_timeout_ms: { type: Number, default: null },
+    live_max_modifications: { type: Number, default: null },
+    live_max_chase_ticks: { type: Number, default: null },
+    live_broker_min_interval_ms: { type: Number, default: null },
     // Executable-order-pricing knobs a paper_legging fill was taken under. All
     // optional/defaulted so trades written before they existed keep loading.
     leg_max_chase_ticks: { type: Number, default: null },
@@ -202,10 +226,9 @@ const scannerConfigSchema = new mongoose.Schema(
 
 const boxTradeSchema = new mongoose.Schema<IBoxTrade>(
   {
-    // Never "live" — this module never places an exchange order.
     execution_mode: {
       type: String,
-      enum: ["paper_touch", "paper_latency", "paper_legging"],
+      enum: ["paper_touch", "paper_latency", "paper_legging", "live"],
       default: "paper_touch",
     },
 
@@ -271,7 +294,11 @@ const boxTradeSchema = new mongoose.Schema<IBoxTrade>(
     // adoption defaults a missing map to a full lot on every role). `exit_attempts`
     // is an audit blob and is projected out of list views (see LIST_EXCLUDE_AUDIT).
     remaining_qty_by_role: { type: mongoose.Schema.Types.Mixed, default: null },
-    position_state: { type: String, enum: ["BOX", "PARTIALLY_EXITED", null], default: null },
+    position_state: {
+      type: String,
+      enum: ["BOX", "PARTIALLY_EXITED", "RECOVERY", "FLAT", null],
+      default: null,
+    },
     exit_attempts: { type: mongoose.Schema.Types.Mixed, default: null },
     cumulative_exit_charges: { type: Number, default: null },
 
@@ -290,6 +317,7 @@ const boxTradeSchema = new mongoose.Schema<IBoxTrade>(
     realised_net_pnl: { type: Number, default: null },
 
     closed_at: { type: Date, default: null },
+    close_idempotency_key: { type: String, default: null },
     exit_reason: {
       type: String,
       enum: ["EDGE_CONVERGED", "PROFIT_CAPTURE", "MANUAL", "EXPIRY_SAFETY", null],
@@ -395,7 +423,11 @@ const boxTradeEventSchema = new mongoose.Schema<IBoxTradeEvent>(
     upper_strike: { type: Number, default: 0 },
     lot_size: { type: Number, default: 0 },
     quantity: { type: Number, default: 0 },
-    execution_mode: { type: String, default: "paper_touch" },
+    execution_mode: {
+      type: String,
+      enum: ["paper_touch", "paper_latency", "paper_legging", "live"],
+      default: "paper_touch",
+    },
 
     box_width: { type: Number, default: null },
     box_cost: { type: Number, default: null },
@@ -433,6 +465,93 @@ export function isBoxEventLedgerEnabled(): boolean {
     : mongoose.connection.readyState === 1;
 }
 
+/* ----------------------------- order intents ------------------------------ */
+
+const boxOrderIntentAuditSchema = new mongoose.Schema(
+  {
+    audit_id: { type: String, required: true },
+    at: { type: Date, required: true },
+    from_state: { type: String, default: null },
+    to_state: { type: String, required: true },
+    broker_order_id: { type: String, default: null },
+    message: { type: String, default: null },
+    fill_identity: { type: String, default: null },
+    payload: { type: mongoose.Schema.Types.Mixed, default: null },
+  },
+  { _id: false },
+);
+
+const boxOrderIntentSchema = new mongoose.Schema(
+  {
+    client_order_id: { type: String, required: true },
+    broker_order_id: { type: String, default: null },
+    broker_mode: { type: String, enum: ["paper", "live"], required: true },
+    trade_id: { type: String, default: null },
+    attempt_id: { type: String, required: true },
+    role: { type: String, enum: ["k1_ce", "k2_ce", "k2_pe", "k1_pe"], required: true },
+    purpose: {
+      type: String,
+      enum: ["ENTRY", "EXIT", "EMERGENCY_RESIDUAL", "PROTECTIVE_CANCEL"],
+      required: true,
+    },
+    phase: { type: String, enum: ["entry", "exit", "unwind"], required: true },
+    exchange: { type: String, required: true },
+    tradingsymbol: { type: String, required: true },
+    token: { type: Number, required: true },
+    side: { type: String, enum: ["BUY", "SELL"], required: true },
+    quantity: { type: Number, required: true },
+    reference_price: { type: Number, required: true },
+    tick_size: { type: Number, required: true },
+    max_chase_ticks: { type: Number, required: true },
+    limit_price: { type: Number, required: true },
+    state: {
+      type: String,
+      enum: [
+        "CREATED", "SUBMITTING", "ACKNOWLEDGED", "OPEN", "PARTIALLY_FILLED",
+        "COMPLETE", "CANCEL_REQUESTED", "CANCELLED", "REJECTED", "UNKNOWN",
+        "RECONCILIATION_REQUIRED",
+      ],
+      default: "CREATED",
+    },
+    filled_quantity: { type: Number, default: 0 },
+    average_price: { type: Number, default: null },
+    broker_tag: { type: String, default: null },
+    reject_family: { type: String, default: null },
+    reject_reason: { type: String, default: null },
+    created_at: { type: Date, required: true },
+    updated_at: { type: Date, required: true },
+    terminal_at: { type: Date, default: null },
+    audit: { type: [boxOrderIntentAuditSchema], default: [] },
+  },
+  { collection: "box_order_intents" },
+);
+
+boxOrderIntentSchema.index(
+  { client_order_id: 1 },
+  { unique: true, name: "box_order_intent_client_order_id" },
+);
+boxOrderIntentSchema.index(
+  { broker_order_id: 1 },
+  {
+    unique: true,
+    sparse: true,
+    partialFilterExpression: { broker_order_id: { $type: "string" } },
+    name: "box_order_intent_broker_order_id",
+  },
+);
+boxOrderIntentSchema.index({ trade_id: 1, created_at: -1 });
+boxOrderIntentSchema.index({ attempt_id: 1, created_at: -1 });
+boxOrderIntentSchema.index({ state: 1, updated_at: 1 });
+
+export interface BoxOrderIntentRecord extends IBoxOrderIntent {
+  _id: mongoose.Types.ObjectId;
+}
+
+export const BoxOrderIntent = boxModel<IBoxOrderIntent>(
+  "BoxOrderIntent",
+  boxOrderIntentSchema as unknown as mongoose.Schema<IBoxOrderIntent>,
+);
+
 /* -------------------------- execution attempts ---------------------------- */
 
 /**
@@ -453,7 +572,11 @@ const boxExecutionAttemptSchema = new mongoose.Schema(
     upper_strike: { type: Number, default: 0 },
     lot_size: { type: Number, default: 0 },
     quantity: { type: Number, default: 0 },
-    execution_mode: { type: String, default: "paper_legging" },
+    execution_mode: {
+      type: String,
+      enum: ["paper_touch", "paper_latency", "paper_legging", "live"],
+      default: "paper_legging",
+    },
     leg_execution_mode: { type: String, default: null },
     detected_at: { type: Date, default: () => new Date() },
     resolved_at: { type: Date, default: () => new Date(), index: true },

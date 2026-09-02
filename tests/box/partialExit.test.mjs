@@ -43,6 +43,7 @@ const EXIT_PRICE = { k1_ce: 299, k2_ce: 221, k2_pe: 199, k1_pe: 106 };
  */
 function fakeSim({ plan, executable } = {}) {
   const submissions = []; // one entry per simulateLeggingExit call
+  const invariantViolations = [];
   let call = 0;
   const buildResult = (position) => {
     const outstanding = outstandingRoles(position);
@@ -53,7 +54,9 @@ function fakeSim({ plan, executable } = {}) {
     const fills_by_role = {};
     let fullyClosed = 0;
     for (const { role, quantity } of outstanding) {
-      const closed = Math.min(quantity, closeMap[role] ?? 0);
+      // Do not sanitize the fake executor's report here: the monitor must detect
+      // an impossible broker over-fill rather than having the test harness hide it.
+      const closed = closeMap[role] ?? 0;
       fills_by_role[role] = closed;
       if (closed > 0) {
         legs.push({
@@ -90,6 +93,8 @@ function fakeSim({ plan, executable } = {}) {
   };
   return {
     submissions,
+    invariantViolations,
+    invariantViolation: (reason) => invariantViolations.push(reason),
     simulateLeggingExit: async ({ position }) => buildResult(position),
     estimateExecutableExit: (position) =>
       outstandingRoles(position).map(({ role, quantity }) => ({
@@ -136,6 +141,7 @@ function harness({ plan = [{}], executable, exitValuePerUnit = 198, config = {} 
         remaining: { ...args.position.remaining_qty_by_role },
         state: args.position.position_state,
         residual: args.residual.map((r) => ({ role: r.role, quantity: r.quantity })),
+        attempts: args.position.exit_attempts.map((attempt) => ({ ...attempt })),
       });
       return true;
     },
@@ -256,17 +262,25 @@ test("C. repeated partial fills on one role never over-close", async () => {
 
 /* ------------------- F. no-reverse-exposure invariant ---------------------- */
 
-test("F. an over-close is clamped, never turned into reverse exposure", async () => {
-  // The executor (buggily) reports closing 200 of a 75 lot. The monitor must clamp
-  // to 75, leave remaining at 0 (never negative), and flag the invariant breach.
+test("F. an over-close is quarantined without clamping or changing quantities", async () => {
   const h = harness({ plan: [{ k1_ce: 200, k2_ce: 75, k2_pe: 75, k1_pe: 75 }] });
+  const before = { ...h.position.remaining_qty_by_role };
+
   await h.monitor.cycle();
-  for (const role of ROLES) {
-    assert.ok(h.position.remaining_qty_by_role[role] >= 0, `${role} never negative`);
-    assert.ok(h.position.remaining_qty_by_role[role] <= LOT, `${role} never above the lot`);
-  }
-  // All roles clamped to flat → closed.
-  assert.equal(h.closes.length, 1);
+
+  assert.equal(h.closes.length, 0, "an impossible fill must never close the trade");
+  assert.equal(h.positions.size, 1, "the trade remains open for reconciliation");
+  assert.equal(h.position.position_state, "RECOVERY");
+  assert.deepEqual(h.position.remaining_qty_by_role, before, "no role is clamped or decremented");
+  for (const role of ROLES) assert.ok(h.position.remaining_qty_by_role[role] >= 0, `${role} stays nonnegative`);
+  assert.equal(h.sim.invariantViolations.length, 1, "the central invariant hook is called");
+  assert.match(h.sim.invariantViolations[0], /confirmed fill invariant violated/);
+  assert.equal(h.position.exit_attempts.length, 1, "the recovery attempt is appended in memory");
+  assert.equal(h.position.exit_attempts[0].status, "INVARIANT_VIOLATION");
+  assert.equal(h.partials.length, 1, "the unchanged recovery projection is persisted");
+  assert.equal(h.partials[0].state, "RECOVERY");
+  assert.deepEqual(h.partials[0].remaining, before);
+  assert.equal(h.partials[0].attempts.at(-1).status, "INVARIANT_VIOLATION");
 });
 
 test("F2. every scripted partial keeps 0 <= remaining <= original for all roles", async () => {

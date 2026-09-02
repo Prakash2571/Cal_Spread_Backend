@@ -97,15 +97,20 @@ function queueModel(name: string, fallback: BoxQueueModel): BoxQueueModel {
 function executionMode(name: string, fallback: ExecutionMode): ExecutionMode {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
-  const v = raw.trim().toLowerCase();
-  if (v === "paper_touch") return "paper_touch";
-  if (v === "paper_latency") return "paper_latency";
-  // paper_legging MUST be accepted here: it is a first-class execution model, and
-  // silently falling back to paper_latency made the whole four-independent-order
-  // simulation unreachable from configuration (and reported the wrong mode).
-  if (v === "paper_legging") return "paper_legging";
-  console.warn(`[Box] ignoring unknown ${name}="${raw}" — using ${fallback}.`);
-  return fallback;
+  const value = raw.trim().toLowerCase();
+  if (
+    value === "paper_touch" ||
+    value === "paper_latency" ||
+    value === "paper_legging" ||
+    value === "live"
+  ) {
+    return value;
+  }
+  // Execution selection is safety-critical. A misspelling must stop startup,
+  // never silently switch the process to a different execution model.
+  throw new Error(
+    `[Box] invalid ${name}="${raw}"; expected paper_touch, paper_latency, paper_legging, or live.`,
+  );
 }
 
 export interface BoxConfig {
@@ -136,6 +141,33 @@ export interface BoxConfig {
   executionPollMs: number;
   /** Cap on simultaneous simulated execution pipelines. */
   maxConcurrentExecutions: number;
+
+  // ---- Live execution safety envelope (env-only, fail-closed) ----
+  /** Deployment kill switch. `executionMode=live` is invalid unless this is true. */
+  liveTradingEnabled: boolean;
+  /** Low-frequency broker reconciliation cadence. */
+  liveReconcileIntervalMs: number;
+  /** Quiet period after a feed reconnect before a new entry may be submitted. */
+  liveFeedReconnectWarmupMs: number;
+  liveMaxOpenBoxes: number;
+  liveMaxConcurrentExecutions: number;
+  liveMaxResidualLegs: number;
+  liveDailyLossLimit: number;
+  liveRejectLimit: number;
+  liveConsecutiveFailureLimit: number;
+  /** Maximum quantity in one live leg and across all absolute open leg quantities. */
+  liveMaxOpenLegQuantity: number;
+  liveMaxGrossOpenLegQuantity: number;
+  /** Distinct bounded deadlines for transport and broker lifecycle phases. */
+  liveHttpTimeoutMs: number;
+  liveAckTimeoutMs: number;
+  liveWorkingTimeoutMs: number;
+  livePartialTimeoutMs: number;
+  liveCancelTimeoutMs: number;
+  liveMaxModifications: number;
+  liveMaxChaseTicks: number;
+  /** Minimum interval between broker transport calls. */
+  liveBrokerMinIntervalMs: number;
 
   // ---- paper_legging: four independent orders ----
   /** How the four legs are submitted: "parallel" (default) or "sequential". */
@@ -499,13 +531,41 @@ export const BOX_TUNING_KEYS: Record<keyof BoxTuning, string> = {
 };
 
 export function loadBoxConfig(): BoxConfig {
+  const mode = executionMode("BOX_EXECUTION_MODE", "paper_latency");
+  const liveTradingEnabled = bool("BOX_LIVE_TRADING_ENABLED", false);
+  if (mode === "live" && !liveTradingEnabled) {
+    throw new Error(
+      "[Box] BOX_EXECUTION_MODE=live requires BOX_LIVE_TRADING_ENABLED=true; refusing to start live execution.",
+    );
+  }
+
   return {
-    executionMode: executionMode("BOX_EXECUTION_MODE", "paper_latency"),
+    executionMode: mode,
     simulatedDecisionMs: num("BOX_SIMULATED_DECISION_MS", 40),
     simulatedLatencyMs: num("BOX_SIMULATED_LATENCY_MS", 250),
     executionMaxWaitMs: num("BOX_EXECUTION_MAX_WAIT_MS", 1500),
     executionPollMs: num("BOX_EXECUTION_POLL_MS", 20),
     maxConcurrentExecutions: num("BOX_MAX_CONCURRENT_EXECUTIONS", 8),
+
+    liveTradingEnabled,
+    liveReconcileIntervalMs: clampInt("BOX_LIVE_RECONCILE_INTERVAL_MS", 60_000, 5_000, 15 * 60_000),
+    liveFeedReconnectWarmupMs: clampInt("BOX_LIVE_FEED_RECONNECT_WARMUP_MS", 5_000, 0, 5 * 60_000),
+    liveMaxOpenBoxes: clampInt("BOX_LIVE_MAX_OPEN_BOXES", 1, 0, 20),
+    liveMaxConcurrentExecutions: clampInt("BOX_LIVE_MAX_CONCURRENT_EXECUTIONS", 1, 1, 4),
+    liveMaxResidualLegs: clampInt("BOX_LIVE_MAX_RESIDUAL_LEGS", 1, 0, 4),
+    liveDailyLossLimit: clampInt("BOX_LIVE_DAILY_LOSS_LIMIT", 5_000, 0, 10_000_000),
+    liveRejectLimit: clampInt("BOX_LIVE_REJECT_LIMIT", 3, 1, 100),
+    liveConsecutiveFailureLimit: clampInt("BOX_LIVE_CONSECUTIVE_FAILURE_LIMIT", 3, 1, 100),
+    liveMaxOpenLegQuantity: clampInt("BOX_LIVE_MAX_OPEN_LEG_QUANTITY", 100, 1, 1_000_000),
+    liveMaxGrossOpenLegQuantity: clampInt("BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY", 400, 1, 4_000_000),
+    liveHttpTimeoutMs: clampInt("BOX_LIVE_HTTP_TIMEOUT_MS", 5_000, 250, 30_000),
+    liveAckTimeoutMs: clampInt("BOX_LIVE_ACK_TIMEOUT_MS", 3_000, 250, 30_000),
+    liveWorkingTimeoutMs: clampInt("BOX_LIVE_WORKING_TIMEOUT_MS", 30_000, 1_000, 10 * 60_000),
+    livePartialTimeoutMs: clampInt("BOX_LIVE_PARTIAL_TIMEOUT_MS", 10_000, 500, 5 * 60_000),
+    liveCancelTimeoutMs: clampInt("BOX_LIVE_CANCEL_TIMEOUT_MS", 5_000, 250, 60_000),
+    liveMaxModifications: clampInt("BOX_LIVE_MAX_MODIFICATIONS", 2, 0, 10),
+    liveMaxChaseTicks: clampInt("BOX_LIVE_MAX_CHASE_TICKS", 2, 0, 20),
+    liveBrokerMinIntervalMs: clampInt("BOX_LIVE_BROKER_MIN_INTERVAL_MS", 250, 50, 5_000),
 
     legExecutionMode:
       (process.env.BOX_LEG_EXECUTION_MODE?.trim().toLowerCase() === "sequential"
@@ -642,6 +702,25 @@ export function configSnapshot(cfg: BoxConfig): BoxScannerConfigSnapshot {
     execution_mode: cfg.executionMode,
     simulated_decision_ms: cfg.simulatedDecisionMs,
     simulated_latency_ms: cfg.simulatedLatencyMs,
+    live_trading_enabled: cfg.liveTradingEnabled,
+    live_reconcile_interval_ms: cfg.liveReconcileIntervalMs,
+    live_feed_reconnect_warmup_ms: cfg.liveFeedReconnectWarmupMs,
+    live_max_open_boxes: cfg.liveMaxOpenBoxes,
+    live_max_concurrent_executions: cfg.liveMaxConcurrentExecutions,
+    live_max_residual_legs: cfg.liveMaxResidualLegs,
+    live_daily_loss_limit: cfg.liveDailyLossLimit,
+    live_reject_limit: cfg.liveRejectLimit,
+    live_consecutive_failure_limit: cfg.liveConsecutiveFailureLimit,
+    live_max_open_leg_quantity: cfg.liveMaxOpenLegQuantity,
+    live_max_gross_open_leg_quantity: cfg.liveMaxGrossOpenLegQuantity,
+    live_http_timeout_ms: cfg.liveHttpTimeoutMs,
+    live_ack_timeout_ms: cfg.liveAckTimeoutMs,
+    live_working_timeout_ms: cfg.liveWorkingTimeoutMs,
+    live_partial_timeout_ms: cfg.livePartialTimeoutMs,
+    live_cancel_timeout_ms: cfg.liveCancelTimeoutMs,
+    live_max_modifications: cfg.liveMaxModifications,
+    live_max_chase_ticks: cfg.liveMaxChaseTicks,
+    live_broker_min_interval_ms: cfg.liveBrokerMinIntervalMs,
     // Executable-order-pricing knobs, frozen so a paper_legging fill stays
     // interpretable after the defaults are retuned.
     leg_max_chase_ticks: cfg.legMaxChaseTicks,

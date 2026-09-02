@@ -2,12 +2,12 @@
  * The box engine: the one object that owns the module's lifecycle.
  *
  * It wires the shared market-data feed to the scanner and the position monitor,
- * maintains the ATM±3 strike windows and their subscriptions, performs the paper
- * fills, persists them, and publishes state to the UI.
+ * maintains the ATM±3 strike windows and their subscriptions, executes through
+ * one mode-neutral gateway, persists fills, and publishes state to the UI.
  *
  * Two independent switches:
  *
- *   DISCOVERY  (RUN / STOP)  — opening NEW paper boxes.
+ *   DISCOVERY  (RUN / STOP)  — opening NEW boxes.
  *   MONITORING (always on)   — managing and exiting boxes that are already open.
  *
  * STOP only turns discovery off. Positions never become unmanaged.
@@ -33,6 +33,9 @@ import {
 import { BoxChargeEstimator, buildEntryChargeLegs, type BoxChargeLeg, type PriceChargeGroupsFn } from "./charges.js";
 import { BoxChargeReconciler } from "./chargeReconciler.js";
 import { BoxExecutionSimulator } from "./executionSimulator.js";
+import { CentralBoxExecutionGateway, type BoxExecutionGateway } from "./executionGateway.js";
+import { KiteBrokerAdapter, KiteHttpTransport, kiteAdapterConfigFromBoxConfig } from "./kiteBrokerAdapter.js";
+import { BoxOrderManager, orderManagerLimitsFromConfig, type OrderManagerReconcileReport } from "./orderManager.js";
 import { LocalChargeCalculator } from "./localCharges.js";
 import { BoxMetrics } from "./metrics.js";
 import {
@@ -45,23 +48,27 @@ import {
   type BoxChainIndex,
 } from "./instruments.js";
 import { buildCandidates, round2 } from "./math.js";
-import { BoxPositionBook, fullLotByRole, isBoxPositionFlat, outstandingRoles, type BoxOpenPosition } from "./positions.js";
+import { BoxPositionBook, deriveBoxPositionState, fullLotByRole, isBoxPositionFlat, outstandingRoles, type BoxOpenPosition } from "./positions.js";
 import { BoxPositionMonitor } from "./positionMonitor.js";
 import { BoxQuoteStore, SpotStore } from "./quotes.js";
 import { initBoxConnection } from "../db.js";
 import {
   appendBoxEvent,
+  allocateBoxTradeId,
   applyBoxPartialExit,
+  applyBoxReconciledProjection,
   closeBoxTrade,
   insertBoxExecutionAttempt,
   insertBoxTrade,
   isBoxDbEnabled,
   loadBoxDailyPnlTradeIds,
   loadBoxExecutionAttempts,
+  loadBoxLiveRiskSeed,
   loadBoxSettings,
   loadBoxTradesClosedSince,
   loadOpenBoxTrades,
   loadUnresolvedBoxExecutionAttempts,
+  markBoxTradeRecovery,
   resolveBoxExecutionAttempt,
   updateBoxExecutionAttemptResidual,
   saveBoxSettings,
@@ -73,6 +80,7 @@ import {
   updateBoxTradeLive,
   upsertBoxDailyPnl,
   type SerializedBoxTrade,
+  boxOrderIntentPersistence,
 } from "./repository.js";
 import type { BoxTradeRecord } from "./model.js";
 import { BoxClosedTradeCache, liteClosedTrade } from "./closedCache.js";
@@ -155,6 +163,8 @@ export class BoxEngine {
   private charges: BoxChargeEstimator;
   private localCharges: LocalChargeCalculator;
   private executionSim: BoxExecutionSimulator;
+  private execution: BoxExecutionGateway;
+  private orderManager: BoxOrderManager | null = null;
   private reconciler: BoxChargeReconciler;
   private metrics: BoxMetrics;
   private scanner: BoxScanner;
@@ -240,6 +250,8 @@ export class BoxEngine {
   /** Cached exchange-hours state, refreshed on the market timer. */
   private marketOpen = false;
   private feedHealthy = false;
+  private feedGeneration = 0;
+  private readonly tokenFeedGeneration = new Map<number, number>();
   private marketTimer: NodeJS.Timeout | null = null;
   private indicativeTimer: NodeJS.Timeout | null = null;
   private indicativeAt: number | null = null;
@@ -264,7 +276,7 @@ export class BoxEngine {
    * succeeded. Retained so a fill is NEVER silently erased when persistence is
    * temporarily unavailable; drained by a slow background retry. See openPaperTrade.
    */
-  private pendingPersists: { payload: IBoxTrade; key: string; attempts: number }[] = [];
+  private pendingPersists: { payload: IBoxTrade; key: string; attempts: number; preallocatedId?: string }[] = [];
   private ownedRetryTimer: NodeJS.Timeout | null = null;
   private static readonly OWNED_RETRY_MS = 15_000;
   /** How many synchronous insert attempts one fill gets before it is retained. */
@@ -275,6 +287,8 @@ export class BoxEngine {
    * attempts, so an interrupted unwind is resumed whether or not RUN is pressed.
    */
   private residualByAttempt = new Map<string, ResidualLegExposure[]>();
+  /** Confirmed residual fills awaiting persistence; skipped by the execution loop. */
+  private pendingResidualPersists = new Map<string, ResidualLegExposure[]>();
   /** Attempt ids whose residual is being flattened right now (concurrency guard). */
   private residualFlattenInFlight = new Set<string>();
   /** Bounded watchdog that works outstanding residuals; runs only while any exist. */
@@ -299,6 +313,47 @@ export class BoxEngine {
       // The local charge calculator prices paper_legging partial-entry and unwind
       // charges synchronously — never a network call inside the fill.
       chargeTotal: (orders) => this.localCharges.legs(orders).total,
+    });
+
+    if (this.cfg.executionMode === "live") {
+      const apiKey = process.env.KITE_API_KEY?.trim() ?? "";
+      if (!apiKey) {
+        throw new Error("[Box] live execution blocked: KITE_API_KEY is missing.");
+      }
+      const transport = new KiteHttpTransport({
+        apiKey,
+        accessToken: () => {
+          const token = this.deps.kite.getAccessToken();
+          if (!token) throw new Error("[Box] live execution blocked: Kite access-token session is missing.");
+          return token;
+        },
+        timeoutMs: this.cfg.liveHttpTimeoutMs,
+      });
+      const adapter = new KiteBrokerAdapter(transport, kiteAdapterConfigFromBoxConfig(this.cfg));
+      this.orderManager = new BoxOrderManager({
+        adapter,
+        persistence: boxOrderIntentPersistence,
+        limits: orderManagerLimitsFromConfig(this.cfg),
+        controls: { entryEnabled: false, liveOrderEnabled: false, emergencyFlatten: false },
+        istDayKey: (at) => this.deps.istDayKey(at),
+        onPersistenceLossAfterFill: (_order, error) => {
+          this.lastError = `live fill persistence failed: ${error instanceof Error ? error.message : String(error)}`;
+          for (const position of this.positions.list()) {
+            position.position_state = "RECOVERY";
+            position.exit_blocked_reason = this.lastError;
+            void markBoxTradeRecovery(position.id, this.lastError).catch(() => undefined);
+          }
+        },
+        onReconciliationIssue: (report) => this.markReconciliationRecovery(report),
+        loadDailyRiskSeed: (day) => loadBoxLiveRiskSeed(istDayStartMs(day)),
+      });
+    }
+    this.execution = new CentralBoxExecutionGateway({
+      cfg: this.cfg,
+      simulator: this.executionSim,
+      quotes: this.quotes,
+      ...(this.orderManager ? { manager: this.orderManager, allocateTradeId: allocateBoxTradeId } : {}),
+      isTokenWarm: (token) => this.tokenFeedGeneration.get(token) === this.feedGeneration,
     });
 
     this.reconciler = new BoxChargeReconciler({
@@ -333,7 +388,7 @@ export class BoxEngine {
       quotes: this.quotes,
       charges: this.charges,
       localCharges: this.localCharges,
-      executionSim: this.executionSim,
+      executionSim: this.execution,
       metrics: this.metrics,
       positions: this.positions,
       openPaperTrade: (args) => this.openPaperTrade(args),
@@ -369,7 +424,7 @@ export class BoxEngine {
       cfg: this.cfg,
       quotes: this.quotes,
       localCharges: this.localCharges,
-      executionSim: this.executionSim,
+      executionSim: this.execution,
       positions: this.positions,
       metrics: this.metrics,
       closePaperTrade: (args) => this.closePaperTrade(args),
@@ -457,6 +512,14 @@ export class BoxEngine {
     // Open the box database first (BOX_MONGODB_URI when set, otherwise the main
     // one) so the positions below are read from the right place.
     await initBoxConnection();
+    if (this.cfg.executionMode === "live") {
+      if (!isBoxDbEnabled()) {
+        throw new Error("[Box] live execution blocked: Box database is not ready.");
+      }
+      if (!this.deps.kite.getAccessToken()) {
+        throw new Error("[Box] live execution blocked: Kite access-token session is missing.");
+      }
+    }
     // Admin-saved thresholds override the env defaults, before anything can be
     // judged against them.
     await this.loadPersistedTuning();
@@ -466,6 +529,9 @@ export class BoxEngine {
       await this.adoptOpenPositions();
     } catch (err) {
       console.warn("[Box] failed to adopt open positions:", err);
+      if (this.cfg.executionMode === "live") {
+        throw new Error(`[Box] live execution blocked: open-position adoption failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
     // Re-adopt any outstanding residual exposure from an interrupted unwind, so it
     // is resumed regardless of whether RUN is ever pressed.
@@ -473,6 +539,45 @@ export class BoxEngine {
       await this.reconcileResidualExposure();
     } catch (err) {
       console.warn("[Box] failed to reconcile residual exposure:", err);
+    }
+    if (this.orderManager) {
+      this.syncManagerExposure();
+      const riskSeed = await loadBoxLiveRiskSeed(istDayStartMs(this.deps.istDayKey()));
+      this.orderManager.seedLimits({
+        tradingDay: this.deps.istDayKey(),
+        realisedPnlToday: riskSeed.realisedPnl,
+        rejects: riskSeed.rejects,
+        consecutiveFailures: riskSeed.consecutiveFailures,
+        openBoxes: this.positions.size,
+        residualLegs: this.residualLegCount(),
+      });
+      try {
+        const report = await this.orderManager.start();
+        if (report.positionMismatches.length > 0 || report.missingAtBroker.length > 0) {
+          const mismatchSymbols = new Set(report.positionMismatches.map((item) => item.symbol));
+          const affectedIds = new Set(report.affectedTradeIds);
+          for (const position of this.positions.list()) {
+            const symbolAffected = BOX_LEG_ROLES.some((role) => {
+              const inst = position.legs[role];
+              return mismatchSymbols.has(`${inst.exchange}:${inst.tradingsymbol}`);
+            });
+            if (!symbolAffected && !affectedIds.has(position.id)) continue;
+            const detail = "live broker reconciliation found an order or attributed-position mismatch";
+            position.position_state = "RECOVERY";
+            position.exit_blocked_reason = detail;
+            await markBoxTradeRecovery(position.id, detail);
+          }
+        }
+      } catch (err) {
+        const detail = `live reconciliation failed: ${err instanceof Error ? err.message : String(err)}`;
+        await Promise.all(this.positions.list().map(async (position) => {
+          position.position_state = "RECOVERY";
+          position.exit_blocked_reason = detail;
+          await markBoxTradeRecovery(position.id, detail).catch(() => undefined);
+        }));
+        this.lastError = detail;
+        console.error(`[Box] ${this.lastError}`);
+      }
     }
     this.monitor.start();
     // Seed the "closed today" tally AND the closed-today trade list from Mongo, so
@@ -705,7 +810,7 @@ export class BoxEngine {
     return { ok: true, tuning: readTuning(this.cfg) };
   }
 
-  /** RUN: start discovering and opening new paper boxes. */
+  /** RUN: start discovering qualified boxes; execution remains gated separately. */
   async start(): Promise<{ ok: boolean; error?: string }> {
     if (!this.deps.kite.getAccessToken()) {
       return { ok: false, error: "Connect to Zerodha before starting the box scanner." };
@@ -801,6 +906,76 @@ export class BoxEngine {
     this.publish();
   }
 
+  setLiveControl(
+    control: "box_entry_enabled" | "box_live_order_enabled" | "box_emergency_flatten",
+    enabled: boolean,
+  ): { ok: boolean; error?: string } {
+    if (!this.orderManager || this.cfg.executionMode !== "live") {
+      return { ok: false, error: "Live controls are unavailable outside explicit live mode." };
+    }
+    const patch = control === "box_entry_enabled"
+      ? { entryEnabled: enabled }
+      : control === "box_live_order_enabled"
+        ? { liveOrderEnabled: enabled }
+        : { emergencyFlatten: enabled };
+    this.orderManager.setControls(patch);
+    return { ok: true };
+  }
+
+  async reconcileLive(): Promise<unknown> {
+    if (!this.orderManager) throw new Error("Live order manager is unavailable.");
+    this.syncManagerExposure();
+    return this.orderManager.reconcile();
+  }
+
+  async cancelWorkingBoxOrders(): Promise<unknown> {
+    if (!this.orderManager) throw new Error("Live order manager is unavailable.");
+    return this.orderManager.cancelWorkingBoxOrders();
+  }
+
+  async flattenAttributedBoxExposure(): Promise<{ attempted: number; results: unknown[] }> {
+    if (!this.orderManager) throw new Error("Live order manager is unavailable.");
+    const managerStatus = this.orderManager.status();
+    if (!managerStatus.controls.emergencyFlatten) {
+      throw new Error("box_emergency_flatten is disabled.");
+    }
+    if (!managerStatus.health.reconciliation_complete && !this.orderManager.canSafelyReduceAttributedExposure()) {
+      throw new Error("Cannot flatten until broker state proves the full durable Box quantity can be reduced safely.");
+    }
+    const positions = this.positions.list();
+    const projectedSymbols = new Set<string>();
+    for (const position of positions) {
+      for (const role of BOX_LEG_ROLES) {
+        const inst = position.legs[role];
+        projectedSymbols.add(`${inst.exchange}:${inst.tradingsymbol}`);
+      }
+    }
+    const results: unknown[] = [];
+    for (const position of positions) {
+      if (position.position_state === "RECOVERY") {
+        // Reconciliation established exact broker equality with the durable map;
+        // this is the only transition that authorises recovery execution.
+        position.position_state = outstandingRoles(position).length === BOX_LEG_ROLES.length
+          ? "BOX"
+          : "PARTIALLY_EXITED";
+      }
+      results.push(await this.monitor.closeManually(position.id));
+    }
+    // A crash can leave COMPLETE owned intents before their trade projection was
+    // inserted. Reconciliation attributes those exact symbols/quantities; flatten
+    // only that durable ownership, never tag-only or arbitrary account positions.
+    const crashOnly = this.orderManager.attributedRecoveryExposure().filter(
+      (residual) => !projectedSymbols.has(`${residual.exchange ?? "NFO"}:${residual.tradingsymbol}`),
+    );
+    if (crashOnly.length > 0) {
+      results.push(await this.execution.flattenResidual({
+        residual: crashOnly,
+        keyPrefix: `boot-recovery:${this.deps.istDayKey()}`,
+      }));
+    }
+    return { attempted: positions.length + crashOnly.length, results };
+  }
+
   /**
    * Tear everything down: stop discovery and the monitor, clear every timer, drop
    * the feed retainer and metrics sampling.
@@ -810,6 +985,7 @@ export class BoxEngine {
    * here so nothing keeps the process alive or leaks across a re-create.
    */
   dispose(): void {
+    this.orderManager?.setControls({ entryEnabled: false });
     this.stop();
     this.monitor.stop();
     this.metrics.stopSampling();
@@ -830,6 +1006,7 @@ export class BoxEngine {
     this.universeTimer = null;
     this.ownedRetryTimer = null;
     this.residualFlattenTimer = null;
+    this.orderManager?.dispose();
     if (this.removeTickListener) {
       this.removeTickListener();
       this.removeTickListener = null;
@@ -855,8 +1032,10 @@ export class BoxEngine {
       // so nothing else would ever notice.
       const healthy = this.isFeedHealthy();
       if (healthy !== this.feedHealthy) {
+        if (!healthy && this.feedHealthy) this.feedGeneration++;
         this.feedHealthy = healthy;
         this.scanner.setFeedHealthy(healthy);
+        this.orderManager?.setFeedHealthy(healthy);
         if (!healthy && this.marketOpen) {
           console.warn(
             `[Box] tick feed has gone quiet (>${this.cfg.feedMaxAgeMs}ms) — entries and automatic exits are paused until it recovers.`,
@@ -1067,6 +1246,7 @@ export class BoxEngine {
     }
     this.metrics.ticks.mark(ticks.length, now);
     const changed = this.quotes.applyTicks(ticks, now);
+    for (const token of changed) this.tokenFeedGeneration.set(token, this.feedGeneration);
     if (changed.length > 0) {
       this.metrics.wsUpdates.mark(changed.length, now);
       // A tick arriving IS the feed-liveness signal, so the gate reopens here
@@ -1074,6 +1254,7 @@ export class BoxEngine {
       if (!this.feedHealthy) {
         this.feedHealthy = true;
         this.scanner.setFeedHealthy(true);
+        this.orderManager?.setFeedHealthy(true);
       }
       // Open-position exits get first look at every changed WS book. This is the
       // primary exit path; the monitor timer is only a watchdog.
@@ -1414,17 +1595,16 @@ export class BoxEngine {
     this.maybeReleaseFeed();
   }
 
-  /* ------------------------------ paper fills ------------------------------ */
+  /* --------------------------- executed positions --------------------------- */
 
   /**
-   * Create the paper trade.
+   * Create the durable trade projection for a confirmed execution.
    *
-   * PAPER ONLY: no Zerodha order-placement API is called anywhere in this path.
-   * The fills recorded are the executable touch prices that were visible in the
-   * revalidated snapshot.
+   * Paper modes contain observed simulated fills; live mode reaches this method
+   * only with broker-confirmed cumulative quantities from the central gateway.
    */
   /**
-   * Persist a paper_legging execution ATTEMPT that did not open a box.
+   * Persist an independent-leg execution ATTEMPT that did not open a box.
    *
    * A failed four-leg execution can itself cost money (partial fill + emergency
    * unwind), so it must not vanish as though nothing happened. Stored in its own
@@ -1438,8 +1618,28 @@ export class BoxEngine {
     detail: string,
   ): Promise<void> {
     const direction = candidate.direction ?? "LONG_BOX";
-    const grossAbort = legging.legging_gross_loss ?? null;
-    const netAbort = legging.legging_net_loss ?? null;
+    let grossAbort = legging.legging_gross_loss ?? null;
+    let netAbort = legging.legging_net_loss ?? null;
+    if (legging.mode === "live" && grossAbort === null) {
+      const entryOrders = legging.legs
+        .filter((leg) => leg.fill_qty > 0 && leg.fill_price !== null)
+        .map((leg) => ({ side: leg.side, tradingsymbol: leg.tradingsymbol, quantity: leg.fill_qty, price: leg.fill_price! }));
+      const unwindOrders = legging.legs
+        .filter((leg) => leg.unwound_qty > 0 && leg.unwind_price !== null)
+        .map((leg) => ({ side: leg.side === "BUY" ? "SELL" as const : "BUY" as const, tradingsymbol: leg.tradingsymbol, quantity: leg.unwound_qty, price: leg.unwind_price! }));
+      grossAbort = round2(legging.legs.reduce((sum, leg) => {
+        if (leg.unwound_qty <= 0 || leg.fill_price === null || leg.unwind_price === null) return sum;
+        const per = leg.side === "BUY" ? leg.unwind_price - leg.fill_price : leg.fill_price - leg.unwind_price;
+        return sum + per * leg.unwound_qty;
+      }, 0));
+      const entryCharges = entryOrders.length > 0 ? this.localCharges.legs(entryOrders).total : 0;
+      const unwindCharges = unwindOrders.length > 0 ? this.localCharges.legs(unwindOrders).total : 0;
+      legging.partial_entry_charges = round2(entryCharges);
+      legging.unwind_charges = round2(unwindCharges);
+      legging.legging_gross_loss = grossAbort;
+      netAbort = round2(grossAbort - entryCharges - unwindCharges);
+      legging.legging_net_loss = netAbort;
+    }
     const residual = legging.residual_exposure ?? [];
     const attempt: IBoxExecutionAttempt = {
       candidate_key: candidate.key,
@@ -1452,7 +1652,7 @@ export class BoxEngine {
       upper_strike: candidate.upper_strike,
       lot_size: candidate.lot_size,
       quantity: candidate.lot_size,
-      execution_mode: "paper_legging",
+      execution_mode: this.cfg.executionMode,
       leg_execution_mode: legging.leg_execution_mode,
       detected_at: new Date(legging.detected_at),
       resolved_at: new Date(),
@@ -1478,12 +1678,16 @@ export class BoxEngine {
       resolved: residual.length === 0,
     };
     const attemptId = await insertBoxExecutionAttempt(attempt);
+    if (this.orderManager && this.cfg.executionMode === "live") {
+      if (attemptId) this.orderManager.recordRealisedPnl(netAbort ?? 0);
+      else this.orderManager.invariantViolation(`live abort ${candidate.key} was not durably projected`);
+    }
     if (residual.length > 0) {
       // Track the outstanding exposure so it is never lost, and start the flatten
       // loop. The id lets a later flatten mark this attempt resolved.
       this.registerResidual(attemptId ?? `local:${candidate.key}:${Date.now()}`, residual);
       console.warn(
-        `[Box] ${residual.length} residual simulated leg(s) left OUTSTANDING by ${candidate.key} ` +
+        `[Box] ${residual.length} residual execution leg(s) left OUTSTANDING by ${candidate.key} ` +
           `(could not be flattened) — recorded and being worked by the flatten loop.`,
       );
     }
@@ -1498,7 +1702,7 @@ export class BoxEngine {
       upper_strike: candidate.upper_strike,
       lot_size: candidate.lot_size,
       quantity: candidate.lot_size,
-      execution_mode: "paper_legging",
+      execution_mode: this.cfg.executionMode,
       net_pnl: netAbort,
       gross_pnl: grossAbort,
       reason,
@@ -1529,6 +1733,13 @@ export class BoxEngine {
     legging?: PaperLeggingExecutionRecord | null;
   }): Promise<string | null> {
     const { candidate, evaluation, decision, execution } = args;
+    const confirmedEntryQty = {} as Record<BoxLegRole, number>;
+    for (const role of BOX_LEG_ROLES) {
+      const confirmed = args.legging?.fills_by_role[role];
+      confirmedEntryQty[role] = Number.isInteger(confirmed) && confirmed! >= 0
+        ? confirmed!
+        : candidate.lot_size;
+    }
     const direction = candidate.direction ?? "LONG_BOX";
     const byRole = new Map(evaluation.legs.map((l) => [l.role, l]));
     const execByRole = new Map((execution?.legs ?? []).map((l) => [l.role, l]));
@@ -1597,7 +1808,7 @@ export class BoxEngine {
       quantity: candidate.lot_size,
       status: "open",
       // A freshly entered box holds one lot on every role and is a whole box.
-      remaining_qty_by_role: fullLotByRole(candidate.lot_size),
+      remaining_qty_by_role: confirmedEntryQty,
       position_state: "BOX",
       exit_attempts: [],
       cumulative_exit_charges: 0,
@@ -1646,14 +1857,22 @@ export class BoxEngine {
       error: null,
     };
 
-    // DURABILITY: the four legs have FILLED, so this box exists. Persist it with a
-    // bounded synchronous retry; if the store is genuinely unavailable, retain the
-    // owned fill and retry in the background rather than dropping the exposure.
+    // DURABILITY: the four legs have FILLED, so this box exists. Live execution
+    // uses the identity allocated before its first intent, preserving a one-to-one
+    // order-intent → trade mapping across crashes and reconciliation.
+    const preallocatedId = this.cfg.executionMode === "live" ? args.legging?.trade_id ?? undefined : undefined;
+    if (this.cfg.executionMode === "live" && !preallocatedId) {
+      this.orderManager?.invariantViolation(`filled live entry ${candidate.key} has no durable trade identity`);
+      this.retainOwnedExecution(payload, candidate.key);
+      return null;
+    }
+    // Persist with a bounded synchronous retry; if the store is genuinely
+    // unavailable, retain the owned fill and retry in the background.
     let doc: BoxTradeRecord | null;
     try {
-      doc = await this.insertWithRetry(payload);
+      doc = await this.insertWithRetry(payload, preallocatedId);
     } catch (err) {
-      this.retainOwnedExecution(payload, candidate.key);
+      this.retainOwnedExecution(payload, candidate.key, preallocatedId);
       console.error(
         `[Box] persistence unavailable for filled box ${candidate.key} — RETAINED for ` +
           `background retry (degraded). ${String(err)}`,
@@ -1696,7 +1915,7 @@ export class BoxEngine {
       opened_at: Date.now(),
       legs: candidate.legs,
       entry_prices: entryPrices,
-      remaining_qty_by_role: fullLotByRole(candidate.lot_size),
+      remaining_qty_by_role: confirmedEntryQty,
       position_state: "BOX",
       cumulative_exit_charges: 0,
       exit_attempts: [],
@@ -1708,6 +1927,7 @@ export class BoxEngine {
       config: configSnapshot(this.cfg),
     };
     this.positions.add(position);
+    this.syncManagerExposure();
 
     // Margin is captured AFTER the fill is recorded, off the hot path.
     void this.captureMargin(id, candidate.legs, candidate.lot_size, candidate.key, direction);
@@ -1751,7 +1971,7 @@ export class BoxEngine {
     });
 
     console.log(
-      `[Box] PAPER ENTRY ${directionLabel(direction)} ${candidate.underlying} ` +
+      `[Box] ${this.cfg.executionMode.toUpperCase()} ENTRY ${directionLabel(direction)} ${candidate.underlying} ` +
         `${candidate.lower_strike}→${candidate.upper_strike} ${candidate.expiry} ` +
         `gross ₹${evaluation.gross_edge} expected-net ₹${decision.expected_net_profit} ` +
         `(slippage ₹${entrySlippageForLog})`,
@@ -1763,9 +1983,9 @@ export class BoxEngine {
   /**
    * Durably mirror a PARTIAL exit to Mongo in one atomic update.
    *
-   * The in-memory position has already been decremented; this persists the exact
-   * remaining-per-role state, the appended attempt audit, the cumulative exit
-   * charges and any residual — so a crash cannot resurrect the closed quantity.
+   * The caller supplies a projected copy; this persists the exact remaining-per-role
+   * state, append-only attempt audit, cumulative charges, and residual before that
+   * projection is copied into the authoritative in-memory position.
    */
   private async persistPartialExit(args: {
     position: BoxOpenPosition;
@@ -1804,7 +2024,7 @@ export class BoxEngine {
     return ok;
   }
 
-  /** Persist a paper exit at the executed touch. */
+  /** Persist a confirmed exit projection atomically. */
   private async closePaperTrade(args: {
     position: BoxOpenPosition;
     metrics: BoxExitMetrics;
@@ -1847,11 +2067,16 @@ export class BoxEngine {
     const netPnl =
       grossPnl === null || totalCharges === null ? null : round2(grossPnl - totalCharges);
 
+    const closeIdempotencyKey = args.exitAttempts?.at(-1)?.attempt_id ??
+      args.legging?.legs[0]?.client_order_id ??
+      (execution ? `${position.id}:${execution.mode}:${execution.detected_at}:${execution.executed_at ?? "none"}` : `${position.id}:${reason}:${metrics.at}`);
+
     // Only the exit half of each leg is written, so the stored entry snapshot
     // (which is an execution record) is never overwritten.
     const setFields: Record<string, unknown> = {
       status: "closed",
       closed_at: new Date(),
+      close_idempotency_key: closeIdempotencyKey,
       exit_reason: reason,
       exit_box_value: metrics.exit_box_value,
       exit_charges: exitCharges,
@@ -1859,9 +2084,10 @@ export class BoxEngine {
       exit_legging: args.legging ?? null,
       residual_exposure: args.residual && args.residual.length > 0 ? args.residual : null,
       // A closed box is flat on every role, and carries its full exit-attempt audit
-      // and cumulative exit charges.
+      // Explicitly persist the terminal geometry; old documents still default to
+      // full per-role quantity during adoption when this map is absent.
       remaining_qty_by_role: fullLotByRole(0),
-      position_state: "BOX",
+      position_state: "FLAT",
       cumulative_exit_charges: exitChargesTotal,
       ...(args.exitAttempts ? { exit_attempts: args.exitAttempts } : {}),
       exit_charge_reconciliation: exitCharges
@@ -1906,10 +2132,14 @@ export class BoxEngine {
       setFields[`legs.${i}.exit_slippage`] = execLeg?.slippage ?? null;
     }
 
-    const closed = await closeBoxTrade(position.id, setFields as never);
+    const closed = await closeBoxTrade(position.id, setFields as never, closeIdempotencyKey);
     if (!closed) return false;
 
+    if (this.orderManager && this.cfg.executionMode === "live") {
+      this.orderManager.recordRealisedPnl(netPnl ?? 0);
+    }
     this.positions.remove(position.id);
+    this.syncManagerExposure();
     this.marginBackfillTries.delete(position.id);
 
     // Fold the realised result into the running day-P&L tally.
@@ -1989,7 +2219,7 @@ export class BoxEngine {
     });
 
     console.log(
-      `[Box] PAPER EXIT ${directionLabel(position.direction ?? "LONG_BOX")} ${position.underlying} ` +
+      `[Box] ${this.cfg.executionMode.toUpperCase()} EXIT ${directionLabel(position.direction ?? "LONG_BOX")} ${position.underlying} ` +
         `${position.lower_strike}→${position.upper_strike} ${reason} net ₹${netPnl ?? "?"}`,
     );
     this.broadcast("exit", { trade: serialized });
@@ -2133,6 +2363,8 @@ export class BoxEngine {
       };
       entryPrices[role] = l.entry_price;
     }
+    const restoredRemaining = this.remainingByRoleFromDoc(doc);
+    const invalidRemaining = this.hasInvalidRemainingByRole(doc);
     this.positions.add({
       id: doc._id.toString(),
       key: tradeKey(doc),
@@ -2168,8 +2400,10 @@ export class BoxEngine {
       // per-role state existed has none, so default every role to the full lot —
       // a whole, un-exited box (never destructive). A partially-closed trade
       // therefore resumes with ONLY its true outstanding exposure.
-      remaining_qty_by_role: this.remainingByRoleFromDoc(doc),
-      position_state: doc.position_state ?? "BOX",
+      remaining_qty_by_role: restoredRemaining,
+      position_state: invalidRemaining
+        ? "RECOVERY"
+        : deriveBoxPositionState(restoredRemaining, doc.position_state ?? "BOX"),
       cumulative_exit_charges: doc.cumulative_exit_charges ?? 0,
       exit_attempts: Array.isArray(doc.exit_attempts) ? doc.exit_attempts : [],
       metrics: null,
@@ -2191,10 +2425,21 @@ export class BoxEngine {
     const stored = doc.remaining_qty_by_role ?? null;
     const out = {} as Record<BoxLegRole, number>;
     for (const role of BOX_LEG_ROLES) {
-      const raw = stored && typeof stored[role] === "number" ? (stored[role] as number) : doc.quantity;
-      out[role] = Math.max(0, Math.min(doc.quantity, Math.round(raw)));
+      const raw = stored === null ? doc.quantity : stored[role];
+      out[role] = typeof raw === "number" && Number.isInteger(raw) && raw >= 0
+        ? raw
+        : doc.quantity;
     }
     return out;
+  }
+
+  private hasInvalidRemainingByRole(doc: BoxTradeRecord): boolean {
+    const stored = doc.remaining_qty_by_role ?? null;
+    if (stored === null) return false;
+    return BOX_LEG_ROLES.some((role) => {
+      const quantity = stored[role];
+      return typeof quantity !== "number" || !Number.isInteger(quantity) || quantity < 0;
+    });
   }
 
   /* ----------------------- execution durability --------------------------- */
@@ -2205,11 +2450,11 @@ export class BoxEngine {
    * is already open — so it returns null immediately without retrying. Runs off
    * the hot scanner path (openPaperTrade is already awaited outside the tick loop).
    */
-  private async insertWithRetry(payload: IBoxTrade): Promise<BoxTradeRecord | null> {
+  private async insertWithRetry(payload: IBoxTrade, preallocatedId?: string): Promise<BoxTradeRecord | null> {
     let lastErr: unknown = null;
     for (let attempt = 1; attempt <= BoxEngine.PERSIST_RETRY_ATTEMPTS; attempt++) {
       try {
-        return await insertBoxTrade(payload);
+        return await insertBoxTrade(payload, preallocatedId);
       } catch (err) {
         lastErr = err;
         if (attempt < BoxEngine.PERSIST_RETRY_ATTEMPTS) {
@@ -2231,8 +2476,13 @@ export class BoxEngine {
    * position is adopted into the live book and managed normally. Until then the
    * engine reports `degraded`.
    */
-  private retainOwnedExecution(payload: IBoxTrade, key: string): void {
-    this.pendingPersists.push({ payload, key, attempts: BoxEngine.PERSIST_RETRY_ATTEMPTS });
+  private retainOwnedExecution(payload: IBoxTrade, key: string, preallocatedId?: string): void {
+    this.pendingPersists.push({
+      payload,
+      key,
+      attempts: BoxEngine.PERSIST_RETRY_ATTEMPTS,
+      ...(preallocatedId ? { preallocatedId } : {}),
+    });
     this.metrics.setPendingUnpersistedFills(this.pendingPersists.length);
     // Hold the strike-pair reservation so no new tick can open a DUPLICATE box for
     // this key while the fill is unpersisted (the Mongo unique index cannot help
@@ -2257,10 +2507,10 @@ export class BoxEngine {
       }
       return;
     }
-    const still: { payload: IBoxTrade; key: string; attempts: number }[] = [];
+    const still: { payload: IBoxTrade; key: string; attempts: number; preallocatedId?: string }[] = [];
     for (const entry of this.pendingPersists) {
       try {
-        const doc = await insertBoxTrade(entry.payload);
+        const doc = await insertBoxTrade(entry.payload, entry.preallocatedId);
         if (doc) {
           // adoptDoc → positions.add clears the held reservation as it takes over.
           this.adoptDoc(doc);
@@ -2327,6 +2577,7 @@ export class BoxEngine {
       this.ensureFeed(); // outstanding exposure needs live books to flatten
       this.ensureResidualFlattenTimer();
     }
+    this.orderManager?.setExposure({ residualLegs: this.residualLegCount() });
   }
 
   private ensureResidualFlattenTimer(): void {
@@ -2354,26 +2605,52 @@ export class BoxEngine {
       }
       return;
     }
+    for (const [attemptId, projected] of [...this.pendingResidualPersists]) {
+      try {
+        const acknowledged = projected.length === 0
+          ? await resolveBoxExecutionAttempt(attemptId)
+          : await updateBoxExecutionAttemptResidual(attemptId, projected);
+        if (!acknowledged) continue;
+        this.pendingResidualPersists.delete(attemptId);
+        if (projected.length === 0) this.residualByAttempt.delete(attemptId);
+        else this.residualByAttempt.set(attemptId, projected);
+      } catch {
+        // Persistence-only retry. Never replay the already-confirmed broker/paper fill.
+      }
+    }
     if (!this.marketOpen || !this.isFeedHealthy()) return; // cannot execute now; residual is kept
 
     for (const [attemptId, residual] of [...this.residualByAttempt]) {
+      if (this.pendingResidualPersists.has(attemptId)) continue;
       if (this.residualFlattenInFlight.has(attemptId)) continue; // no concurrent flatten
       this.residualFlattenInFlight.add(attemptId);
       this.metrics.recordResidualFlattenAttempt();
       try {
-        const res = await this.executionSim.flattenResidual({ residual, keyPrefix: attemptId });
+        const res = await this.execution.flattenResidual({ residual, keyPrefix: attemptId });
         if (res.remaining.length === 0) {
+          const acknowledged = await resolveBoxExecutionAttempt(attemptId).catch(() => false);
+          if (!acknowledged) {
+            this.pendingResidualPersists.set(attemptId, []);
+            this.execution.invariantViolation(`residual ${attemptId} flattened but durable resolution is unacknowledged`);
+            this.metrics.recordResidualFlattenFailure();
+            continue;
+          }
           this.residualByAttempt.delete(attemptId);
-          await resolveBoxExecutionAttempt(attemptId);
           this.metrics.recordResidualFlattenSuccess();
           console.log(`[Box] residual exposure for attempt ${attemptId} fully flattened.`);
         } else {
-          // Some (or none) flattened — persist ONLY what remains, so a retry never
-          // re-sends the quantity already flattened.
+          // Persist ONLY what remains before changing the authoritative in-memory
+          // work set, so a lost acknowledgement can never replay a stale quantity.
           const sumQty = (legs: ResidualLegExposure[]): number => legs.reduce((s, r) => s + r.quantity, 0);
           const flattenedAny = sumQty(res.remaining) < sumQty(residual);
+          const acknowledged = await updateBoxExecutionAttemptResidual(attemptId, res.remaining).catch(() => false);
+          if (!acknowledged) {
+            this.pendingResidualPersists.set(attemptId, res.remaining);
+            this.execution.invariantViolation(`residual ${attemptId} partial flatten awaits durable projection`);
+            this.metrics.recordResidualFlattenFailure();
+            continue;
+          }
           this.residualByAttempt.set(attemptId, res.remaining);
-          await updateBoxExecutionAttemptResidual(attemptId, res.remaining);
           if (flattenedAny) this.metrics.recordResidualFlattenPartial();
           else this.metrics.recordResidualFlattenFailure();
         }
@@ -2391,9 +2668,76 @@ export class BoxEngine {
     }
   }
 
+  private async markReconciliationRecovery(report: OrderManagerReconcileReport): Promise<void> {
+    const mismatchSymbols = new Set(report.positionMismatches.map((item) => item.symbol));
+    const affectedIds = new Set(report.affectedTradeIds);
+    for (const position of this.positions.list()) {
+      const projected = report.remainingByTrade[position.id];
+      if (projected) {
+        const exact = {} as Record<BoxLegRole, number>;
+        let valid = true;
+        for (const role of BOX_LEG_ROLES) {
+          const quantity = projected[role] ?? 0;
+          if (!Number.isInteger(quantity) || quantity < 0 || quantity > position.quantity) valid = false;
+          exact[role] = quantity;
+        }
+        const changed = BOX_LEG_ROLES.some((role) => exact[role] !== position.remaining_qty_by_role[role]);
+        if (!valid) {
+          affectedIds.add(position.id);
+        } else if (changed) {
+          const projectedState = isBoxPositionFlat(exact)
+            ? "RECOVERY" as const
+            : deriveBoxPositionState(exact, position.position_state);
+          const persisted = await applyBoxReconciledProjection(position.id, exact, projectedState);
+          if (!persisted) throw new Error(`failed to persist reconciled quantity projection for ${position.id}`);
+          position.remaining_qty_by_role = exact;
+          position.position_state = projectedState;
+          if (projectedState === "RECOVERY") {
+            position.exit_blocked_reason = "broker-confirmed flat quantity requires terminal close-accounting recovery";
+          }
+        }
+      }
+
+      const symbolAffected = BOX_LEG_ROLES.some((role) => {
+        const inst = position.legs[role];
+        return mismatchSymbols.has(`${inst.exchange}:${inst.tradingsymbol}`);
+      });
+      if (!symbolAffected && !affectedIds.has(position.id)) continue;
+      const detail = "live broker reconciliation found an order or attributed-position mismatch";
+      position.position_state = "RECOVERY";
+      position.exit_blocked_reason = detail;
+      await markBoxTradeRecovery(position.id, detail);
+    }
+  }
+
+  private syncManagerExposure(): void {
+    if (!this.orderManager) return;
+    const bySymbol = new Map<string, { token: number; exchange: string; tradingsymbol: string; net_quantity: number; average_price: number }>();
+    for (const position of this.positions.list()) {
+      const direction = position.direction ?? "LONG_BOX";
+      for (const role of BOX_LEG_ROLES) {
+        const quantity = position.remaining_qty_by_role[role];
+        if (!Number.isInteger(quantity) || quantity <= 0) continue;
+        const inst = position.legs[role];
+        const key = `${inst.exchange}:${inst.tradingsymbol}`;
+        const current = bySymbol.get(key) ?? { token: inst.token, exchange: inst.exchange, tradingsymbol: inst.tradingsymbol, net_quantity: 0, average_price: position.entry_prices[role] ?? 0 };
+        current.net_quantity += entrySideFor(role, direction) === "BUY" ? quantity : -quantity;
+        bySymbol.set(key, current);
+      }
+    }
+    this.orderManager.setAttributedBoxPositions([...bySymbol.values()].filter((position) => position.net_quantity !== 0));
+    this.orderManager.setExposure({
+      openBoxes: this.positions.size,
+      residualLegs: this.residualLegCount(),
+    });
+  }
+
   /** Authoritative degraded verdict, derived from actual ownership risk. */
   private computeDegraded(): boolean {
-    return this.pendingPersists.length > 0 || this.residualByAttempt.size > 0;
+    const live = this.orderManager?.status();
+    return this.pendingPersists.length > 0 ||
+      this.residualByAttempt.size > 0 ||
+      Boolean(live && (live.health.persistence === "unhealthy" || live.unknownOrders > 0 || live.recoveryActive));
   }
 
   /* --------------------------------- views -------------------------------- */
@@ -2461,6 +2805,7 @@ export class BoxEngine {
 
   getStatus() {
     const scanner = this.scanner.getStats();
+    const live = this.orderManager?.status() ?? null;
     return {
       running: this.running,
       state: this.running
@@ -2479,6 +2824,17 @@ export class BoxEngine {
       indicative_stale_legs: this.indicativeStaleLegs,
       execution_mode: this.cfg.executionMode,
       authenticated: this.deps.kite.getAccessToken() !== null,
+      broker_auth_healthy: live ? live.health.broker_auth === "healthy" : null,
+      broker_orders_api_healthy: live ? live.health.broker_orders_api === "healthy" : null,
+      broker_positions_api_healthy: live ? live.health.broker_positions_api === "healthy" : null,
+      market_data_healthy: this.isFeedHealthy(),
+      database_healthy: isBoxDbEnabled() && (!live || live.health.persistence === "healthy"),
+      daily_risk_seed_healthy: live ? live.health.daily_risk_seed === "healthy" : null,
+      reconciliation_complete: live?.health.reconciliation_complete ?? true,
+      unknown_orders: live?.unknownOrders ?? 0,
+      recovery_active: live?.recoveryActive ?? false,
+      circuit_state: live?.health.circuit ?? "closed",
+      live_manager: live,
       db_enabled: isBoxDbEnabled(),
       started_at: this.startedAt,
       stopped_at: this.stoppedAt,
@@ -2829,7 +3185,7 @@ export class BoxEngine {
     for (const opp of this.scanner.opportunitiesFor(state.underlying)) {
       const isOpen = openKeys.has(opp.key);
       const relevant =
-        isOpen || opp.status === "ELIGIBLE" || opp.status === "PAPER_OPENED" || opp.status === "UNPRICED";
+        isOpen || opp.status === "ELIGIBLE" || opp.status === "PAPER_OPENED" || opp.status === "LIVE_OPENED" || opp.status === "UNPRICED";
       if (!relevant) continue;
       for (const leg of opp.legs) {
         addMark(leg.token, `${leg.side}_${leg.instrument_type}`);

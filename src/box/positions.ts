@@ -82,7 +82,7 @@ export interface BoxOpenPosition {
    * is already flat is never traded again.
    */
   remaining_qty_by_role: Record<BoxLegRole, number>;
-  /** "BOX" while all four roles are whole; "PARTIALLY_EXITED" once any is reduced. */
+  /** Complete, partial, recovery, or confirmed-flat geometry. */
   position_state: BoxPositionState;
   /** Running total of exit-side charges across every exit attempt so far (₹). */
   cumulative_exit_charges: number;
@@ -203,8 +203,26 @@ export function fullLotByRole(quantity: number): Record<BoxLegRole, number> {
  * true. Reading a per-role map (rather than counting filled exit legs) is what
  * makes the answer correct across several partial attempts.
  */
-export function isBoxPositionFlat(pos: Pick<BoxOpenPosition, "remaining_qty_by_role">): boolean {
-  return BOX_LEG_ROLES.every((role) => (pos.remaining_qty_by_role[role] ?? 0) <= 0);
+export function isBoxPositionFlat(remainingQtyByRole: Record<BoxLegRole, number>): boolean {
+  return BOX_LEG_ROLES.every((role) => remainingQtyByRole[role] === 0);
+}
+
+/**
+ * Derive position geometry from exact canonical quantities.
+ *
+ * RECOVERY is sticky until the exposure is genuinely flat; callers must explicitly
+ * move a recovered position back to ordinary management after reconciliation.
+ */
+export function deriveBoxPositionState(
+  remainingQtyByRole: Record<BoxLegRole, number>,
+  current?: BoxPositionState,
+): BoxPositionState {
+  if (isBoxPositionFlat(remainingQtyByRole)) return "FLAT";
+  if (current === "RECOVERY") return "RECOVERY";
+  const first = remainingQtyByRole.k1_ce;
+  return first > 0 && BOX_LEG_ROLES.every((role) => remainingQtyByRole[role] === first)
+    ? "BOX"
+    : "PARTIALLY_EXITED";
 }
 
 /** Roles that still carry outstanding quantity, with that quantity. */
