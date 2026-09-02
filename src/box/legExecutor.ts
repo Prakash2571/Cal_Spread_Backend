@@ -85,6 +85,8 @@ export interface LegExecutorDeps {
   quotes: BoxQuoteStore;
   now: () => number;
   wait: (ms: number) => Promise<void>;
+  /** Optional: records an internal per-order retry. Never a new strategy attempt. */
+  metrics?: { recordLogicalRetry: () => void } | undefined;
 }
 
 /** What the run produced. */
@@ -107,6 +109,8 @@ interface LegState {
   req: LegOrderRequest;
   /** Terminal states need no further scheduling. */
   done: boolean;
+  /** How many times `tryFill` has already been attempted for this order. */
+  fillAttempts: number;
 }
 
 /** Statuses that are fully resolved — no further fills possible. */
@@ -159,6 +163,7 @@ export class LegExecutor {
     const states: LegState[] = args.requests.map((req) => ({
       req,
       done: false,
+      fillAttempts: 0,
       leg: blankLeg(req, args.orderIdPrefix, phase),
     }));
 
@@ -178,6 +183,11 @@ export class LegExecutor {
         if (!touched.has(st.req.inst.token)) continue;
         // A timed-out order must not be revived by a later tick.
         if (st.leg.timeout_at !== null && at > st.leg.timeout_at) continue;
+        // A book update woke an order that already tried and failed/partially
+        // filled at least once — this is a genuine internal retry of the SAME
+        // order, never a new strategy attempt.
+        if (st.fillAttempts > 0) this.deps.metrics?.recordLogicalRetry();
+        st.fillAttempts++;
         this.tryFill(st, at, phase, maxAgeMs, booksAtFill);
       }
     });
@@ -225,6 +235,8 @@ export class LegExecutor {
             continue;
           }
 
+          if (st.fillAttempts > 0) this.deps.metrics?.recordLogicalRetry();
+          st.fillAttempts++;
           const result = this.tryFill(st, at, phase, maxAgeMs, booksAtFill);
           // Sequential: only a COMPLETE fill releases the next order.
           if (sequential && result === "filled") this.submitNext(states, st, at, latency);

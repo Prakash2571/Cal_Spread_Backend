@@ -317,7 +317,17 @@ export class BoxScanner {
       return;
     }
 
-    void this.attemptEntry(cand, evaluation);
+    // This is the rare transition from discovery into a real order pipeline, so
+    // take one immutable four-book snapshot with depth. Hot tick evaluation stays
+    // allocation-light; subsequent ticks cannot mutate this audit record.
+    const executionDetection = evaluateCandidate({
+      candidate: cand,
+      quotes: this.deps.quotes.view(),
+      now,
+      maxAgeMs: this.deps.cfg.quoteMaxAgeMs,
+      captureDepth: true,
+    });
+    void this.attemptEntry(cand, executionDetection);
   }
 
   /**
@@ -378,6 +388,33 @@ export class BoxScanner {
     this.entryInFlight.add(cand.key);
     this.stats.qualifyAttempts++;
     this.stats.executionsAttempted++;
+    // This parent id represents ONE strategy decision. Four leg orders, recovery
+    // work and retries remain child events and cannot change this denominator.
+    const attemptId = `entry:${cand.key}:${detection.at}`;
+    this.deps.metrics?.beginLogicalAttempt(attemptId);
+    const detectionDecision = this.localDecisionFor(
+      detection,
+      this.deps.cfg.expectedEntrySlippage,
+    );
+    const finish = (
+      outcome: "SUCCESS" | "FAILED" | "PARTIAL_RECOVERED" | "PARTIAL_UNRESOLVED" | "ABORTED",
+      reason: string | null,
+      realisedExpectedNet: number | null,
+      decisionToFillMs: number | null,
+      arrivalExecutionSlippage: number | null,
+    ) => this.deps.metrics?.finishLogicalAttempt(attemptId, outcome, reason, {
+      decisionDeterioration:
+        detectionDecision && detectionDecision.expected_net_profit !== null && realisedExpectedNet !== null
+          ? round2(detectionDecision.expected_net_profit - realisedExpectedNet)
+          : null,
+      // Atomic paper fills are priced exactly from their captured arrival book, so
+      // zero is an honest measurement. Modes without an arrival reference stay null.
+      arrivalExecutionSlippage,
+      detectionToDecisionMs: 0,
+      decisionToOrderSendMs: 0,
+      orderLatencyMs: decisionToFillMs,
+      decisionToFillMs,
+    });
 
     const stillWanted = () =>
       this.discovering &&
@@ -401,6 +438,27 @@ export class BoxScanner {
             this.deps.onExecutionAttempt?.(cand, legging.legging, legging.reason, legging.detail);
           }
           this.recordExecutionFailure(cand, detection, legging.reason, legging.detail);
+          finish(
+            // Residual exposure outstanding is the most severe state, whatever
+            // else is true. Otherwise: a clean abort-after-fill (4/4 filled, then
+            // fully reversed because the executed economics failed re-qualification)
+            // is ABORTED, never "recovered" — it must be checked BEFORE the generic
+            // filled_leg_count>0 case, since an abort-after-fill always has
+            // filled_leg_count===4 and would otherwise be misclassified as a partial
+            // recovery. A partial fill (1-3 legs) that was cleanly unwound with no
+            // residual is the actual PARTIAL_RECOVERED case.
+            legging.legging.residual_exposure.length > 0
+              ? "PARTIAL_UNRESOLVED"
+              : legging.legging.abort_after_fill
+                ? "ABORTED"
+                : legging.legging.filled_leg_count > 0
+                  ? "PARTIAL_RECOVERED"
+                  : "FAILED",
+            legging.reason,
+            legging.legging.final_expected_net_profit,
+            legging.legging.decision_to_last_fill_ms,
+            null,
+          );
           this.deps.positions.release(cand.key);
           return;
         }
@@ -419,7 +477,14 @@ export class BoxScanner {
          * is persisted and handed to the monitor — which runs regardless of RUN/STOP,
          * market hours or feed health, and will exit it when it can.
          */
-        await this.finalizeOpen(cand, legging.evaluation, legging.decision, null, legging.legging);
+        const opened = await this.finalizeOpen(cand, legging.evaluation, legging.decision, null, legging.legging);
+        finish(
+          opened ? "SUCCESS" : "PARTIAL_UNRESOLVED",
+          opened ? null : "persistence_unavailable",
+          legging.decision.expected_net_profit,
+          legging.legging.decision_to_last_fill_ms,
+          null,
+        );
         return;
       }
 
@@ -434,6 +499,13 @@ export class BoxScanner {
 
       if (!result.ok) {
         this.recordExecutionFailure(cand, detection, result.reason, result.detail);
+        finish(
+          "FAILED",
+          result.reason,
+          null,
+          result.record.decision_to_fill_ms,
+          result.record.executed_at === null ? null : 0,
+        );
         this.deps.positions.release(cand.key);
         return;
       }
@@ -450,9 +522,18 @@ export class BoxScanner {
        * The simulator's own pre-fill checks are what cancel an entry safely; once
        * filled, the position is persisted and the (always-on) monitor owns it.
        */
-      await this.finalizeOpen(cand, result.evaluation, result.decision, result.record, null);
+      const opened = await this.finalizeOpen(cand, result.evaluation, result.decision, result.record, null);
+      finish(
+        opened ? "SUCCESS" : "PARTIAL_UNRESOLVED",
+        opened ? null : "persistence_unavailable",
+        result.decision.expected_net_profit,
+        result.record.decision_to_fill_ms,
+        // Atomic paper fills are the captured arrival-book touch by construction.
+        0,
+      );
     } catch (err) {
       console.warn("[Box] entry attempt failed for", cand.key, err);
+      finish("FAILED", "internal_error", null, null, null);
       this.deps.positions.release(cand.key);
     } finally {
       this.entryInFlight.delete(cand.key);
@@ -512,7 +593,7 @@ export class BoxScanner {
     decision: BoxEntryDecision,
     execution: BoxExecutionRecord | null,
     legging: PaperLeggingExecutionRecord | null,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const legs = buildEntryChargeLegs(evaluation.candidate, evaluation.legs);
     if (!legs) {
       // Should be unreachable: a filled evaluation always has four priced legs. But
@@ -523,7 +604,7 @@ export class BoxScanner {
           `so no position was recorded. This is an accounting hole — investigate.`,
       );
       this.deps.positions.release(cand.key);
-      return;
+      return false;
     }
     const orders = legs.map((l) => ({
       side: l.side,
@@ -560,6 +641,7 @@ export class BoxScanner {
       );
       this.deps.positions.release(cand.key);
     }
+    return id !== null;
   }
 
   private recordExecutionFailure(
