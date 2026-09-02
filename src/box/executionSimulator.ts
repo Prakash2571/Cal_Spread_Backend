@@ -52,8 +52,8 @@ import {
   slippagePerUnit,
   temporalCoherence,
 } from "./math.js";
-import { touchPrice } from "./orderPricing.js";
-import type { BoxOpenPosition } from "./positions.js";
+import { touchPrice, walkDepth } from "./orderPricing.js";
+import { outstandingRoles, type BoxOpenPosition } from "./positions.js";
 import type { BoxQuoteStore } from "./quotes.js";
 import {
   BOX_LEG_ROLES,
@@ -242,6 +242,16 @@ export class BoxExecutionSimulator {
     const { candidate, detection } = args;
     const key = candidate.key;
 
+    // Live execution is owned by OrderManager. Until the engine is explicitly
+    // integrated with it, never let `live` fall through to a paper fill model.
+    if (this.mode === "live") {
+      return this.refuse(
+        detection,
+        "discovery_stopped",
+        "live OrderManager is not integrated with BoxExecutionSimulator; refusing a paper fallback",
+      );
+    }
+
     if (this.inFlight.has(key)) {
       return this.refuse(detection, "duplicate", "an execution pipeline is already running for this candidate");
     }
@@ -391,6 +401,10 @@ export class BoxExecutionSimulator {
       required_expected_net_profit: null,
       temporal: null,
       residual_exposure: [],
+      submitted_leg_count: 0,
+      fully_closed_role_count: 0,
+      remaining_role_count: 0,
+      fills_by_role: {},
       failure_reason: null,
       failure_detail: null,
     });
@@ -492,6 +506,10 @@ export class BoxExecutionSimulator {
         decision_to_last_fill_ms: timing.decision_to_last_fill_ms,
         // Exposure starts the moment the FIRST leg fills. It ends when the box is
         // complete (4/4) or when the unwind finishes — set on those paths below.
+        submitted_leg_count: legs.length,
+        fully_closed_role_count: filledCount,
+        remaining_role_count: legs.filter((l) => l.remaining_qty > 0).length,
+        fills_by_role: Object.fromEntries(legs.map((l) => [l.role, l.fill_qty])) as Partial<Record<BoxLegRole, number>>,
         exposure_started_at: timing.first_fill_at,
         exposure_ended_at: filledCount === 4 ? timing.last_fill_at : null,
         exposure_duration_ms:
@@ -650,7 +668,15 @@ export class BoxExecutionSimulator {
     stillWanted?: () => boolean;
   }): Promise<
     | { ok: true; legs: BoxLegEvaluation[]; record: PaperLeggingExecutionRecord; booksAtFill: Map<number, BoxQuote> }
-    | { ok: false; record: PaperLeggingExecutionRecord; reason: BoxExecutionFailureReason; detail: string }
+    | {
+        ok: false;
+        record: PaperLeggingExecutionRecord;
+        reason: BoxExecutionFailureReason;
+        detail: string;
+        /** Any quantity that DID close on a partial exit — real closes to apply. */
+        legs?: BoxLegEvaluation[];
+        booksAtFill?: Map<number, BoxQuote>;
+      }
   > {
     const { position, detectionLegs } = args;
     const key = `exit:${position.id}`;
@@ -687,6 +713,10 @@ export class BoxExecutionSimulator {
       required_expected_net_profit: null,
       temporal: null,
       residual_exposure: [],
+      submitted_leg_count: 0,
+      fully_closed_role_count: 0,
+      remaining_role_count: 0,
+      fills_by_role: {},
       failure_reason: null,
       failure_detail: null,
     });
@@ -699,8 +729,21 @@ export class BoxExecutionSimulator {
 
     try {
       const sentAt = args.detectedAt + Math.max(0, this.deps.cfg.simulatedDecisionMs);
+
+      // Size each closing order from the EXACT outstanding quantity per role — a
+      // role already flat is never submitted, so a partial exit can never re-close
+      // a leg or create reverse exposure. Between 1 and 4 orders may go out.
+      const toClose = outstandingRoles(position);
+      if (toClose.length === 0) {
+        // Nothing left to close — the position is already flat. Not an error; the
+        // caller treats an empty close as a no-op.
+        const rec: PaperLeggingExecutionRecord = { ...base(), submitted_leg_count: 0 };
+        return { ok: false, record: rec, reason: "legging_incomplete", detail: "position already flat — nothing to close" };
+      }
+      const submittedRoles = toClose.map((t) => t.role);
+
       const run = await this.legExecutor.run({
-        requests: BOX_LEG_ROLES.map((role) => {
+        requests: toClose.map(({ role, quantity }) => {
           const det = detByRole.get(role);
           return {
             role,
@@ -708,7 +751,7 @@ export class BoxExecutionSimulator {
             inst: position.legs[role],
             detected_price: det?.price ?? null,
             detected_qty: det?.qty_at_touch ?? 0,
-            quantity: lotSize,
+            quantity, // exactly the outstanding quantity for this role
           } satisfies LegOrderRequest;
         }),
         submitAt: sentAt,
@@ -718,14 +761,16 @@ export class BoxExecutionSimulator {
       });
 
       const legs = run.legs;
-      const filledRoles = legs.filter((l) => l.status === "FILLED").map((l) => l.role);
-      const filledCount = filledRoles.length;
+      const fullyClosedRoles = legs.filter((l) => l.status === "FILLED").map((l) => l.role);
+      const filledCount = fullyClosedRoles.length;
       const timing = fillTiming(legs, args.detectedAt);
+      const fillsByRole: Partial<Record<BoxLegRole, number>> = {};
+      for (const l of legs) fillsByRole[l.role] = l.fill_qty;
+      const remainingRoleCount = legs.filter((l) => l.remaining_qty > 0).length;
       const record: PaperLeggingExecutionRecord = {
         ...base(),
-        leg_execution_mode: run.aborted ? this.deps.cfg.legExecutionMode : this.deps.cfg.legExecutionMode,
         filled_leg_count: filledCount,
-        failed_legs: BOX_LEG_ROLES.filter((r) => !filledRoles.includes(r)),
+        failed_legs: submittedRoles.filter((r) => !fullyClosedRoles.includes(r)),
         timed_out_legs: legs.filter((l) => l.status === "TIMED_OUT").map((l) => l.role),
         partial_fill_legs: legs.filter((l) => l.fill_qty > 0 && l.fill_qty < l.quantity).map((l) => l.role),
         legs,
@@ -733,38 +778,98 @@ export class BoxExecutionSimulator {
         decision_to_first_fill_ms: timing.decision_to_first_fill_ms,
         decision_to_last_fill_ms: timing.decision_to_last_fill_ms,
         decision_to_complete_ms: round2(this.now() - args.detectedAt),
+        submitted_leg_count: submittedRoles.length,
+        fully_closed_role_count: filledCount,
+        remaining_role_count: remainingRoleCount,
+        fills_by_role: fillsByRole,
       };
       for (const _ of record.timed_out_legs) this.deps.metrics?.recordLegTimeout();
       for (const _ of record.partial_fill_legs) this.deps.metrics?.recordPartialFill();
 
-      if (filledCount === 4) {
-        // Clean four-leg close: price it on the actual average fills.
-        const exitLegs = BOX_LEG_ROLES.map((role) => {
-          const leg = legs.find((l) => l.role === role)!;
-          const book = run.booksAtFill.get(position.legs[role].token);
-          return this.legEvaluationFromFill(role, leg, position.legs[role], book, timing.last_fill_at ?? this.now());
+      // Build a leg evaluation for every role that closed ANY quantity — the close
+      // accounting is priced on the actual average fills, per role, for whatever
+      // filled (full or partial).
+      const closedLegs: BoxLegEvaluation[] = legs
+        .filter((l) => l.fill_qty > 0)
+        .map((l) => {
+          const book = run.booksAtFill.get(position.legs[l.role].token);
+          return this.legEvaluationFromFill(l.role, l, position.legs[l.role], book, timing.last_fill_at ?? this.now());
         });
+
+      // A CLEAN close: every role that was still outstanding filled completely.
+      const cleanClose = remainingRoleCount === 0 && filledCount === submittedRoles.length;
+      if (cleanClose) {
         const exitSlip = round2(legs.reduce((s, l) => s + (l.slippage ?? 0), 0));
         this.deps.metrics?.recordExitSlippage(exitSlip);
-        return { ok: true, legs: exitLegs, record, booksAtFill: run.booksAtFill };
+        return { ok: true, legs: closedLegs, record, booksAtFill: run.booksAtFill };
       }
 
-      // Some (or no) exit legs filled → the box is no longer whole. The filled
-      // legs are REAL closes; the unfilled roles are still open positions. That is
-      // residual exposure, reported explicitly.
+      // Some quantity did not close → the position is (still) partial. Any quantity
+      // that DID close is a real close (returned in `closedLegs`); the outstanding
+      // remainder is residual exposure the caller must keep working.
       const residual = this.residualFromPartialExit(position, legs, this.now());
       record.residual_exposure = residual;
       record.failure_reason = run.aborted?.reason ?? "legging_incomplete";
       record.failure_detail =
-        `${filledCount}/4 exit legs filled` + (run.aborted ? ` — ${run.aborted.detail}` : "") +
+        `${filledCount}/${submittedRoles.length} submitted exit legs filled` +
+        (run.aborted ? ` — ${run.aborted.detail}` : "") +
         (residual.length > 0 ? ` — ${residual.length} leg(s) of residual exposure remain` : "");
       if (residual.length > 0) this.deps.metrics?.recordResidualExposure(residual.length);
       this.deps.metrics?.recordExecutionFailed(record.failure_reason);
-      return { ok: false, record, reason: record.failure_reason, detail: record.failure_detail };
+      return { ok: false, record, reason: record.failure_reason, detail: record.failure_detail, legs: closedLegs, booksAtFill: run.booksAtFill };
     } finally {
       this.active--;
       this.inFlight.delete(key);
     }
+  }
+
+  /**
+   * NON-MUTATING estimate of how much of each still-open role could execute RIGHT
+   * NOW, using the SAME marketable-limit pricing, depth walking and queue haircut
+   * the LegExecutor uses to actually fill. Qualification and execution therefore
+   * share one implementation and cannot drift.
+   *
+   * For each outstanding role it reports the executable quantity within the limit
+   * (across depth levels, after the queue haircut) so the caller can pre-reject an
+   * exit only when the executable quantity is genuinely below what is needed —
+   * never merely because the whole lot is not resting at the single best touch.
+   */
+  estimateExecutableExit(
+    position: BoxOpenPosition,
+    now = this.now(),
+  ): { role: BoxLegRole; side: OrderSide; remaining: number; executable: number; fresh: boolean }[] {
+    const direction = position.direction ?? "LONG_BOX";
+    const maxAgeMs = this.policy.quoteMaxAgeMs;
+    const out: { role: BoxLegRole; side: OrderSide; remaining: number; executable: number; fresh: boolean }[] = [];
+    for (const { role, quantity } of outstandingRoles(position)) {
+      const side = exitSideFor(role, direction);
+      const inst = position.legs[role];
+      const quote = this.deps.quotes.get(inst.token);
+      if (!quote) {
+        out.push({ role, side, remaining: quantity, executable: 0, fresh: false });
+        continue;
+      }
+      const age = now - quote.at;
+      const fresh = age >= 0 && age <= maxAgeMs;
+      const ref = touchPrice(side, quote.bids, quote.asks);
+      if (!fresh || ref === null || !(ref > 0)) {
+        out.push({ role, side, remaining: quantity, executable: 0, fresh });
+        continue;
+      }
+      const pricing = this.policy.priceOrder({ side, quantity, referencePrice: ref, inst, phase: "entry" });
+      const walk = walkDepth({
+        side,
+        levels: side === "BUY" ? quote.asks : quote.bids,
+        remainingQty: quantity,
+        limitPrice: pricing.limit_price,
+        queueModel: this.policy.queueModel,
+        haircutPct: this.policy.queueHaircutPct,
+        at: now,
+        quoteVersion: quote.version,
+      });
+      out.push({ role, side, remaining: quantity, executable: walk.executable_within_limit, fresh });
+    }
+    return out;
   }
 
   /**
@@ -782,7 +887,11 @@ export class BoxExecutionSimulator {
     for (const role of BOX_LEG_ROLES) {
       const leg = exitLegs.find((l) => l.role === role);
       const closed = leg?.fill_qty ?? 0;
-      const outstanding = position.quantity - closed;
+      // Outstanding is measured against the role's CURRENT open quantity, not the
+      // original lot — a role that was already partly closed in a prior attempt
+      // must not have its earlier closes counted again here.
+      const openNow = position.remaining_qty_by_role[role] ?? 0;
+      const outstanding = openNow - closed;
       if (outstanding <= 0) continue;
       out.push({
         token: position.legs[role].token,
@@ -967,6 +1076,90 @@ export class BoxExecutionSimulator {
     return { unwindFailed, partial_entry_charges, unwind_charges, legging_gross_loss, legging_net_loss, residual };
   }
 
+  /**
+   * Flatten outstanding RESIDUAL exposure through the SAME order lifecycle — a
+   * marketable-limit order (wider unwind chase band), depth walking, queue haircut,
+   * latency and timeout. Submits the OPPOSITE side of what we hold, sized to the
+   * EXACT residual quantity, so a quantity already flattened is never re-sent.
+   *
+   * NOT gated by any scanner/discovery predicate — flattening real exposure must
+   * proceed whenever the market is open and the feed is healthy (the caller checks
+   * those before calling). Returns how much of each residual leg was flattened, the
+   * charges billed for the flatten fills, and the STILL-outstanding residual.
+   */
+  async flattenResidual(args: {
+    residual: ResidualLegExposure[];
+    keyPrefix: string;
+  }): Promise<{
+    flattened_by_role: Partial<Record<BoxLegRole, number>>;
+    flatten_charges: number;
+    remaining: ResidualLegExposure[];
+    legs: PaperLegExecution[];
+  }> {
+    const now = this.now();
+    const requests: LegOrderRequest[] = args.residual.map((r) => {
+      // We HOLD r.side; flatten by trading the opposite side.
+      const flattenSide: OrderSide = r.side === "BUY" ? "SELL" : "BUY";
+      const inst = {
+        token: r.token,
+        tradingsymbol: r.tradingsymbol,
+        exchange: "NFO",
+        strike: 0,
+        instrument_type: r.role.endsWith("_ce") ? "CE" : "PE",
+        expiry: "",
+        lot_size: r.quantity,
+      } as const;
+      const q = this.deps.quotes.get(r.token);
+      const ref = q ? touchPrice(flattenSide, q.bids, q.asks) : null;
+      return {
+        role: r.role,
+        side: flattenSide,
+        inst,
+        detected_price: ref,
+        detected_qty: 0,
+        quantity: r.quantity,
+      };
+    });
+
+    const run = await this.legExecutor.run({
+      requests,
+      submitAt: now,
+      latencyMs: this.policy.unwindLatencyMs,
+      phase: "unwind",
+      orderIdPrefix: `${args.keyPrefix}:flatten`,
+      // Only a dead feed / closed market may halt flattening — never discovery state.
+      abortReason: this.leggingAbortReason(),
+    });
+
+    const flattenedByRole: Partial<Record<BoxLegRole, number>> = {};
+    const charge = this.deps.chargeTotal ?? (() => 0);
+    const flattenOrders: { side: OrderSide; tradingsymbol: string; quantity: number; price: number }[] = [];
+    const remaining: ResidualLegExposure[] = [];
+
+    for (const r of args.residual) {
+      const leg = run.legs.find((x) => x.role === r.role);
+      const flat = leg?.fill_qty ?? 0;
+      flattenedByRole[r.role] = flat;
+      if (flat > 0 && (leg?.average_fill_price ?? leg?.fill_price) !== null) {
+        flattenOrders.push({
+          side: leg!.side,
+          tradingsymbol: r.tradingsymbol,
+          quantity: flat,
+          price: (leg!.average_fill_price ?? leg!.fill_price) as number,
+        });
+      }
+      const left = r.quantity - flat;
+      if (left > 0) remaining.push({ ...r, quantity: left, created_at: r.created_at });
+    }
+
+    return {
+      flattened_by_role: flattenedByRole,
+      flatten_charges: round2(charge(flattenOrders)),
+      remaining,
+      legs: run.legs,
+    };
+  }
+
   /** Temporal coherence of a candidate's four books right now (for the skew gate). */
   private temporalFor(
     candidate: BoxCandidate,
@@ -1044,6 +1237,15 @@ export class BoxExecutionSimulator {
     const { position, detectionLegs } = args;
     const key = `exit:${position.id}`;
     const direction = position.direction ?? "LONG_BOX";
+
+    if (this.mode === "live") {
+      return this.refuseLegs(
+        detectionLegs,
+        args.detectedAt,
+        "discovery_stopped",
+        "live OrderManager is not integrated with BoxExecutionSimulator; refusing a paper fallback",
+      );
+    }
 
     if (this.inFlight.has(key)) {
       return this.refuseLegs(detectionLegs, args.detectedAt, "duplicate", "an exit pipeline is already running for this position");

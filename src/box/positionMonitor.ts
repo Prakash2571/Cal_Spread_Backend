@@ -17,22 +17,29 @@
  *      decision-critical path. There is no Zerodha round trip between measuring a
  *      position and deciding to close it; verification happens asynchronously
  *      elsewhere (chargeReconciler.ts).
- *   2. The fill itself goes through the execution simulator. In paper_latency mode
- *      the recorded exit prices come from the first WebSocket book published at or
- *      after a simulated arrival — never a stale pre-decision snapshot. In
- *      paper_touch mode it fills at the current touch, as before.
+ *   2. The fill itself goes through the central execution gateway. Paper modes
+ *      retain their simulator semantics; live mode uses durable bounded LIMIT
+ *      orders and applies only broker-confirmed cumulative fills.
  */
 
 import type { BoxConfig } from "./config.js";
-import type { BoxExecutionSimulator } from "./executionSimulator.js";
+import type { BoxExecutionGateway } from "./executionGateway.js";
+import type { BoxMetrics } from "./metrics.js";
 import { LocalChargeCalculator, ordersFromLegs } from "./localCharges.js";
 import {
   computeExitMetrics,
+  entrySideFor,
   evaluateExitLegs,
   exitLiquidityOk,
   round2,
 } from "./math.js";
-import type { BoxOpenPosition, BoxPositionBook } from "./positions.js";
+import {
+  deriveBoxPositionState,
+  isBoxPositionFlat,
+  outstandingRoles,
+  type BoxOpenPosition,
+  type BoxPositionBook,
+} from "./positions.js";
 import type { BoxQuoteStore } from "./quotes.js";
 import {
   BOX_LEG_ROLES,
@@ -40,7 +47,10 @@ import {
   type BoxExecutionRecord,
   type BoxExitMetrics,
   type BoxExitReason,
+  type BoxExecutionFailureReason,
   type BoxLegEvaluation,
+  type BoxLegRole,
+  type IBoxExitAttempt,
   type PaperLeggingExecutionRecord,
   type ResidualLegExposure,
 } from "./types.js";
@@ -49,8 +59,10 @@ export interface BoxMonitorDeps {
   cfg: BoxConfig;
   quotes: BoxQuoteStore;
   localCharges: LocalChargeCalculator;
-  executionSim: BoxExecutionSimulator;
+  executionSim: BoxExecutionGateway;
   positions: BoxPositionBook;
+  /** Bounded metrics sink (optional; absent in some tests). */
+  metrics?: BoxMetrics;
   /** Persists the close. Returns true when this call is the one that closed it. */
   closePaperTrade: (args: {
     position: BoxOpenPosition;
@@ -61,6 +73,22 @@ export interface BoxMonitorDeps {
     /** The independent-order exit audit, when the exit used paper_legging. */
     legging?: PaperLeggingExecutionRecord | null;
     residual?: ResidualLegExposure[] | null;
+    /** CUMULATIVE realised gross across all exit attempts (paper_legging). */
+    grossPnlOverride?: number | null;
+    /** CUMULATIVE exit charges across all attempts (paper_legging). */
+    exitChargesTotalOverride?: number | null;
+    /** The full append-only exit-attempt audit to persist on close. */
+    exitAttempts?: IBoxExitAttempt[] | null;
+  }) => Promise<boolean>;
+  /**
+   * Durably record a PARTIAL exit (some quantity closed, some remains) in one
+   * atomic update, BEFORE the monitor treats the execution as clean. Returns true
+   * when the update matched an open trade.
+   */
+  persistPartialExit: (args: {
+    position: BoxOpenPosition;
+    residual: ResidualLegExposure[];
+    legging: PaperLeggingExecutionRecord;
   }) => Promise<boolean>;
   /** Slow periodic flush of the live convergence figure. */
   persistLive: (position: BoxOpenPosition) => Promise<void>;
@@ -88,6 +116,13 @@ export class BoxPositionMonitor {
   private evaluationTasks = new Map<string, Promise<void>>();
   private pendingEvaluationIds = new Set<string>();
   private closingIds = new Set<string>();
+  private pendingPartialPersists = new Map<string, {
+    projected: BoxOpenPosition;
+    residual: ResidualLegExposure[];
+    legging: PaperLeggingExecutionRecord;
+  }>();
+  /** Confirmed final fills awaiting the one atomic close projection. No order is replayed. */
+  private pendingFinalPersists = new Map<string, Parameters<BoxMonitorDeps["closePaperTrade"]>[0]>();
   private lastBlockedKey = new Map<string, string>();
   private stats = {
     cycles: 0,
@@ -161,6 +196,8 @@ export class BoxPositionMonitor {
     if (this.ticking) return;
     this.ticking = true;
     try {
+      await this.retryPendingFinalPersists();
+      await this.retryPendingPartialPersists();
       this.stats.cycles++;
       this.stats.lastCycleAt = Date.now();
       await Promise.all(this.deps.positions.list().map((pos) => this.requestEvaluation(pos.id)));
@@ -230,6 +267,42 @@ export class BoxPositionMonitor {
     });
   }
 
+  private async retryPendingFinalPersists(): Promise<void> {
+    for (const [id, pending] of [...this.pendingFinalPersists]) {
+      const current = this.deps.positions.get(id);
+      if (!current) {
+        this.pendingFinalPersists.delete(id);
+        continue;
+      }
+      const closed = await this.deps.closePaperTrade(pending).catch(() => false);
+      if (!closed) continue;
+      this.pendingFinalPersists.delete(id);
+    }
+  }
+
+  private async retryPendingPartialPersists(): Promise<void> {
+    for (const [id, pending] of [...this.pendingPartialPersists]) {
+      const current = this.deps.positions.get(id);
+      if (!current) {
+        this.pendingPartialPersists.delete(id);
+        continue;
+      }
+      const persisted = await this.deps.persistPartialExit({
+        position: pending.projected,
+        residual: pending.residual,
+        legging: pending.legging,
+      }).catch(() => false);
+      if (!persisted) continue;
+      current.remaining_qty_by_role = { ...pending.projected.remaining_qty_by_role };
+      current.position_state = pending.projected.position_state;
+      current.cumulative_exit_charges = pending.projected.cumulative_exit_charges;
+      current.exit_attempts = [...pending.projected.exit_attempts];
+      current.metrics = pending.projected.metrics;
+      current.exit_blocked_reason = pending.projected.exit_blocked_reason;
+      this.pendingPartialPersists.delete(id);
+    }
+  }
+
   private async evaluatePosition(pos: BoxOpenPosition): Promise<void> {
     const now = Date.now();
     let metrics = this.measure(pos, now);
@@ -243,6 +316,7 @@ export class BoxPositionMonitor {
     }
 
     if (pos.closing || this.closingIds.has(pos.id)) return;
+    if (this.pendingFinalPersists.has(pos.id) || this.pendingPartialPersists.has(pos.id)) return;
 
     // Outside market hours / dead feed: refresh metrics, attempt nothing. Neither
     // is a liquidity event.
@@ -260,6 +334,33 @@ export class BoxPositionMonitor {
       );
     }
 
+    // RECOVERY means broker attribution/quantity is not yet trusted. Never feed it
+    // into ordinary box convergence or automatic flattening; OrderManager
+    // reconciliation owns broker-authoritative recovery.
+    if (pos.position_state === "RECOVERY") {
+      const detail = "position is in RECOVERY and requires broker order/position reconciliation";
+      pos.exit_blocked_reason = detail;
+      const gapKey = "recovery:reconciliation_required";
+      if (this.lastBlockedKey.get(pos.id) !== gapKey) {
+        this.lastBlockedKey.set(pos.id, gapKey);
+        this.deps.onEvent("ERROR", pos, metrics, detail);
+      }
+      return;
+    }
+
+    // A PARTIALLY_EXITED position is no longer a whole box: prioritise FLATTENING
+    // the remaining exposure rather than waiting for a convergence signal that no
+    // longer describes it. Throttled so a burst of ticks cannot hammer the executor
+    // while an attempt is (or just was) in flight.
+    if (pos.position_state === "PARTIALLY_EXITED") {
+      const throttle = Math.max(250, this.deps.cfg.legTimeoutMs);
+      if (now - (pos.last_exit_attempt_at ?? 0) < throttle) return;
+      this.deps.metrics?.recordPartialExitRetry();
+      const cleanupReason: BoxExitReason = pos.exit_attempts[0]?.reason ?? "EDGE_CONVERGED";
+      await this.runExit(pos, metrics, expirySafety ? "EXPIRY_SAFETY" : cleanupReason, expirySafety);
+      return;
+    }
+
     const decision = metrics.decision;
     // Nothing to do: no rule fired and we are not in the expiry window.
     if (decision.rule_reason === null && !expirySafety) {
@@ -272,8 +373,11 @@ export class BoxPositionMonitor {
       decision.rule_reason ?? (expirySafety ? "EXPIRY_SAFETY" : null);
     if (!reason) return;
 
-    // The rules want to close. Does the CURRENT touch support one whole lot?
-    if (!exitLiquidityOk(metrics.legs)) {
+    // The rules want to close. Is there enough EXECUTABLE liquidity to work it?
+    // paper_legging walks depth within a limit, so its pre-gate is depth-aware
+    // (do not reject merely because the whole lot is not at the single best
+    // touch); the atomic modes fill at the touch, so they keep the touch gate.
+    if (!this.exitExecutionOk(pos, metrics)) {
       this.recordLiquiditySkip(pos, metrics);
       return;
     }
@@ -306,9 +410,8 @@ export class BoxPositionMonitor {
     pos.closing = true;
     let handed = false;
 
-    // paper_legging: close with four INDEPENDENT orders, so a partial close leaves
-    // visible residual exposure rather than a fabricated clean exit.
-    if (this.deps.cfg.executionMode === "paper_legging") {
+    // Independent-role execution is shared by paper_legging and live.
+    if (this.deps.cfg.executionMode === "paper_legging" || this.deps.cfg.executionMode === "live") {
       try {
         await this.runLeggingExit(pos, detectionMetrics, reason);
       } finally {
@@ -428,20 +531,17 @@ export class BoxPositionMonitor {
   }
 
   /**
-   * Close a box with four INDEPENDENT exit orders (paper_legging).
-   *
-   * A clean 4/4 close is priced on the actual average fills and persisted like any
-   * exit. If only SOME exit legs fill the box is no longer whole: the trade is NOT
-   * closed and NOT marked flat — the residual exposure (the legs that could not be
-   * closed) is recorded and surfaced, and the next cycle retries the full close.
-   * This is the paper simulation's honest handling of a partial exit: it never
-   * pretends the position stayed intact, and it never fabricates a clean exit.
+   * Close a box with four INDEPENDENT exit orders (paper_legging), sizing each
+   * closing order from the EXACT outstanding quantity per role. Delegates the
+   * fill-application, per-role decrement and persistence to the shared helper so
+   * automatic and manual legging exits use identical mechanics.
    */
   private async runLeggingExit(
     pos: BoxOpenPosition,
     detectionMetrics: BoxExitMetrics,
     reason: BoxExitReason,
   ): Promise<void> {
+    pos.last_exit_attempt_at = Date.now();
     const result = await this.deps.executionSim.simulateLeggingExit({
       position: pos,
       detectionLegs: detectionMetrics.legs,
@@ -451,61 +551,413 @@ export class BoxPositionMonitor {
         this.deps.isMarketOpen() &&
         this.deps.isFeedHealthy(),
     });
+    await this.applyLeggingExitResult(pos, result, reason, "auto");
+  }
 
-    if (!result.ok) {
-      // Some or none of the exit legs filled. Keep the position open, record the
-      // residual exposure for visibility, and let a later cycle retry.
+  /**
+   * Apply the result of a legging exit to the position — the ONE place partial and
+   * full closes are turned into durable state, shared by automatic and manual
+   * exits so they can never diverge.
+   *
+   *  - Any quantity that CLOSED is applied irreversibly: `remaining_qty_by_role`
+   *    is decremented (never below zero, never re-closing a flat leg), an exit
+   *    attempt is appended, and charges/realised-gross accumulate.
+   *  - If every role is now flat, the trade is closed on the CUMULATIVE accounting.
+   *  - Otherwise the partial exit is persisted atomically and the position stays
+   *    open for the next cycle to keep flattening — never marked flat, never
+   *    turned into reverse exposure.
+   *
+   * Returns what happened so a manual caller can report it honestly.
+   */
+  private async applyLeggingExitResult(
+    pos: BoxOpenPosition,
+    result:
+      | { ok: true; legs: BoxLegEvaluation[]; record: PaperLeggingExecutionRecord }
+      | { ok: false; record: PaperLeggingExecutionRecord; reason: BoxExecutionFailureReason; detail: string; legs?: BoxLegEvaluation[] },
+    reason: BoxExitReason,
+    origin: "auto" | "manual",
+  ): Promise<{ closedAny: boolean; flat: boolean; closedRoles: BoxLegRole[] }> {
+    const record = result.record;
+    const uncertain = this.deps.cfg.executionMode === "live" && !result.ok && /uncertain|reconcil/i.test(result.detail);
+    if (uncertain) {
+      const requested = emptyRoleMap();
+      for (const leg of record.legs) requested[leg.role] = leg.requested_qty;
+      const attempt: IBoxExitAttempt = {
+        attempt_id: record.legs[0]?.order_id ?? `${pos.id}:exit:${pos.exit_attempts.length}`,
+        source: origin,
+        status: "UNCERTAIN",
+        origin,
+        reason,
+        detected_at: new Date(record.detected_at),
+        requested_at: new Date(record.detected_at),
+        submitted_at: new Date(record.order_sent_at),
+        completed_at: null,
+        requested_qty_by_role: requested,
+        filled_qty_by_role: { ...record.fills_by_role },
+        fills_by_role: { ...record.fills_by_role },
+        avg_price_by_role: {},
+        charges: null,
+        charges_total: 0,
+        gross_pnl: null,
+        remaining_after: { ...pos.remaining_qty_by_role },
+        submitted_role_count: record.submitted_leg_count,
+        fully_filled_role_count: record.fully_closed_role_count,
+        remaining_role_count: outstandingRoles(pos).length,
+        submitted_leg_count: record.submitted_leg_count,
+        filled_leg_count: record.fully_closed_role_count,
+        broker_orders: record.legs.map((leg) => ({
+          client_order_id: leg.client_order_id,
+          broker_order_id: leg.order_id,
+          state: "RECONCILIATION_REQUIRED",
+          requested_quantity: leg.requested_qty,
+          filled_quantity: leg.fill_qty,
+          average_price: leg.average_fill_price,
+        })),
+      };
+      const projected: BoxOpenPosition = {
+        ...pos,
+        position_state: "RECOVERY",
+        exit_blocked_reason: result.detail,
+        exit_attempts: [...pos.exit_attempts, attempt],
+        remaining_qty_by_role: { ...pos.remaining_qty_by_role },
+      };
+      const residual = outstandingRoles(projected).map<ResidualLegExposure>(({ role, quantity }) => ({
+        token: projected.legs[role].token,
+        tradingsymbol: projected.legs[role].tradingsymbol,
+        role,
+        side: entrySideFor(role, projected.direction ?? "LONG_BOX"),
+        quantity,
+        average_price: projected.entry_prices[role] ?? 0,
+        source: "partial_exit",
+        created_at: Date.now(),
+      }));
+      const persisted = await this.deps.persistPartialExit({ position: projected, residual, legging: record }).catch(() => false);
+      if (persisted) {
+        pos.position_state = "RECOVERY";
+        pos.exit_blocked_reason = result.detail;
+        pos.exit_attempts = projected.exit_attempts;
+      } else {
+        this.pendingPartialPersists.set(pos.id, { projected, residual, legging: record });
+      }
+      this.deps.executionSim.invariantViolation(`${pos.id}: ${result.detail}`);
+      return { closedAny: false, flat: false, closedRoles: [] };
+    }
+    const closedLegs = (result.ok ? result.legs : result.legs ?? []).filter(
+      (l) => (record.fills_by_role[l.role] ?? 0) > 0,
+    );
+    this.deps.metrics?.recordPartialExitAttempt();
+
+    if (closedLegs.length === 0) {
+      // Nothing closed this attempt. Keep the position open and record why (deduped).
       this.stats.exitsFailedExecution++;
-      const residual = result.record.residual_exposure;
       const detail =
-        `paper_legging exit ${result.record.filled_leg_count}/4 filled` +
-        (residual.length > 0 ? `; ${residual.length} leg(s) still open` : "");
+        `${this.deps.cfg.executionMode} exit closed 0/${record.submitted_leg_count} submitted legs` +
+        (result.ok ? "" : ` — ${result.detail}`);
       pos.exit_blocked_reason = detail;
-      // Dedupe the event the same way a liquidity skip is deduped.
-      const gapKey = `legging_exit:${result.record.filled_leg_count}`;
+      const gapKey = `legging_exit:0:${record.submitted_leg_count}`;
       if (this.lastBlockedKey.get(pos.id) !== gapKey) {
         this.lastBlockedKey.set(pos.id, gapKey);
         this.deps.onEvent("EXIT_SKIPPED_LIQUIDITY", pos, pos.metrics, detail);
       }
-      return;
+      return { closedAny: false, flat: false, closedRoles: [] };
     }
 
-    // Clean four-leg close on the actual average fills.
-    const exitCharges = this.localExitCharges(pos, result.legs);
-    const exitTotal = exitCharges ? exitCharges.total : this.localExitChargesTotal(pos, result.legs);
-    const finalMetrics = computeExitMetrics({
-      boxWidth: pos.box_width,
-      lotSize: pos.lot_size,
-      entryBoxCostPerUnit: pos.entry_box_cost_per_unit,
-      entryNetEdge: pos.entry_net_edge,
-      entryChargesTotal: pos.entry_charges_total,
-      currentExitChargesTotal: exitTotal,
-      legs: result.legs,
-      now: Date.now(),
-      direction: pos.direction ?? "LONG_BOX",
-      entryEdge: pos.entry_gross_edge,
-      // The exit executed at known prices: no forward allowance (Task 6/7).
-      executionCost: 0,
-      useRealisableForFloor: false,
-      openedAt: pos.opened_at,
-      expirySafety: this.isInExpirySafetyWindow(pos),
-      cfg: this.deps.cfg,
+    const submittedRoles = new Set<BoxLegRole>([
+      ...record.legs.map((leg) => leg.role),
+      ...(Object.keys(record.fills_by_role) as BoxLegRole[]),
+    ]);
+    const invalidRole = [...submittedRoles].find((role) => {
+      const previous = pos.remaining_qty_by_role[role] ?? 0;
+      const confirmed = record.fills_by_role[role] ?? 0;
+      return !Number.isInteger(confirmed) || confirmed < 0 || confirmed > previous;
     });
-    pos.metrics = finalMetrics;
-    pos.exit_blocked_reason = null;
-    this.lastBlockedKey.delete(pos.id);
-    this.stats.exitsTriggered++;
-    this.deps.onEvent("EXIT_TRIGGERED", pos, finalMetrics, reason);
-    await this.deps.closePaperTrade({
-      position: pos,
-      metrics: finalMetrics,
-      exitCharges,
+    if (invalidRole) {
+      const previous = pos.remaining_qty_by_role[invalidRole] ?? 0;
+      const confirmed = record.fills_by_role[invalidRole] ?? 0;
+      const message = `confirmed fill invariant violated for ${invalidRole}: ${confirmed} not within 0..${previous}`;
+      this.deps.metrics?.recordInvariantFailure();
+      const requested = emptyRoleMap();
+      for (const leg of record.legs) requested[leg.role] = leg.requested_qty;
+      const violation: IBoxExitAttempt = {
+        attempt_id: record.legs[0]?.order_id ?? `${pos.id}:exit:${pos.exit_attempts.length}`,
+        source: origin,
+        status: "INVARIANT_VIOLATION",
+        origin,
+        reason,
+        detected_at: new Date(record.detected_at),
+        requested_at: new Date(record.detected_at),
+        submitted_at: new Date(record.order_sent_at),
+        completed_at: new Date(),
+        requested_qty_by_role: requested,
+        filled_qty_by_role: { ...record.fills_by_role },
+        fills_by_role: { ...record.fills_by_role },
+        avg_price_by_role: {},
+        charges: null,
+        charges_total: 0,
+        gross_pnl: null,
+        remaining_after: { ...pos.remaining_qty_by_role },
+        submitted_role_count: record.submitted_leg_count,
+        fully_filled_role_count: record.fully_closed_role_count,
+        remaining_role_count: outstandingRoles(pos).length,
+        submitted_leg_count: record.submitted_leg_count,
+        filled_leg_count: record.fully_closed_role_count,
+        invariant_violation: message,
+      };
+      const projected: BoxOpenPosition = {
+        ...pos,
+        exit_attempts: [...pos.exit_attempts, violation],
+        position_state: "RECOVERY",
+        exit_blocked_reason: message,
+        remaining_qty_by_role: { ...pos.remaining_qty_by_role },
+      };
+      const residual = outstandingRoles(projected).map<ResidualLegExposure>(({ role, quantity }) => ({
+        token: pos.legs[role].token,
+        tradingsymbol: pos.legs[role].tradingsymbol,
+        role,
+        side: entrySideFor(role, pos.direction ?? "LONG_BOX"),
+        quantity,
+        average_price: pos.entry_prices[role] ?? 0,
+        source: "partial_exit",
+        created_at: Date.now(),
+      }));
+      const persisted = await this.deps.persistPartialExit({
+        position: projected,
+        residual,
+        legging: record,
+      }).catch(() => false);
+      if (persisted) {
+        pos.exit_attempts = [...projected.exit_attempts];
+        pos.position_state = projected.position_state;
+        pos.exit_blocked_reason = projected.exit_blocked_reason;
+      } else {
+        this.pendingPartialPersists.set(pos.id, { projected, residual, legging: record });
+        pos.position_state = "RECOVERY";
+        pos.exit_blocked_reason = `${message}; durable recovery projection is pending`;
+      }
+      this.deps.executionSim.invariantViolation(`${pos.id}: ${message}`);
+      this.deps.onEvent("ERROR", pos, pos.metrics, message);
+      return { closedAny: false, flat: false, closedRoles: [] };
+    }
+
+    const direction = pos.direction ?? "LONG_BOX";
+    const now = Date.now();
+    const projected: BoxOpenPosition = {
+      ...pos,
+      remaining_qty_by_role: { ...pos.remaining_qty_by_role },
+      exit_attempts: [...pos.exit_attempts],
+    };
+    const fillsByRole: Partial<Record<BoxLegRole, number>> = {};
+    const avgByRole: Partial<Record<BoxLegRole, number>> = {};
+    const requestedByRole = emptyRoleMap();
+    for (const leg of record.legs) requestedByRole[leg.role] = leg.requested_qty;
+    const remainingAfter: Record<BoxLegRole, number> = { ...pos.remaining_qty_by_role };
+    const closedRoles: BoxLegRole[] = [];
+    const chargeOrders: { side: "BUY" | "SELL"; tradingsymbol: string; quantity: number; price: number }[] = [];
+    let attemptGross = 0;
+    let closedQtyTotal = 0;
+
+    for (const leg of closedLegs) {
+      const role = leg.role;
+      const prev = pos.remaining_qty_by_role[role] ?? 0;
+      const closed = record.fills_by_role[role] ?? 0;
+      if (closed <= 0) continue;
+      const price = leg.price ?? 0;
+      const remaining = Math.max(0, prev - closed);
+      projected.remaining_qty_by_role[role] = remaining;
+      fillsByRole[role] = closed;
+      avgByRole[role] = price;
+      remainingAfter[role] = remaining;
+      closedRoles.push(role);
+      closedQtyTotal += closed;
+      // Realised gross for the closed quantity of this leg (per-leg identity that
+      // sums to the box gross once all four are flat).
+      const entrySide = entrySideFor(role, direction);
+      const entryPrice = pos.entry_prices[role] ?? 0;
+      const per = entrySide === "BUY" ? price - entryPrice : entryPrice - price;
+      attemptGross += per * closed;
+      chargeOrders.push({ side: leg.side, tradingsymbol: leg.tradingsymbol, quantity: closed, price });
+    }
+
+    const attemptChargeObject = this.deps.localCharges.legs(chargeOrders, "kite_estimate");
+    const attemptCharges = round2(attemptChargeObject.total);
+    attemptGross = round2(attemptGross);
+    projected.cumulative_exit_charges = round2(pos.cumulative_exit_charges + attemptCharges);
+    projected.metrics = this.measure(projected, now);
+
+    const flat = isBoxPositionFlat(projected.remaining_qty_by_role);
+    projected.position_state = deriveBoxPositionState(projected.remaining_qty_by_role, pos.position_state);
+
+    const attempt: IBoxExitAttempt = {
+      attempt_id: record.legs[0]?.order_id ?? `${pos.id}:exit:${pos.exit_attempts.length}`,
+      source: origin,
+      status: flat ? "COMPLETE" : "PARTIAL",
+      origin,
       reason,
-      // No single BoxExecutionRecord for a legging exit; the per-leg audit is the
-      // legging record instead.
-      execution: null,
-      legging: result.record,
-      residual: null,
+      detected_at: new Date(record.detected_at),
+      requested_at: new Date(record.detected_at),
+      submitted_at: new Date(record.order_sent_at),
+      completed_at: new Date(now),
+      requested_qty_by_role: requestedByRole,
+      filled_qty_by_role: fillsByRole,
+      fills_by_role: fillsByRole,
+      avg_price_by_role: avgByRole,
+      charges: attemptChargeObject,
+      charges_total: attemptCharges,
+      gross_pnl: attemptGross,
+      remaining_after: remainingAfter,
+      submitted_role_count: record.submitted_leg_count,
+      fully_filled_role_count: record.fully_closed_role_count,
+      remaining_role_count: BOX_LEG_ROLES.filter((role) => projected.remaining_qty_by_role[role] > 0).length,
+      submitted_leg_count: record.submitted_leg_count,
+      filled_leg_count: record.fully_closed_role_count,
+      broker_orders: record.legs.map((leg) => ({
+        client_order_id: leg.client_order_id,
+        broker_order_id: leg.order_id,
+        state: leg.status === "FILLED" ? "COMPLETE" : leg.status === "CANCELLED" ? "CANCELLED" : leg.status === "FAILED" ? "REJECTED" : "PARTIALLY_FILLED",
+        requested_quantity: leg.requested_qty,
+        filled_quantity: leg.fill_qty,
+        average_price: leg.average_fill_price,
+      })),
+    };
+    projected.exit_attempts.push(attempt);
+    this.deps.metrics?.recordPartialExitFilledQty(closedQtyTotal);
+
+    if (flat) {
+      // Every role is flat → close on the CUMULATIVE accounting across attempts.
+      const cumulativeGross = round2(projected.exit_attempts.reduce((s, a) => s + (a.gross_pnl ?? 0), 0));
+      const finalLegs = this.buildFinalExitLegs(projected);
+      const finalMetrics = computeExitMetrics({
+        boxWidth: pos.box_width,
+        lotSize: pos.lot_size,
+        entryBoxCostPerUnit: pos.entry_box_cost_per_unit,
+        entryNetEdge: pos.entry_net_edge,
+        entryChargesTotal: pos.entry_charges_total,
+        currentExitChargesTotal: projected.cumulative_exit_charges,
+        legs: finalLegs,
+        now,
+        direction,
+        entryEdge: pos.entry_gross_edge,
+        executionCost: 0,
+        useRealisableForFloor: false,
+        openedAt: pos.opened_at,
+        expirySafety: this.isInExpirySafetyWindow(pos),
+        cfg: this.deps.cfg,
+      });
+      projected.metrics = finalMetrics;
+      projected.exit_blocked_reason = null;
+      this.lastBlockedKey.delete(pos.id);
+      this.stats.exitsTriggered++;
+      if (origin === "manual") this.deps.metrics?.recordManualLeggingExit();
+      this.deps.onEvent("EXIT_TRIGGERED", projected, finalMetrics, reason);
+      const closeArgs: Parameters<BoxMonitorDeps["closePaperTrade"]>[0] = {
+        position: projected,
+        metrics: finalMetrics,
+        exitCharges: null,
+        reason,
+        execution: null,
+        legging: record,
+        residual: null,
+        grossPnlOverride: cumulativeGross,
+        exitChargesTotalOverride: projected.cumulative_exit_charges,
+        exitAttempts: projected.exit_attempts,
+      };
+      const closed = await this.deps.closePaperTrade(closeArgs).catch(() => false);
+      if (!closed) {
+        // Broker-confirmed fills are irreversible, but the close projection is not
+        // authoritative until Mongo accepts it. Quarantine and retry persistence
+        // only; never submit another exit order for these already-flat roles.
+        this.pendingFinalPersists.set(pos.id, closeArgs);
+        pos.position_state = "RECOVERY";
+        pos.exit_blocked_reason = "all exit fills confirmed, but final close persistence is pending";
+        this.deps.executionSim.invariantViolation(`${pos.id}: final close persistence pending`);
+        return { closedAny: true, flat: false, closedRoles };
+      }
+      pos.remaining_qty_by_role = { ...projected.remaining_qty_by_role };
+      pos.position_state = projected.position_state;
+      pos.cumulative_exit_charges = projected.cumulative_exit_charges;
+      pos.exit_attempts = [...projected.exit_attempts];
+      pos.metrics = projected.metrics;
+      pos.exit_blocked_reason = null;
+      return { closedAny: true, flat: true, closedRoles };
+    }
+
+    // Partial close → persist the projected exact map before making it authoritative.
+    const residual = outstandingRoles(projected).map<ResidualLegExposure>(({ role, quantity }) => ({
+      token: pos.legs[role].token,
+      tradingsymbol: pos.legs[role].tradingsymbol,
+      role,
+      side: entrySideFor(role, direction),
+      quantity,
+      average_price: pos.entry_prices[role] ?? 0,
+      source: "partial_exit",
+      created_at: now,
+    }));
+    this.deps.metrics?.recordPartialExitRemainingRoles(residual.length);
+    const persisted = await this.deps.persistPartialExit({ position: projected, residual, legging: record });
+    const detail =
+      `partial exit: closed ${closedRoles.join(", ")}; still open ` +
+      `${residual.map((r) => `${r.role}×${r.quantity}`).join(", ")}` +
+      (persisted ? "" : " (persist failed — retained for deterministic retry)");
+    if (persisted) {
+      pos.remaining_qty_by_role = { ...projected.remaining_qty_by_role };
+      pos.position_state = projected.position_state;
+      pos.cumulative_exit_charges = projected.cumulative_exit_charges;
+      pos.exit_attempts = [...projected.exit_attempts];
+      pos.metrics = projected.metrics;
+    } else {
+      this.pendingPartialPersists.set(pos.id, { projected, residual, legging: record });
+      pos.position_state = "RECOVERY";
+      this.deps.executionSim.invariantViolation(`${pos.id}: confirmed partial exit awaits durable persistence`);
+    }
+    pos.exit_blocked_reason = detail;
+    const gapKey = `partial_exit:${residual.map((r) => r.role).join("|")}`;
+    if (this.lastBlockedKey.get(pos.id) !== gapKey) {
+      this.lastBlockedKey.set(pos.id, gapKey);
+      this.deps.onEvent("EXIT_SKIPPED_LIQUIDITY", pos, pos.metrics, detail);
+    }
+    return { closedAny: true, flat: false, closedRoles };
+  }
+
+  /**
+   * Build one exit-side leg evaluation per role from the accumulated attempts'
+   * volume-weighted average close price — the coherent four-leg view a completed
+   * multi-attempt close is priced/displayed on.
+   */
+  private buildFinalExitLegs(pos: BoxOpenPosition): BoxLegEvaluation[] {
+    const direction = pos.direction ?? "LONG_BOX";
+    return BOX_LEG_ROLES.map((role) => {
+      let qty = 0;
+      let value = 0;
+      for (const a of pos.exit_attempts) {
+        const q = a.fills_by_role[role] ?? 0;
+        const p = a.avg_price_by_role[role] ?? 0;
+        qty += q;
+        value += q * p;
+      }
+      const price = qty > 0 ? round2(value / qty) : pos.entry_prices[role] ?? 0;
+      const inst = pos.legs[role];
+      return {
+        role,
+        side: direction === "LONG_BOX"
+          ? (role === "k1_ce" || role === "k2_pe" ? "SELL" : "BUY")
+          : (role === "k1_ce" || role === "k2_pe" ? "BUY" : "SELL"),
+        token: inst.token,
+        tradingsymbol: inst.tradingsymbol,
+        strike: inst.strike,
+        instrument_type: inst.instrument_type,
+        price,
+        qty_at_touch: qty,
+        bid: 0,
+        bid_qty: 0,
+        ask: 0,
+        ask_qty: 0,
+        quote_at: null,
+        quote_version: null,
+        depth: null,
+        age_ms: null,
+        fresh: true,
+        executable: price > 0,
+      };
     });
   }
 
@@ -529,15 +981,18 @@ export class BoxPositionMonitor {
    * calculator. Refuses rather than inventing prices when the four-leg one-lot
    * market is unavailable, and says why.
    */
-  async closeManually(
-    id: string,
-  ): Promise<
-    | { ok: true }
-    | { ok: false; error: string; metrics: BoxExitMetrics | null; code: number }
-  > {
+  async closeManually(id: string): Promise<ManualCloseResult> {
     const pos = this.deps.positions.get(id);
     if (!pos) {
       return { ok: false, error: "That box position is not open.", metrics: null, code: 404 };
+    }
+    if (pos.position_state === "RECOVERY") {
+      return {
+        ok: false,
+        error: "Cannot manually close a RECOVERY position through ordinary execution. Reconcile broker orders and positions first.",
+        metrics: pos.metrics,
+        code: 409,
+      };
     }
     if (pos.closing || this.closingIds.has(id)) {
       return {
@@ -562,6 +1017,13 @@ export class BoxPositionMonitor {
         metrics: pos.metrics,
         code: 409,
       };
+    }
+
+    // A manual close changes only the REASON, never the execution mechanics: in
+    // paper_legging it uses the SAME independent-order model (and partial-state
+    // persistence) as an automatic close.
+    if (this.deps.cfg.executionMode === "paper_legging" || this.deps.cfg.executionMode === "live") {
+      return this.manualLeggingClose(pos);
     }
 
     const first = this.measure(pos);
@@ -656,11 +1118,120 @@ export class BoxPositionMonitor {
     }
   }
 
+  /**
+   * Manual close for paper_legging — the SAME independent-order path and partial-
+   * state persistence as an automatic close, differing only in the exit reason and
+   * in reporting the outcome honestly to the caller.
+   */
+  private async manualLeggingClose(pos: BoxOpenPosition): Promise<ManualCloseResult> {
+    const first = this.measure(pos);
+    pos.metrics = first;
+
+    // Depth-aware pre-gate (shared with the executor): refuse only when there is
+    // genuinely not enough executable liquidity for the outstanding quantity.
+    if (!this.exitExecutionOk(pos, first)) {
+      const detail = describeLiquidityGap(first.legs, pos.lot_size);
+      pos.exit_blocked_reason = detail;
+      this.deps.onEvent("EXIT_SKIPPED_LIQUIDITY", pos, first, `manual close refused: ${detail}`);
+      return {
+        ok: false,
+        error: `Cannot close at an executable price right now: ${detail}. The position is still open and being monitored.`,
+        metrics: first,
+        code: 409,
+      };
+    }
+
+    this.closingIds.add(pos.id);
+    pos.closing = true;
+    pos.last_exit_attempt_at = Date.now();
+    let outcome: { closedAny: boolean; flat: boolean; closedRoles: BoxLegRole[] } = {
+      closedAny: false,
+      flat: false,
+      closedRoles: [],
+    };
+    try {
+      const result = await this.deps.executionSim.simulateLeggingExit({
+        position: pos,
+        detectionLegs: first.legs,
+        detectedAt: first.at,
+        stillWanted: () => this.deps.isMarketOpen() && this.deps.isFeedHealthy(),
+      });
+      outcome = await this.applyLeggingExitResult(pos, result, "MANUAL", "manual");
+    } catch (err) {
+      console.warn("[Box] manual legging close failed for", pos.id, err);
+      this.deps.onEvent("ERROR", pos, pos.metrics, `manual close failed: ${String(err)}`);
+    } finally {
+      this.closingIds.delete(pos.id);
+      // Only a fully flat position is removed by closePaperTrade; if it is still
+      // open (nothing/partial closed) clear the guard so a later cycle retries.
+      if (this.deps.positions.get(pos.id)) pos.closing = false;
+    }
+
+    if (outcome.flat) return { ok: true };
+
+    const remaining = { ...pos.remaining_qty_by_role };
+    if (outcome.closedAny) {
+      // Some roles closed, others remain: report the partial honestly rather than
+      // pretending nothing happened. The remaining exposure keeps being managed.
+      return {
+        ok: false,
+        partial: true,
+        filled_roles: outcome.closedRoles,
+        remaining_qty_by_role: remaining,
+        error: "Position partially closed; remaining exposure is still being managed.",
+        metrics: pos.metrics,
+        code: 409,
+      };
+    }
+    return {
+      ok: false,
+      error: "Cannot close at an executable price right now. The position is still open and being monitored.",
+      metrics: pos.metrics,
+      code: 409,
+    };
+  }
+
+  /**
+   * Whether there is enough EXECUTABLE liquidity to work a close right now.
+   *
+   * paper_legging walks depth within a limit, so its gate asks the shared executor
+   * estimator whether every outstanding role can execute its remaining quantity;
+   * the atomic modes fill at the single touch, so they keep the whole-lot touch
+   * gate. One implementation per model — the qualification cannot drift from what
+   * the executor actually does.
+   */
+  private exitExecutionOk(pos: BoxOpenPosition, metrics: BoxExitMetrics): boolean {
+    if (this.deps.cfg.executionMode === "paper_legging" || this.deps.cfg.executionMode === "live") {
+      const est = this.deps.executionSim.estimateExecutableExit(pos);
+      if (est.length === 0) return false;
+      return est.every((e) => e.fresh && e.executable >= e.remaining);
+    }
+    return exitLiquidityOk(metrics.legs);
+  }
+
   private isInExpirySafetyWindow(pos: BoxOpenPosition): boolean {
     if (pos.expiry !== this.deps.istDayKey()) return false;
     const minutes = this.deps.istMinutesOfDay();
     return minutes >= IST_CLOSE_MINUTES - this.deps.cfg.expirySafetyMinutesBeforeClose;
   }
+}
+
+/** The result of a manual close — honest about partial execution. */
+export type ManualCloseResult =
+  | { ok: true; partial?: false }
+  | {
+      ok: false;
+      error: string;
+      metrics: BoxExitMetrics | null;
+      code: number;
+      /** True when SOME roles closed but exposure remains (still being managed). */
+      partial?: boolean;
+      filled_roles?: BoxLegRole[];
+      remaining_qty_by_role?: Record<BoxLegRole, number>;
+    };
+
+function emptyRoleMap(): Record<BoxLegRole, number> {
+  return { k1_ce: 0, k2_ce: 0, k2_pe: 0, k1_pe: 0 };
 }
 
 /**

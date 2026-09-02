@@ -124,7 +124,7 @@ export interface BoxChargeReconciliation {
  *                     price the simulator records is one the market actually
  *                     published after the order could have arrived.
  */
-export type ExecutionMode = "paper_touch" | "paper_latency" | "paper_legging";
+export type ExecutionMode = "paper_touch" | "paper_latency" | "paper_legging" | "live";
 
 /**
  * How displayed order-book depth is treated as executable for our simulated
@@ -141,6 +141,7 @@ export const EXECUTION_MODES: readonly ExecutionMode[] = [
   "paper_touch",
   "paper_latency",
   "paper_legging",
+  "live",
 ] as const;
 /** @deprecated Retained so older imports keep compiling. */
 export const EXECUTION_MODE = "paper_touch" as const;
@@ -538,6 +539,7 @@ export interface BoxOpportunity {
     | "UNPRICED"
     | "ELIGIBLE"
     | "PAPER_OPENED"
+    | "LIVE_OPENED"
     | "OPEN"
     | "REJECTED";
   reject: BoxRejectReason | null;
@@ -797,6 +799,8 @@ export type ResidualExposureSource = "partial_entry" | "partial_exit" | "failed_
 export interface ResidualLegExposure {
   token: number;
   tradingsymbol: string;
+  /** Exchange is retained for live crash-recovery orders; legacy paper rows omit it. */
+  exchange?: string;
   role: BoxLegRole;
   /** The side we are currently HOLDING (BUY = long the contract, SELL = short it). */
   side: OrderSide;
@@ -818,7 +822,10 @@ export interface ResidualLegExposure {
  * whole reason this model exists.
  */
 export interface PaperLeggingExecutionRecord {
-  mode: "paper_legging";
+  /** Honest execution source: live records must never be labelled simulated. */
+  mode: "paper_legging" | "live";
+  /** Preallocated durable trade identity used by every live intent and final trade. */
+  trade_id?: string | null;
   leg_execution_mode: BoxLegExecutionMode;
   detected_at: number;
   order_sent_at: number;
@@ -881,6 +888,20 @@ export interface PaperLeggingExecutionRecord {
   temporal: BoxTemporalCoherence | null;
   /* ---- residual exposure: outstanding simulated contracts, if any ---- */
   residual_exposure: ResidualLegExposure[];
+  /* ---- partial-quantity accounting (exits / residual flattening) ---- */
+  /**
+   * How many role-orders were actually SUBMITTED this run. On an entry this is
+   * always 4; on a partial exit or a residual flatten it is only the roles that
+   * still had outstanding quantity, so internal correctness logic must NOT assume
+   * "/4". `filled_leg_count` still means the submitted orders that FULLY filled.
+   */
+  submitted_leg_count: number;
+  /** Submitted role-orders that completely filled their requested quantity. */
+  fully_closed_role_count: number;
+  /** Submitted role-orders left with outstanding quantity after this run. */
+  remaining_role_count: number;
+  /** Quantity actually closed/filled per role this run (absent roles = 0). */
+  fills_by_role: Partial<Record<BoxLegRole, number>>;
   failure_reason: BoxExecutionFailureReason | null;
   failure_detail: string | null;
 }
@@ -908,6 +929,87 @@ export interface BoxTemporalCoherence {
   /** How many legs' books changed (version advanced) during the decision latency. */
   books_changed_during_latency: number;
 }
+
+/** Durable lifecycle vocabulary shared by live broker orders and their intent journal. */
+export type BoxOrderIntentState =
+  | "CREATED"
+  | "SUBMITTING"
+  | "ACKNOWLEDGED"
+  | "OPEN"
+  | "PARTIALLY_FILLED"
+  | "COMPLETE"
+  | "CANCEL_REQUESTED"
+  | "CANCELLED"
+  | "REJECTED"
+  | "UNKNOWN"
+  | "RECONCILIATION_REQUIRED";
+
+export type BoxOrderPurpose = "ENTRY" | "EXIT" | "EMERGENCY_RESIDUAL" | "PROTECTIVE_CANCEL";
+export type BoxOrderPhase = "entry" | "exit" | "unwind";
+
+/** One idempotent state transition in the separate order-intent audit journal. */
+export interface BoxOrderIntentAudit {
+  audit_id: string;
+  at: Date;
+  from_state: BoxOrderIntentState | null;
+  to_state: BoxOrderIntentState;
+  broker_order_id: string | null;
+  message: string | null;
+  fill_identity: string | null;
+  payload?: Record<string, unknown> | null;
+}
+
+/**
+ * Durable intent written BEFORE any live transport call.
+ *
+ * This lives in `box_order_intents`, never in the trade document, so high-volume
+ * broker evidence cannot leak into trade-list/history projections.
+ */
+export interface IBoxOrderIntent {
+  client_order_id: string;
+  broker_order_id: string | null;
+  broker_mode: "paper" | "live";
+  trade_id: string | null;
+  attempt_id: string;
+  role: BoxLegRole;
+  purpose: BoxOrderPurpose;
+  phase: BoxOrderPhase;
+  exchange: string;
+  tradingsymbol: string;
+  token: number;
+  side: OrderSide;
+  quantity: number;
+  reference_price: number;
+  tick_size: number;
+  max_chase_ticks: number;
+  limit_price: number;
+  state: BoxOrderIntentState;
+  filled_quantity: number;
+  average_price: number | null;
+  broker_tag: string | null;
+  reject_family: string | null;
+  reject_reason: string | null;
+  created_at: Date;
+  updated_at: Date;
+  terminal_at: Date | null;
+  /** Append-only, idempotent by audit_id. Kept only in this dedicated collection. */
+  audit: BoxOrderIntentAudit[];
+}
+
+export type BoxOrderIntentPatch = Partial<
+  Pick<
+    IBoxOrderIntent,
+    | "broker_order_id"
+    | "state"
+    | "filled_quantity"
+    | "average_price"
+    | "broker_tag"
+    | "reject_family"
+    | "reject_reason"
+    | "updated_at"
+    | "terminal_at"
+  >
+>;
 
 /** A persisted record of an execution ATTEMPT that did not open a box. */
 export interface IBoxExecutionAttempt {
@@ -998,6 +1100,68 @@ export interface BoxDepthSnapshot {
 
 export type BoxTradeStatus = "open" | "closed" | "error";
 
+/**
+ * Whether a position is a complete box, partially exited, in reconciliation
+ * recovery, or confirmed flat.
+ *
+ * RECOVERY is deliberately sticky while any canonical role remains non-zero;
+ * FLAT is derived only when all four canonical quantities are exactly zero.
+ */
+export type BoxPositionState = "BOX" | "PARTIALLY_EXITED" | "RECOVERY" | "FLAT";
+
+/**
+ * One durable record of an exit ATTEMPT against a position.
+ *
+ * A box may be closed across several attempts (some legs fill, others fail and are
+ * retried). Each attempt appends one of these so the full exit audit — what closed,
+ * when, at what cost, and what remained — is never overwritten. Kept deliberately
+ * light (no depth ladders) so it can ride on the trade document; the full per-leg
+ * legging audit stays in the Mixed `exit_legging` blob, projected out of list
+ * views.
+ */
+export interface IBoxExitAttempt {
+  attempt_id: string;
+  /** Durable source and lifecycle of this append-only attempt. */
+  source: "auto" | "manual" | "recovery";
+  status: "SUBMITTED" | "PARTIAL" | "COMPLETE" | "FAILED" | "INVARIANT_VIOLATION" | "UNCERTAIN";
+  /** @deprecated Compatibility alias for source. */
+  origin: "auto" | "manual";
+  reason: BoxExitReason;
+  detected_at: Date;
+  requested_at: Date;
+  submitted_at: Date | null;
+  completed_at: Date | null;
+  requested_qty_by_role: Record<BoxLegRole, number>;
+  /** Quantity confirmed closed per role in THIS attempt. */
+  filled_qty_by_role: Partial<Record<BoxLegRole, number>>;
+  /** Compatibility alias retained for older consumers. */
+  fills_by_role: Partial<Record<BoxLegRole, number>>;
+  /** Weighted-average fill price per role in this attempt. */
+  avg_price_by_role: Partial<Record<BoxLegRole, number>>;
+  /** Full charge object and scalar for this attempt. */
+  charges: BoxChargesWithOrigin | null;
+  charges_total: number;
+  /** Realised gross P&L booked by the quantity closed in this attempt (₹). */
+  gross_pnl: number | null;
+  /** Exact canonical per-role remaining quantity after this attempt. */
+  remaining_after: Record<BoxLegRole, number>;
+  submitted_role_count: number;
+  fully_filled_role_count: number;
+  remaining_role_count: number;
+  /** Compatibility counters retained for old readers. */
+  submitted_leg_count: number;
+  filled_leg_count: number;
+  broker_orders?: Array<{
+    client_order_id: string;
+    broker_order_id: string | null;
+    state: BoxOrderIntentState;
+    requested_quantity: number;
+    filled_quantity: number;
+    average_price: number | null;
+  }>;
+  invariant_violation?: string | null;
+}
+
 export type BoxExitReason =
   | "EDGE_CONVERGED"
   | "PROFIT_CAPTURE"
@@ -1036,6 +1200,26 @@ export interface BoxScannerConfigSnapshot {
   execution_mode: ExecutionMode;
   simulated_decision_ms?: number;
   simulated_latency_ms?: number;
+  /** Live safety envelope captured for audit; absent on legacy paper documents. */
+  live_trading_enabled?: boolean;
+  live_reconcile_interval_ms?: number;
+  live_feed_reconnect_warmup_ms?: number;
+  live_max_open_boxes?: number;
+  live_max_concurrent_executions?: number;
+  live_max_residual_legs?: number;
+  live_daily_loss_limit?: number;
+  live_reject_limit?: number;
+  live_consecutive_failure_limit?: number;
+  live_max_open_leg_quantity?: number;
+  live_max_gross_open_leg_quantity?: number;
+  live_http_timeout_ms?: number;
+  live_ack_timeout_ms?: number;
+  live_working_timeout_ms?: number;
+  live_partial_timeout_ms?: number;
+  live_cancel_timeout_ms?: number;
+  live_max_modifications?: number;
+  live_max_chase_ticks?: number;
+  live_broker_min_interval_ms?: number;
   /** Executable-order-pricing knobs a paper_legging fill was taken under. */
   leg_max_chase_ticks?: number;
   unwind_max_chase_ticks?: number;
@@ -1044,7 +1228,7 @@ export interface BoxScannerConfigSnapshot {
   max_cross_leg_exchange_dispersion_ms?: number;
 }
 
-/** A persisted box paper trade. */
+/** A persisted Box strategy trade (paper or explicitly gated live). */
 export interface IBoxTrade {
   execution_mode: ExecutionMode;
 
@@ -1067,6 +1251,21 @@ export interface IBoxTrade {
   quantity: number;
 
   status: BoxTradeStatus;
+
+  /**
+   * EXACT per-role open quantity. At entry every role holds one lot; a partial
+   * exit decrements only the roles it closed. This is the authoritative record of
+   * what is still on our book, so a retry never re-closes a flat leg. OPTIONAL: a
+   * document written before per-role state existed has none, and startup adoption
+   * defaults every role to `quantity` (a full, un-exited box).
+   */
+  remaining_qty_by_role?: Partial<Record<BoxLegRole, number>> | null;
+  /** Durable geometry; absent on old docs is still treated as a full "BOX". */
+  position_state?: BoxPositionState | null;
+  /** Every exit attempt against this trade, appended (never overwritten). */
+  exit_attempts?: IBoxExitAttempt[] | null;
+  /** Running total of exit-side charges across all attempts (₹). */
+  cumulative_exit_charges?: number | null;
 
   legs: IBoxLeg[];
 
@@ -1142,6 +1341,8 @@ export interface IBoxTrade {
 
   closed_at: Date | null;
   exit_reason: BoxExitReason | null;
+  /** Stable final execution identity for idempotent close acknowledgement. */
+  close_idempotency_key?: string | null;
 
   /** Set when an automatic close was wanted but the touch could not fill it. */
   exit_blocked_reason: string | null;

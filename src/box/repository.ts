@@ -12,12 +12,14 @@ import { isBoxConnectionReady } from "../db.js";
 import {
   BoxDailyPnl,
   BoxExecutionAttempt,
+  BoxOrderIntent,
   BoxSetting,
   BoxTrade,
   BoxTradeEvent,
   isBoxEventLedgerEnabled,
   type BoxDailyPnlRecord,
   type BoxExecutionAttemptRecord,
+  type BoxOrderIntentRecord,
   type BoxTradeRecord,
   type IBoxDailyPnl,
   type IBoxSetting,
@@ -28,8 +30,13 @@ import type {
   BoxEventLeg,
   BoxEventType,
   BoxExecutionRecord,
+  BoxOrderIntentAudit,
+  BoxOrderIntentPatch,
+  BoxOrderIntentState,
+  BoxPositionState,
   ExecutionMode,
   IBoxExecutionAttempt,
+  IBoxOrderIntent,
   IBoxTrade,
   IBoxTradeEvent,
 } from "./types.js";
@@ -122,6 +129,11 @@ const LIST_EXCLUDE_AUDIT = {
   // The independent-order exit audit is the same kind of fat Mixed blob as the
   // others and no list view renders it, so it is projected out here too.
   exit_legging: 0,
+  // Per-attempt exit audit can accumulate several attempts' worth of per-leg data;
+  // no list view renders it, so keep it out of bulk queries too. The small scalar
+  // fields (remaining_qty_by_role, position_state, cumulative_exit_charges) are
+  // left in — they are cheap and useful for a partial-position row.
+  exit_attempts: 0,
   "legs.entry_depth": 0,
   "legs.exit_depth": 0,
 } as const;
@@ -158,14 +170,29 @@ export async function findBoxTradeById(id: string): Promise<BoxTradeRecord | nul
  * exactly the duplicate case: another tick already opened this strike pair. The
  * caller treats that as "already open", not as an error.
  */
+/** Allocate the final Mongo identity before any live order intent is submitted. */
+export function allocateBoxTradeId(): string {
+  return new mongoose.Types.ObjectId().toString();
+}
+
 export async function insertBoxTrade(
   payload: IBoxTrade,
+  preallocatedId?: string,
 ): Promise<BoxTradeRecord | null> {
   try {
-    const doc = await BoxTrade.create(payload);
+    const insert = preallocatedId
+      ? ({ ...payload, _id: new mongoose.Types.ObjectId(preallocatedId) } as unknown as IBoxTrade)
+      : payload;
+    const doc = await BoxTrade.create(insert);
     return doc.toObject() as BoxTradeRecord;
   } catch (err) {
-    if (isDuplicateKeyError(err)) return null;
+    if (isDuplicateKeyError(err)) {
+      if (preallocatedId && mongoose.isValidObjectId(preallocatedId)) {
+        const existing = await BoxTrade.findById(preallocatedId).lean<BoxTradeRecord>();
+        if (existing) return existing;
+      }
+      return null;
+    }
     throw err;
   }
 }
@@ -237,6 +264,7 @@ export async function setBoxChargeReconciliation(
 export async function closeBoxTrade(
   id: string,
   fields: Partial<IBoxTrade>,
+  idempotencyKey?: string,
 ): Promise<BoxTradeRecord | null> {
   if (!isBoxDbEnabled() || !isValidBoxId(id)) return null;
   const updated = await BoxTrade.findOneAndUpdate(
@@ -244,7 +272,82 @@ export async function closeBoxTrade(
     { $set: fields },
     { new: true },
   ).lean<BoxTradeRecord>();
-  return updated ?? null;
+  if (updated) return updated;
+  if (!idempotencyKey) return null;
+  const existing = await BoxTrade.findOne({
+    _id: id,
+    status: "closed",
+    close_idempotency_key: idempotencyKey,
+  }).lean<BoxTradeRecord>();
+  return existing ?? null;
+}
+
+/**
+ * Durably record a PARTIAL exit in ONE atomic document update.
+ *
+ * A partial exit is a real, irreversible execution event: some quantity closed,
+ * some remains. It must be persisted BEFORE the monitor treats the execution as
+ * clean, so a crash cannot resurrect the already-closed quantity. This is a single
+ * `$set` (never several independent writes that could leave the position
+ * half-updated), guarded on `status: "open"` so it cannot race a close.
+ *
+ * The trade stays OPEN — a partial exit is not a closed box; only `remaining_qty_
+ * by_role` all-zero closes it (see closeBoxTrade / the monitor).
+ */
+export async function applyBoxPartialExit(
+  id: string,
+  patch: {
+    remaining_qty_by_role: Record<string, number>;
+    position_state: BoxPositionState;
+    cumulative_exit_charges: number;
+    /** The full append-only attempt array (set whole, so no $push-onto-null). */
+    exit_attempts: unknown[];
+    /** Outstanding residual exposure after this attempt, or null when none. */
+    residual_exposure: unknown[] | null;
+    /** Latest per-leg exit legging audit (Mixed). */
+    exit_legging: unknown | null;
+    current_remaining_edge?: number | null;
+  },
+): Promise<boolean> {
+  if (!isBoxDbEnabled() || !isValidBoxId(id)) return false;
+  const res = await BoxTrade.updateOne(
+    { _id: id, status: "open" },
+    {
+      $set: {
+        remaining_qty_by_role: patch.remaining_qty_by_role,
+        position_state: patch.position_state,
+        cumulative_exit_charges: patch.cumulative_exit_charges,
+        exit_attempts: patch.exit_attempts,
+        residual_exposure: patch.residual_exposure,
+        exit_legging: patch.exit_legging,
+        ...(patch.current_remaining_edge !== undefined
+          ? { current_remaining_edge: patch.current_remaining_edge }
+          : {}),
+      },
+    },
+  );
+  return (res.matchedCount ?? 0) > 0;
+}
+
+export async function applyBoxReconciledProjection(
+  id: string,
+  remaining: Record<string, number>,
+  state: BoxPositionState,
+): Promise<boolean> {
+  if (!isBoxDbEnabled() || !isValidBoxId(id)) return false;
+  const result = await BoxTrade.updateOne(
+    { _id: id, status: "open" },
+    { $set: { remaining_qty_by_role: remaining, position_state: state } },
+  );
+  return (result.matchedCount ?? 0) > 0;
+}
+
+export async function markBoxTradeRecovery(id: string, message: string): Promise<void> {
+  if (!isBoxDbEnabled() || !isValidBoxId(id)) return;
+  await BoxTrade.updateOne(
+    { _id: id, status: "open" },
+    { $set: { position_state: "RECOVERY", error: message, exit_blocked_reason: message } },
+  );
 }
 
 /** Mark a trade as errored without closing it (kept visible for the operator). */
@@ -340,6 +443,189 @@ export async function appendBoxEvent(input: BoxEventInput): Promise<void> {
   }
 }
 
+/* ----------------------------- order intents ------------------------------ */
+
+const NONTERMINAL_ORDER_STATES: readonly BoxOrderIntentState[] = [
+  "CREATED",
+  "SUBMITTING",
+  "ACKNOWLEDGED",
+  "OPEN",
+  "PARTIALLY_FILLED",
+  "CANCEL_REQUESTED",
+  "UNKNOWN",
+  "RECONCILIATION_REQUIRED",
+];
+
+/**
+ * Create the durable intent before transport submission. Repeating the same
+ * client id returns the original row and never creates a second broker intent.
+ */
+export async function createBoxOrderIntent(
+  intent: IBoxOrderIntent,
+): Promise<BoxOrderIntentRecord> {
+  if (!isBoxDbEnabled()) {
+    throw new Error("Box persistence is unavailable; live order intent was not created.");
+  }
+  const row = await BoxOrderIntent.findOneAndUpdate(
+    { client_order_id: intent.client_order_id },
+    { $setOnInsert: intent },
+    { upsert: true, new: true },
+  ).lean<BoxOrderIntentRecord>();
+  if (!row) throw new Error(`Failed to create order intent ${intent.client_order_id}.`);
+  assertIntentImmutableMatch(row, intent);
+  return row;
+}
+
+export async function findBoxOrderIntentByClientId(
+  clientOrderId: string,
+): Promise<BoxOrderIntentRecord | null> {
+  if (!isBoxDbEnabled()) return null;
+  return BoxOrderIntent.findOne({ client_order_id: clientOrderId }).lean<BoxOrderIntentRecord>();
+}
+
+export async function findBoxOrderIntentByBrokerId(
+  brokerOrderId: string,
+): Promise<BoxOrderIntentRecord | null> {
+  if (!isBoxDbEnabled()) return null;
+  return BoxOrderIntent.findOne({ broker_order_id: brokerOrderId }).lean<BoxOrderIntentRecord>();
+}
+
+export async function loadNonterminalBoxOrderIntents(): Promise<BoxOrderIntentRecord[]> {
+  if (!isBoxDbEnabled()) {
+    throw new Error("Box persistence is unavailable while loading nonterminal live order intents.");
+  }
+  // Safety-critical reconciliation must never silently omit an unresolved row.
+  return BoxOrderIntent.find({ state: { $in: NONTERMINAL_ORDER_STATES } })
+    .sort({ updated_at: 1 })
+    .lean<BoxOrderIntentRecord[]>();
+}
+
+export async function loadOwnedBoxOrderIntents(): Promise<BoxOrderIntentRecord[]> {
+  if (!isBoxDbEnabled()) {
+    throw new Error("Box persistence is unavailable while loading owned live order intents.");
+  }
+  // Never truncate one side of an entry/exit history: crash-recovery net exposure
+  // must be derived from the complete durable BOX-intent ledger.
+  return BoxOrderIntent.find({ broker_mode: "live" })
+    .sort({ created_at: -1 })
+    .lean<BoxOrderIntentRecord[]>();
+}
+
+const INTENT_STATE_PREDECESSORS: Readonly<Record<BoxOrderIntentState, readonly BoxOrderIntentState[]>> = {
+  CREATED: ["CREATED"],
+  SUBMITTING: ["CREATED", "SUBMITTING"],
+  ACKNOWLEDGED: [
+    "SUBMITTING", "ACKNOWLEDGED", "UNKNOWN", "RECONCILIATION_REQUIRED",
+  ],
+  OPEN: [
+    "SUBMITTING", "ACKNOWLEDGED", "OPEN", "UNKNOWN", "RECONCILIATION_REQUIRED",
+  ],
+  PARTIALLY_FILLED: [
+    "ACKNOWLEDGED", "OPEN", "PARTIALLY_FILLED", "UNKNOWN", "RECONCILIATION_REQUIRED",
+  ],
+  COMPLETE: [
+    "SUBMITTING", "ACKNOWLEDGED", "OPEN", "PARTIALLY_FILLED", "CANCEL_REQUESTED",
+    "CANCELLED", "UNKNOWN", "RECONCILIATION_REQUIRED", "COMPLETE",
+  ],
+  CANCEL_REQUESTED: [
+    "ACKNOWLEDGED", "OPEN", "PARTIALLY_FILLED", "CANCEL_REQUESTED", "UNKNOWN",
+    "RECONCILIATION_REQUIRED",
+  ],
+  CANCELLED: [
+    "ACKNOWLEDGED", "OPEN", "PARTIALLY_FILLED", "CANCEL_REQUESTED", "UNKNOWN",
+    "RECONCILIATION_REQUIRED", "CANCELLED",
+  ],
+  REJECTED: ["CREATED", "SUBMITTING", "ACKNOWLEDGED", "OPEN", "REJECTED"],
+  UNKNOWN: [
+    "CREATED", "SUBMITTING", "ACKNOWLEDGED", "OPEN", "PARTIALLY_FILLED",
+    "CANCEL_REQUESTED", "UNKNOWN", "RECONCILIATION_REQUIRED",
+  ],
+  RECONCILIATION_REQUIRED: [
+    "CREATED", "SUBMITTING", "ACKNOWLEDGED", "OPEN", "PARTIALLY_FILLED",
+    "CANCEL_REQUESTED", "UNKNOWN", "RECONCILIATION_REQUIRED",
+  ],
+};
+
+/**
+ * Apply a monotonic state/fill snapshot and append one audit event exactly once.
+ * Stale OPEN/lower-fill snapshots cannot regress a terminal or newer document.
+ */
+export interface BoxOrderIntentUpdateResult {
+  intent: BoxOrderIntentRecord | null;
+  applied: boolean;
+}
+
+export async function updateBoxOrderIntent(
+  clientOrderId: string,
+  patch: BoxOrderIntentPatch,
+  audit: BoxOrderIntentAudit,
+): Promise<BoxOrderIntentUpdateResult> {
+  if (!isBoxDbEnabled()) {
+    throw new Error("Box persistence is unavailable while updating a live order intent.");
+  }
+  const guards: Record<string, unknown>[] = [];
+  if (patch.state) guards.push({ state: { $in: INTENT_STATE_PREDECESSORS[patch.state] } });
+  if (patch.filled_quantity !== undefined) {
+    guards.push({ filled_quantity: { $lte: patch.filled_quantity } });
+  }
+  const brokerGuard = patch.broker_order_id
+    ? { $or: [{ broker_order_id: null }, { broker_order_id: patch.broker_order_id }] }
+    : {};
+  const setPatch = Object.fromEntries(
+    Object.entries(patch).map(([key, value]) => [key, { $literal: value }]),
+  );
+  const row = await BoxOrderIntent.findOneAndUpdate(
+    {
+      client_order_id: clientOrderId,
+      ...brokerGuard,
+      ...(guards.length > 0 ? { $and: guards } : {}),
+    },
+    [{
+      $set: {
+        ...setPatch,
+        audit: {
+          $cond: [
+            { $in: [audit.audit_id, { $ifNull: ["$audit.audit_id", []] }] },
+            { $ifNull: ["$audit", []] },
+            { $concatArrays: [{ $ifNull: ["$audit", []] }, [{ $literal: audit }]] },
+          ],
+        },
+      },
+    }] as unknown as Record<string, unknown>,
+    { new: true },
+  ).lean<BoxOrderIntentRecord>();
+  if (!row) {
+    return { intent: await findBoxOrderIntentByClientId(clientOrderId), applied: false };
+  }
+  return { intent: row, applied: true };
+}
+
+/** Ready-to-inject durable persistence contract for OrderManager. */
+export const boxOrderIntentPersistence = {
+  create: createBoxOrderIntent,
+  update: updateBoxOrderIntent,
+  loadNonterminal: loadNonterminalBoxOrderIntents,
+  loadOwned: loadOwnedBoxOrderIntents,
+  findByClientId: findBoxOrderIntentByClientId,
+  findByBrokerId: findBoxOrderIntentByBrokerId,
+};
+
+const IMMUTABLE_INTENT_FIELDS = [
+  "broker_mode", "trade_id", "attempt_id", "role", "purpose", "phase", "exchange",
+  "tradingsymbol", "token", "side", "quantity", "reference_price", "tick_size",
+  "max_chase_ticks", "limit_price",
+] as const;
+
+function assertIntentImmutableMatch(existing: IBoxOrderIntent, proposed: IBoxOrderIntent): void {
+  for (const field of IMMUTABLE_INTENT_FIELDS) {
+    if (existing[field] !== proposed[field]) {
+      throw new Error(
+        `Client order id ${proposed.client_order_id} was reused with different immutable field ${field}.`,
+      );
+    }
+  }
+}
+
 /* --------------------------- execution attempts --------------------------- */
 
 /**
@@ -399,16 +685,73 @@ export async function loadUnresolvedBoxExecutionAttempts(
 }
 
 /** Mark an execution attempt's residual exposure as flattened (best-effort). */
-export async function resolveBoxExecutionAttempt(id: string): Promise<void> {
-  if (!isBoxDbEnabled() || !isValidBoxId(id)) return;
-  try {
-    await BoxExecutionAttempt.updateOne(
-      { _id: id },
-      { $set: { resolved: true, residual_exposure: null } },
-    );
-  } catch (err) {
-    console.warn("[Box] failed to mark execution attempt resolved:", id, err);
+export async function resolveBoxExecutionAttempt(id: string): Promise<boolean> {
+  if (!isBoxDbEnabled() || !isValidBoxId(id)) return false;
+  const result = await BoxExecutionAttempt.updateOne(
+    { _id: id },
+    { $set: { resolved: true, residual_exposure: [] } },
+  );
+  return (result.matchedCount ?? 0) > 0;
+}
+
+/**
+ * Persist the STILL-OUTSTANDING residual after a partial flatten, idempotently.
+ *
+ * When `residual` is empty the attempt is resolved; otherwise the remaining
+ * exposure is written back so a later flatten (or a restart) works only what is
+ * left — never the quantity already flattened.
+ */
+export async function updateBoxExecutionAttemptResidual(
+  id: string,
+  residual: unknown[],
+  cumulativeUnwindCharges?: number,
+): Promise<boolean> {
+  if (!isBoxDbEnabled() || !isValidBoxId(id)) return false;
+  const resolved = residual.length === 0;
+  const set: Record<string, unknown> = {
+    residual_exposure: resolved ? [] : residual,
+    resolved,
+  };
+  if (cumulativeUnwindCharges !== undefined) set.unwind_charges = round2Repo(cumulativeUnwindCharges);
+  const result = await BoxExecutionAttempt.updateOne({ _id: id }, { $set: set });
+  return (result.matchedCount ?? 0) > 0;
+}
+
+function round2Repo(v: number): number {
+  return Math.round(v * 100) / 100;
+}
+
+export async function loadBoxLiveRiskSeed(sinceMs: number): Promise<{
+  realisedPnl: number;
+  rejects: number;
+  consecutiveFailures: number;
+}> {
+  if (!isBoxDbEnabled()) {
+    throw new Error("Box persistence is unavailable while loading the live daily-risk seed.");
   }
+  const [trades, attempts, rejectedCount, recentIntents] = await Promise.all([
+    BoxTrade.find({ closed_at: { $gte: new Date(sinceMs) } })
+      .select({ realised_net_pnl: 1, net_pnl: 1 })
+      .lean<Array<{ realised_net_pnl?: number | null; net_pnl?: number | null }>>(),
+    BoxExecutionAttempt.find({ resolved_at: { $gte: new Date(sinceMs) } })
+      .select({ net_abort_pnl: 1 })
+      .lean<Array<{ net_abort_pnl?: number | null }>>(),
+    BoxOrderIntent.countDocuments({ state: "REJECTED", updated_at: { $gte: new Date(sinceMs) } }),
+    BoxOrderIntent.find({ updated_at: { $gte: new Date(sinceMs) } })
+      .select({ state: 1 })
+      .sort({ updated_at: -1 })
+      .lean<Array<{ state: BoxOrderIntentState }>>(),
+  ]);
+  const tradePnl = trades.reduce((sum, trade) => sum + (trade.realised_net_pnl ?? trade.net_pnl ?? 0), 0);
+  const abortPnl = attempts.reduce((sum, attempt) => sum + (attempt.net_abort_pnl ?? 0), 0);
+  let consecutiveFailures = 0;
+  for (const intent of recentIntents) {
+    if (intent.state === "COMPLETE") break;
+    if (intent.state === "REJECTED" || intent.state === "UNKNOWN" || intent.state === "RECONCILIATION_REQUIRED") {
+      consecutiveFailures++;
+    }
+  }
+  return { realisedPnl: tradePnl + abortPnl, rejects: rejectedCount, consecutiveFailures };
 }
 
 /* ----------------------------- daily P&L archive -------------------------- */

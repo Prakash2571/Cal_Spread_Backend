@@ -40,6 +40,14 @@ function fail(res: Response, err: unknown): void {
 
 export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
   const { engine, requireAdmin } = deps;
+  const requireFull = (req: Request, res: Response): boolean => {
+    const token = req.header("x-admin-token") ?? undefined;
+    if (deps.getAdminRole(token) !== "full") {
+      res.status(403).json({ error: "Full administrator access required." });
+      return false;
+    }
+    return true;
+  };
 
   /* ------------------------------- control ------------------------------- */
 
@@ -131,6 +139,48 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
   app.post("/api/box/stop", requireAdmin, (_req: Request, res: Response) => {
     engine.stop();
     res.json({ ok: true, status: engine.getStatus() });
+  });
+
+  for (const control of [
+    "box_entry_enabled",
+    "box_live_order_enabled",
+    "box_emergency_flatten",
+  ] as const) {
+    app.post(`/api/box/controls/${control}`, requireAdmin, (req: Request, res: Response) => {
+      if (!requireFull(req, res)) return;
+      const enabled = (req.body as { enabled?: unknown } | undefined)?.enabled;
+      if (typeof enabled !== "boolean") {
+        res.status(400).json({ error: "enabled must be a boolean." });
+        return;
+      }
+      const result = engine.setLiveControl(control, enabled);
+      if (!result.ok) {
+        res.status(409).json({ error: result.error, status: engine.getStatus() });
+        return;
+      }
+      res.json({ ok: true, status: engine.getStatus() });
+    });
+  }
+
+  app.post("/api/box/live/reconcile", requireAdmin, async (req: Request, res: Response) => {
+    if (!requireFull(req, res)) return;
+    try {
+      res.json({ ok: true, reconciliation: await engine.reconcileLive(), status: engine.getStatus() });
+    } catch (err) { fail(res, err); }
+  });
+
+  app.post("/api/box/live/cancel-working", requireAdmin, async (req: Request, res: Response) => {
+    if (!requireFull(req, res)) return;
+    try {
+      res.json({ ok: true, orders: await engine.cancelWorkingBoxOrders(), status: engine.getStatus() });
+    } catch (err) { fail(res, err); }
+  });
+
+  app.post("/api/box/live/flatten", requireAdmin, async (req: Request, res: Response) => {
+    if (!requireFull(req, res)) return;
+    try {
+      res.json({ ok: true, ...(await engine.flattenAttributedBoxExposure()), status: engine.getStatus() });
+    } catch (err) { fail(res, err); }
   });
 
   /* ----------------------------- opportunities ---------------------------- */

@@ -6,10 +6,9 @@
  * charge estimator WITHOUT index.ts having to export its internals or the box
  * code having to import from it (which would be a circular import).
  *
- * PAPER TRADING ONLY. Nothing in this module calls a Zerodha order-placement
- * API. Fills are simulated at the executable market touch that was visible in
- * the snapshot the decision was made on, and are stored with
- * execution_mode: "paper_touch".
+ * Paper execution remains the default. Live broker access is constructed only
+ * behind the independent execution-mode and live-trading gates; all broker
+ * mutations then pass through the durable central order manager.
  */
 
 import type { Express, RequestHandler } from "express";

@@ -56,6 +56,7 @@ import type {
   OrderSide,
   PaperLegExecution,
   PaperLegStatus,
+  PaperOrderPricing,
 } from "./types.js";
 
 /** One order to work: what to trade, and the reference it is priced against. */
@@ -68,6 +69,8 @@ export interface LegOrderRequest {
   detected_qty: number;
   /** Requested quantity (one lot on entry; the outstanding quantity on an unwind). */
   quantity: number;
+  /** Optional authoritative LIMIT envelope supplied by a broker-neutral adapter. */
+  pricing?: PaperOrderPricing;
 }
 
 /**
@@ -448,7 +451,7 @@ function blankLeg(req: LegOrderRequest, orderIdPrefix: string, phase: ExecutionP
     tradingsymbol: req.inst.tradingsymbol,
     order_id: orderId,
     client_order_id: orderId,
-    pricing: null,
+    pricing: req.pricing ? { ...req.pricing } : null,
     detected_price: req.detected_price,
     detected_qty: req.detected_qty,
     submit_at: 0,

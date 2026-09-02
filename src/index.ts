@@ -51,9 +51,10 @@ import { initNseFnoConnections } from "./db.js";
 import { SpreadSummary } from "./db.js";
 import { startHourlyScheduler, backfillMissedHours, startDayReviewScheduler } from "./hourlyCapture.js";
 import { startEodScheduler, backfillStockFutures, checkAndRecomputeSummary } from "./eodCapture.js";
-// Box arbitrage (paper trading) — an independent module that reuses this file's
-// Kite session, ticker hub, instrument cache and charge estimator by injection.
-// It owns its own routes, models and collections; nothing here changes.
+// Box arbitrage (paper by default; live only when explicitly double-gated) — an
+// independent module that reuses this file's Kite session, ticker hub, instrument
+// cache and charge estimator by injection. It owns its own routes, models and
+// collections; the calendar strategy remains unchanged.
 import { registerBoxModule, type BoxModule } from "./box/index.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
@@ -5086,10 +5087,10 @@ async function restoreSessionOnStartup(): Promise<void> {
 }
 
 // ============================================================================
-//  Box arbitrage (paper trading) — registered LAST so it cannot affect the
-//  matching of any existing route. It mounts its own /api/box/* endpoints and
-//  reuses the shared Kite session, ticker hub, instrument cache and the very same
-//  Zerodha charge estimator the calendar trades use.
+//  Box arbitrage (paper by default; live only when explicitly double-gated) —
+//  registered LAST so it cannot affect matching of any existing route. It mounts
+//  its own /api/box/* endpoints and reuses the shared Kite session, ticker hub,
+//  instrument cache and the same Zerodha charge estimator used by calendar trades.
 // ============================================================================
 const boxModule: BoxModule = registerBoxModule(app, {
   kite,
@@ -5164,8 +5165,8 @@ app.listen(PORT, () => {
     // Intraday NIFTY option-OI capture so the Analytics page has a real
     // 1m/5m/15m/1h baseline at any time of day.
     startOptionOiCapture();
-    // Adopt any box paper position left open by the previous process and start
-    // its monitor. Discovery of NEW boxes stays off until an admin presses RUN,
+    // Adopt any Box position left open by the previous process and start its
+    // monitor. Discovery of NEW boxes stays off until an admin presses RUN,
     // but an OPEN position must be managed from the moment the process is up.
     void boxModule.boot().catch((e) => console.warn("[Box] boot failed:", e));
   });

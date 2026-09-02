@@ -14,14 +14,17 @@
  *     The unique partial index in Mongo backs this up across processes.
  */
 
-import type {
-  BoxChargeOrigin,
-  BoxDirection,
-  BoxExecutionRecord,
-  BoxExitMetrics,
-  BoxLegRole,
-  BoxOptionInstrument,
-  BoxScannerConfigSnapshot,
+import {
+  BOX_LEG_ROLES,
+  type BoxChargeOrigin,
+  type BoxDirection,
+  type BoxExecutionRecord,
+  type BoxExitMetrics,
+  type BoxLegRole,
+  type BoxOptionInstrument,
+  type BoxPositionState,
+  type BoxScannerConfigSnapshot,
+  type IBoxExitAttempt,
 } from "./types.js";
 
 /** One live box position, as the monitor sees it. */
@@ -71,6 +74,22 @@ export interface BoxOpenPosition {
 
   legs: Record<BoxLegRole, BoxOptionInstrument>;
   entry_prices: Record<BoxLegRole, number>;
+
+  /**
+   * EXACT open quantity per role — the authoritative record of what is still on
+   * our book. At entry every role = `quantity`; a partial exit decrements only the
+   * roles it closed. Every exit/flatten request is sized from this, so a leg that
+   * is already flat is never traded again.
+   */
+  remaining_qty_by_role: Record<BoxLegRole, number>;
+  /** Complete, partial, recovery, or confirmed-flat geometry. */
+  position_state: BoxPositionState;
+  /** Running total of exit-side charges across every exit attempt so far (₹). */
+  cumulative_exit_charges: number;
+  /** Append-only per-attempt exit audit (kept in memory, mirrored to Mongo). */
+  exit_attempts: IBoxExitAttempt[];
+  /** Instant the last exit attempt ran, for the partial-flatten retry throttle. */
+  last_exit_attempt_at?: number;
 
   /** Newest exit arithmetic, refreshed by the monitor. */
   metrics: BoxExitMetrics | null;
@@ -167,4 +186,53 @@ export class BoxPositionBook {
     this.byKey.clear();
     this.reserved.clear();
   }
+}
+
+/** Every role holding a full lot — the state a freshly entered box starts in. */
+export function fullLotByRole(quantity: number): Record<BoxLegRole, number> {
+  const out = {} as Record<BoxLegRole, number>;
+  for (const role of BOX_LEG_ROLES) out[role] = quantity;
+  return out;
+}
+
+/**
+ * A box is CLOSED only when every role is flat.
+ *
+ * The single source of truth for "is this position done": a 1/4, 2/4 or 3/4 exit
+ * is NOT a closed box, and the trade document must stay `open` until this returns
+ * true. Reading a per-role map (rather than counting filled exit legs) is what
+ * makes the answer correct across several partial attempts.
+ */
+export function isBoxPositionFlat(remainingQtyByRole: Record<BoxLegRole, number>): boolean {
+  return BOX_LEG_ROLES.every((role) => remainingQtyByRole[role] === 0);
+}
+
+/**
+ * Derive position geometry from exact canonical quantities.
+ *
+ * RECOVERY is sticky until the exposure is genuinely flat; callers must explicitly
+ * move a recovered position back to ordinary management after reconciliation.
+ */
+export function deriveBoxPositionState(
+  remainingQtyByRole: Record<BoxLegRole, number>,
+  current?: BoxPositionState,
+): BoxPositionState {
+  if (isBoxPositionFlat(remainingQtyByRole)) return "FLAT";
+  if (current === "RECOVERY") return "RECOVERY";
+  const first = remainingQtyByRole.k1_ce;
+  return first > 0 && BOX_LEG_ROLES.every((role) => remainingQtyByRole[role] === first)
+    ? "BOX"
+    : "PARTIALLY_EXITED";
+}
+
+/** Roles that still carry outstanding quantity, with that quantity. */
+export function outstandingRoles(
+  pos: Pick<BoxOpenPosition, "remaining_qty_by_role">,
+): { role: BoxLegRole; quantity: number }[] {
+  const out: { role: BoxLegRole; quantity: number }[] = [];
+  for (const role of BOX_LEG_ROLES) {
+    const q = pos.remaining_qty_by_role[role] ?? 0;
+    if (q > 0) out.push({ role, quantity: q });
+  }
+  return out;
 }

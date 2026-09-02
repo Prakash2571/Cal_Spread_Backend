@@ -1,17 +1,17 @@
 /**
- * The box scanner: the event-driven discovery and paper-entry path.
+ * The box scanner: the event-driven discovery and entry path.
  *
  *   Kite WebSocket → quote map → affected candidates → fast LOCAL calculation
- *   → net-profit qualification → simulated execution → paper trade
+ *   → net-profit qualification → centralized execution gateway → durable trade
  *
  * Nothing on the qualification path touches MongoDB, and nothing waits on the
  * frontend OR on Zerodha. Charges are computed synchronously by the local
  * calculator; Zerodha is consulted only afterwards, to reconcile. A tick affects
  * only the candidates that reference the token that moved.
  *
- * The scanner NEVER places a real order. It hands qualified candidates to the
- * execution simulator, which records a fill at a book the market actually
- * published after the simulated order could have arrived.
+ * The scanner never calls Kite order APIs directly. Qualified candidates are
+ * handed to a narrow execution gateway: paper modes delegate to the deterministic
+ * simulator, while explicit live mode uses durable bounded-LIMIT coordination.
  */
 
 import type { BoxConfig } from "./config.js";
@@ -21,7 +21,7 @@ import {
   buildEntryChargeLegs,
   type BoxChargeLeg,
 } from "./charges.js";
-import type { BoxExecutionSimulator } from "./executionSimulator.js";
+import type { BoxExecutionGateway } from "./executionGateway.js";
 import { LocalChargeCalculator } from "./localCharges.js";
 import type { BoxMetrics } from "./metrics.js";
 import {
@@ -54,8 +54,8 @@ export interface BoxScannerDeps {
   charges: BoxChargeEstimator;
   /** The synchronous, deterministic charge calculator for the hot path. */
   localCharges: LocalChargeCalculator;
-  /** Simulates the fill after a decision + latency delay. */
-  executionSim: BoxExecutionSimulator;
+  /** Central mode-neutral execution gateway. */
+  executionSim: BoxExecutionGateway;
   positions: BoxPositionBook;
   metrics?: BoxMetrics;
   /** Opens the paper trade. Returns the trade id, or null when it did not open. */
@@ -386,8 +386,8 @@ export class BoxScanner {
       this.deps.positions.getByKey(cand.key) === undefined;
 
     try {
-      // paper_legging: four independent orders, which may partially fill and abort.
-      if (this.deps.cfg.executionMode === "paper_legging") {
+      // Independent role orders in paper_legging and live modes.
+      if (this.deps.cfg.executionMode === "paper_legging" || this.deps.cfg.executionMode === "live") {
         const legging = await this.deps.executionSim.simulateLeggingEntry({
           candidate: cand,
           detection,
@@ -547,7 +547,7 @@ export class BoxScanner {
 
     if (id) {
       this.stats.entriesOpened++;
-      this.markStatus(cand.key, "PAPER_OPENED");
+      this.markStatus(cand.key, this.deps.cfg.executionMode === "live" ? "LIVE_OPENED" : "PAPER_OPENED");
     } else {
       // The legs FILLED but nothing was persisted — either the unique index says this
       // box is already open, or the write failed. Either way simulated exposure was
@@ -671,7 +671,7 @@ export class BoxScanner {
 
     let status: BoxOpportunity["status"];
     if (ctx.openKeyTaken) status = "OPEN";
-    else if (previous?.status === "PAPER_OPENED" && !ctx.openKeyTaken) status = "PAPER_OPENED";
+    else if ((previous?.status === "PAPER_OPENED" || previous?.status === "LIVE_OPENED") && !ctx.openKeyTaken) status = previous.status;
     else if (indicative) status = "INDICATIVE";
     else if (!evaluation.tradable) status = ctx.passedPrefilter ? "REJECTED" : "WATCHING";
     else if (decision && decision.qualifies) status = "ELIGIBLE";
@@ -756,6 +756,7 @@ export class BoxScanner {
       const interesting =
         opp.status === "OPEN" ||
         opp.status === "PAPER_OPENED" ||
+        opp.status === "LIVE_OPENED" ||
         opp.status === "ELIGIBLE" ||
         opp.status === "UNPRICED" ||
         opp.status === "INDICATIVE" ||
@@ -765,6 +766,7 @@ export class BoxScanner {
       if (
         opp.status !== "OPEN" &&
         opp.status !== "PAPER_OPENED" &&
+        opp.status !== "LIVE_OPENED" &&
         (opp.gross_edge === null || opp.gross_edge <= 0)
       ) {
         continue;
