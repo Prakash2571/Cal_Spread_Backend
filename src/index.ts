@@ -2182,9 +2182,11 @@ app.get("/api/option-chain/:underlying", async (req: Request, res: Response) => 
     // the live ATM from the streamed spot tick).
     let spot = 0;
     try {
-      const [q] = await kite.getQuoteFull([
-        `${spotInst.exchange}:${spotInst.tradingsymbol}`,
-      ]);
+      // Routed to the ACTIVE broker. `spotInst` already comes from the active broker's
+      // universe, so quoting it by internal token keeps the identity consistent — a
+      // Kite lookup here would have thrown with Dhan active and silently degraded the
+      // band to the median strike.
+      const [q] = await brokerManager.quoteProvider.quotesByToken([spotInst.instrument_token]);
       spot = q?.last_price ?? 0;
     } catch {
       /* non-fatal: fall back to the median strike below */
