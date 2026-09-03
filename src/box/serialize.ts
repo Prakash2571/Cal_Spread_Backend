@@ -7,7 +7,7 @@
  */
 
 import { candidateKey } from "./math.js";
-import { directionOf, type BoxEventLeg, type BoxLegEvaluation, type IBoxTrade } from "./types.js";
+import { brokerOf, directionOf, type BoxEventLeg, type BoxLegEvaluation, type IBoxTrade } from "./types.js";
 
 /** A stored box document plus whatever id shape the driver returned. */
 export interface BoxTradeDocLike extends IBoxTrade {
@@ -19,6 +19,10 @@ export function serializeBoxTrade(doc: BoxTradeDocLike) {
   return {
     id: doc._id.toString(),
     execution_mode: doc.execution_mode,
+    // Documents written before broker identity existed are Zerodha trades: that
+    // was the only broker the application ever had. The legacy default lives in
+    // brokerOf() so exactly one place decides it.
+    broker: brokerOf(doc),
     underlying: doc.underlying,
     name: doc.name,
     is_index: doc.is_index,

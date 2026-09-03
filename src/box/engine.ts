@@ -14,8 +14,14 @@
  */
 
 import type { Response } from "express";
-import type { Instrument, KiteClient } from "../kite.js";
+import type { Instrument } from "../kite.js";
 import type { TickerHub } from "../hub.js";
+import type { BrokerId } from "../brokers/types.js";
+import type {
+  BoxLiveAdapterFactory,
+  BoxMarginProvider,
+  BoxMarketDataProvider,
+} from "./brokerContext.js";
 import type { Tick } from "../ticker.js";
 import {
   BOX_TUNING_KEYS,
@@ -34,7 +40,6 @@ import { BoxChargeEstimator, buildEntryChargeLegs, type BoxChargeLeg, type Price
 import { BoxChargeReconciler } from "./chargeReconciler.js";
 import { BoxExecutionSimulator } from "./executionSimulator.js";
 import { CentralBoxExecutionGateway, type BoxExecutionGateway } from "./executionGateway.js";
-import { KiteBrokerAdapter, KiteHttpTransport, kiteAdapterConfigFromBoxConfig } from "./kiteBrokerAdapter.js";
 import { BoxOrderManager, orderManagerLimitsFromConfig, type OrderManagerReconcileReport } from "./orderManager.js";
 import { LocalChargeCalculator } from "./localCharges.js";
 import { BoxMetrics } from "./metrics.js";
@@ -118,31 +123,44 @@ import {
 } from "./types.js";
 import type { BoxExecutionFailureReason } from "./types.js";
 import { entrySideFor } from "./math.js";
+import { brokerOf } from "../brokers/types.js";
 
 export interface BoxEngineDeps {
-  kite: KiteClient;
+  /**
+   * Broker-neutral market data. NOT a KiteClient: the engine must not be able to
+   * name a venue. See brokerContext.ts for why the surface is this small.
+   */
+  marketData: BoxMarketDataProvider;
+  /**
+   * Which broker currently owns the feed, the scanner and execution.
+   *
+   * A function rather than a value because it is read at decision time: a broker
+   * switch must be visible to the very next trade the engine stamps, without
+   * reconstructing the engine.
+   */
+  activeBroker: () => BrokerId;
   tickerHub: TickerHub;
   getAllInstruments: () => Promise<Instrument[]>;
   getBoard: () => Promise<BoxBoardItem[]>;
-  /** The calendar engine's Zerodha charge estimator, injected UNCHANGED. */
+  /**
+   * The ACTIVE broker's charge estimator.
+   *
+   * Broker-scoped on purpose: a Dhan trade costed with Zerodha brokerage would
+   * make the expected-net gate spend money it does not have. The registry swaps
+   * this with the broker.
+   */
   priceChargeGroups: PriceChargeGroupsFn;
   istDayKey: (at?: number) => string;
   makeIdResolver: (all: Instrument[]) => (token: number) => string | null;
   /** NSE equity-derivatives hours, reused from the calendar engine. */
   isMarketOpen: () => boolean;
-  /** Zerodha basket-margin API, reused unchanged from the calendar engine. */
-  getBasketMargin: (
-    orders: {
-      exchange: string;
-      tradingsymbol: string;
-      transaction_type: "BUY" | "SELL";
-      variety: string;
-      product: string;
-      order_type: string;
-      quantity: number;
-      price: number;
-    }[],
-  ) => Promise<{ initial: number; final: number; total: number }>;
+  /** The ACTIVE broker's basket-margin provider. */
+  margins: BoxMarginProvider;
+  /**
+   * Builds the live order adapter. Absent ⇒ live execution is impossible, which
+   * is the correct default: no injected adapter means no way to place an order.
+   */
+  createLiveAdapter?: BoxLiveAdapterFactory;
 }
 
 /** Minutes past IST midnight, right now. */
@@ -326,20 +344,17 @@ export class BoxEngine {
     });
 
     if (this.cfg.executionMode === "live") {
-      const apiKey = process.env.KITE_API_KEY?.trim() ?? "";
-      if (!apiKey) {
-        throw new Error("[Box] live execution blocked: KITE_API_KEY is missing.");
+      // The strategy does not build broker transports. The registry assembles the
+      // active broker's adapter and injects the factory; a missing factory means
+      // live execution is not possible, and that must stop startup rather than
+      // quietly fall back to simulated fills.
+      const createAdapter = this.deps.createLiveAdapter;
+      if (!createAdapter) {
+        throw new Error(
+          "[Box] live execution blocked: no live execution adapter was injected for the active broker.",
+        );
       }
-      const transport = new KiteHttpTransport({
-        apiKey,
-        accessToken: () => {
-          const token = this.deps.kite.getAccessToken();
-          if (!token) throw new Error("[Box] live execution blocked: Kite access-token session is missing.");
-          return token;
-        },
-        timeoutMs: this.cfg.liveHttpTimeoutMs,
-      });
-      const adapter = new KiteBrokerAdapter(transport, kiteAdapterConfigFromBoxConfig(this.cfg));
+      const adapter = createAdapter({ broker: this.deps.activeBroker(), cfg: this.cfg });
       this.orderManager = new BoxOrderManager({
         adapter,
         persistence: boxOrderIntentPersistence,
@@ -370,7 +385,7 @@ export class BoxEngine {
       cfg: this.cfg,
       charges: this.charges,
       metrics: this.metrics,
-      isAuthenticated: () => this.deps.kite.getAccessToken() !== null,
+      isAuthenticated: () => this.deps.marketData.isAuthenticated(),
       persist: (tradeId, phase, verdict) =>
         setBoxChargeReconciliation(tradeId, phase, verdict),
       onReconciled: (tradeId, phase, verdict, warned) => {
@@ -527,8 +542,10 @@ export class BoxEngine {
       if (!isBoxDbEnabled()) {
         throw new Error("[Box] live execution blocked: Box database is not ready.");
       }
-      if (!this.deps.kite.getAccessToken()) {
-        throw new Error("[Box] live execution blocked: Kite access-token session is missing.");
+      if (!this.deps.marketData.isAuthenticated()) {
+        throw new Error(
+          `[Box] live execution blocked: the ${this.deps.activeBroker()} broker session is missing.`,
+        );
       }
     }
     // Admin-saved thresholds override the env defaults, before anything can be
@@ -663,7 +680,7 @@ export class BoxEngine {
     // would empty the page when Zerodha is disconnected, with nothing able to
     // repopulate it — a control documented as affecting only new discovery should
     // not be able to blank the view.
-    if (this.deps.kite.getAccessToken()) {
+    if (this.deps.marketData.isAuthenticated()) {
       try {
         // The published list describes the OLD window, so it has to go: leaving it
         // up would show boxes at strikes that are no longer monitored, which is
@@ -828,7 +845,7 @@ export class BoxEngine {
 
   /** RUN: start discovering qualified boxes; execution remains gated separately. */
   async start(): Promise<{ ok: boolean; error?: string }> {
-    if (!this.deps.kite.getAccessToken()) {
+    if (!this.deps.marketData.isAuthenticated()) {
       return { ok: false, error: "Connect to Zerodha before starting the box scanner." };
     }
     if (!isBoxDbEnabled()) {
@@ -1118,7 +1135,7 @@ export class BoxEngine {
    */
   private async refreshClosedMarketView(): Promise<void> {
     if (this.marketOpen) return;
-    if (!this.deps.kite.getAccessToken()) return;
+    if (!this.deps.marketData.isAuthenticated()) return;
     try {
       await this.refreshUniverse();
     } catch (err) {
@@ -1136,7 +1153,7 @@ export class BoxEngine {
    * but never traded.
    */
   async refreshIndicative(): Promise<void> {
-    if (!this.deps.kite.getAccessToken()) return;
+    if (!this.deps.marketData.isAuthenticated()) return;
     // Price every leg of every monitored WINDOW, not just the tokens that happen to
     // be streaming. With discovery off the feed carries only open positions' legs,
     // so keying off subscriptions meant the last-close view could see almost
@@ -1156,7 +1173,7 @@ export class BoxEngine {
         .filter((s): s is string => typeof s === "string");
       if (ids.length === 0) return;
       // Chunked at 500 identifiers per request inside the client.
-      const quotes = await this.deps.kite.getQuoteFull(ids);
+      const quotes = await this.deps.marketData.getQuoteFull(ids);
 
       // Only legs that traded in the LATEST session may be compared.
       //
@@ -1386,7 +1403,7 @@ export class BoxEngine {
    *     last-close prices over REST and subscribed to nothing.
    */
   async refreshUniverse(): Promise<void> {
-    if (!this.deps.kite.getAccessToken()) return;
+    if (!this.deps.marketData.isAuthenticated()) return;
     const now = Date.now();
     const today = this.deps.istDayKey();
 
@@ -1581,7 +1598,7 @@ export class BoxEngine {
       .filter((s): s is string => typeof s === "string");
     if (ids.length === 0) return;
     try {
-      const quotes = await this.deps.kite.getQuoteFull(ids);
+      const quotes = await this.deps.marketData.getQuoteFull(ids);
       const at = Date.now();
       const bySymbol = new Map(quotes.map((q) => [q.instrument_token, q]));
       for (const b of missing) {
@@ -1833,8 +1850,12 @@ export class BoxEngine {
     // The recorded net edge is the expected NET profit the entry qualified on.
     const recordedNetEdge =
       decision.expected_net_profit ?? round2(evaluation.gross_edge! - this.cfg.safetyBuffer);
+    const broker = this.deps.activeBroker();
     const payload: IBoxTrade = {
       execution_mode: this.cfg.executionMode,
+      // Stamped at creation and never changed again. Which broker's feed priced
+      // these legs, and whose fee schedule costed them, is not recoverable later.
+      broker,
       underlying: candidate.underlying,
       name: candidate.name,
       is_index: candidate.is_index,
@@ -1929,6 +1950,8 @@ export class BoxEngine {
     const position: BoxOpenPosition = {
       id,
       key: candidate.key,
+      broker,
+      execution_mode: this.cfg.executionMode,
       underlying: candidate.underlying,
       name: candidate.name,
       is_index: candidate.is_index,
@@ -2302,10 +2325,10 @@ export class BoxEngine {
     try {
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
-          const res = await this.deps.getBasketMargin(orders);
+          const res = await this.deps.margins.basketMargin(orders);
           // Accept whatever the API returns, INCLUDING a small or zero figure: a
-          // long box is a hedged position, so Zerodha's position-aware margin can
-          // legitimately be low. Only a thrown error (network / auth / rate
+          // long box is a hedged position, so a position-aware basket margin can
+          // legitimately be low, whichever broker computed it. Only a thrown error (network / auth / rate
           // limit) is a miss worth retrying — a successful small number is real.
           if (!Number.isFinite(res.total)) {
             throw new Error(`basket margin returned a non-numeric total`);
@@ -2348,7 +2371,7 @@ export class BoxEngine {
    * rounds it is left null and reported as unknown.
    */
   private backfillMissingMargins(): void {
-    if (!this.deps.kite.getAccessToken()) return;
+    if (!this.deps.marketData.isAuthenticated()) return;
     for (const pos of this.positions.list()) {
       if (pos.margin !== null) continue;
       if (this.marginInFlight.has(pos.id)) continue;
@@ -2406,6 +2429,12 @@ export class BoxEngine {
     this.positions.add({
       id: doc._id.toString(),
       key: tradeKey(doc),
+      // Read from the DOCUMENT, never from the running config. An adopted position
+      // may predate a broker switch or an execution-mode change, and the delete
+      // guard and the foreign-exposure guard both depend on the truth of what this
+      // position actually is — not on how the process happens to be configured now.
+      broker: brokerOf(doc),
+      execution_mode: doc.execution_mode,
       underlying: doc.underlying,
       name: doc.name,
       is_index: doc.is_index,
@@ -2861,7 +2890,11 @@ export class BoxEngine {
       indicative_session_day: this.indicativeSessionDay,
       indicative_stale_legs: this.indicativeStaleLegs,
       execution_mode: this.cfg.executionMode,
-      authenticated: this.deps.kite.getAccessToken() !== null,
+      /** The broker that owns the feed, the scanner and execution right now. */
+      broker: this.deps.activeBroker(),
+      /** Distinct brokers holding open exposure — normally just the active one. */
+      brokers_with_open_positions: this.positions.brokersInUse(),
+      authenticated: this.deps.marketData.isAuthenticated(),
       broker_auth_healthy: live ? live.health.broker_auth === "healthy" : null,
       broker_orders_api_healthy: live ? live.health.broker_orders_api === "healthy" : null,
       broker_positions_api_healthy: live ? live.health.broker_positions_api === "healthy" : null,
@@ -3314,7 +3347,10 @@ export class BoxEngine {
       return {
         id: pos.id,
         key: pos.key,
-        execution_mode: this.cfg.executionMode,
+        // The position's OWN mode/broker, not the engine's current config, so an
+        // adopted trade is never mislabelled after a switch.
+        execution_mode: pos.execution_mode,
+        broker: pos.broker,
         underlying: pos.underlying,
         name: pos.name,
         is_index: pos.is_index,

@@ -14,6 +14,7 @@
 import mongoose from "mongoose";
 import type { ILegCharges, ITradeCharges } from "../db.js";
 import { boxConnection } from "../db.js";
+import { BROKER_IDS } from "../brokers/types.js";
 import type {
   BoxCharges,
   BoxChargesWithOrigin,
@@ -101,7 +102,14 @@ const boxChargesSchema = new mongoose.Schema<BoxChargesWithOrigin>(
     source: { type: String, enum: ["kite", "kite_estimate"], default: "kite" },
     // Who produced the figures. Nullable/defaulted so old documents load; a value
     // of "local" makes clear the number was not Zerodha-confirmed.
-    computed_by: { type: String, enum: ["local", "kite", "local_verified"], default: "local" },
+    // Widened for Dhan: a Dhan trade's charges must never be labelled as Zerodha's.
+    computed_by: {
+      type: String,
+      enum: ["local", "kite", "local_verified", "dhan", "dhan_estimate"],
+      default: "local",
+    },
+    /** Whose fee schedule produced these numbers. Absent on legacy docs ⇒ zerodha. */
+    broker: { type: String, enum: BROKER_IDS, default: "zerodha" },
     at: { type: Date, default: () => new Date() },
   },
   { _id: false },
@@ -232,6 +240,21 @@ const boxTradeSchema = new mongoose.Schema<IBoxTrade>(
       default: "paper_touch",
     },
 
+    /**
+     * Which broker created this trade.
+     *
+     * `default: "zerodha"` rather than `required`, so the millions of documents
+     * written before broker identity existed keep loading untouched and no
+     * destructive migration is needed to boot. Indexed because the closed-history
+     * broker filter and the per-broker totals both query on it.
+     */
+    broker: {
+      type: String,
+      enum: BROKER_IDS,
+      default: "zerodha",
+      index: true,
+    },
+
     underlying: { type: String, required: true, index: true },
     name: { type: String, default: "" },
     is_index: { type: Boolean, default: false },
@@ -270,7 +293,11 @@ const boxTradeSchema = new mongoose.Schema<IBoxTrade>(
     // The decisive entry figure and the cost terms behind it (all defaulted).
     expected_net_profit: { type: Number, default: null },
     entry_execution_cost: { type: Number, default: null },
-    charge_origin: { type: String, enum: ["local", "kite", "local_verified"], default: "local" },
+    charge_origin: {
+      type: String,
+      enum: ["local", "kite", "local_verified", "dhan", "dhan_estimate"],
+      default: "local",
+    },
     // Which statutory rate card priced this trade. Nullable so documents written
     // before the rate card was versioned still load unchanged.
     charge_rate_version: { type: String, default: null },
@@ -428,6 +455,7 @@ const boxTradeEventSchema = new mongoose.Schema<IBoxTradeEvent>(
       enum: ["paper_touch", "paper_latency", "paper_legging", "live"],
       default: "paper_touch",
     },
+    broker: { type: String, enum: BROKER_IDS, default: "zerodha", index: true },
 
     box_width: { type: Number, default: null },
     box_cost: { type: Number, default: null },
@@ -486,6 +514,13 @@ const boxOrderIntentSchema = new mongoose.Schema(
     client_order_id: { type: String, required: true },
     broker_order_id: { type: String, default: null },
     broker_mode: { type: String, enum: ["paper", "live"], required: true },
+    /**
+     * The broker this intent belongs to. Reconciliation routes on it, so it is
+     * indexed and treated as immutable (see IMMUTABLE_INTENT_FIELDS).
+     */
+    broker: { type: String, enum: BROKER_IDS, default: "zerodha", index: true },
+    /** Bounded broker-side correlation identity (Dhan caps it at 25 chars). */
+    broker_correlation_id: { type: String, default: null },
     trade_id: { type: String, default: null },
     attempt_id: { type: String, required: true },
     role: { type: String, enum: ["k1_ce", "k2_ce", "k2_pe", "k1_pe"], required: true },
@@ -577,6 +612,7 @@ const boxExecutionAttemptSchema = new mongoose.Schema(
       enum: ["paper_touch", "paper_latency", "paper_legging", "live"],
       default: "paper_legging",
     },
+    broker: { type: String, enum: BROKER_IDS, default: "zerodha", index: true },
     leg_execution_mode: { type: String, default: null },
     detected_at: { type: Date, default: () => new Date() },
     resolved_at: { type: Date, default: () => new Date(), index: true },

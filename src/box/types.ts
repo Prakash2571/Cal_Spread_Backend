@@ -15,7 +15,16 @@
  * long box RECEIVES that width at expiry and the short box PAYS it. So the
  * arbitrage in either direction is the difference between the width and what the
  * four legs are actually worth right now — signed by the direction.
+ *
+ * BROKER IDENTITY
+ * Every record the strategy writes carries the `BrokerId` that created it. The
+ * field is OPTIONAL on every persisted shape so documents written before broker
+ * identity existed keep loading, and `brokerOf()` resolves an absent value to
+ * "zerodha" — which is a statement of fact, since Zerodha was the only broker the
+ * application ever had. A record's broker is IMMUTABLE once written.
  */
+
+import type { BrokerId } from "../brokers/types.js";
 
 /**
  * One order's charges, as billed by Zerodha's virtual contract note (or by the
@@ -71,12 +80,35 @@ export interface BoxCharges {
  *   "local"          computed synchronously from the centralized rate card
  *   "kite"           Zerodha's virtual contract note
  *   "local_verified" local figures that a Zerodha reconciliation has since agreed with
+ *   "dhan"           Dhan's own charge/brokerage figures for the executed trade
+ *   "dhan_estimate"  Dhan's rate card applied locally (no broker confirmation yet)
+ *
+ * The two Dhan values exist because Dhan's brokerage and Zerodha's are DIFFERENT
+ * numbers. Labelling a locally computed Dhan note as "local" would be honest but
+ * useless — the operator needs to know which rate card produced the figure that
+ * the expected-net gate actually spent, and a Zerodha-priced note must never be
+ * displayed against a Dhan trade.
  */
-export type BoxChargeOrigin = "local" | "kite" | "local_verified";
+export type BoxChargeOrigin =
+  | "local"
+  | "kite"
+  | "local_verified"
+  | "dhan"
+  | "dhan_estimate";
 
-/** A charge record that also says where it came from. */
+/**
+ * A charge record that also says where it came from.
+ *
+ * `broker` is carried separately from `source` because `BoxCharges` must stay
+ * structurally interchangeable with the calendar ledger's `ITradeCharges` (see the
+ * assignability assertions in model.ts), whose `source` enum is fixed. So the
+ * venue travels alongside rather than inside it — and every charge record can then
+ * state, unambiguously, whose fee schedule it represents.
+ */
 export interface BoxChargesWithOrigin extends BoxCharges {
   computed_by?: BoxChargeOrigin;
+  /** Which broker's fee schedule produced these numbers. Absent ⇒ zerodha. */
+  broker?: BrokerId;
 }
 
 /**
@@ -975,6 +1007,25 @@ export interface IBoxOrderIntent {
   client_order_id: string;
   broker_order_id: string | null;
   broker_mode: "paper" | "live";
+  /**
+   * WHICH BROKER this intent was (or will be) submitted to — immutable.
+   *
+   * Reconciliation routes on this field and nothing else. An unresolved Zerodha
+   * intent must NEVER be looked up through Dhan, and vice versa: the two brokers'
+   * order-id spaces are unrelated, so a cross-broker lookup would either 404 (and
+   * be misread as "the order never existed") or, far worse, collide with an
+   * unrelated real order. See ActiveBrokerManager's foreign-exposure guard.
+   */
+  broker?: BrokerId;
+  /**
+   * The bounded broker-side correlation identity, when the broker constrains it.
+   *
+   * Dhan's correlationId is limited to 25 characters, which a Box client order id
+   * ("BOX:<24-char-oid>:ENTRY:k1_ce:attempt-1") comfortably exceeds. Both are
+   * persisted so the original strategy identity is never lost and the broker-side
+   * handle stays recoverable.
+   */
+  broker_correlation_id?: string | null;
   trade_id: string | null;
   attempt_id: string;
   role: BoxLegRole;
@@ -1030,6 +1081,8 @@ export interface IBoxExecutionAttempt {
   lot_size: number;
   quantity: number;
   execution_mode: ExecutionMode;
+  /** The broker this attempt ran against. Absent ⇒ zerodha. */
+  broker?: BrokerId;
   leg_execution_mode: BoxLegExecutionMode | null;
   detected_at: Date;
   resolved_at: Date;
@@ -1238,6 +1291,20 @@ export interface BoxScannerConfigSnapshot {
 export interface IBoxTrade {
   execution_mode: ExecutionMode;
 
+  /**
+   * WHICH BROKER created this trade — permanent and immutable.
+   *
+   * Distinct from `execution_mode` on purpose: that says whether the fill was
+   * simulated or real, this says whose market data and whose order book it came
+   * from. Both matter and neither implies the other (a Dhan paper trade and a
+   * Zerodha paper trade are priced by different feeds and costed by different
+   * fee schedules).
+   *
+   * OPTIONAL so pre-existing documents load unchanged; `brokerOf()` resolves an
+   * absent value to "zerodha".
+   */
+  broker?: BrokerId;
+
   underlying: string;
   name: string;
   is_index: boolean;
@@ -1383,6 +1450,16 @@ export type BoxEventType =
   | "SCANNER_STOPPED"
   /** An admin changed a live threshold (entry gate / safety buffer). */
   | "SCANNER_CONFIG"
+  /**
+   * A full administrator DELETED a trade record.
+   *
+   * The trade document itself is gone, so this event is the only surviving
+   * evidence that it ever existed and that a human removed it. The ledger stays
+   * append-only precisely so a deletion cannot erase its own audit trail.
+   */
+  | "TRADE_DELETED"
+  /** The active broker was switched (or a switch was refused). */
+  | "BROKER_SWITCHED"
   | "ERROR";
 
 /** One immutable decision snapshot in the box ledger. */
@@ -1401,6 +1478,8 @@ export interface IBoxTradeEvent {
   lot_size: number;
   quantity: number;
   execution_mode: ExecutionMode;
+  /** The broker this decision was taken against. Absent ⇒ zerodha. */
+  broker?: BrokerId;
 
   box_width: number | null;
   box_cost: number | null;
@@ -1531,4 +1610,21 @@ export function directionOf(doc: { direction?: BoxDirection | null }): BoxDirect
 /** Human label for a direction, used in logs and the UI. */
 export function directionLabel(direction: BoxDirection): string {
   return direction === "SHORT_BOX" ? "SHORT BOX" : "LONG BOX";
+}
+
+
+/**
+ * The broker of a stored document, with the legacy default applied.
+ *
+ * Re-exported here (rather than only from ../brokers/types.js) so every box
+ * module reads broker identity through the same import it already uses for
+ * `directionOf` — the two backwards-compatibility rules are exactly analogous and
+ * belong side by side.
+ */
+export { brokerOf, brokerLabel, BROKER_IDS, LEGACY_BROKER, isBrokerId } from "../brokers/types.js";
+export type { BrokerId } from "../brokers/types.js";
+
+/** True for every simulated execution mode — i.e. anything that is not live. */
+export function isPaperExecutionMode(mode: ExecutionMode): boolean {
+  return mode !== "live";
 }

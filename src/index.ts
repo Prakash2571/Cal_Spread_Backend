@@ -56,6 +56,7 @@ import { startEodScheduler, backfillStockFutures, checkAndRecomputeSummary } fro
 // cache and charge estimator by injection. It owns its own routes, models and
 // collections; the calendar strategy remains unchanged.
 import { registerBoxModule, type BoxModule } from "./box/index.js";
+import { zerodhaOnlyLiveAdapterFactory } from "./brokers/zerodha/liveAdapter.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
@@ -5104,6 +5105,10 @@ const boxModule: BoxModule = registerBoxModule(app, {
   getBasketMargin: (orders) => kite.getBasketMargin(orders),
   requireAdmin,
   getAdminRole,
+  // The engine no longer builds broker transports itself. Zerodha's live adapter
+  // is assembled here and injected; the factory REFUSES any other broker rather
+  // than silently returning a Kite adapter for it.
+  createLiveAdapter: zerodhaOnlyLiveAdapterFactory(kite),
 });
 onFeedSessionLost = () => boxModule.engine.onSessionLost();
 
