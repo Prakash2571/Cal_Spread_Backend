@@ -23,6 +23,7 @@ import {
   normalizeDhanExpiry,
   normalizeDhanInstrumentType,
   parseDhanScripMaster,
+  getDhanParseReport,
   splitCsvLine,
 } from "../../dist/brokers/dhan/instruments.js";
 import {
@@ -375,4 +376,98 @@ test("a range within the limit is a single chunk", () => {
   const from = new Date("2026-01-01T00:00:00Z");
   const to = new Date("2026-01-03T00:00:00Z");
   assert.equal(chunkDateRange(from, to, 5).length, 1);
+});
+
+
+/* ------------------- instrument-master quality filtering ------------------- */
+
+/**
+ * These exist because the live board came up showing `01INSETEST` … `14INSETEST` with
+ * expiries 3736 days out, and only 20 "underlyings". Those are NSE's TEST series: they
+ * parse perfectly and look exactly like ordinary futures, so nothing rejected them and
+ * they crowded out the real universe.
+ */
+
+test("exchange TEST scrips are excluded from the universe", () => {
+  const csv = [
+    "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,SYMBOL_NAME,UNDERLYING_SYMBOL,LOT_SIZE,SM_EXPIRY_DATE,TICK_SIZE",
+    "NSE,D,101,FUTSTK,01INSETEST-Nov2036-FUT,01INSETEST,1,2036-11-27,0.05",
+    "NSE,D,102,FUTSTK,TESTSCRIP26SEPFUT,TESTSCRIP,1,2026-09-29,0.05",
+    "NSE,D,103,FUTSTK,RELIANCE26SEPFUT,RELIANCE,250,2026-09-29,0.05",
+  ].join("\n");
+  const rows = parseDhanScripMaster(csv);
+  assert.equal(rows.length, 1, "only the real future survived");
+  assert.equal(rows[0].name, "RELIANCE");
+});
+
+test("implausibly long-dated derivatives are excluded", () => {
+  // 10 years out is a test/long-dated artefact, not something the strategies can trade.
+  const far = new Date(Date.now() + 3736 * 86_400_000).toISOString().slice(0, 10);
+  const near = new Date(Date.now() + 26 * 86_400_000).toISOString().slice(0, 10);
+  const csv = [
+    "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,SYMBOL_NAME,UNDERLYING_SYMBOL,LOT_SIZE,SM_EXPIRY_DATE,TICK_SIZE",
+    `NSE,D,201,FUTSTK,LONGDATEDFUT,LONGDATED,250,${far},0.05`,
+    `NSE,D,202,FUTSTK,ASTRALFUT,ASTRAL,275,${near},0.05`,
+  ].join("\n");
+  const rows = parseDhanScripMaster(csv);
+  assert.deepEqual(rows.map((r) => r.name), ["ASTRAL"]);
+});
+
+test("EQUITY and INDEX rows are NOT expiry-filtered", () => {
+  // They legitimately have no expiry; applying the derivative rule would delete every
+  // spot instrument and leave the board with no underlying prices.
+  const csv = [
+    "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,SYMBOL_NAME,UNDERLYING_SYMBOL,LOT_SIZE,SM_EXPIRY_DATE,TICK_SIZE",
+    "NSE,E,1512,EQUITY,ASTRAL,ASTRAL,1,,0.05",
+    "NSE,I,13,INDEX,NIFTY 50,NIFTY,0,,0.05",
+  ].join("\n");
+  const rows = parseDhanScripMaster(csv);
+  assert.equal(rows.length, 2);
+});
+
+test("the parse report records what was found and why rows were skipped", () => {
+  // This report is the diagnosis tool: guessing at Dhan's column names has already
+  // cost two cycles, so the parser now states what it actually saw.
+  const csv = [
+    "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,SYMBOL_NAME,UNDERLYING_SYMBOL,LOT_SIZE,SM_EXPIRY_DATE,TICK_SIZE",
+    "NSE,D,101,FUTSTK,01INSETEST-FUT,01INSETEST,1,2036-11-27,0.05",
+    "NSE,D,103,FUTSTK,RELIANCE26SEPFUT,RELIANCE,250,2026-09-29,0.05",
+    "NSE,D,,FUTSTK,BROKEN,BROKEN,250,2026-09-29,0.05",
+  ].join("\n");
+  parseDhanScripMaster(csv);
+  const report = getDhanParseReport();
+  assert.ok(report, "a report was produced");
+  assert.equal(report.totalRows, 3);
+  assert.equal(report.skippedTest, 1);
+  assert.equal(report.skippedNoSecurityId, 1);
+  assert.equal(report.parsed, 1);
+  assert.equal(report.fnoFutures, 1);
+  // The columns that were actually located, so a renamed column is obvious.
+  assert.ok(report.columns.SECURITY_ID >= 0);
+  assert.ok(Array.isArray(report.missingColumns));
+});
+
+test("the report NAMES missing columns rather than silently reading them empty", () => {
+  const csv = ["EXCH_ID,SECURITY_ID,SYMBOL_NAME", "NSE,999,SOMETHING"].join("\n");
+  parseDhanScripMaster(csv);
+  const report = getDhanParseReport();
+  // LOT_SIZE and TICK_SIZE genuinely are absent here; saying so is the point.
+  assert.ok(report.missingColumns.includes("LOT_SIZE"));
+  assert.ok(report.missingColumns.includes("TICK_SIZE"));
+});
+
+test("the report samples REAL F&O futures, which is what the board needs", () => {
+  const rows = [
+    "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,SYMBOL_NAME,UNDERLYING_SYMBOL,LOT_SIZE,SM_EXPIRY_DATE,TICK_SIZE",
+  ];
+  const near = new Date(Date.now() + 26 * 86_400_000).toISOString().slice(0, 10);
+  for (let i = 0; i < 12; i++) {
+    rows.push(`NSE,D,${900 + i},FUTSTK,SYM${i}FUT,SYM${i},250,${near},0.05`);
+  }
+  parseDhanScripMaster(rows.join("\n"));
+  const report = getDhanParseReport();
+  assert.equal(report.fnoFutures, 12);
+  assert.equal(report.samples.length, 8, "capped, so the payload stays small");
+  assert.equal(report.samples[0].instrument_type, "FUT");
+  assert.ok(report.samples[0].token > 1_000_000_000, "a Dhan-namespaced token");
 });

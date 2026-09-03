@@ -48,7 +48,7 @@ import { QuoteProvider } from "./quoteProvider.js";
 import { computeFeedHealth, type FeedHealth } from "./feedHealth.js";
 import { DhanHttp, dhanHttpConfigFromEnv } from "./dhan/http.js";
 import { DhanFeed } from "./dhan/feed.js";
-import { DhanInstrumentStore, dhanInternalToken, type DhanInstrument } from "./dhan/instruments.js";
+import { DhanInstrumentStore, dhanInternalToken, getDhanParseReport, type DhanInstrument } from "./dhan/instruments.js";
 import { DhanChargeCalculator } from "./dhan/charges.js";
 import { DhanBrokerAdapter, dhanAdapterConfigFromBoxConfig } from "../box/dhanBrokerAdapter.js";
 import {
@@ -706,6 +706,24 @@ export class ActiveBrokerManager {
     }
     if (this.dhanFeed && !this.dhanFeed.isConnected() && this.dhanAccessToken) {
       problems.push("Feed reconnecting");
+    }
+    // A universe that parsed but yielded almost no tradable futures is a layout problem,
+    // not a quiet market — surfaced here so it is visible in the UI rather than only in
+    // the server log.
+    const parse = getDhanParseReport();
+    if (parse) {
+      if (parse.missingColumns.length > 0) {
+        problems.push(
+          `Dhan instrument master is missing columns (${parse.missingColumns.join(", ")}) — ` +
+            `see /api/dhan/instruments/diagnostics`,
+        );
+      }
+      if (parse.fnoFutures < 50) {
+        problems.push(
+          `Only ${parse.fnoFutures} Dhan F&O futures were recognised (expected ~600). ` +
+            `The board and scanner will be incomplete — see /api/dhan/instruments/diagnostics`,
+        );
+      }
     }
     return problems;
   }

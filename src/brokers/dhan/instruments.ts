@@ -169,6 +169,50 @@ function internalSegment(exchange: string, instrumentType: string): string {
  * Skips rows it cannot make sense of instead of throwing: the master is ~100k rows
  * and one malformed line must not cost the whole universe.
  */
+/**
+ * Exchange TEST/dummy scrips, which are present in the live master.
+ *
+ * NSE publishes test series (`01INSETEST` … `14INSETEST`) with far-future expiries.
+ * They parse perfectly and look like ordinary futures, so without this filter they
+ * populate the board with ~20 fake underlyings and crowd out the real ones — which is
+ * exactly what happened.
+ */
+const TEST_SYMBOL = /(?:INSETEST|TESTSCRIP|DUMMY|^TEST)/i;
+
+/** A future expiring further out than this is not a real tradable contract. */
+const MAX_FUTURE_EXPIRY_DAYS = 400;
+
+/**
+ * What the last parse actually saw.
+ *
+ * Exposed because Dhan's column names are not something to keep guessing at: when the
+ * board looks wrong, this says which columns were FOUND, which were missing, and what a
+ * parsed row looks like. That turns "the board is empty" into a five-second diagnosis.
+ */
+export interface DhanParseReport {
+  header: string[];
+  columns: Record<string, number>;
+  missingColumns: string[];
+  totalRows: number;
+  parsed: number;
+  skippedTest: number;
+  skippedNoSecurityId: number;
+  skippedNoSymbol: number;
+  skippedSegment: number;
+  skippedImplausibleExpiry: number;
+  byExchange: Record<string, number>;
+  byInstrumentType: Record<string, number>;
+  fnoFutures: number;
+  samples: { tradingsymbol: string; name: string; exchange: string; instrument_type: string; expiry: string; token: number; securityId: number }[];
+}
+
+let lastParseReport: DhanParseReport | null = null;
+
+/** The most recent instrument-master parse report, for diagnostics. */
+export function getDhanParseReport(): DhanParseReport | null {
+  return lastParseReport;
+}
+
 export function parseDhanScripMaster(csv: string): DhanInstrument[] {
   const lines = csv.split(/\r?\n/).filter((l) => l.trim() !== "");
   if (lines.length < 2) return [];
@@ -200,10 +244,30 @@ export function parseDhanScripMaster(csv: string): DhanInstrument[] {
   const out: DhanInstrument[] = [];
   const pick = (cells: string[], at: number): string => (at >= 0 ? (cells[at] ?? "").trim() : "");
 
+  const columns = {
+    EXCH_ID: iExch, SEGMENT: iSegment, SECURITY_ID: iSecurityId, INSTRUMENT: iInstrument,
+    INSTRUMENT_TYPE: iInstrumentType, SYMBOL_NAME: iSymbolName, DISPLAY_NAME: iDisplayName,
+    UNDERLYING_SYMBOL: iUnderlying, UNDERLYING_SECURITY_ID: iUnderlyingId, LOT_SIZE: iLotSize,
+    EXPIRY_DATE: iExpiry, STRIKE_PRICE: iStrike, OPTION_TYPE: iOptionType, TICK_SIZE: iTickSize,
+  };
+  const report: DhanParseReport = {
+    header,
+    columns,
+    missingColumns: Object.entries(columns).filter(([, v]) => v < 0).map(([k]) => k),
+    totalRows: lines.length - 1,
+    parsed: 0, skippedTest: 0, skippedNoSecurityId: 0, skippedNoSymbol: 0,
+    skippedSegment: 0, skippedImplausibleExpiry: 0,
+    byExchange: {}, byInstrumentType: {}, fnoFutures: 0, samples: [],
+  };
+  const now = Date.now();
+
   for (let i = 1; i < lines.length; i++) {
     const cells = splitCsvLine(lines[i]!);
     const securityId = Number(pick(cells, iSecurityId));
-    if (!Number.isFinite(securityId) || securityId <= 0) continue;
+    if (!Number.isFinite(securityId) || securityId <= 0) {
+      report.skippedNoSecurityId++;
+      continue;
+    }
 
     const rawSegment = pick(cells, iSegment);
     const rawExch = pick(cells, iExch);
@@ -215,11 +279,36 @@ export function parseDhanScripMaster(csv: string): DhanInstrument[] {
     // Dhan's SEGMENT column is a short code ("D" derivatives, "E" equity, "I"
     // index); combining it with EXCH_ID is more reliable than either alone.
     const segment = resolveSegment(rawExch, rawSegment, instrumentRaw, isIndex);
-    if (!segment) continue;
+    if (!segment) {
+      report.skippedSegment++;
+      continue;
+    }
 
     const exchange = internalExchangeFor(segment);
     const tradingsymbol = pick(cells, iSymbolName) || pick(cells, iDisplayName);
-    if (!tradingsymbol) continue;
+    if (!tradingsymbol) {
+      report.skippedNoSymbol++;
+      continue;
+    }
+
+    const underlyingName = pick(cells, iUnderlying);
+    // Exchange TEST series parse cleanly and look like real futures, so they must be
+    // excluded explicitly or they populate the board with fake underlyings.
+    if (TEST_SYMBOL.test(tradingsymbol) || TEST_SYMBOL.test(underlyingName)) {
+      report.skippedTest++;
+      continue;
+    }
+
+    const expiryIso = normalizeDhanExpiry(pick(cells, iExpiry));
+    // A derivative expiring years out is a test/long-dated artefact, not something the
+    // calendar or box strategies can trade.
+    if (expiryIso !== "" && instrumentType !== "EQ" && instrumentType !== "INDEX") {
+      const expiryMs = Date.parse(`${expiryIso}T00:00:00+05:30`);
+      if (Number.isFinite(expiryMs) && expiryMs - now > MAX_FUTURE_EXPIRY_DAYS * 86_400_000) {
+        report.skippedImplausibleExpiry++;
+        continue;
+      }
+    }
 
     const lotSize = Number(pick(cells, iLotSize));
     const tickSize = Number(pick(cells, iTickSize));
@@ -232,9 +321,9 @@ export function parseDhanScripMaster(csv: string): DhanInstrument[] {
       // honest value and nothing in Calspread keys off it.
       exchange_token: securityId,
       tradingsymbol,
-      name: pick(cells, iUnderlying) || pick(cells, iDisplayName) || tradingsymbol,
+      name: underlyingName || pick(cells, iDisplayName) || tradingsymbol,
       last_price: 0,
-      expiry: normalizeDhanExpiry(pick(cells, iExpiry)),
+      expiry: expiryIso,
       strike: Number.isFinite(strike) && strike > 0 ? strike : 0,
       tick_size: Number.isFinite(tickSize) && tickSize > 0 ? tickSize : 0.05,
       lot_size: Number.isFinite(lotSize) && lotSize > 0 ? lotSize : 0,
@@ -246,6 +335,51 @@ export function parseDhanScripMaster(csv: string): DhanInstrument[] {
       dhan_underlying_security_id:
         Number.isFinite(underlyingId) && underlyingId > 0 ? underlyingId : null,
     });
+
+    report.parsed++;
+    report.byExchange[exchange] = (report.byExchange[exchange] ?? 0) + 1;
+    report.byInstrumentType[instrumentType] = (report.byInstrumentType[instrumentType] ?? 0) + 1;
+    if (exchange === "NFO" && instrumentType === "FUT") {
+      report.fnoFutures++;
+      // Sample real F&O futures specifically: they are what the calendar board needs,
+      // so they are the rows worth eyeballing when the board looks wrong.
+      if (report.samples.length < 8) {
+        const last = out[out.length - 1]!;
+        report.samples.push({
+          tradingsymbol: last.tradingsymbol,
+          name: last.name,
+          exchange: last.exchange,
+          instrument_type: last.instrument_type,
+          expiry: last.expiry,
+          token: last.instrument_token,
+          securityId: last.dhan_security_id,
+        });
+      }
+    }
+  }
+
+  lastParseReport = report;
+  console.log(
+    `[Dhan] instrument master parsed: ${report.parsed}/${report.totalRows} rows, ` +
+      `${report.fnoFutures} NFO futures, skipped ${report.skippedTest} test / ` +
+      `${report.skippedImplausibleExpiry} long-dated / ${report.skippedSegment} unknown-segment / ` +
+      `${report.skippedNoSymbol} no-symbol.`,
+  );
+  if (report.missingColumns.length > 0) {
+    // Loud, because a missing column is why a field silently reads empty.
+    console.warn(
+      `[Dhan] instrument master is MISSING expected columns: ${report.missingColumns.join(", ")}. ` +
+        `Header was: ${header.slice(0, 20).join(",")}`,
+    );
+  }
+  if (report.fnoFutures < 50) {
+    // The real F&O universe is ~200 underlyings x 3 expiries. Far fewer means the
+    // classification is wrong, not that the market is quiet.
+    console.error(
+      `[Dhan] ONLY ${report.fnoFutures} NFO futures were classified — the instrument master ` +
+        `layout has probably changed. Board and scanner will be incomplete. ` +
+        `Inspect GET /api/dhan/instruments/diagnostics.`,
+    );
   }
   return out;
 }
