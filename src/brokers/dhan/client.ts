@@ -599,6 +599,58 @@ export class DhanClient {
 }
 
 /**
+ * Every IPv4 address present anywhere in a `/ip/getIP` response.
+ *
+ * WHY A SCAN RATHER THAN NAMED FIELDS
+ * The first implementation read only `primaryIP` / `secondaryIP` and, when Dhan
+ * returned the whitelist under different names, concluded BOTH were unset and failed
+ * closed — reporting "primary unset, secondary unset" while the Dhan dashboard plainly
+ * showed a whitelisted address. Guessing one spelling for a fail-closed security check
+ * is fragile in the worst direction: it blocks trading and blames the operator's config.
+ *
+ * So this walks the whole payload (through a `data` wrapper, nested objects and arrays)
+ * and collects anything shaped like an IPv4 address. That is correct for
+ * `primaryIP`/`secondaryIP`, `ipAddress1`/`ipAddress2`, a `staticIp` array, or whatever
+ * Dhan names them next — the VALUE is what has to match, and its key name is incidental.
+ *
+ * `"NA"`, `""` and null are skipped: Dhan uses `NA` for an unset second slot, and
+ * treating that as an address would let a literal "NA" satisfy the comparison.
+ */
+export function extractIpv4Addresses(payload: unknown): string[] {
+  const found: string[] = [];
+  const seen = new Set<string>();
+  // Deliberately strict: four dotted octets, each 0-255. A loose /[\d.]+/ would match
+  // version strings and quantities and produce false confidence.
+  const IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+
+  const walk = (node: unknown, depth: number): void => {
+    // Bounded so a cyclic or pathological payload cannot spin this.
+    if (depth > 6 || node === null || node === undefined) return;
+    if (typeof node === "string") {
+      const value = node.trim();
+      if (value === "" || value.toUpperCase() === "NA") return;
+      if (IPV4.test(value) && !seen.has(value)) {
+        seen.add(value);
+        found.push(value);
+      }
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item, depth + 1);
+      return;
+    }
+    if (typeof node === "object") {
+      for (const value of Object.values(node as Record<string, unknown>)) {
+        walk(value, depth + 1);
+      }
+    }
+  };
+
+  walk(payload, 0);
+  return found;
+}
+
+/**
  * Dhan is inconsistent about whether a list arrives bare or wrapped in `data`.
  * Accepting both is not laziness — it is what stops a wrapper change from
  * presenting as "no orders exist", which on the reconciliation path would be

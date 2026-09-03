@@ -18,7 +18,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { ActiveBrokerManager } from "../../dist/brokers/registry.js";
-import { normalizeDhanMultiMargin } from "../../dist/brokers/dhan/client.js";
+import { extractIpv4Addresses, normalizeDhanMultiMargin } from "../../dist/brokers/dhan/client.js";
 
 /* ------------------------- multi-margin normalization ---------------------- */
 
@@ -378,5 +378,108 @@ test("readiness on the manual flag alone is reported as weaker evidence", async 
       problems.some((p) => /DHAN_STATIC_PUBLIC_IP/.test(p)),
       `expected a note recommending API verification, got: ${problems.join(" | ")}`,
     );
+  });
+});
+
+
+/* --------------------- /ip/getIP payload shape tolerance ------------------- */
+
+/**
+ * These exist because the first implementation read ONLY `primaryIP`/`secondaryIP`,
+ * and when Dhan returned the whitelist under different keys it concluded both were
+ * unset and failed closed — reporting an empty whitelist while the Dhan dashboard
+ * plainly showed a whitelisted address. Guessing one spelling for a fail-closed
+ * security check is fragile in the worst direction: it blocks trading and blames the
+ * operator's configuration.
+ */
+
+test("IPv4 addresses are found under Dhan's dashboard-style ipAddress1/2 keys", () => {
+  // The dashboard labels them "IP Address 1" / "IP Address 2", and NA marks an
+  // unused second slot.
+  const found = extractIpv4Addresses({
+    dhanClientId: "1000000001",
+    ipAddress1: "100.31.218.89",
+    ipAddress2: "NA",
+  });
+  assert.deepEqual(found, ["100.31.218.89"]);
+});
+
+test("IPv4 addresses are found under primaryIP/secondaryIP keys", () => {
+  const found = extractIpv4Addresses({ primaryIP: "203.0.113.7", secondaryIP: "198.51.100.2" });
+  assert.deepEqual(found, ["203.0.113.7", "198.51.100.2"]);
+});
+
+test("a `data`-wrapped payload is scanned", () => {
+  const found = extractIpv4Addresses({ status: "success", data: { ipAddress1: "203.0.113.7" } });
+  assert.deepEqual(found, ["203.0.113.7"]);
+});
+
+test("an array of addresses is scanned", () => {
+  const found = extractIpv4Addresses({ staticIp: ["203.0.113.7", "198.51.100.2"] });
+  assert.deepEqual(found, ["203.0.113.7", "198.51.100.2"]);
+});
+
+test("NA, empty and null slots are skipped, never treated as addresses", () => {
+  // Matching a literal "NA" would let an unset slot satisfy the comparison.
+  assert.deepEqual(extractIpv4Addresses({ a: "NA", b: "na", c: "", d: null }), []);
+});
+
+test("non-IP strings are not mistaken for addresses", () => {
+  // A loose /[\d.]+/ would match version strings and quantities and produce false
+  // confidence in a security check.
+  assert.deepEqual(
+    extractIpv4Addresses({ version: "2.0.1", qty: "275", ratio: "1.5", ip: "999.1.1.1" }),
+    [],
+  );
+});
+
+test("duplicates are collapsed", () => {
+  const found = extractIpv4Addresses({ a: "203.0.113.7", b: "203.0.113.7" });
+  assert.deepEqual(found, ["203.0.113.7"]);
+});
+
+test("the scan is bounded and safe on odd payloads", () => {
+  assert.deepEqual(extractIpv4Addresses(null), []);
+  assert.deepEqual(extractIpv4Addresses(undefined), []);
+  assert.deepEqual(extractIpv4Addresses("203.0.113.7"), ["203.0.113.7"]);
+  assert.deepEqual(extractIpv4Addresses(42), []);
+});
+
+test("verification MATCHES against Dhan's dashboard-style key names", async () => {
+  // The end-to-end regression: this exact payload previously produced
+  // "primary unset, secondary unset" and blocked live trading.
+  await ipEnv({ DHAN_STATIC_PUBLIC_IP: "100.31.218.89" }, async () => {
+    const m = ipManager(async () => ({
+      dhanClientId: "1000000001",
+      ipAddress1: "100.31.218.89",
+      ipAddress2: "NA",
+    }));
+    const result = await m.verifyDhanStaticIp();
+    assert.equal(result.verified, true, result.error ?? "should have verified");
+    assert.equal(m.dhanStaticIpReady(), true);
+    assert.equal(result.primary_ip, "100.31.218.89");
+  });
+});
+
+test("an EMPTY whitelist is reported differently from a mismatch", async () => {
+  // Different operator actions: add a static IP vs correct the configured one.
+  await ipEnv({ DHAN_STATIC_PUBLIC_IP: "100.31.218.89" }, async () => {
+    const m = ipManager(async () => ({ dhanClientId: "1", ipAddress1: "NA", ipAddress2: "NA" }));
+    const result = await m.verifyDhanStaticIp();
+    assert.equal(result.verified, false);
+    assert.match(result.error, /returned no IP address/);
+    // The received keys are named so a future shape change is diagnosable.
+    assert.match(result.error, /Response fields/);
+  });
+});
+
+test("a genuine mismatch lists what Dhan actually has", async () => {
+  await ipEnv({ DHAN_STATIC_PUBLIC_IP: "100.31.218.89" }, async () => {
+    const m = ipManager(async () => ({ ipAddress1: "198.51.100.1", ipAddress2: "198.51.100.2" }));
+    const result = await m.verifyDhanStaticIp();
+    assert.equal(result.verified, false);
+    assert.match(result.error, /does not match/);
+    assert.match(result.error, /198\.51\.100\.1, 198\.51\.100\.2/);
+    assert.equal(m.dhanStaticIpReady(), false, "still fails closed");
   });
 });
