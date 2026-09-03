@@ -9,6 +9,7 @@
 
 import mongoose from "mongoose";
 import { isBoxConnectionReady } from "../db.js";
+import { LEGACY_BROKER, type BrokerId } from "../brokers/types.js";
 import {
   BoxDailyPnl,
   BoxExecutionAttempt,
@@ -329,6 +330,94 @@ export async function applyBoxPartialExit(
   return (res.matchedCount ?? 0) > 0;
 }
 
+/**
+ * PERMANENTLY delete a box trade — paper trades only, never a live one.
+ *
+ * The safety rule is enforced IN THE QUERY, exactly like `closeBoxTrade`'s
+ * `status: "open"` guard, rather than by reading the document first and deciding
+ * in application code. A read-then-delete has a window in which a paper trade
+ * could be adopted, or a mode could change, between the two operations; a guarded
+ * filter cannot be raced.
+ *
+ * `execution_mode: { $ne: "live" }` is the whole protection: a live box may have
+ * REAL broker exposure attached to it, so deleting its record would orphan that
+ * exposure — the position would still exist at the broker with nothing in our
+ * database pointing at it. `deletedCount === 0` therefore means "not found OR
+ * refused", and the caller must distinguish the two with a prior read purely to
+ * choose the right HTTP status (404 vs 409), never to decide whether to delete.
+ *
+ * Returns the number of documents removed (0 or 1).
+ */
+export async function deleteBoxTrade(id: string): Promise<number> {
+  if (!isBoxDbEnabled() || !isValidBoxId(id)) return 0;
+  const res = await BoxTrade.deleteOne({ _id: id, execution_mode: { $ne: "live" } });
+  return res.deletedCount ?? 0;
+}
+
+/**
+ * Drop a trade's rows from the daily-P&L ARCHIVE.
+ *
+ * Called after a deletion so a regenerated day summary cannot be rebuilt from a
+ * trade that no longer exists. Without this, `box_daily_pnl` would keep an
+ * orphaned row and every later report of that day would silently include a
+ * deleted trade's P&L — precisely the "the numbers disagree" class of bug that
+ * deletion is supposed to fix rather than create.
+ */
+export async function deleteBoxDailyPnlForTrade(tradeId: string): Promise<number> {
+  if (!isBoxDbEnabled()) return 0;
+  const res = await BoxDailyPnl.deleteMany({ trade_id: tradeId });
+  return res.deletedCount ?? 0;
+}
+
+/**
+ * Every trade closed on a given IST day, for a full statistics rebuild.
+ *
+ * Distinct from `loadBoxTradesClosedSince` in intent: that one feeds the running
+ * day tally, this one is the authoritative re-read used after a deletion, when the
+ * in-memory tallies must be discarded and recomputed from what actually remains.
+ */
+export async function loadBoxTradesClosedBetween(
+  fromMs: number,
+  toMs: number,
+): Promise<BoxTradeRecord[]> {
+  if (!isBoxDbEnabled()) return [];
+  return BoxTrade.find({
+    status: { $in: CLOSED_STATUSES },
+    closed_at: { $gte: new Date(fromMs), $lt: new Date(toMs) },
+  })
+    .select(LIST_EXCLUDE_AUDIT)
+    .sort({ closed_at: -1, opened_at: -1 })
+    .lean<BoxTradeRecord[]>();
+}
+
+/**
+ * Open/closed trade intervals for a peak-concurrent-margin REPLAY.
+ *
+ * Only the four fields the replay needs, so this stays cheap enough to run on
+ * every deletion. `margin` is nullable and the replay must treat null as
+ * "unknown", never as zero.
+ */
+export async function loadBoxMarginIntervalsSince(sinceMs: number): Promise<
+  { id: string; opened_at: Date; closed_at: Date | null; margin: number | null }[]
+> {
+  if (!isBoxDbEnabled()) return [];
+  const rows = await BoxTrade.find(
+    {
+      $or: [
+        { status: "open" },
+        { closed_at: { $gte: new Date(sinceMs) } },
+      ],
+    },
+    { opened_at: 1, closed_at: 1, margin: 1 },
+  ).lean<{ _id: unknown; opened_at: Date; closed_at: Date | null; margin: number | null }[]>();
+  return rows.map((r) => ({
+    id: String(r._id),
+    opened_at: r.opened_at,
+    closed_at: r.closed_at ?? null,
+    margin: r.margin ?? null,
+  }));
+}
+
 export async function applyBoxReconciledProjection(
   id: string,
   remaining: Record<string, number>,
@@ -389,6 +478,8 @@ export interface BoxEventInput {
   captured_pct?: number | null;
   execution?: BoxExecutionRecord | null;
   execution_mode?: ExecutionMode;
+  /** The broker the decision was taken against. Absent ⇒ the legacy default. */
+  broker?: BrokerId;
   legs?: BoxEventLeg[];
   reason?: string | null;
   detail?: string | null;
@@ -417,6 +508,9 @@ export async function appendBoxEvent(input: BoxEventInput): Promise<void> {
     lot_size: input.lot_size,
     quantity: input.quantity,
     execution_mode: input.execution_mode ?? "paper_touch",
+    // Zerodha for anything that does not say otherwise — the same legacy rule the
+    // trade documents follow, applied in exactly one place.
+    broker: input.broker ?? LEGACY_BROKER,
     box_width: input.box_width ?? null,
     box_cost: input.box_cost ?? null,
     gross_edge: input.gross_edge ?? null,

@@ -922,7 +922,12 @@ app.set("etag", false);
 // --- CORS (so the Vite frontend can call this API) ---
 app.use((req: Request, res: Response, next: NextFunction) => {
   res.header("Access-Control-Allow-Origin", FRONTEND_URL);
-  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  // DELETE is in the list for the destructive Box-trade and calendar-trade
+  // endpoints. Without it the browser's preflight fails and the request never
+  // reaches Express — which is why the existing manual-close endpoint had to be a
+  // POST. Adding the verb here does not widen access: every destructive route is
+  // still behind full-admin authentication.
+  res.header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, x-admin-token");
   res.header("Access-Control-Allow-Credentials", "true");
   // Prevent browser/proxy caching of API responses (no 304 revalidation).

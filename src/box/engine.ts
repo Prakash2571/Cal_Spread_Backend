@@ -63,10 +63,15 @@ import {
   applyBoxPartialExit,
   applyBoxReconciledProjection,
   closeBoxTrade,
+  deleteBoxDailyPnlForTrade,
+  deleteBoxTrade,
+  findBoxTradeById,
   insertBoxExecutionAttempt,
   insertBoxTrade,
   isBoxDbEnabled,
+  isValidBoxId,
   loadBoxDailyPnlTradeIds,
+  loadBoxMarginIntervalsSince,
   loadBoxExecutionAttempts,
   loadBoxLiveRiskSeed,
   loadBoxSettings,
@@ -124,6 +129,7 @@ import {
 import type { BoxExecutionFailureReason } from "./types.js";
 import { entrySideFor } from "./math.js";
 import { brokerOf } from "../brokers/types.js";
+import { peakConcurrentMargin, usableMarginIntervals } from "./marginReplay.js";
 
 export interface BoxEngineDeps {
   /**
@@ -2481,6 +2487,209 @@ export class BoxEngine {
       config: doc.scanner_config_snapshot,
     });
     return true;
+  }
+
+  /* ------------------------------ deletion -------------------------------- */
+
+  /**
+   * PERMANENTLY delete a PAPER box trade — open, closed or errored — and correct
+   * every trade-derived statistic from what actually remains.
+   *
+   * WHY DELETION IS NOT "CLOSE WITH EXTRA STEPS"
+   * A close is a market event: it produces fills, realises P&L and belongs in the
+   * day's history. A delete is an ADMINISTRATIVE correction: the trade should never
+   * have counted at all. So nothing about it may survive in any statistic, in any
+   * of the four places box state lives (in-process memory, Redis, Mongo, and the
+   * P&L archive) — and the numbers must be RECOMPUTED, not adjusted.
+   *
+   * WHY LIVE TRADES ARE REFUSED
+   * A live box may have real broker exposure attached. Deleting the record would
+   * orphan it: the position would still exist at the broker with nothing in our
+   * database pointing at it, so no reconciliation, no monitor and no flatten could
+   * ever find it again. An open live trade must be flattened first. A CLOSED live
+   * trade is retained too, deliberately — it is the audit record of real money
+   * moving, and `deleteBoxTrade`'s query guard refuses both cases.
+   *
+   * Returns a `{ ok, code, error }` result in the same shape as `closeManually`, so
+   * the route surfaces it with `res.status(result.code)` exactly as it already does.
+   */
+  async deleteTrade(
+    id: string,
+    opts: { actor: string; reason?: string | null } = { actor: "admin" },
+  ): Promise<{ ok: boolean; code: number; error?: string; deleted?: SerializedBoxTrade | null }> {
+    if (!isValidBoxId(id)) {
+      return { ok: false, code: 400, error: "Invalid trade id." };
+    }
+    if (!isBoxDbEnabled()) {
+      return { ok: false, code: 503, error: "The Box database is not available." };
+    }
+
+    // Read first — but ONLY to choose the right status code and to capture the
+    // audit fields before they vanish. The delete itself is guarded in its own
+    // query, so this read is never load-bearing for the safety decision.
+    const doc = await findBoxTradeById(id);
+    if (!doc) {
+      return { ok: false, code: 404, error: "No such Box trade." };
+    }
+    const serialized = serializeBoxTrade(doc);
+
+    if (doc.execution_mode === "live") {
+      // Distinct messages: an open live position is a live-exposure problem the
+      // operator can act on, whereas a closed live trade is a retention decision.
+      const message = doc.status === "open"
+        ? "Cannot delete an open live trade because broker exposure may still exist. Flatten/close it first."
+        : "Closed LIVE trades are retained as the audit record of real executed orders and cannot be deleted.";
+      return { ok: false, code: 409, error: message };
+    }
+
+    const position = this.positions.get(id);
+
+    // A paper position mid-exit is still refused. `closing` means an exit is in
+    // flight and `pendingFinalPersists` may already hold a CONFIRMED fill; deleting
+    // underneath that would race the persist and could resurrect the document.
+    if (position?.closing) {
+      return {
+        ok: false,
+        code: 409,
+        error: "This trade is currently being closed. Wait for the exit to finish, then delete it.",
+      };
+    }
+
+    const deletedCount = await deleteBoxTrade(id);
+    if (deletedCount === 0) {
+      // The guarded filter refused it or it vanished between the read and here.
+      return { ok: false, code: 409, error: "The trade could not be deleted." };
+    }
+
+    /* ---- 1. in-memory position book, and everything keyed off it ---- */
+    if (position) {
+      this.positions.remove(id);          // also frees the byKey / reserved entry
+      this.syncManagerExposure();         // exposure counts the manager enforces
+      this.marginBackfillTries.delete(id);
+      this.marginInFlight.delete(id);
+      // Interrupt any retry/evaluation state the monitor still holds, or the next
+      // cycle would re-persist the trade we just removed.
+      const wasHeld = this.monitor.forgetPosition(id);
+      if (wasHeld) {
+        console.warn(`[Box] deletion of ${id} interrupted in-flight monitor work for that trade.`);
+      }
+      // Release feed subscriptions this position was the last claimant of. With the
+      // scanner stopped this narrows the token set; with it running the scanner's
+      // own universe keeps whatever it still wants, so nothing it needs is dropped.
+      if (!this.running) this.shrinkToOpenPositions();
+      else this.maybeReleaseFeed();
+    }
+
+    /* ---- 2. Redis mirrors (the only paths that ever remove a trade) ---- */
+    const day = this.deps.istDayKey();
+    await this.closedCache.evictTrade(day, id).catch(() => false);
+    await this.pnlCache.evictTrade(day, id).catch(() => false);
+
+    /* ---- 3. the P&L archive, so a regenerated day cannot resurrect it ---- */
+    await deleteBoxDailyPnlForTrade(id).catch((err) =>
+      console.warn(`[Box] failed to drop box_daily_pnl rows for deleted trade ${id}:`, err),
+    );
+
+    /* ---- 4. RECOMPUTE every trade-derived figure from what remains ---- */
+    await this.recomputeTradeDerivedStatistics();
+
+    /* ---- 5. audit, then tell every browser ---- */
+    void appendBoxEvent({
+      event: "TRADE_DELETED",
+      trade_id: id,
+      candidate_key: tradeKey(doc),
+      underlying: doc.underlying,
+      expiry: doc.expiry,
+      direction: directionOf(doc),
+      broker: brokerOf(doc),
+      lower_strike: doc.lower_strike,
+      upper_strike: doc.upper_strike,
+      lot_size: doc.lot_size,
+      quantity: doc.quantity,
+      execution_mode: doc.execution_mode,
+      box_width: doc.box_width,
+      gross_pnl: doc.gross_pnl,
+      net_pnl: doc.net_pnl,
+      reason: `deleted_by:${opts.actor}`,
+      detail:
+        `status_before=${doc.status} mode=${doc.execution_mode} broker=${brokerOf(doc)} ` +
+        `opened_at=${doc.opened_at.toISOString()} ` +
+        `closed_at=${doc.closed_at ? doc.closed_at.toISOString() : "null"} ` +
+        `deleted_at=${new Date().toISOString()}` +
+        (opts.reason ? ` reason=${opts.reason}` : ""),
+    });
+
+    console.log(
+      `[Box] TRADE DELETED ${id} (${doc.underlying} ${directionLabel(directionOf(doc))}, ` +
+        `${doc.status}, ${doc.execution_mode}, ${brokerOf(doc)}) by ${opts.actor}.`,
+    );
+
+    this.broadcast("trade_deleted", { id, trade: serialized });
+    // A full snapshot immediately after, so every open tab shows the corrected
+    // counts, P&L and margin without waiting for the next publish tick or a reload.
+    this.publish();
+
+    return { ok: true, code: 200, deleted: serialized };
+  }
+
+  /**
+   * Rebuild every trade-derived statistic from the surviving records.
+   *
+   * RECOMPUTED, NEVER ADJUSTED. Subtracting a deleted trade's fields from the
+   * running tallies is wrong in at least three ways, and the peak is the clearest
+   * case: `peak -= deleted.margin` is simply not what a maximum is. If the deleted
+   * trade set the previous high-water mark, the true peak is whatever the highest
+   * remaining OVERLAP is — which can only be found by replaying the intervals.
+   *
+   * The open side needs no work: `computeDayPnl()` derives it from the position
+   * book on every read, so removing the position already corrected it.
+   */
+  private async recomputeTradeDerivedStatistics(): Promise<void> {
+    // Closed-today tallies and the fast list: re-read the day from Mongo rather
+    // than decrementing counters. This is the same query the boot seed uses, so
+    // there is exactly one definition of "today's closed set" in the engine.
+    await this.refreshClosedTodayFromDb().catch((err) =>
+      console.warn("[Box] closed-today recompute after deletion failed:", err),
+    );
+    await this.recomputePeakConcurrentMargin();
+  }
+
+  /**
+   * Recompute peak concurrent margin by REPLAYING the surviving trade intervals.
+   *
+   * Each trade blocks its margin over [opened_at, closed_at) — or to now while it
+   * is still open. The peak concurrent figure is the largest sum of margins whose
+   * intervals overlap at a single instant. That maximum can only occur at an
+   * interval START (adding exposure is the only thing that can raise the sum), so
+   * sweeping the start points is exact rather than sampled.
+   *
+   * Trades with an unknown (null) margin are EXCLUDED, never counted as zero —
+   * consistent with `computeDayPnl`, which reports them separately. Including them
+   * as zero would understate the peak and quietly present a guess as a measurement.
+   *
+   * This replaces the process-lifetime sampled high-water mark for the day being
+   * recomputed: after a deletion the sampled value may reflect a trade that no
+   * longer exists, and an honest recomputation is strictly better than a stale
+   * observation.
+   */
+  private async recomputePeakConcurrentMargin(): Promise<void> {
+    try {
+      const dayStart = istDayStartMs(this.deps.istDayKey());
+      const rows = await loadBoxMarginIntervalsSince(dayStart);
+      const now = Date.now();
+      // The arithmetic itself lives in the pure marginReplay module so it can be
+      // unit-tested offline; this method only supplies the data.
+      const intervals = usableMarginIntervals(
+        rows.map((r) => ({
+          from: r.opened_at.getTime(),
+          to: r.closed_at ? r.closed_at.getTime() : now,
+          margin: r.margin,
+        })),
+      );
+      this.peakConcurrentMargin = peakConcurrentMargin(intervals);
+    } catch (err) {
+      console.warn("[Box] peak-concurrent-margin replay failed:", err);
+    }
   }
 
   /**

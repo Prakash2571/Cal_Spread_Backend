@@ -12,6 +12,7 @@
 
 import type { Express, Request, RequestHandler, Response } from "express";
 import { KiteError } from "../kite.js";
+import { rateLimit } from "../ratelimit.js";
 import type { BoxEngine } from "./engine.js";
 import {
   isBoxDbEnabled,
@@ -37,6 +38,19 @@ function fail(res: Response, err: unknown): void {
   console.error("[Box] request failed:", err);
   res.status(500).json({ error: message });
 }
+
+/**
+ * A tight bucket for the destructive delete endpoint.
+ *
+ * Deliberately far below the global /api limit: deleting trades is a deliberate,
+ * one-at-a-time operator action, so 20 a minute is generous for a human and still
+ * stops a stuck client from walking the whole book.
+ */
+const deleteRateLimit = rateLimit({
+  windowMs: 60_000,
+  max: 20,
+  message: "Too many delete requests. Slow down.",
+});
 
 export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
   const { engine, requireAdmin } = deps;
@@ -326,6 +340,58 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
       fail(res, err);
     }
   });
+
+  /**
+   * PERMANENTLY delete a PAPER Box trade (open, closed or errored).
+   *
+   * FULL ADMIN ONLY. This is destructive and irreversible, so trade-access users
+   * cannot reach it even though they can see every trade — viewing history and
+   * rewriting it are different privileges.
+   *
+   * Rate limited separately from the global /api bucket: a destructive endpoint
+   * should not be reachable at the same 150-per-minute rate as a price read, and a
+   * runaway client (or a stuck retry loop in the UI) must not be able to walk the
+   * whole book.
+   *
+   * The engine owns every safety decision and returns the status code to use, so
+   * this handler stays a thin translation layer. LIVE trades are refused with 409.
+   */
+  app.delete(
+    "/api/box/trades/:id",
+    deleteRateLimit,
+    requireAdmin,
+    async (req: Request, res: Response) => {
+      if (!requireFull(req, res)) return;
+      try {
+        const id = String(req.params.id ?? "");
+        const body = (req.body ?? {}) as { reason?: unknown };
+        const reason = typeof body.reason === "string" && body.reason.trim() !== ""
+          ? body.reason.trim().slice(0, 500)
+          : null;
+        const token = req.header("x-admin-token") ?? undefined;
+        const actor = deps.getAdminRole(token) ?? "admin";
+
+        const result = await engine.deleteTrade(id, { actor, reason });
+        if (!result.ok) {
+          res.status(result.code).json({ error: result.error });
+          return;
+        }
+        // Return the corrected state alongside the acknowledgement so the UI can
+        // apply it immediately — no reload, and no second round trip to discover
+        // the new counts, P&L and margin.
+        const { trades, source, day } = await engine.getClosedToday();
+        res.json({
+          ok: true,
+          deleted_id: id,
+          status: engine.getStatus(),
+          open: engine.getOpenPositions(),
+          closed_today: { trades, source, day, lite: true },
+        });
+      } catch (err) {
+        fail(res, err);
+      }
+    },
+  );
 
   /* --------------------------------- SSE --------------------------------- */
 
