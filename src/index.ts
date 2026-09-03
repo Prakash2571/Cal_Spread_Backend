@@ -5353,6 +5353,7 @@ registerBrokerRoutes(app, {
   getAdminRole,
   // Every open tab must see a broker change immediately, not on the next poll.
   onBrokerChanged: () => boxModule.engine.publishNow(),
+  indexSpotMap: INDEX_SPOT_MAP,
 });
 
 app.listen(PORT, () => {

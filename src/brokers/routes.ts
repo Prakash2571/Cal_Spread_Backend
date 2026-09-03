@@ -14,6 +14,7 @@ import { rateLimit } from "../ratelimit.js";
 import { DhanError } from "./dhan/errors.js";
 import { isDhanTokenExpired, redactedSession } from "./dhan/auth.js";
 import { getDhanParseReport } from "./dhan/instruments.js";
+import { checkKnownSymbols, diagnoseBoard } from "./boardDiagnostics.js";
 import { loadDhanSession } from "../db.js";
 import { parseBrokerId, type BrokerId } from "./types.js";
 import type { ActiveBrokerManager } from "./registry.js";
@@ -25,6 +26,8 @@ export interface BrokerRouteDeps {
   getAdminRole: (token: string | undefined) => "full" | "trade" | null;
   /** Called after a successful broker switch so the Box SSE snapshot goes out. */
   onBrokerChanged?: (broker: BrokerId) => void;
+  /** The app's underlying→index-spot-symbol map, for board diagnostics. */
+  indexSpotMap?: Record<string, string>;
 }
 
 /** The auth flow spends the app credentials, so it gets its own tight bucket. */
@@ -231,12 +234,33 @@ export function registerBrokerRoutes(app: Express, deps: BrokerRouteDeps): void 
         });
         return;
       }
+      // Reproduce the board join so the report explains WHY a large universe becomes a
+      // small board — the stage that was previously invisible.
+      const universe = manager.dhanInstrumentStore.instruments;
+      const board = diagnoseBoard(universe, deps.indexSpotMap ?? {});
+      const known = checkKnownSymbols(universe);
+
       res.json({
         broker: "dhan",
-        healthy: report.fnoFutures >= 50 && report.missingColumns.length === 0,
-        ...report,
-        // The header is the single most useful field when a column name has moved.
-        header_line: report.header.join(","),
+        active_broker: manager.activeBroker,
+        generation: manager.generation,
+        healthy:
+          report.fnoFutures >= 100 &&
+          report.distinctFutureUnderlyings >= 50 &&
+          board.boardSize >= 50 &&
+          report.missingColumns.length === 0,
+        instrument_universe_size: universe.length,
+        parser_report: {
+          ...report,
+          // The header is the single most useful field when a column name has moved.
+          header_line: report.header.join(","),
+          // Cap the raw header echo; the rest of the report is already summarised.
+          header: report.header.slice(0, 40),
+        },
+        board,
+        known_symbols: known,
+        subscriptions: manager.subscriptions.stats(),
+        feed: manager.feedHealth(),
       });
     } catch (err) {
       fail(res, err);
