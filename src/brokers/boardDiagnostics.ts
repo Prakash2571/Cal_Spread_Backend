@@ -12,6 +12,7 @@
  */
 
 import type { Instrument } from "../kite.js";
+import { resolveIndexSpotSymbol } from "../indexSpot.js";
 
 export interface UnmatchedUnderlying {
   underlying: string;
@@ -93,8 +94,14 @@ export function diagnoseBoard(
       matchedEquities++;
       continue;
     }
-    const indexSymbol = indexSpotMap[underlying];
-    if (indexSymbol && indexBySymbol.has(indexSymbol)) {
+    // Shares the real resolver rather than re-implementing the candidate order: the two
+    // MUST agree about which spot name wins, or this report would contradict the board.
+    const indexSymbol = resolveIndexSpotSymbol(
+      underlying,
+      (sym) => indexBySymbol.has(sym),
+      indexSpotMap,
+    );
+    if (indexSymbol) {
       matchedIndices++;
       continue;
     }
@@ -105,8 +112,9 @@ export function diagnoseBoard(
       futureName: sample.name,
       expiry: sample.expiry,
       // Distinguishing these matters: a missing equity means the underlying join is
-      // broken, whereas a missing index mapping is a known, small, fixable list.
-      reason: indexSymbol ? "no_index_mapping" : "no_spot_equity",
+      // broken, whereas a known index underlying whose spot cannot be found is a naming
+      // mismatch between brokers.
+      reason: indexSpotMap[underlying] ? "no_index_mapping" : "no_spot_equity",
     });
   }
 
