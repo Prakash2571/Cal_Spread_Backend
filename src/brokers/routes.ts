@@ -13,6 +13,7 @@ import type { Express, Request, RequestHandler, Response } from "express";
 import { rateLimit } from "../ratelimit.js";
 import { DhanError } from "./dhan/errors.js";
 import { isDhanTokenExpired, redactedSession } from "./dhan/auth.js";
+import { getDhanParseReport } from "./dhan/instruments.js";
 import { loadDhanSession } from "../db.js";
 import { parseBrokerId, type BrokerId } from "./types.js";
 import type { ActiveBrokerManager } from "./registry.js";
@@ -203,6 +204,40 @@ export function registerBrokerRoutes(app: Express, deps: BrokerRouteDeps): void 
     try {
       const result = await manager.verifyDhanStaticIp();
       res.json({ ok: result.verified, ...result, static_ip: manager.dhanStaticIpState() });
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  /**
+   * What the Dhan instrument-master parse actually saw.
+   *
+   * Exists because Dhan's CSV column names are not something to keep guessing at. When
+   * the board looks wrong (empty, or full of exchange TEST scrips) this reports which
+   * columns were FOUND, which were missing, how many rows were skipped and why, and
+   * sample parsed futures — turning a mystery into a five-second diagnosis.
+   *
+   * Full admin: it echoes the master's header layout.
+   */
+  app.get("/api/dhan/instruments/diagnostics", requireFullAdmin, async (_req: Request, res: Response) => {
+    try {
+      // Force a parse so the report reflects the CURRENT master, not a cached one.
+      await manager.dhanInstrumentStore.load(true).catch(() => undefined);
+      const report = getDhanParseReport();
+      if (!report) {
+        res.status(503).json({
+          error: "The Dhan instrument master has not been parsed yet.",
+          hint: "Connect Dhan, then retry.",
+        });
+        return;
+      }
+      res.json({
+        broker: "dhan",
+        healthy: report.fnoFutures >= 50 && report.missingColumns.length === 0,
+        ...report,
+        // The header is the single most useful field when a column name has moved.
+        header_line: report.header.join(","),
+      });
     } catch (err) {
       fail(res, err);
     }
