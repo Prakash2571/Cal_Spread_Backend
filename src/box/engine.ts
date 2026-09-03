@@ -1642,6 +1642,15 @@ export class BoxEngine {
     this.subscribedOptionTokens = wantOption;
     this.subscribedSpotTokens = wantSpot;
 
+    // Prefer declaring the whole set: the coordinator can then refcount correctly and
+    // will not drop a token another consumer (a browser SSE client) still wants.
+    if (this.deps.feed.setStrategyTokens) {
+      this.deps.feed.setStrategyTokens([...wantOption, ...wantSpot]);
+      this.subscribedOptionTokens = new Set(wantOption);
+      this.subscribedSpotTokens = new Set(wantSpot);
+      if (toDrop.length > 0) this.quotes.forget(toDrop);
+      return;
+    }
     if (toAdd.length > 0) this.deps.feed.subscribeTokens(toAdd);
     if (toDrop.length > 0) {
       this.deps.feed.unsubscribeTokens(toDrop);

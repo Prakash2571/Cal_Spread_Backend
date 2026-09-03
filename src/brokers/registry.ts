@@ -42,6 +42,10 @@ import type {
 import { BROKER_IDS, type BrokerHealthState, type BrokerId, type BrokerSessionState } from "./types.js";
 import { createZerodhaLiveAdapter } from "./zerodha/liveAdapter.js";
 import { DhanClient, extractIpv4Addresses, normalizeDhanMultiMargin } from "./dhan/client.js";
+import { SubscriptionCoordinator } from "./subscriptions.js";
+import { InstrumentProvider } from "./instrumentProvider.js";
+import { QuoteProvider } from "./quoteProvider.js";
+import { computeFeedHealth, type FeedHealth } from "./feedHealth.js";
 import { DhanHttp, dhanHttpConfigFromEnv } from "./dhan/http.js";
 import { DhanFeed } from "./dhan/feed.js";
 import { DhanInstrumentStore, dhanInternalToken, type DhanInstrument } from "./dhan/instruments.js";
@@ -168,6 +172,24 @@ export class ActiveBrokerManager {
   private dhanIpCheckedAt: number | null = null;
   private dhanIpError: string | null = null;
 
+  /**
+   * Broker/feed GENERATION. Bumped on every switch.
+   *
+   * Kite tokens and Dhan tokens are different namespaces, so anything cached under a
+   * previous generation is not merely stale — it is meaningless. The number lets every
+   * cache and book be attributed, and lets an old-generation book be rejected rather
+   * than mistaken for a current one.
+   */
+  private gen = 1;
+  /** Newest tick timestamp seen from the ACTIVE broker's feed. */
+  private lastTickAt: number | null = null;
+  /** Set while a switch is mid-flight, so nothing reports READY during a transition. */
+  private transitioning = false;
+
+  readonly subscriptions: SubscriptionCoordinator;
+  readonly instrumentProvider: InstrumentProvider;
+  readonly quoteProvider: QuoteProvider;
+
   constructor(private deps: ActiveBrokerManagerDeps) {
     this.dhanHttp = new DhanHttp(
       dhanHttpConfigFromEnv({
@@ -178,6 +200,80 @@ export class ActiveBrokerManager {
     this.dhanClient = new DhanClient(this.dhanHttp, () =>
       this.dhanSessionMeta?.clientId ?? process.env.DHAN_CLIENT_ID?.trim() ?? "",
     );
+
+    // EVERY market-data subscription goes through the coordinator, which diffs
+    // refcounts and only then touches the ACTIVE broker's socket. This is what stops a
+    // browser SSE client from opening a Zerodha WebSocket while Dhan is active.
+    this.subscriptions = new SubscriptionCoordinator({
+      subscribeTokens: (tokens) => this.subscribeUpstream(tokens),
+      unsubscribeTokens: (tokens) => this.unsubscribeUpstream(tokens),
+    });
+
+    this.instrumentProvider = new InstrumentProvider({
+      activeBroker: () => this.active,
+      kite: deps.kite,
+      dhanInstruments: this.dhanInstruments,
+      generation: () => this.gen,
+    });
+
+    this.quoteProvider = new QuoteProvider({
+      activeBroker: () => this.active,
+      kite: deps.kite,
+      dhan: this.dhanClient,
+      dhanInstruments: this.dhanInstruments,
+      instruments: () => this.instrumentProvider.load(),
+    });
+  }
+
+  /** The current broker/feed generation. */
+  get generation(): number {
+    return this.gen;
+  }
+
+  /** Record that a tick arrived, for the feed-health model. */
+  noteTick(at: number = Date.now()): void {
+    this.lastTickAt = at;
+  }
+
+  /**
+   * Reject a token that does not belong to the ACTIVE broker.
+   *
+   * Loud rather than silent: a cross-namespace token means some caller is holding a
+   * board from the previous broker, and guessing which instrument was meant would
+   * attribute a price to the wrong contract. Returns true when the token is usable.
+   */
+  assertActiveBrokerToken(token: number, context: string): boolean {
+    const owned = this.instrumentProvider.ownsToken(token);
+    // null = the universe has not loaded, so we genuinely cannot tell. Refusing then
+    // would break startup rather than prevent a bug.
+    if (owned === null) return true;
+    if (!owned) {
+      console.error(
+        `[Broker] REJECTED token ${token} in ${context}: it does not belong to the active ` +
+          `broker (${this.active}, generation ${this.gen}). This is a cross-broker token leak.`,
+      );
+      return false;
+    }
+    return true;
+  }
+
+  /** Subscribe on the ACTIVE broker only. Called by the coordinator. */
+  private subscribeUpstream(tokens: number[]): void {
+    if (tokens.length === 0) return;
+    if (this.active === "zerodha") {
+      this.deps.tickerHub.subscribeTokens(tokens);
+      return;
+    }
+    this.ensureDhanFeed().subscribeTokens(tokens);
+  }
+
+  private unsubscribeUpstream(tokens: number[]): void {
+    if (tokens.length === 0) return;
+    if (this.active === "zerodha") {
+      this.deps.tickerHub.unsubscribeTokens(tokens);
+      return;
+    }
+    this.dhanFeed?.unsubscribeTokens(tokens);
   }
 
   /** Wire the exposure probe and switch hooks (done once, after the engine exists). */
@@ -224,6 +320,30 @@ export class ActiveBrokerManager {
       }
     }
     if (this.active === "dhan") this.dhanProblems = this.computeDhanProblems();
+  }
+
+  /**
+   * Bring the ACTIVE broker's runtime up at boot, in dependency order.
+   *
+   * Prerequisites are established BEFORE the runtime is reported ready: verifying the
+   * session and loading the universe first means a status read during startup says
+   * "connecting", never "live with an empty board".
+   */
+  async startActiveRuntime(): Promise<void> {
+    const session = this.sessionFor(this.active);
+    if (!session.authenticated) {
+      console.log(`[Broker] active=${this.active} generation=${this.gen} — no session, runtime idle`);
+      return;
+    }
+    console.log(`[Broker] active=${this.active} generation=${this.gen}`);
+    if (this.active === "dhan") {
+      await this.verifyDhanStaticIp().catch(() => undefined);
+    }
+    await this.instrumentProvider.load(true).catch((err) =>
+      console.warn(`[Broker] ${this.active} universe load failed at boot:`, err),
+    );
+    this.startActiveFeed();
+    this.dhanProblems = this.computeDhanProblems();
   }
 
   /* -------------------------- Dhan session state ------------------------- */
@@ -277,11 +397,44 @@ export class ActiveBrokerManager {
     void this.dhanInstruments.load().catch((err) =>
       console.warn("[Dhan] instrument master load failed after login:", err),
     );
+    // A RECONNECT replaces the access token, so the socket opened with the PREVIOUS
+    // token must not survive: it authenticates with a credential we have just
+    // superseded, and Dhan may drop it at any moment while the runtime still believes
+    // the feed is live. Recycle it explicitly.
+    if (this.dhanFeed) {
+      console.log("[Broker] recycling the Dhan feed onto the new access token");
+      this.dhanFeed.stop();
+      // Drop the feed object entirely: its token reader is a closure over session
+      // state, and a fresh instance is cheaper to reason about than a mutated one.
+      this.dhanFeed = null;
+      this.lastTickAt = null;
+    }
+
     // Verify the static IP NOW. Establishing a session is the first moment the check
     // is even possible (it needs the token), and without this nothing in the normal
     // connect flow ever triggers it — leaving trading blocked as "not yet verified"
     // with no way for the operator to discover why.
     await this.verifyDhanStaticIp().catch(() => undefined);
+
+    // Bring the runtime back up on the new session, but only when Dhan is the broker
+    // that actually owns the runtime. Connecting a Dhan session while Zerodha is
+    // active must NOT start a Dhan feed.
+    if (this.active === "dhan") {
+      await this.instrumentProvider.load(true).catch((err) =>
+        console.warn("[Dhan] universe load after login failed:", err),
+      );
+      this.startActiveFeed();
+      // Re-subscribe whatever consumers still want. Tokens are unchanged (same broker,
+      // same namespace), so the coordinator's table is still valid — only the socket
+      // was replaced.
+      const wanted = this.subscriptions.activeTokens();
+      if (wanted.length > 0) {
+        console.log(`[Broker] restoring ${wanted.length} Dhan subscription(s) after reconnect`);
+        this.subscribeUpstream(wanted);
+      }
+      this.hooks?.publish();
+    }
+    this.dhanProblems = this.computeDhanProblems();
     return this.sessionFor("dhan");
   }
 
@@ -915,23 +1068,38 @@ export class ActiveBrokerManager {
     return this.dhanFeed;
   }
 
-  /** Subscribe tokens on the ACTIVE broker's feed. */
+  /**
+   * The STRATEGY's token set, declared as a whole.
+   *
+   * Routed through the coordinator so the Box engine's window can move without
+   * unsubscribing a token a browser or another consumer still needs.
+   */
   subscribeTokens(tokens: number[]): void {
     if (tokens.length === 0) return;
-    if (this.active === "zerodha") {
-      this.deps.tickerHub.subscribeTokens(tokens);
-      return;
-    }
-    this.ensureDhanFeed().subscribeTokens(tokens);
+    this.subscriptions.acquire("strategy", tokens);
   }
 
   unsubscribeTokens(tokens: number[]): void {
+    // The strategy releases by re-declaring its set; see setStrategyTokens. Kept for
+    // the existing BoxFeedProvider contract.
     if (tokens.length === 0) return;
-    if (this.active === "zerodha") {
-      this.deps.tickerHub.unsubscribeTokens(tokens);
-      return;
-    }
-    this.dhanFeed?.unsubscribeTokens(tokens);
+    this.unsubscribeUpstream(
+      tokens.filter((t) => {
+        const counts = this.subscriptions.countsFor(t);
+        // Only reach upstream for tokens nothing else wants.
+        return counts === null || counts.total === 0;
+      }),
+    );
+  }
+
+  /** Replace the strategy's entire token set in one diff. */
+  setStrategyTokens(tokens: number[]): void {
+    this.subscriptions.setOwnerTokens("strategy", tokens);
+  }
+
+  /** Acquire a BROWSER lease (one per SSE client). Returns a release function. */
+  acquireBrowserTokens(tokens: number[]): () => void {
+    return this.subscriptions.acquire("browser", tokens).release;
   }
 
   feedConnected(): boolean {
@@ -940,10 +1108,24 @@ export class ActiveBrokerManager {
       : (this.dhanFeed?.isConnected() ?? false);
   }
 
+  /** Tokens the coordinator wants upstream — the honest subscription count. */
   subscribedCount(): number {
-    return this.active === "zerodha"
-      ? this.deps.tickerHub.subscribedCount()
-      : (this.dhanFeed?.subscribedCount() ?? 0);
+    return this.subscriptions.size;
+  }
+
+  /** Truthful feed health: connection AND subscriptions AND data arrival. */
+  feedHealth(): FeedHealth {
+    const session = this.sessionFor(this.active);
+    const universe = this.instrumentProvider.size();
+    return computeFeedHealth({
+      connected: this.feedConnected(),
+      connecting: this.transitioning,
+      authenticated:
+        session.authenticated && (this.active === "zerodha" || this.dhanDataEnabled()),
+      subscribed: this.subscriptions.size,
+      universe: universe > 0 ? universe : null,
+      lastTickAt: this.lastTickAt,
+    });
   }
 
   /** Start the ACTIVE broker's feed. Never starts the inactive one. */
@@ -1056,45 +1238,79 @@ export class ActiveBrokerManager {
 
     const previous = this.active;
     const hooks = this.hooks;
+    this.transitioning = true;
+    console.log(`[Broker] switch ${previous} -> ${target} requested by ${actor}`);
 
-    // 1. stop discovery on the outgoing broker
-    hooks?.stopScanner();
-
-    // 2 + 3. stop the outgoing feed and DROP its subscriptions and books
-    if (previous === "zerodha") {
-      // The Kite hub clears `subscribed` and `latest` on stop, so no Zerodha depth
-      // survives into the Dhan session.
-      this.deps.tickerHub.stop();
-    } else {
-      this.dhanFeed?.stop();
-    }
-
-    // 4. clear broker-specific runtime caches
-    if (previous === "dhan") this.dhanInstruments.clear();
-    // The Box quote store and feed generation are the engine's; the hook clears them.
-    hooks?.invalidateBooks();
-
-    // 5. the switch itself — nothing before this point could touch the new broker,
-    //    and nothing after it can touch the old one.
-    this.active = target;
-    await saveActiveBroker(target, actor).catch((err) =>
-      console.warn("[Broker] failed to persist the active broker:", err),
-    );
-
-    // 6 + 7. bring the new broker up, then start ONLY its feed
     try {
-      if (target === "dhan") {
-        await this.dhanInstruments.load(true);
-        // Confirm the whitelist against Dhan now, so `trading_ready` is truthful the
-        // moment the switch completes rather than at the first order attempt.
-        await this.verifyDhanStaticIp().catch(() => undefined);
+      // 1. stop discovery on the outgoing broker (also prevents new execution)
+      hooks?.stopScanner();
+      console.log("[Broker] scanner stopped");
+
+      // 2 + 3. stop the outgoing feed and DROP its subscriptions and books
+      if (previous === "zerodha") {
+        // The Kite hub clears `subscribed` and `latest` on stop, so no Zerodha depth
+        // survives into the Dhan session.
+        this.deps.tickerHub.stop();
+      } else {
+        this.dhanFeed?.stop();
       }
-      await hooks?.reloadUniverse();
-    } catch (err) {
-      console.warn(`[Broker] switched to ${target} but the universe reload failed:`, err);
+      console.log(`[Broker] ${previous} feed stopped`);
+
+      // 4. drop every token registration. NOT translated: a Kite token has no Dhan
+      //    counterpart even when the integers coincide, so carrying the table across
+      //    would be the exact namespace leak this transition exists to prevent.
+      const dropped = this.subscriptions.resetForBrokerSwitch();
+      console.log(
+        `[Broker] ${dropped.droppedTokens} old subscription(s) cleared ` +
+          `(${dropped.droppedLeases} lease(s))`,
+      );
+
+      // 5. invalidate every market-data book/cache, and both instrument universes
+      if (previous === "dhan") this.dhanInstruments.clear();
+      this.instrumentProvider.invalidate();
+      this.lastTickAt = null;
+      hooks?.invalidateBooks();
+      console.log(`[Broker] quote generation ${this.gen} invalidated`);
+
+      // 6. THE SWITCH. Nothing before this could touch the new broker, and nothing
+      //    after it can touch the old one. The generation bump makes every surviving
+      //    reference to an old book identifiable as stale.
+      this.active = target;
+      this.gen += 1;
+      console.log(`[Broker] active=${target} generation=${this.gen}`);
+      await saveActiveBroker(target, actor).catch((err) =>
+        console.warn("[Broker] failed to persist the active broker:", err),
+      );
+
+      // 7. load the NEW broker's universe BEFORE anything can ask for a token in it
+      try {
+        if (target === "dhan") {
+          await this.dhanInstruments.load(true);
+          // Verify the whitelist now, so trading_ready is truthful the moment the
+          // switch completes rather than at the first order attempt.
+          await this.verifyDhanStaticIp().catch(() => undefined);
+        }
+        await this.instrumentProvider.load(true);
+      } catch (err) {
+        console.warn(`[Broker] switched to ${target} but the universe load failed:`, err);
+      }
+
+      // 8. rebuild the strategy's instrument set against the NEW token namespace
+      try {
+        await hooks?.reloadUniverse();
+      } catch (err) {
+        console.warn(`[Broker] universe rebuild after switch to ${target} failed:`, err);
+      }
+
+      // 9. start ONLY the new broker's feed
+      this.startActiveFeed();
+      console.log(`[Broker] ${target} feed started`);
+    } finally {
+      this.transitioning = false;
     }
-    this.startActiveFeed();
+
     this.dhanProblems = this.computeDhanProblems();
+    // 10. publish fresh runtime state so every open tab refetches its board.
     hooks?.publish();
 
     console.log(`[Broker] active broker switched ${previous} → ${target} by ${actor}.`);
@@ -1111,6 +1327,11 @@ export class ActiveBrokerManager {
     dhan_instruments_loaded_at: number | null;
     dhan_static_ip: ReturnType<ActiveBrokerManager["dhanStaticIpState"]>;
     last_margin_source: BoxMarginSource | null;
+    generation: number;
+    feed: FeedHealth;
+    subscriptions: ReturnType<SubscriptionCoordinator["stats"]>;
+    instruments: number;
+    instruments_loaded_at: number | null;
   } {
     return {
       broker: this.active,
@@ -1122,6 +1343,11 @@ export class ActiveBrokerManager {
       dhan_static_ip: this.dhanStaticIpState(),
       /** Which margin calculation produced the most recent figure. */
       last_margin_source: this.lastMarginSource,
+      generation: this.gen,
+      feed: this.feedHealth(),
+      subscriptions: this.subscriptions.stats(),
+      instruments: this.instrumentProvider.size(),
+      instruments_loaded_at: this.instrumentProvider.loadedAt(),
     };
   }
 }

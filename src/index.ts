@@ -118,13 +118,69 @@ const brokerManager = new ActiveBrokerManager({
   // Dhan ticks are pushed into the shared hub's caches so EVERY existing consumer
   // (the Box quote store, SSE clients, analytics) sees them through the same path it
   // already uses. No consumer needs to know which broker produced a tick.
-  onDhanTicks: (ticks) => tickerHub.ingestExternalTicks(ticks),
+  onDhanTicks: (ticks) => {
+    // Record liveness for the feed-health model, then fan out through the shared hub
+    // so every existing consumer (SSE, Box quote store, analytics) sees Dhan ticks
+    // through the same path it already uses.
+    brokerManager.noteTick();
+    tickerHub.ingestExternalTicks(ticks);
+  },
   onDhanConnection: (connected) => tickerHub.setExternalConnected(connected),
   onSessionLost: (broker, reason) => {
     console.warn(`[Broker] ${broker} session lost: ${reason}`);
     onFeedSessionLost?.();
   },
 });
+
+/**
+ * The ACTIVE broker's market-data readiness, as a route guard.
+ *
+ * Replaces the `if (!kite.getAccessToken())` checks that gated live-data routes on
+ * ZERODHA specifically. Those made every chart and quote endpoint 401 while Dhan was
+ * authenticated and streaming — the frontend then had no way to show prices at all.
+ */
+function requireMarketData(res: Response, what: string): boolean {
+  const health = brokerManager.activeHealth();
+  if (health.data_ready) return true;
+  const label = brokerManager.activeBroker === "dhan" ? "Dhan" : "Zerodha";
+  res.status(401).json({
+    error: `${what} requires a ${label} session. Connect ${label}.`,
+    broker: brokerManager.activeBroker,
+    problems: health.problems,
+  });
+  return false;
+}
+
+/**
+ * ZERODHA-ONLY analytics recorders: may this capture run right now?
+ *
+ * The NIFTY option-OI, futures-OI and previous-close recorders are genuinely
+ * Zerodha-specific. Their stored series are keyed by KITE instrument tokens, and the
+ * multi-day history already in Mongo was built that way — so running them while Dhan
+ * is active would append Kite-keyed rows to datasets the app would then read with Dhan
+ * tokens, and nothing would join.
+ *
+ * They are therefore explicitly labelled Zerodha-only and SKIPPED when another broker
+ * owns the runtime, rather than silently pretending to be broker-neutral. Converting
+ * them to the active broker is tracked as a known limitation: Dhan can supply option
+ * chain OI, but the historical series would need a parallel, Dhan-keyed store to avoid
+ * mixing identifier namespaces.
+ */
+let zerodhaOnlyCaptureWarned = false;
+function zerodhaCaptureAllowed(what: string): boolean {
+  if (brokerManager.activeBroker !== "zerodha") {
+    if (!zerodhaOnlyCaptureWarned) {
+      zerodhaOnlyCaptureWarned = true;
+      console.log(
+        `[Capture] ${what} and the other Zerodha-only analytics recorders are paused: ` +
+          `active broker is ${brokerManager.activeBroker}. Their series are keyed by Kite ` +
+          `instrument tokens, so they must not append while another broker is active.`,
+      );
+    }
+    return false;
+  }
+  return kite.getAccessToken() !== null;
+}
 
 /**
  * Broker-neutral historical candles.
@@ -1000,8 +1056,35 @@ app.get("/", (_req: Request, res: Response) => {
 });
 
 // --- Status (under /api so it works behind a same-domain /api proxy) ---
+/**
+ * Runtime status.
+ *
+ * `authenticated` now means THE ACTIVE BROKER'S session is usable — not Kite's. It
+ * used to be `kite.hasSession()`, which made the whole frontend unusable with Dhan
+ * active: the browser saw `authenticated: false`, never opened SSE, and showed
+ * `LTP -` with a "Connect to Zerodha" banner while Dhan was authenticated and its
+ * feed was live.
+ *
+ * The broker-specific fields are additive, so an older client reading only
+ * `authenticated` keeps working — it just now reflects the right broker.
+ */
 app.get("/api/status", (_req: Request, res: Response) => {
-  res.json({ status: "ok", authenticated: kite.hasSession() });
+  const health = brokerManager.activeHealth();
+  const feed = brokerManager.feedHealth();
+  res.json({
+    status: "ok",
+    authenticated: health.authenticated && health.data_ready,
+    broker: brokerManager.activeBroker,
+    broker_authenticated: health.authenticated,
+    market_data_ready: health.data_ready,
+    feed_connected: feed.connected,
+    feed_state: feed.state,
+    trading_ready: health.trading_ready,
+    problems: health.problems,
+    generation: brokerManager.generation,
+    /** Zerodha's own session, for the admin UI only. Never gates market data. */
+    zerodha_session: kite.hasSession(),
+  });
 });
 
 // --- Internal: share the current Zerodha session with the local market_data
@@ -1475,15 +1558,23 @@ app.get("/api/quotes", async (req: Request, res: Response) => {
     res.status(400).json({ error: "Provide ?tokens=token1,token2,..." });
     return;
   }
-  if (!kite.getAccessToken()) {
+  // The ACTIVE broker's readiness, not Kite's.
+  const quoteHealth = brokerManager.activeHealth();
+  if (!quoteHealth.data_ready) {
     res.status(401).json({
-      error: "Quotes require a one-time Zerodha login.",
+      error: `Quotes require a ${brokerManager.activeBroker} session.`,
+      broker: brokerManager.activeBroker,
+      problems: quoteHealth.problems,
     });
     return;
   }
 
-  // Serve from the short-lived cache when fresh (protects the Kite quota).
-  const cacheKey = tokens.slice().sort((a, b) => a - b).join(",");
+  // Cache key includes the BROKER and GENERATION: the same integer means a different
+  // instrument at each broker, so a shared key would serve Zerodha prices for Dhan
+  // tokens after a switch.
+  const cacheKey =
+    `${brokerManager.activeBroker}:${brokerManager.generation}:` +
+    tokens.slice().sort((a, b) => a - b).join(",");
   const cached = quotesCache.get(cacheKey);
   if (cached && Date.now() - cached.at < QUOTES_TTL_MS) {
     res.json({ ticks: cached.ticks });
@@ -1491,24 +1582,9 @@ app.get("/api/quotes", async (req: Request, res: Response) => {
   }
 
   try {
-    const all = await getAllInstrumentsCached();
-    const byToken = new Map<number, string>();
-    for (const inst of all) {
-      byToken.set(inst.instrument_token, `${inst.exchange}:${inst.tradingsymbol}`);
-    }
-    const identifiers = tokens
-      .map((t) => byToken.get(t))
-      .filter((s): s is string => typeof s === "string");
-
-    const quotes = await kite.getQuoteFull(identifiers);
-    const ticks = quotes.map((q) => ({
-      token: q.instrument_token,
-      last_price: q.last_price,
-      close_price: q.close,
-      oi: q.oi,
-      bid: 0, // filled by the live full-mode stream
-      ask: 0,
-    }));
+    // Routed to the ACTIVE broker. Dhan's REST quote also carries depth, so bid/ask
+    // arrive here rather than only from the socket.
+    const ticks = await brokerManager.quoteProvider.quotesByToken(tokens);
     quotesCache.set(cacheKey, { at: Date.now(), ticks });
     // Warm the shared hub cache so late-joining SSE clients get instant data.
     tickerHub.seed(ticks);
@@ -1535,11 +1611,33 @@ app.get("/api/stream", (req: Request, res: Response) => {
     return;
   }
 
-  const accessToken = kite.getAccessToken();
-  if (!accessToken) {
+  // The ACTIVE broker's readiness, not Kite's. Gating on Kite here is what stopped
+  // the browser from ever opening a stream while Dhan was live.
+  const streamHealth = brokerManager.activeHealth();
+  if (!streamHealth.data_ready) {
+    const label = brokerManager.activeBroker === "dhan" ? "Dhan" : "Zerodha";
     res.status(401).json({
+      error: `Live prices require a ${label} session. Connect ${label}.`,
+      broker: brokerManager.activeBroker,
+      problems: streamHealth.problems,
+    });
+    return;
+  }
+
+  // Refuse tokens from the previous broker's namespace rather than subscribing them.
+  // A browser holding a stale board would otherwise ask Dhan for Kite tokens, which
+  // silently yields no data and looks like a dead feed.
+  const foreign = tokens.filter(
+    (t) => !brokerManager.assertActiveBrokerToken(t, "GET /api/stream"),
+  );
+  if (foreign.length > 0) {
+    res.status(409).json({
       error:
-        "Live prices require a one-time Zerodha login. Click “Connect to Zerodha”.",
+        `${foreign.length} requested token(s) do not belong to the active broker ` +
+        `(${brokerManager.activeBroker}). Refetch the board.`,
+      broker: brokerManager.activeBroker,
+      generation: brokerManager.generation,
+      stale_tokens: foreign.slice(0, 10),
     });
     return;
   }
@@ -1549,15 +1647,29 @@ app.get("/api/stream", (req: Request, res: Response) => {
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders?.();
 
-  // Register with the shared hub (one upstream Zerodha WS for all viewers).
-  const unsubscribe = tickerHub.addClient(res, tokens);
+  // TWO SEPARATE CONCERNS, deliberately split.
+  //
+  // 1. Attach the browser to the hub's fan-out and snapshot cache. The hub is now
+  //    purely downstream: it caches and distributes ticks from WHICHEVER broker is
+  //    active (Dhan ticks are injected via ingestExternalTicks), so this does not
+  //    imply Zerodha.
+  const detach = tickerHub.attachClient(res, tokens);
+  //
+  // 2. Register the browser's token interest with the refcounted coordinator, which
+  //    is the ONLY thing allowed to touch an upstream socket. Previously
+  //    `hub.addClient` did both, which meant opening a browser tab called
+  //    `connectTicker` — a ZERODHA WebSocket — regardless of the active broker.
+  const releaseTokens = brokerManager.acquireBrowserTokens(tokens);
 
   // Keep the connection alive through proxies.
   const keepAlive = setInterval(() => res.write(`: ping\n\n`), 20000);
 
   req.on("close", () => {
     clearInterval(keepAlive);
-    unsubscribe();
+    // Release the refcounts first: a token another client or the scanner still wants
+    // must survive this disconnect.
+    releaseTokens();
+    detach();
     res.end();
   });
 });
@@ -1661,10 +1773,7 @@ function makeIdResolver(all: Instrument[]): (token: number) => string | null {
 }
 
 app.get("/api/history/:symbol", async (req: Request, res: Response) => {
-  if (!kite.getAccessToken()) {
-    res.status(401).json({ error: "Historical data requires a Zerodha login." });
-    return;
-  }
+  if (!requireMarketData(res, "Historical data")) return;
   const symbol = String(req.params.symbol).toUpperCase();
 
   const today = istDayKey();
@@ -1722,10 +1831,7 @@ app.get("/api/history/:symbol", async (req: Request, res: Response) => {
 const spreadHistoryCache = new Map<string, { day: string; data: unknown }>();
 
 app.get("/api/spread-history/:symbol", async (req: Request, res: Response) => {
-  if (!kite.getAccessToken()) {
-    res.status(401).json({ error: "Historical data requires a Zerodha login." });
-    return;
-  }
+  if (!requireMarketData(res, "Historical data")) return;
   const symbol = String(req.params.symbol).toUpperCase();
 
   const today = istDayKey();
@@ -1823,10 +1929,7 @@ app.get("/api/spread-history/:symbol", async (req: Request, res: Response) => {
 const intradayCache = new Map<string, { day: string; data: unknown }>();
 
 app.get("/api/intraday/:symbol", async (req: Request, res: Response) => {
-  if (!kite.getAccessToken()) {
-    res.status(401).json({ error: "Historical data requires a Zerodha login." });
-    return;
-  }
+  if (!requireMarketData(res, "Historical data")) return;
   const symbol = String(req.params.symbol).toUpperCase();
 
   const today = istDayKey();
@@ -1887,10 +1990,7 @@ const minuteCache = new Map<string, { at: number; data: unknown }>();
 const MINUTE_TTL_MS = 60 * 1000;
 
 app.get("/api/minute/:symbol", async (req: Request, res: Response) => {
-  if (!kite.getAccessToken()) {
-    res.status(401).json({ error: "Historical data requires a Zerodha login." });
-    return;
-  }
+  if (!requireMarketData(res, "Historical data")) return;
   const symbol = String(req.params.symbol).toUpperCase();
 
   const cached = minuteCache.get(symbol);
@@ -1947,10 +2047,7 @@ const fiveMinCache = new Map<string, { at: number; data: unknown }>();
 const FIVEMIN_TTL_MS = 5 * 60 * 1000;
 
 app.get("/api/fivemin/:symbol", async (req: Request, res: Response) => {
-  if (!kite.getAccessToken()) {
-    res.status(401).json({ error: "Historical data requires a Zerodha login." });
-    return;
-  }
+  if (!requireMarketData(res, "Historical data")) return;
   const symbol = String(req.params.symbol).toUpperCase();
 
   const cached = fiveMinCache.get(symbol);
@@ -2037,12 +2134,7 @@ app.get("/api/option-chain/:underlying", async (req: Request, res: Response) => 
   // 40) so the ATM can drift intraday while the frontend still shows ATM ± 30.
   const band = Math.min(80, Math.max(5, Number(req.query.band ?? 40)));
 
-  if (!kite.getAccessToken()) {
-    res.status(401).json({
-      error: "Option chain requires a one-time Zerodha login.",
-    });
-    return;
-  }
+  if (!requireMarketData(res, "Option chain")) return;
 
   try {
     const all = await getAllInstrumentsCached();
@@ -2664,10 +2756,8 @@ app.post("/api/trades", requireAdmin, async (req: Request, res: Response) => {
     res.status(503).json({ error: "Trade persistence is not configured (set MONGODB_URI)." });
     return;
   }
-  if (!kite.getAccessToken()) {
-    res.status(401).json({ error: "Connect to Zerodha before taking a trade." });
-    return;
-  }
+  // Calendar entry prices from the ACTIVE broker's feed/quotes.
+  if (!requireMarketData(res, "Taking a trade")) return;
   if (!isMarketOpen()) {
     res.status(400).json({
       error: "Trades can only be taken during market hours (Mon–Fri, 9:15–15:40 IST).",
@@ -2936,10 +3026,7 @@ app.post("/api/trades/:id/close", requireAdmin, async (req: Request, res: Respon
       res.json({ trade: serializeTrade(trade.toObject() as TradeRecord) });
       return;
     }
-    if (!kite.getAccessToken()) {
-      res.status(401).json({ error: "Connect to Zerodha to close a trade." });
-      return;
-    }
+    if (!requireMarketData(res, "Closing a trade")) return;
 
     // Exit at the touch (WebSocket book first, REST fallback): the long leg is
     // sold into the best BID, the short leg bought back at the best ASK — the
@@ -3285,14 +3372,17 @@ function deriveFnoStocks(all: Instrument[]): FnoStock[] {
   return out;
 }
 
+/**
+ * The ACTIVE broker's instrument universe.
+ *
+ * Was `kite.getInstruments()` unconditionally, which meant the calendar board was
+ * built from ZERODHA instruments even when Dhan was active — every token on it then
+ * belonged to the wrong namespace, so quotes could not resolve and the feed could not
+ * subscribe them. Routed through InstrumentProvider, which keeps one cache per broker
+ * and is generation-scoped, so a switch cannot serve the other broker's dump.
+ */
 async function getAllInstrumentsCached(): Promise<Instrument[]> {
-  const fresh = instrumentCache && Date.now() - instrumentCache.at < CACHE_TTL_MS;
-  if (fresh && instrumentCache) {
-    return instrumentCache.data;
-  }
-  const data = await kite.getInstruments(); // full multi-exchange dump
-  instrumentCache = { at: Date.now(), data };
-  return data;
+  return brokerManager.instrumentProvider.load();
 }
 
 function sendError(res: Response, err: unknown): void {
@@ -3569,7 +3659,7 @@ function niftyNearestExpiryOptions(all: Instrument[]): {
  * the cache when the IST day (or the nearest expiry) changes.
  */
 async function captureOptionOi(): Promise<void> {
-  if (!kite.getAccessToken()) return;
+  if (!zerodhaCaptureAllowed("option-OI capture")) return;
   try {
     // Stamp the instant the tick fired, BEFORE any await. Everything after this
     // is latency to be excluded: the instruments cache expires hourly and that
@@ -3753,7 +3843,7 @@ let prevCloseAttempts = { day: "", n: 0 };
  */
 async function backfillPrevClose(): Promise<void> {
   const today = istDayKey();
-  if (prevCloseBackfillRunning || !kite.getAccessToken()) return;
+  if (prevCloseBackfillRunning || !zerodhaCaptureAllowed("previous-close backfill")) return;
   prevCloseBackfillRunning = true;
   try {
     const all = await getAllInstrumentsCached();
@@ -4529,7 +4619,7 @@ let oiBackfillRunning = false;
  * listed (e.g. an already-expired earlier weekly) cannot be reconstructed.
  */
 async function backfillOiFrames(fromMsOverride?: number): Promise<void> {
-  if (oiBackfillRunning || !kite.getAccessToken()) return;
+  if (oiBackfillRunning || !zerodhaCaptureAllowed("option-OI frame backfill")) return;
   oiBackfillRunning = true;
   try {
     const now = Date.now();
@@ -4916,7 +5006,7 @@ function futOiBackfillFromMs(now: number): number {
  * its last known one so a whole contract's series never gains a hole.
  */
 async function captureFuturesOi(): Promise<void> {
-  if (!kite.getAccessToken()) return;
+  if (!zerodhaCaptureAllowed("futures-OI capture")) return;
   try {
     // Stamped before any await — see captureOptionOi. This capture is awaited
     // after the option one, so it has even less of the lead left.
@@ -4971,7 +5061,7 @@ let futOiBackfillRunning = false;
  * Gap-aware: only fetches from the earliest still-missing slot.
  */
 async function backfillFutOiFrames(fromMsOverride?: number): Promise<void> {
-  if (futOiBackfillRunning || !kite.getAccessToken()) return;
+  if (futOiBackfillRunning || !zerodhaCaptureAllowed("futures-OI frame backfill")) return;
   futOiBackfillRunning = true;
   try {
     const now = Date.now();
@@ -5198,11 +5288,21 @@ const boxModule: BoxModule = registerBoxModule(app, {
   // Subscriptions go to whichever feed is active; the hub is still the publish path
   // for both brokers (see TickerHub.ingestExternalTicks).
   feed: {
-    addTickListener: (fn) => tickerHub.addTickListener(fn),
+    addTickListener: (fn) =>
+      tickerHub.addTickListener((ticks) => {
+        // Liveness for BOTH brokers: Zerodha ticks arrive through the hub's own
+        // socket, Dhan's are injected. Recording here keeps feed health honest
+        // whichever broker is active.
+        brokerManager.noteTick();
+        fn(ticks);
+      }),
     addConnectionListener: (fn) => tickerHub.addConnectionListener(fn),
     retain: () => tickerHub.retain(),
     subscribeTokens: (tokens) => brokerManager.subscribeTokens(tokens),
     unsubscribeTokens: (tokens) => brokerManager.unsubscribeTokens(tokens),
+    // Declaring the whole set is what makes a moving strike window safe: the
+    // coordinator diffs it, so a token also wanted by a browser survives.
+    setStrategyTokens: (tokens) => brokerManager.setStrategyTokens(tokens),
     subscribedCount: () => brokerManager.subscribedCount(),
     isConnected: () => brokerManager.feedConnected(),
   },
@@ -5272,13 +5372,13 @@ app.listen(PORT, () => {
     await brokerManager.restore().catch((err) =>
       console.warn("[Broker] failed to restore the active broker:", err),
     );
-    brokerManager.startActiveFeed();
-    // Confirm the Dhan whitelist at boot when Dhan is the active broker, so
-    // `trading_ready` is truthful from the first status read rather than only after
-    // the first order attempt.
-    if (brokerManager.activeBroker === "dhan") {
-      await brokerManager.verifyDhanStaticIp().catch(() => undefined);
-    }
+    // Bring the ACTIVE broker's runtime up in dependency order: verify the session
+    // and its prerequisites, load the instrument universe, THEN start the feed. Doing
+    // it in this order means a status read during startup reports "connecting" rather
+    // than "live with an empty board".
+    await brokerManager.startActiveRuntime().catch((err) =>
+      console.warn("[Broker] active runtime startup failed:", err),
+    );
     // Restore persisted admin/trade sessions so an admin who logged in earlier
     // today stays logged in across a backend restart (no re-entering the secret).
     try {

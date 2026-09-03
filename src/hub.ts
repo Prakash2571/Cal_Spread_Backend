@@ -62,6 +62,40 @@ export class TickerHub {
    * Register an SSE client. Returns a cleanup function to call when the client
    * disconnects. Immediately pushes the latest cached snapshot for its tokens.
    */
+  /**
+   * Attach a browser for FAN-OUT ONLY — never opens an upstream socket.
+   *
+   * The split matters: `addClient` used to both register the client AND call
+   * `ensureSocket`, which meant opening a browser tab created a ZERODHA WebSocket even
+   * when Dhan was the active broker. Upstream subscription is now the
+   * SubscriptionCoordinator's job (see brokers/subscriptions.ts), and this hub is
+   * purely the downstream cache/fan-out layer for whichever broker is active.
+   */
+  attachClient(res: Response, tokens: number[]): () => void {
+    const client: HubClient = { res, tokens: new Set(tokens) };
+    this.clients.add(client);
+
+    // Instant snapshot so the visitor sees prices without waiting for a live tick.
+    const snapshot = tokens
+      .map((t) => this.latest.get(t))
+      .filter((t): t is Tick => Boolean(t));
+    if (snapshot.length) {
+      res.write(`data: ${JSON.stringify(snapshot)}\n\n`);
+    }
+
+    return () => {
+      this.clients.delete(client);
+      // Deliberately does NOT stop the upstream feed. Whether a token is still needed
+      // is the coordinator's decision, and tearing the socket down from here would
+      // disconnect the scanner and every other client.
+    };
+  }
+
+  /**
+   * @deprecated Zerodha-only legacy path: attaches AND opens a Kite socket.
+   * Retained for the Zerodha-only capture/recorder callers. New code must use
+   * `attachClient` plus the SubscriptionCoordinator so the ACTIVE broker is honoured.
+   */
   addClient(res: Response, tokens: number[]): () => void {
     const client: HubClient = { res, tokens: new Set(tokens) };
     this.clients.add(client);
