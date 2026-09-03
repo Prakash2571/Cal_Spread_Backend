@@ -123,6 +123,14 @@ export interface SwitchHooks {
   reloadUniverse: () => Promise<void>;
   /** Re-publish state to every SSE client. */
   publish: () => void;
+  /**
+   * Invalidate every stored browser market-data subscription session.
+   *
+   * A session holds a token list in the PREVIOUS broker's namespace. Left in place, a
+   * reconnecting `EventSource` would resubscribe those integers against the new broker
+   * — the cross-broker leak the switch exists to prevent.
+   */
+  dropMarketDataSessions?: () => number;
 }
 
 export interface ActiveBrokerManagerDeps {
@@ -1131,6 +1139,42 @@ export class ActiveBrokerManager {
     return this.subscriptions.size;
   }
 
+  /**
+   * What the ACTIVE broker's socket has been asked for vs what it has confirmed.
+   *
+   * `wanted` and `subscribed` are reported separately because the gap between them is
+   * a distinct, diagnosable fault: demand reached the feed but the subscribe frame did
+   * not go out (or was rejected). Collapsing them into one number makes that
+   * indistinguishable from "nobody asked for anything", which is the ambiguity that
+   * made the blank board so hard to localise.
+   */
+  upstreamFeedStats(): {
+    broker: BrokerId;
+    wanted: number | null;
+    subscribed: number | null;
+    socket_connected: boolean;
+    last_tick_at: number | null;
+  } {
+    if (this.active === "dhan") {
+      const feed = this.dhanFeed;
+      return {
+        broker: "dhan",
+        // null, not 0: "no feed object yet" is not the same as "wants nothing".
+        wanted: feed ? feed.wantedCount() : null,
+        subscribed: feed ? feed.subscribedCount() : null,
+        socket_connected: feed?.isConnected() ?? false,
+        last_tick_at: feed ? feed.lastTickAtMs() : null,
+      };
+    }
+    return {
+      broker: "zerodha",
+      wanted: this.deps.tickerHub.subscribedCount(),
+      subscribed: this.deps.tickerHub.subscribedCount(),
+      socket_connected: this.deps.tickerHub.isConnected(),
+      last_tick_at: this.lastTickAt,
+    };
+  }
+
   /** Truthful feed health: connection AND subscriptions AND data arrival. */
   feedHealth(): FeedHealth {
     const session = this.sessionFor(this.active);
@@ -1282,6 +1326,12 @@ export class ActiveBrokerManager {
         `[Broker] ${dropped.droppedTokens} old subscription(s) cleared ` +
           `(${dropped.droppedLeases} lease(s))`,
       );
+      // Browser stream sessions hold token lists in the OLD namespace, so they die here
+      // too. Their owners get a 409 and refetch the board.
+      const droppedSessions = hooks?.dropMarketDataSessions?.() ?? 0;
+      if (droppedSessions > 0) {
+        console.log(`[Broker] ${droppedSessions} browser stream session(s) invalidated`);
+      }
 
       // 5. invalidate every market-data book/cache, and both instrument universes
       if (previous === "dhan") this.dhanInstruments.clear();

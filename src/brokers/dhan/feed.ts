@@ -113,6 +113,22 @@ export class DhanFeed {
     return this.subscribed.size;
   }
 
+  /**
+   * Tokens the feed has been ASKED for, as opposed to confirmed onto the socket.
+   *
+   * Reported separately because `wanted > 0 && subscribed === 0` is a specific,
+   * diagnosable failure — the subscribe frame never went out or was rejected — and is
+   * indistinguishable from "nothing is subscribed" if only one number is exposed.
+   */
+  wantedCount(): number {
+    return this.wanted.size;
+  }
+
+  /** Epoch ms of the newest tick, or null when nothing has arrived. */
+  lastTickAtMs(): number | null {
+    return this.lastTickAt === 0 ? null : this.lastTickAt;
+  }
+
   feedGeneration(): number {
     return this.generation;
   }
@@ -127,8 +143,16 @@ export class DhanFeed {
     const fresh = tokens.filter((t) => !this.wanted.has(t));
     for (const t of fresh) this.wanted.add(t);
     if (fresh.length === 0) return;
+    // One line per subscription CHANGE (never per tick). This is the trace that shows
+    // whether browser demand actually reached the socket, which is precisely what was
+    // impossible to tell while the board was silently rendering "-".
+    console.log(
+      `[DhanFeed] subscribe request: fresh=${fresh.length} wanted=${this.wanted.size} ` +
+        `subscribed=${this.subscribed.size} socketConnected=${this.connected}`,
+    );
     this.ensureSocket();
     if (this.connected) this.sendSubscribe(fresh);
+    else console.log(`[DhanFeed] socket not open yet; ${this.wanted.size} token(s) queued`);
   }
 
   /** Unsubscribe internal tokens and DROP their books. */
@@ -242,6 +266,14 @@ export class DhanFeed {
       ticks.push(toTick(merged));
     }
     if (ticks.length === 0) return;
+    // FIRST tick only. It is the single most valuable log line here (it proves the
+    // whole chain end to end), and logging every tick would bury everything else.
+    if (this.lastTickAt === 0) {
+      console.log(
+        `[DhanFeed] firstTick internalToken=${ticks[0]!.token} ltp=${ticks[0]!.last_price} ` +
+          `batch=${ticks.length} wanted=${this.wanted.size} subscribed=${this.subscribed.size}`,
+      );
+    }
     this.lastTickAt = now;
     this.opts.onTicks(ticks);
   }
@@ -319,8 +351,23 @@ export class DhanFeed {
       })
       .filter((x): x is { ExchangeSegment: DhanExchangeSegment; SecurityId: string } => x !== null);
 
+    // Unresolvable tokens are a real failure mode (universe not loaded, or a token
+    // from the other broker), and silently sending a shorter list hides it.
+    if (list.length < tokens.length) {
+      console.warn(
+        `[DhanFeed] ${tokens.length - list.length} of ${tokens.length} token(s) could not be ` +
+          `resolved to a Dhan (segment, securityId) and were NOT sent upstream.`,
+      );
+    }
+
     for (let i = 0; i < list.length; i += SUBSCRIBE_BATCH) {
       const batch = list.slice(i, i + SUBSCRIBE_BATCH);
+      // Dhan's per-message instrument cap is a WS protocol limit, entirely separate
+      // from any HTTP chunking the browser does.
+      console.log(
+        `[DhanFeed] sending ${requestCode === REQUEST_CODE.UNSUBSCRIBE_FULL ? "unsubscribe" : "subscribe"} ` +
+          `batch=${batch.length} (${i + batch.length}/${list.length})`,
+      );
       try {
         ws.send(
           JSON.stringify({

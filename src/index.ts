@@ -21,7 +21,6 @@ import {
   type OrderCharges,
 } from "./kite.js";
 import { TickerHub } from "./hub.js";
-import type { Tick } from "./ticker.js";
 import { rateLimit } from "./ratelimit.js";
 import { getDividendYields } from "./yahoo.js";
 import {
@@ -58,6 +57,8 @@ import { startEodScheduler, backfillStockFutures, checkAndRecomputeSummary } fro
 import { registerBoxModule, type BoxModule } from "./box/index.js";
 import { ActiveBrokerManager } from "./brokers/registry.js";
 import { registerBrokerRoutes } from "./brokers/routes.js";
+import { registerMarketDataRoutes } from "./marketDataRoutes.js";
+import { MarketDataSessionStore } from "./marketDataSession.js";
 import { HistoryProvider } from "./brokers/history.js";
 import { parseBrokerId, type BrokerId } from "./brokers/types.js";
 import { LocalChargeCalculator } from "./box/localCharges.js";
@@ -1538,141 +1539,25 @@ app.get("/api/fno-stocks/:symbol", async (req: Request, res: Response) => {
   }
 });
 
-// Short-lived cache of the REST quote snapshot, keyed by the requested token
-// set. This means that no matter how many visitors load/refresh the page, we
-// hit Zerodha's rate-limited quote API at most once every QUOTES_TTL_MS —
-// protecting the API quota from repeated refreshes or deliberate abuse.
-const quotesCache = new Map<string, { at: number; ticks: Tick[] }>();
-const QUOTES_TTL_MS = 4000;
+/**
+ * Browser market-data subscription sessions.
+ *
+ * Declared here (well before the routes are registered) because the broker-switch hook
+ * further down needs to invalidate the whole store.
+ */
+const marketDataSessions = new MarketDataSessionStore();
+// The store also sweeps on access; this bounds how long an abandoned session lingers
+// when nothing else is happening. Unref'd so it can never hold the process open.
+setInterval(() => marketDataSessions.sweep(), 60_000).unref();
 
-// --- Snapshot quotes (REST): last price + close for the given tokens.
-// Works regardless of market hours, so prices/premiums show even after close.
-// PUBLIC: anyone can read the data once an admin has connected Zerodha. ---
-app.get("/api/quotes", async (req: Request, res: Response) => {
-  const tokens = String(req.query.tokens ?? "")
-    .split(",")
-    .map((s) => Number(s.trim()))
-    .filter((n) => Number.isFinite(n) && n > 0);
-
-  if (tokens.length === 0) {
-    res.status(400).json({ error: "Provide ?tokens=token1,token2,..." });
-    return;
-  }
-  // The ACTIVE broker's readiness, not Kite's.
-  const quoteHealth = brokerManager.activeHealth();
-  if (!quoteHealth.data_ready) {
-    res.status(401).json({
-      error: `Quotes require a ${brokerManager.activeBroker} session.`,
-      broker: brokerManager.activeBroker,
-      problems: quoteHealth.problems,
-    });
-    return;
-  }
-
-  // Cache key includes the BROKER and GENERATION: the same integer means a different
-  // instrument at each broker, so a shared key would serve Zerodha prices for Dhan
-  // tokens after a switch.
-  const cacheKey =
-    `${brokerManager.activeBroker}:${brokerManager.generation}:` +
-    tokens.slice().sort((a, b) => a - b).join(",");
-  const cached = quotesCache.get(cacheKey);
-  if (cached && Date.now() - cached.at < QUOTES_TTL_MS) {
-    res.json({ ticks: cached.ticks });
-    return;
-  }
-
-  try {
-    // Routed to the ACTIVE broker. Dhan's REST quote also carries depth, so bid/ask
-    // arrive here rather than only from the socket.
-    const ticks = await brokerManager.quoteProvider.quotesByToken(tokens);
-    quotesCache.set(cacheKey, { at: Date.now(), ticks });
-    // Warm the shared hub cache so late-joining SSE clients get instant data.
-    tickerHub.seed(ticks);
-    res.json({ ticks });
-  } catch (err) {
-    sendError(res, err);
-  }
-});
-
-// --- Live data: Server-Sent Events stream of ticks for the given tokens. ---
-// The backend opens a Kite WebSocket (using the stored access token), parses
-// the binary ticks, and relays them to the browser as JSON SSE events.
-// PUBLIC: anyone can subscribe to the live stream once an admin has connected
-// Zerodha. The stream only emits data while a valid Zerodha session exists.
-//   tokens   comma-separated instrument tokens
-app.get("/api/stream", (req: Request, res: Response) => {
-  const tokens = String(req.query.tokens ?? "")
-    .split(",")
-    .map((s) => Number(s.trim()))
-    .filter((n) => Number.isFinite(n) && n > 0);
-
-  if (tokens.length === 0) {
-    res.status(400).json({ error: "Provide ?tokens=token1,token2,..." });
-    return;
-  }
-
-  // The ACTIVE broker's readiness, not Kite's. Gating on Kite here is what stopped
-  // the browser from ever opening a stream while Dhan was live.
-  const streamHealth = brokerManager.activeHealth();
-  if (!streamHealth.data_ready) {
-    const label = brokerManager.activeBroker === "dhan" ? "Dhan" : "Zerodha";
-    res.status(401).json({
-      error: `Live prices require a ${label} session. Connect ${label}.`,
-      broker: brokerManager.activeBroker,
-      problems: streamHealth.problems,
-    });
-    return;
-  }
-
-  // Refuse tokens from the previous broker's namespace rather than subscribing them.
-  // A browser holding a stale board would otherwise ask Dhan for Kite tokens, which
-  // silently yields no data and looks like a dead feed.
-  const foreign = tokens.filter(
-    (t) => !brokerManager.assertActiveBrokerToken(t, "GET /api/stream"),
-  );
-  if (foreign.length > 0) {
-    res.status(409).json({
-      error:
-        `${foreign.length} requested token(s) do not belong to the active broker ` +
-        `(${brokerManager.activeBroker}). Refetch the board.`,
-      broker: brokerManager.activeBroker,
-      generation: brokerManager.generation,
-      stale_tokens: foreign.slice(0, 10),
-    });
-    return;
-  }
-
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders?.();
-
-  // TWO SEPARATE CONCERNS, deliberately split.
-  //
-  // 1. Attach the browser to the hub's fan-out and snapshot cache. The hub is now
-  //    purely downstream: it caches and distributes ticks from WHICHEVER broker is
-  //    active (Dhan ticks are injected via ingestExternalTicks), so this does not
-  //    imply Zerodha.
-  const detach = tickerHub.attachClient(res, tokens);
-  //
-  // 2. Register the browser's token interest with the refcounted coordinator, which
-  //    is the ONLY thing allowed to touch an upstream socket. Previously
-  //    `hub.addClient` did both, which meant opening a browser tab called
-  //    `connectTicker` — a ZERODHA WebSocket — regardless of the active broker.
-  const releaseTokens = brokerManager.acquireBrowserTokens(tokens);
-
-  // Keep the connection alive through proxies.
-  const keepAlive = setInterval(() => res.write(`: ping\n\n`), 20000);
-
-  req.on("close", () => {
-    clearInterval(keepAlive);
-    // Release the refcounts first: a token another client or the scanner still wants
-    // must survive this disconnect.
-    releaseTokens();
-    detach();
-    res.end();
-  });
-});
+// --- Snapshot quotes + live SSE tick stream.
+//
+// MOVED OUT OF THIS FILE. Both transports previously listed every board token in a
+// query string, producing a ~9 KB request line that nginx rejected with 414 before
+// Express ran the handler -- so browser subscriptions never reached the coordinator and
+// the board rendered "-" everywhere. See marketDataRoutes.ts for the replacement
+// (POST /api/quotes, POST /api/stream/session + GET /api/stream/session/:id) and the
+// measurements behind it. Registered below, after `requireFullAdmin` is in scope. ---
 
 // --- Dividend yields (%) per F&O stock, sourced from Yahoo Finance.
 // Cached for 24h. Works without a Zerodha login. Failures map to 0%. ---
@@ -5343,8 +5228,25 @@ brokerManager.attach(
     invalidateBooks: () => boxModule.engine.invalidateBooks(),
     reloadUniverse: () => boxModule.engine.reloadUniverse(),
     publish: () => boxModule.engine.publishNow(),
+    dropMarketDataSessions: () => marketDataSessions.dropAll(),
   },
 );
+
+registerMarketDataRoutes(app, {
+  brokerManager,
+  tickerHub,
+  sessions: marketDataSessions,
+  requireFullAdmin,
+  sendError,
+  // Reported for diagnostics only, so a failure here must never surface as an error.
+  boardSize: async () => {
+    try {
+      return deriveFnoBoard(await getAllInstrumentsCached()).length;
+    } catch {
+      return null;
+    }
+  },
+});
 
 registerBrokerRoutes(app, {
   manager: brokerManager,

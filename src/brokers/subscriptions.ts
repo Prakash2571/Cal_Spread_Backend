@@ -86,6 +86,13 @@ export class SubscriptionCoordinator {
       // Only a 0 -> 1 transition reaches upstream.
       if (wasZero) toSubscribe.push(token);
     }
+    // `acquire` vs `upstreamAdd` differ exactly when another consumer already wanted a
+    // token, so printing both is what proves refcounting is doing its job instead of
+    // duplicating upstream subscriptions.
+    console.log(
+      `[Subscriptions] owner=${owner} acquire=${unique.size} upstreamAdd=${toSubscribe.length} ` +
+        `totalTokens=${this.counts.size} leases=${this.leases.size}`,
+    );
     if (toSubscribe.length > 0) this.transport.subscribeTokens(toSubscribe);
 
     let released = false;
@@ -118,6 +125,11 @@ export class SubscriptionCoordinator {
         this.counts.set(token, entry);
       }
     }
+    console.log(
+      `[Subscriptions] owner=${lease.owner} release=${lease.tokens.size} ` +
+        `upstreamDrop=${toUnsubscribe.length} totalTokens=${this.counts.size} ` +
+        `leases=${this.leases.size}`,
+    );
     if (toUnsubscribe.length > 0) this.transport.unsubscribeTokens(toUnsubscribe);
   }
 
