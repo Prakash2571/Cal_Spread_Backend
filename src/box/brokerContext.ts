@@ -160,6 +160,15 @@ export interface BoxFeedProvider {
   retain(): () => void;
   subscribeTokens(tokens: number[]): void;
   unsubscribeTokens(tokens: number[]): void;
+  /**
+   * Declare the strategy's ENTIRE token set in one diff.
+   *
+   * Optional so existing wiring keeps working. When present the engine prefers it,
+   * because a moving strike window otherwise unsubscribes tokens that a browser SSE
+   * client or another consumer may still need — the refcount can only be maintained
+   * correctly if the owner states its whole set rather than deltas.
+   */
+  setStrategyTokens?(tokens: number[]): void;
   subscribedCount(): number;
   isConnected(): boolean;
 }
