@@ -853,8 +853,11 @@ function numberOrNull(value: unknown): number | null {
 }
 
 function sleep(ms: number): Promise<void> {
+  // NOT unref'd. An unref'd timer does not hold the event loop open, so awaiting one
+  // can never resolve if nothing else is pending — the await simply hangs. `unref` is
+  // right for a background retry timer (see the feed's reconnect), and wrong for a
+  // delay something is waiting on.
   return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    t.unref?.();
+    setTimeout(resolve, ms);
   });
 }
