@@ -58,6 +58,7 @@ import { registerBoxModule, type BoxModule } from "./box/index.js";
 import { ActiveBrokerManager } from "./brokers/registry.js";
 import { registerBrokerRoutes } from "./brokers/routes.js";
 import { registerMarketDataRoutes } from "./marketDataRoutes.js";
+import { INDEX_SPOT_MAP, indexSpotCandidates, resolveIndexSpotSymbol } from "./indexSpot.js";
 import { MarketDataSessionStore } from "./marketDataSession.js";
 import { HistoryProvider } from "./brokers/history.js";
 import { parseBrokerId, type BrokerId } from "./brokers/types.js";
@@ -1591,12 +1592,22 @@ app.get("/api/debug/indices", async (_req: Request, res: Response) => {
         .filter((i) => i.exchange === "NFO" && i.instrument_type === "FUT")
         .map((i) => i.name),
     );
-    const resolved = Object.entries(INDEX_SPOT_MAP).map(([underlying, spot]) => ({
-      underlying,
-      hasFutures: futNames.has(underlying),
-      spotSymbol: spot,
-      spotFound: indexInstruments.includes(spot),
-    }));
+    const resolved = Object.entries(INDEX_SPOT_MAP).map(([underlying, spot]) => {
+      const matched = resolveIndexSpotSymbol(underlying, (sym) =>
+        indexInstruments.includes(sym),
+      );
+      return {
+        underlying,
+        hasFutures: futNames.has(underlying),
+        // Every name tried, and which one the universe actually contains. Reporting only
+        // the curated name is what made this look like a missing instrument rather than
+        // a naming mismatch.
+        candidates: indexSpotCandidates(underlying),
+        zerodhaSpotSymbol: spot,
+        resolvedSpotSymbol: matched,
+        spotFound: matched !== null,
+      };
+    });
     const board = deriveFnoBoard(all);
     res.json({
       totalIndexInstruments: indexInstruments.length,
@@ -2049,7 +2060,9 @@ app.get("/api/option-chain/:underlying", async (req: Request, res: Response) => 
       expiryParam && expiries.includes(expiryParam) ? expiryParam : expiries[0]!;
 
     // Resolve the underlying spot instrument (index or equity) to find the ATM.
-    const spotSymbol = INDEX_SPOT_MAP[underlying];
+    const spotSymbol = resolveIndexSpotSymbol(underlying, (sym) =>
+      all.some((i) => i.segment === "INDICES" && i.tradingsymbol === sym),
+    );
     const spotInst = spotSymbol
       ? all.find((i) => i.segment === "INDICES" && i.tradingsymbol === spotSymbol)
       : all.find(
@@ -3154,13 +3167,9 @@ interface BoardItem {
 
 // F&O index underlyings (as they appear on NFO futures `name`) mapped to their
 // NSE spot index tradingsymbol (in the INDICES segment of the instrument dump).
-const INDEX_SPOT_MAP: Record<string, string> = {
-  NIFTY: "NIFTY 50",
-  BANKNIFTY: "NIFTY BANK",
-  FINNIFTY: "NIFTY FIN SERVICE",
-  MIDCPNIFTY: "NIFTY MID SELECT",
-  NIFTYNXT50: "NIFTY NEXT 50",
-};
+// INDEX_SPOT_MAP and the spot resolver now live in indexSpot.ts: the mapped names are
+// ZERODHA's trading symbols ("NIFTY 50"), and Dhan calls the same index "NIFTY", so the
+// lookup has to try both. See that file for the evidence from the live master.
 
 /** Build the full F&O board: each underlying with its spot + 3 nearest futures. */
 function deriveFnoBoard(all: Instrument[]): BoardItem[] {
@@ -3206,13 +3215,14 @@ function deriveFnoBoard(all: Instrument[]): BoardItem[] {
       continue;
     }
 
-    // Not an equity — try to resolve it as an index underlying.
-    const indexTradingSymbol = INDEX_SPOT_MAP[symbol];
+    // Not an equity — try to resolve it as an index underlying. The curated Zerodha
+    // name is tried first, then the underlying symbol itself, which is what Dhan uses.
+    const indexTradingSymbol = resolveIndexSpotSymbol(symbol, (sym) => indexBySymbol.has(sym));
     const idx = indexTradingSymbol ? indexBySymbol.get(indexTradingSymbol) : undefined;
     if (idx) {
       indices.push({
         symbol,
-        name: idx.tradingsymbol, // e.g. "NIFTY 50"
+        name: idx.tradingsymbol, // "NIFTY 50" on Zerodha, "NIFTY" on Dhan
         spot_token: idx.instrument_token,
         futures,
         is_index: true,
@@ -3515,7 +3525,9 @@ function niftyNearestExpiryOptions(all: Instrument[]): {
   if (expiries.length === 0) return null;
   const expiry = expiries[0]!;
 
-  const spotSymbol = INDEX_SPOT_MAP[OPTION_OI_UNDERLYING];
+  const spotSymbol = resolveIndexSpotSymbol(OPTION_OI_UNDERLYING, (sym) =>
+    all.some((i) => i.segment === "INDICES" && i.tradingsymbol === sym),
+  );
   const spotInst = spotSymbol
     ? all.find((i) => i.segment === "INDICES" && i.tradingsymbol === spotSymbol)
     : undefined;
