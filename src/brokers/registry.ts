@@ -41,7 +41,7 @@ import type {
 } from "../box/brokerContext.js";
 import { BROKER_IDS, type BrokerHealthState, type BrokerId, type BrokerSessionState } from "./types.js";
 import { createZerodhaLiveAdapter } from "./zerodha/liveAdapter.js";
-import { DhanClient, normalizeDhanMultiMargin } from "./dhan/client.js";
+import { DhanClient, extractIpv4Addresses, normalizeDhanMultiMargin } from "./dhan/client.js";
 import { DhanHttp, dhanHttpConfigFromEnv } from "./dhan/http.js";
 import { DhanFeed } from "./dhan/feed.js";
 import { DhanInstrumentStore, dhanInternalToken, type DhanInstrument } from "./dhan/instruments.js";
@@ -415,16 +415,30 @@ export class ActiveBrokerManager {
 
     try {
       const res = await this.dhanClient.getStaticIp();
-      const primary = typeof res.primaryIP === "string" ? res.primaryIP.trim() : "";
-      const secondary = typeof res.secondaryIP === "string" ? res.secondaryIP.trim() : "";
-      this.dhanIpPrimary = primary || null;
-      this.dhanIpSecondary = secondary || null;
-      const matched = configuredIp === primary || configuredIp === secondary;
+      // Scan the payload for IPv4 values rather than trusting one field spelling: the
+      // previous named-field read missed Dhan's actual keys and reported the whitelist
+      // as empty while the dashboard plainly showed an address.
+      const addresses = extractIpv4Addresses(res);
+      this.dhanIpPrimary = addresses[0] ?? null;
+      this.dhanIpSecondary = addresses[1] ?? null;
+      const matched = addresses.includes(configuredIp);
       this.dhanIpVerified = matched;
-      this.dhanIpError = matched
-        ? null
-        : `DHAN_STATIC_PUBLIC_IP (${configuredIp}) does not match Dhan's whitelist ` +
-          `(primary ${primary || "unset"}, secondary ${secondary || "unset"}).`;
+      if (matched) {
+        this.dhanIpError = null;
+      } else if (addresses.length === 0) {
+        // Distinguish "Dhan reports no whitelist" from "it does not match", because the
+        // operator actions are different — and name the keys we actually received so a
+        // future shape change is diagnosable instead of mysterious.
+        this.dhanIpError =
+          `Dhan returned no IP address in its whitelist response, so ` +
+          `DHAN_STATIC_PUBLIC_IP (${configuredIp}) could not be verified. ` +
+          `Response fields: [${Object.keys((res ?? {}) as object).join(", ") || "none"}]. ` +
+          `Add a Static IP under My Profile → Access DhanHQ APIs → Static IP Setting.`;
+      } else {
+        this.dhanIpError =
+          `DHAN_STATIC_PUBLIC_IP (${configuredIp}) does not match Dhan's whitelist ` +
+          `(${addresses.join(", ")}).`;
+      }
       if (!matched) console.warn(`[Dhan] ${this.dhanIpError}`);
       this.dhanProblems = this.computeDhanProblems();
       return {
