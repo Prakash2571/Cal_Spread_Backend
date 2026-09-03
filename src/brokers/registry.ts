@@ -277,6 +277,11 @@ export class ActiveBrokerManager {
     void this.dhanInstruments.load().catch((err) =>
       console.warn("[Dhan] instrument master load failed after login:", err),
     );
+    // Verify the static IP NOW. Establishing a session is the first moment the check
+    // is even possible (it needs the token), and without this nothing in the normal
+    // connect flow ever triggers it — leaving trading blocked as "not yet verified"
+    // with no way for the operator to discover why.
+    await this.verifyDhanStaticIp().catch(() => undefined);
     return this.sessionFor("dhan");
   }
 
@@ -463,6 +468,25 @@ export class ActiveBrokerManager {
         error: this.dhanIpError,
       };
     }
+  }
+
+  /**
+   * Verify the static IP only if it has not been established yet.
+   *
+   * Exists because the check is cached and, in the ordinary connect flow, nothing else
+   * triggers it: a broker switch short-circuits when the target is already active, and
+   * boot only verifies when Dhan was already the active broker WITH a live session. So
+   * the status endpoint calls this, which makes simply opening (or refreshing) the
+   * broker panel resolve a pending verification.
+   *
+   * A no-op when there is nothing to check, when a verdict already exists, or when
+   * there is no session to check with.
+   */
+  async ensureDhanStaticIpVerified(): Promise<void> {
+    if (this.dhanConfiguredIp() === "") return;
+    if (this.dhanIpVerified !== null) return;
+    if (this.usableDhanToken() === null) return;
+    await this.verifyDhanStaticIp().catch(() => undefined);
   }
 
   /** The static-IP readiness detail, for the status endpoints. */

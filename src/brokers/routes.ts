@@ -162,6 +162,11 @@ export function registerBrokerRoutes(app: Express, deps: BrokerRouteDeps): void 
   /** Dhan session + readiness. Never includes the token or the app secret. */
   app.get("/api/dhan/status", requireAdmin, async (_req: Request, res: Response) => {
     try {
+      // Resolve a pending static-IP verification before reporting. The check is cached
+      // and nothing else in the ordinary connect flow triggers it, so reading the
+      // status is what turns "not yet verified" into a real verdict — which makes the
+      // broker panel's Refresh button do the obvious thing.
+      await manager.ensureDhanStaticIpVerified();
       const health = manager.healthFor("dhan");
       const stored = await loadDhanSession().catch(() => null);
       res.json({
