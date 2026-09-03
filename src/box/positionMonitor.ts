@@ -25,7 +25,8 @@
 import type { BoxConfig } from "./config.js";
 import type { BoxExecutionGateway } from "./executionGateway.js";
 import type { BoxMetrics } from "./metrics.js";
-import { LocalChargeCalculator, ordersFromLegs } from "./localCharges.js";
+import { ordersFromLegs } from "./localCharges.js";
+import type { BoxChargeCalculatorLike } from "./brokerContext.js";
 import {
   computeExitMetrics,
   entrySideFor,
@@ -58,7 +59,8 @@ import {
 export interface BoxMonitorDeps {
   cfg: BoxConfig;
   quotes: BoxQuoteStore;
-  localCharges: LocalChargeCalculator;
+  /** The ACTIVE broker's charge calculator (see brokerContext.ts). */
+  localCharges: BoxChargeCalculatorLike;
   executionSim: BoxExecutionGateway;
   positions: BoxPositionBook;
   /** Bounded metrics sink (optional; absent in some tests). */

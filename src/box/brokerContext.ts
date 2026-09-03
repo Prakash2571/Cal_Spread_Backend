@@ -23,7 +23,7 @@
 import type { BrokerId } from "../brokers/types.js";
 import type { BrokerAdapter } from "./brokerAdapter.js";
 import type { BoxConfig } from "./config.js";
-import type { BoxChargesWithOrigin, OrderSide } from "./types.js";
+import type { BoxCharges, BoxChargesWithOrigin, OrderSide } from "./types.js";
 
 /**
  * One instrument's REST snapshot, broker-neutral.
@@ -143,16 +143,23 @@ export interface BoxFeedProvider {
  * expected-net gate spends whatever this object says, so it must be the right one.
  */
 export interface BoxChargeCalculatorLike {
-  legs(orders: BoxChargeCalcOrder[]): BoxChargesWithOrigin;
-  roundTrip(orders: BoxChargeCalcOrder[]): {
+  legs(orders: BoxChargeCalcOrder[], source?: BoxCharges["source"]): BoxChargesWithOrigin;
+  roundTrip(
+    orders: BoxChargeCalcOrder[],
+    at?: Date,
+  ): {
     entry: BoxChargesWithOrigin;
     estimated_exit: BoxChargesWithOrigin;
     entry_total: number;
     estimated_exit_total: number;
   };
-  /** Total charges for a set of orders — the hot-path helper the simulator uses. */
-  totals(orders: BoxChargeCalcOrder[]): number;
-  /** The stamped rate-card version, so a historical trade stays interpretable. */
+  /** Entry + projected-exit totals — what the hot path actually needs. */
+  totals(orders: BoxChargeCalcOrder[]): { entry: number; exit: number };
+  /**
+   * The stamped rate-card version, so a historical trade stays interpretable after
+   * rates change. Widened to the fields the strategy reads, so both brokers' richer
+   * rate cards satisfy it.
+   */
   readonly rates: { rateVersion: string };
 }
 

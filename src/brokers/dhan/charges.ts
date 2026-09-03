@@ -19,7 +19,7 @@
  * structurally interchangeable with a Zerodha one and the two are comparable.
  */
 
-import type { BoxChargesWithOrigin, BoxLegCharges, OrderSide } from "../../box/types.js";
+import type { BoxCharges, BoxChargesWithOrigin, BoxLegCharges, OrderSide } from "../../box/types.js";
 
 /** One order to be costed. */
 export interface DhanChargeOrder {
@@ -227,15 +227,26 @@ export class DhanChargeCalculator {
     this.rates = rates ?? loadDhanChargeRates();
   }
 
-  legs(orders: DhanChargeOrder[]): BoxChargesWithOrigin {
+  /**
+   * `source` is accepted and IGNORED on purpose.
+   *
+   * It exists only so this class is signature-compatible with the Zerodha
+   * calculator, whose `source` distinguishes a Kite-priced note from a Kite
+   * projection. Neither value is meaningful for Dhan, and the honest provenance is
+   * already carried by `computed_by: "dhan_estimate"` + `broker: "dhan"`.
+   */
+  legs(orders: DhanChargeOrder[], _source?: BoxCharges["source"]): BoxChargesWithOrigin {
+    void _source;
     return calculateDhanCharges(orders, this.rates);
   }
 
-  roundTrip(orders: DhanChargeOrder[]): ReturnType<typeof dhanRoundTrip> {
-    return dhanRoundTrip(orders, this.rates);
+  roundTrip(orders: DhanChargeOrder[], at?: Date): ReturnType<typeof dhanRoundTrip> {
+    return dhanRoundTrip(orders, this.rates, at ?? new Date());
   }
 
-  totals(orders: DhanChargeOrder[]): number {
-    return this.legs(orders).total;
+  /** Entry + projected-exit totals, matching the Zerodha calculator's shape. */
+  totals(orders: DhanChargeOrder[]): { entry: number; exit: number } {
+    const trip = this.roundTrip(orders);
+    return { entry: trip.entry_total, exit: trip.estimated_exit_total };
   }
 }
