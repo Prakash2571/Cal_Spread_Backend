@@ -384,7 +384,20 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     const startedAt = Date.now();
     let firstPartialAt: number | null = current.filled_quantity > 0 ? startedAt : null;
 
+    // Hard iteration cap in addition to the wall-clock deadlines. A broker that keeps
+    // answering "still working" without the clock advancing as expected must not be
+    // able to spin this loop indefinitely and wedge the order path.
+    const maxPolls = Math.max(
+      10,
+      Math.ceil((this.cfg.workingTimeoutMs + this.cfg.partialTimeoutMs) / Math.max(1, this.cfg.brokerMinIntervalMs)) + 10,
+    );
+    let polls = 0;
+
     while (!isBrokerOrderTerminal(current.state)) {
+      if (++polls > maxPolls) {
+        // Out of budget without a terminal answer: quarantine rather than guess.
+        return this.protectiveCancelAndConfirm(clientOrderId, current);
+      }
       const elapsed = Date.now() - startedAt;
       const ackDeadlineHit = current.state === "ACKNOWLEDGED" && elapsed > this.cfg.ackTimeoutMs;
       const workingDeadlineHit = elapsed > this.cfg.workingTimeoutMs;
@@ -427,7 +440,13 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       }
     }
     const deadline = Date.now() + this.cfg.cancelTimeoutMs;
-    while (Date.now() < deadline) {
+    const maxConfirmPolls = Math.max(
+      5,
+      Math.ceil(this.cfg.cancelTimeoutMs / Math.max(1, this.cfg.brokerMinIntervalMs)) + 5,
+    );
+    let confirmPolls = 0;
+    while (Date.now() < deadline && confirmPolls < maxConfirmPolls) {
+      confirmPolls++;
       await sleep(this.cfg.brokerMinIntervalMs);
       const refreshed = await this.refresh(clientOrderId);
       if (refreshed && isBrokerOrderTerminal(refreshed.state)) return cloneOrder(refreshed);

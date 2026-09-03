@@ -234,14 +234,14 @@ function adapter(clientOverrides = {}, cfgOverrides = {}) {
   return { a: new DhanBrokerAdapter(client, cfg), calls, client };
 }
 
-test("an AMBIGUOUS submission reconciles by correlation id and NEVER re-POSTs", async () => {
+test("an AMBIGUOUS submission reconciles by correlation id and NEVER re-POSTs", { timeout: 5000 }, async () => {
   const { a, calls } = adapter();
   await assert.rejects(() => a.submitOrder(REQUEST), BrokerAmbiguousSubmitError);
   assert.equal(calls.place, 1, "exactly one POST /orders was attempted");
   assert.ok(calls.byCorrelation >= 1, "the correlation lookup was used to reconcile");
 });
 
-test("an ambiguous submission that DOES resolve adopts the existing order", async () => {
+test("an ambiguous submission that DOES resolve adopts the existing order", { timeout: 5000 }, async () => {
   // Dhan timed out but the order is live. It must be adopted, not re-sent.
   const { a, calls } = adapter({
     getOrderByCorrelationId: async () => ({
@@ -264,7 +264,7 @@ test("an ambiguous submission that DOES resolve adopts the existing order", asyn
   assert.equal(order.filled_quantity, 275);
 });
 
-test("a DEFINITIVE 4xx is a rejection, not an ambiguity", async () => {
+test("a DEFINITIVE 4xx is a rejection, not an ambiguity", { timeout: 5000 }, async () => {
   // Dhan understood and refused, so no reconciliation lookup is needed.
   const { a, calls } = adapter({
     placeOrder: async () => {
@@ -276,7 +276,7 @@ test("a DEFINITIVE 4xx is a rejection, not an ambiguity", async () => {
   assert.equal(calls.byCorrelation, 0, "a definitive rejection needs no reconciliation");
 });
 
-test("a 429 is treated as AMBIGUOUS, not as a definitive rejection", async () => {
+test("a 429 is treated as AMBIGUOUS, not as a definitive rejection", { timeout: 5000 }, async () => {
   // "Not now" says nothing about whether an earlier attempt landed.
   const { a, calls } = adapter({
     placeOrder: async () => {
@@ -288,7 +288,7 @@ test("a 429 is treated as AMBIGUOUS, not as a definitive rejection", async () =>
   assert.ok(calls.byCorrelation >= 1);
 });
 
-test("a 200 with no orderId is ambiguous and reconciles rather than re-POSTing", async () => {
+test("a 200 with no orderId is ambiguous and reconciles rather than re-POSTing", { timeout: 5000 }, async () => {
   const { a, calls } = adapter({
     placeOrder: async () => {
       calls.place++;
@@ -300,7 +300,7 @@ test("a 200 with no orderId is ambiguous and reconciles rather than re-POSTing",
   assert.ok(calls.byCorrelation >= 1);
 });
 
-test("submitting the same client order id twice does not place a second order", async () => {
+test("submitting the same client order id twice does not place a second order", { timeout: 5000 }, async () => {
   let placed = 0;
   const { a } = adapter({
     placeOrder: async () => {
@@ -328,7 +328,7 @@ test("submitting the same client order id twice does not place a second order", 
 
 /* --------------------------------- gating --------------------------------- */
 
-test("a DISABLED adapter makes zero broker calls, including reads", async () => {
+test("a DISABLED adapter makes zero broker calls, including reads", { timeout: 5000 }, async () => {
   const { a, calls } = adapter({}, { enabled: false });
   await assert.rejects(() => a.submitOrder(REQUEST), BrokerDisabledError);
   await assert.rejects(() => a.listOrders(), BrokerDisabledError);
@@ -336,12 +336,12 @@ test("a DISABLED adapter makes zero broker calls, including reads", async () => 
   assert.equal(calls.place, 0);
 });
 
-test("paper execution mode cannot reach the live adapter", async () => {
+test("paper execution mode cannot reach the live adapter", { timeout: 5000 }, async () => {
   const { a } = adapter({}, { executionMode: "paper_legging" });
   await assert.rejects(() => a.submitOrder(REQUEST), BrokerDisabledError);
 });
 
-test("submission FAILS CLOSED when the static IP is not whitelisted", async () => {
+test("submission FAILS CLOSED when the static IP is not whitelisted", { timeout: 5000 }, async () => {
   // Dhan refuses order placement from a non-whitelisted IP. Discovering that
   // mid-box would leave a partially built position, so it is refused locally.
   const { a, calls } = adapter({}, { staticIpReady: () => false });
@@ -349,7 +349,7 @@ test("submission FAILS CLOSED when the static IP is not whitelisted", async () =
   assert.equal(calls.place, 0, "nothing was sent");
 });
 
-test("static-IP failure does NOT block reads, so reconciliation can still recover", async () => {
+test("static-IP failure does NOT block reads, so reconciliation can still recover", { timeout: 5000 }, async () => {
   const { a } = adapter({}, { staticIpReady: () => false });
   // listOrders must still work: blocking it would prevent the very reconciliation
   // needed to resolve outstanding exposure.
@@ -357,7 +357,7 @@ test("static-IP failure does NOT block reads, so reconciliation can still recove
   assert.deepEqual(orders, []);
 });
 
-test("an unbounded LIMIT envelope is refused before anything is sent", async () => {
+test("an unbounded LIMIT envelope is refused before anything is sent", { timeout: 5000 }, async () => {
   const { a, calls } = adapter();
   await assert.rejects(
     () =>
@@ -371,7 +371,7 @@ test("an unbounded LIMIT envelope is refused before anything is sent", async () 
   assert.equal(calls.place, 0);
 });
 
-test("health reports authenticated-but-not-trading-ready when the static IP is missing", async () => {
+test("health reports authenticated-but-not-trading-ready when the static IP is missing", { timeout: 5000 }, async () => {
   const { a } = adapter({}, { staticIpReady: () => false });
   const health = await a.health();
   assert.equal(health.authenticated, true, "the session itself is fine");
@@ -379,7 +379,7 @@ test("health reports authenticated-but-not-trading-ready when the static IP is m
   assert.match(health.message, /static public IP/);
 });
 
-test("margins normalize Dhan's fund limit", async () => {
+test("margins normalize Dhan's fund limit", { timeout: 5000 }, async () => {
   const { a } = adapter();
   const margin = await a.margins();
   assert.equal(margin.available, 100000);
