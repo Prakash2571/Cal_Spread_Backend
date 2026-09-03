@@ -723,3 +723,247 @@ and residual exposure from a failed unwind is flattened by a runtime loop that r
 RUN/STOP whenever the market is open and the feed is healthy. Manual and automatic closes share one
 code path and differ only in the exit reason; a manual close reports partial execution honestly
 rather than pretending nothing happened.
+
+
+---
+
+## 9. Two brokers, one active: Zerodha and Dhan
+
+Calspread supports **Zerodha** and **DhanHQ v2**. Historical trades from both live in the
+database forever; **only one broker is ever active** for market data, the Box scanner, the
+quote/depth feed, new trades, live execution, positions, reconciliation, margins and charges.
+
+That rule is enforced structurally, not by convention. Everything broker-specific is
+reachable only through `ActiveBrokerManager.runtime()`, which returns exactly one runtime —
+there is no way to ask for "the Dhan feed" while Zerodha is active. `BoxEngine` consumes only
+the interfaces in `src/box/brokerContext.ts` (`BoxMarketDataProvider`, `BoxFeedProvider`,
+`BoxMarginProvider`, `BoxChargeCalculatorLike`, `BoxLiveAdapterFactory`) and cannot name a
+venue, so there are no `if (broker === "dhan")` branches in the strategy.
+
+### Login URLs
+
+| Broker | Login redirect | Postback |
+|---|---|---|
+| Zerodha | `https://calspread.online/zerodha/verify` | — |
+| Dhan | `https://calspread.online/dhan/verify` | `https://calspread.online/api/dhan/postback` |
+
+Both must match the redirect URL configured on the broker's app **exactly**.
+
+### Choosing a broker
+
+`/admin/verify` now asks for a broker before the admin password:
+
+```
+Choose broker      [ ZERODHA ]  [ DHAN ]
+Admin secret       ••••••••
+```
+
+`POST /api/admin/verify` accepts `{ "secret": "…", "broker": "dhan" }`. The field is optional,
+so an older client sending only `secret` keeps working. `GET /api/admin/status` returns
+`{ authenticated, role, broker }`.
+
+Trade-access users under `/admin/access` **inherit** the active broker and cannot choose one —
+switching brokers moves the whole system, so it is full-admin only.
+
+### Connecting Dhan
+
+1. `POST /api/dhan/login` (full admin) → the backend calls Dhan's `generate-consent` with the
+   API key/secret and returns a browser login URL.
+2. The browser completes Dhan's login (password + 2FA).
+3. Dhan redirects to `/dhan/verify?tokenId=…`; the frontend posts the `tokenId` to
+   `POST /api/dhan/session`, which exchanges it via `consumeApp-consent` and persists the
+   session in the `dhan_session` collection.
+
+The **`tokenId` is single-use**, so the frontend carries the same StrictMode double-invoke
+guard the Zerodha flow uses. **The API secret and the access token never reach the browser** —
+`GET /api/dhan/status` returns only account identifiers and timestamps.
+
+Other routes: `GET /api/dhan/status`, `POST /api/dhan/logout`,
+`GET /api/dhan/access-token` (full admin), `POST /api/dhan/postback`.
+
+### Token expiry
+
+Dhan states an explicit `expiryTime`, which is honoured directly rather than inferred from a
+login date the way the Zerodha session is (Kite tokens die at the IST day boundary; Dhan's do
+not necessarily). An **absent** expiry means UNKNOWN — validated by using it, never treated as
+"never expires".
+
+On expiry the system **fails closed**: the feed stops, executable books are invalidated, live
+execution is blocked, and the UI shows **"Dhan session expired — reconnect Dhan"**.
+
+### Static IP is required for live Dhan orders
+
+Dhan requires the server's **public IP to be whitelisted** before it accepts order placement,
+modification or cancellation. There is no API to query this, so it is an explicit operator
+declaration via `DHAN_STATIC_IP_EXPECTED`, which **defaults to false and fails closed**.
+
+Setting it to `true` without actually whitelisting the IP does not make orders work — it only
+removes the local guard, and Dhan then rejects orders at the edge, potentially part-way
+through building a four-leg box. Whitelist the IP in the Dhan API dashboard first.
+
+Readiness is reported per capability, because data and trading fail independently:
+
+```json
+{ "broker": "dhan", "authenticated": true, "data_ready": true,
+  "static_ip_configured": false, "trading_ready": false,
+  "problems": ["Static IP not configured — Dhan live order placement is blocked"] }
+```
+
+### Switching brokers
+
+`POST /api/broker/select` refuses with **HTTP 409** — and lists **every** blocker, not just the
+first — while any of these exist:
+
+- the scanner is running
+- an open Box position exists
+- broker orders are still working
+- an entry/exit is in flight
+- reconciliation is incomplete
+- residual leg exposure is outstanding
+- any order is in an unknown state
+- the broker being **left** still has unresolved durable order intents
+
+A switch is refused rather than queued because there is no safe automatic resolution: a real
+position would be left monitored by the wrong feed and reconciled against the wrong order-id
+space. `GET /api/broker/switch-blockers?broker=dhan` reports the same list without attempting
+the switch.
+
+When a switch **is** allowed, the ordering is the safety property. The old broker is fully torn
+down before the new one is reachable:
+
+1. stop the scanner
+2. stop the old feed and drop its subscriptions
+3. invalidate every cached quote/depth book and bump the feed generation
+4. clear broker-specific runtime caches (instrument master)
+5. move the active broker
+6. load the new broker's instruments
+7. start **only** the new broker's feed
+
+There is therefore no instant at which two feeds could both drive a Box decision, and no way
+for one broker's book to price the other's trade.
+
+### Broker-scoped reconciliation
+
+Every durable order intent persists its `broker`. On restart a Zerodha intent is reconciled
+**only** through Zerodha and a Dhan intent **only** through Dhan: the two order-id spaces are
+unrelated, so a cross-broker lookup would either 404 (misread as "the order never existed",
+losing real exposure) or collide with an unrelated real order. Legacy intents have no `broker`
+field and are Zerodha's.
+
+### Broker identity on trades
+
+Every trade permanently records the broker that created it (`broker` on `box_trades`,
+`box_trade_events`, `box_execution_attempts`, `box_order_intents`). It is **immutable** after
+creation and orthogonal to `execution_mode`: paper/live says how a fill was produced, broker
+says whose feed priced it and whose fees costed it.
+
+**Existing documents load unchanged.** Every field is optional with a `"zerodha"` schema
+default, resolved through one reader (`brokerOf()`) — Zerodha was the only broker the app ever
+had, so that is a statement of fact, not a convenience. **No migration is needed to boot.**
+
+The UI shows a compact `[ZERODHA]` / `[DHAN]` badge on every open card, every closed-history
+row and in trade details, plus a `BROKER` tile on the Box page. Each trade shows **its own**
+broker, never the currently active one — otherwise switching would silently relabel history.
+The closed-history filter (`All | Zerodha | Dhan`) appears only when both brokers are present.
+
+### Dhan charges and margin are Dhan's
+
+The statutory heads are identical at every broker; **brokerage is not**. A four-leg box round
+trip is **eight orders**, so a per-order difference is multiplied eightfold against a ₹1,200
+entry gate. Dhan trades are therefore costed with Dhan's rate card and labelled
+`computed_by: "dhan_estimate"`, `broker: "dhan"` — never as `local` (the Zerodha calculator) or
+`kite`. The Box expected-net gate always spends the **active** broker's charges.
+
+Margin uses Dhan's calculator, summed across the four legs. That is a conservative **upper**
+bound — it ignores the offsetting benefit a real box receives — so the figure can only be too
+high, never too low. Under-stating margin would be dangerous; over-stating it is merely
+pessimistic, and the figure is display/accounting only and never gates a trade.
+
+### Dhan market data
+
+- **Feed:** one shared binary WebSocket (`wss://api-feed.dhan.co`), FULL packet mode, fanned
+  out through the existing hub so no consumer knows which broker produced a tick. Subscriptions
+  are batched at Dhan's 100-instrument-per-message limit; reconnect uses capped exponential
+  backoff; books are dropped on every switch.
+- **`exchange_at` is always null.** Dhan's FULL packet carries a *Last Trade Time*, which is
+  when the last trade printed — **not** when the order book was published. For an illiquid
+  option those differ by minutes. The Box cross-leg temporal-coherence check needs a book
+  timestamp, so feeding it a trade time would corrupt an executability decision. The engine
+  falls back to local receive time, which is honest and already supported.
+- **Box always uses executable bid/ask depth, never the LTP.**
+- **History:** `/api/history/:symbol`, `/api/intraday/:symbol`, `/api/minute/:symbol` and
+  `/api/fivemin/:symbol` are unchanged for the frontend and route to the active broker. Dhan
+  returns candles **column-wise** (parallel arrays) where Kite returns rows, so the
+  transposition is explicit; intraday ranges are **chunked** because Dhan bounds how much one
+  request may cover.
+
+### Dhan order safety
+
+`src/box/dhanBrokerAdapter.ts` implements the existing `BrokerAdapter` and reuses the same
+`BoxOrderManager`, durable intents and reconciliation state machine. There is no second
+strategy and no second order manager.
+
+- **Bounded marketable LIMIT only.** `assertBoundedLimit` runs before anything is sent, and a
+  modification is re-validated inside the *original* envelope so chasing cannot walk outside
+  the configured band. Product type is `MARGIN` (F&O carry-forward) — never `INTRADAY`, which
+  would be auto-squared-off. Box is never switched to unrestricted MARKET orders.
+- **Never a blind re-submit.** On an ambiguous `POST /orders` (timeout, 5xx, 429) the order may
+  be live. The adapter reconciles via `GET /orders/external/{correlation-id}` and **never**
+  POSTs again — a second POST is how a four-leg box grows a fifth leg. A definitive 4xx (not
+  429) is recorded as a rejection; anything it cannot prove becomes
+  `RECONCILIATION_REQUIRED` rather than a guessed terminal state.
+- **Correlation IDs.** Dhan caps `correlationId` at 25 characters, well below a Box client
+  order id. Truncating would be catastrophic — the trade id sits in the *middle*, so two
+  different trades' `k1_ce` legs share a prefix and could collide. Instead a deterministic
+  64-bit hash of the whole client id is used, so it is recomputable after a crash with no
+  stored mapping. Both ids are persisted (`client_order_id`, `broker_correlation_id`).
+- **Status normalization** maps `TRANSIT / PENDING / PART_TRADED / TRADED / CANCELLED /
+  REJECTED / EXPIRED` onto the existing `BrokerOrderState`, consulting filled quantity rather
+  than trusting the label (Dhan reports some partial fills as `PENDING`). An unrecognised
+  status becomes `UNKNOWN`, never a fabricated `COMPLETE`.
+
+## 10. Deleting Box trades
+
+`DELETE /api/box/trades/:id` — **full admin only**, rate limited separately from the global
+`/api` bucket.
+
+A close is a market event that realises P&L and belongs in history. A delete is an
+**administrative correction**: the trade should never have counted, so nothing about it may
+survive in any of the four places box state lives — in-process memory, Redis, Mongo and the
+daily-P&L archive.
+
+**Allowed:** `paper_touch`, `paper_latency`, `paper_legging` — in `open`, `closed` or `error`
+status.
+
+**Refused with 409:**
+- an **open LIVE** trade — real broker exposure would be orphaned: still at the broker, with
+  nothing in our database pointing at it, so no reconciliation, monitor or flatten could ever
+  find it again. Flatten it first.
+- a **closed LIVE** trade — retained deliberately as the audit record of real executed orders.
+- a paper trade **mid-exit** — a confirmed fill may already be queued for persistence, and
+  deleting underneath it could resurrect the document.
+
+Deletion removes the Mongo row, the `BoxPositionBook` entry (freeing the duplicate-open key so
+the box can be re-entered), the monitor's retry/evaluation state, feed subscriptions no longer
+needed, the Redis closed-trade and P&L cache entries, and the `box_daily_pnl` archive rows. A
+deleted open position **stops being monitored and can never close later**.
+
+Every trade-derived number is then **recomputed from what remains** — not adjusted:
+
+open running net · closed today net · day net · open count · closed count · open margin ·
+closed margin · cumulative trade margin · total margin · **peak concurrent margin**
+
+Peak concurrent margin is **replayed** from the surviving trade intervals. `peak -=
+deleted.margin` is mathematically wrong: two non-overlapping ₹5L trades peak at ₹5L, so
+deleting one must leave ₹5L, while subtraction reports ₹0. Margin is held over the half-open
+interval `[opened_at, closed_at)` and the total can only rise at an interval **start**, so
+sweeping the start points finds the true maximum exactly. Unknown (null) margins are excluded,
+never counted as zero.
+
+An append-only `TRADE_DELETED` event records the id, broker, underlying, direction, status
+before deletion, execution mode, opened/closed/deleted timestamps, the acting admin role and an
+optional reason — deleting a trade cannot erase the evidence that it was deleted.
+
+The response returns the already-recomputed status, open positions and closed-today list, and a
+`trade_deleted` event plus a full snapshot go out over Box SSE, so every open tab corrects
+itself with no reload.
