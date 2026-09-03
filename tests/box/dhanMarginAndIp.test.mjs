@@ -247,13 +247,21 @@ test("Zerodha still uses its own basket API, labelled kite_basket", async () => 
 
 /* ------------------------------- static IP -------------------------------- */
 
-function ipEnv(values, fn) {
+/**
+ * Run `fn` with a controlled Dhan environment, then restore it.
+ *
+ * MUST await inside the try. `try { return fn() } finally { restore() }` restores the
+ * environment the instant `fn()` returns its promise — while the async body is still
+ * running — so the body would observe the original env and every assertion would be
+ * meaningless.
+ */
+async function ipEnv(values, fn) {
   const keys = ["DHAN_STATIC_IP_EXPECTED", "DHAN_STATIC_PUBLIC_IP", "DHAN_LIVE_TRADING_ENABLED"];
   const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
   for (const k of keys) delete process.env[k];
   Object.assign(process.env, values);
   try {
-    return fn();
+    return await fn();
   } finally {
     for (const k of keys) {
       if (saved[k] === undefined) delete process.env[k];

@@ -73,8 +73,13 @@ function manager(overrides = {}) {
   return { m, probe, hooks, events };
 }
 
-/** Dhan credentials must be present for a switch TO Dhan to be allowed. */
-function withDhanEnv(fn) {
+/**
+ * Dhan credentials must be present for a switch TO Dhan to be allowed.
+ *
+ * Awaits inside the try: restoring on the synchronous return of an async `fn` would
+ * tear the environment down while the body was still running.
+ */
+async function withDhanEnv(fn) {
   const saved = {
     id: process.env.DHAN_CLIENT_ID,
     key: process.env.DHAN_API_KEY,
@@ -84,7 +89,7 @@ function withDhanEnv(fn) {
   process.env.DHAN_API_KEY = "key";
   process.env.DHAN_API_SECRET = "secret";
   try {
-    return fn();
+    return await fn();
   } finally {
     restore("DHAN_CLIENT_ID", saved.id);
     restore("DHAN_API_KEY", saved.key);

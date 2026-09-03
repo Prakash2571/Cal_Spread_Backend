@@ -123,7 +123,9 @@ test("ids differing only in a TRAILING character still differ", () => {
 
 test("isValidDhanCorrelationId rejects over-long and non-alphanumeric ids", () => {
   assert.equal(isValidDhanCorrelationId(""), false);
-  assert.equal(isValidDhanCorrelationId("a".repeat(26)), false);
+  // Exactly at the limit is fine; one over is not.
+  assert.equal(isValidDhanCorrelationId("a".repeat(30)), true);
+  assert.equal(isValidDhanCorrelationId("a".repeat(31)), false);
   assert.equal(isValidDhanCorrelationId("BOX:t1:ENTRY"), false, "colons are not allowed");
 });
 
