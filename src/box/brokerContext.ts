@@ -23,6 +23,7 @@
 import type { BrokerId } from "../brokers/types.js";
 import type { BrokerAdapter } from "./brokerAdapter.js";
 import type { BoxConfig } from "./config.js";
+import type { BoxChargesWithOrigin, OrderSide } from "./types.js";
 
 /**
  * One instrument's REST snapshot, broker-neutral.
@@ -105,3 +106,58 @@ export type BoxLiveAdapterFactory = (ctx: {
   broker: BrokerId;
   cfg: BoxConfig;
 }) => BrokerAdapter;
+
+
+/**
+ * The live feed, as the strategy uses it.
+ *
+ * Abstracts the six calls BoxEngine made directly on the Kite `TickerHub`. With this
+ * in place the engine subscribes, unsubscribes and reads liveness without knowing
+ * whether a Kite or a Dhan socket is behind it — which is what lets the registry
+ * swap feeds on a broker switch without touching the strategy.
+ */
+export interface BoxFeedProvider {
+  /** Register a tick listener. Returns a remover. */
+  addTickListener(fn: (ticks: import("../ticker.js").Tick[]) => void): () => void;
+  /**
+   * Register a connection-state listener. Returns a remover.
+   *
+   * Implementations MUST deliver the current state immediately on subscribe, so a
+   * late listener cannot mistake books gathered before it attached for warm ones.
+   */
+  addConnectionListener(fn: (connected: boolean) => void): () => void;
+  /** Hold the feed open with no browser attached. Returns a release function. */
+  retain(): () => void;
+  subscribeTokens(tokens: number[]): void;
+  unsubscribeTokens(tokens: number[]): void;
+  subscribedCount(): number;
+  isConnected(): boolean;
+}
+
+/**
+ * A charge calculator, as the strategy uses it.
+ *
+ * `LocalChargeCalculator` (Zerodha) and `DhanChargeCalculator` both satisfy this, so
+ * the active broker's fee schedule is injected rather than branched on. This is the
+ * seam that stops a Dhan trade from being costed with Zerodha brokerage — the Box
+ * expected-net gate spends whatever this object says, so it must be the right one.
+ */
+export interface BoxChargeCalculatorLike {
+  legs(orders: BoxChargeCalcOrder[]): BoxChargesWithOrigin;
+  roundTrip(orders: BoxChargeCalcOrder[]): {
+    entry: BoxChargesWithOrigin;
+    estimated_exit: BoxChargesWithOrigin;
+    entry_total: number;
+    estimated_exit_total: number;
+  };
+  /** The stamped rate-card version, so a historical trade stays interpretable. */
+  readonly rates: { rateVersion: string };
+}
+
+/** One order to be costed, broker-neutral. */
+export interface BoxChargeCalcOrder {
+  side: OrderSide;
+  tradingsymbol: string;
+  quantity: number;
+  price: number;
+}

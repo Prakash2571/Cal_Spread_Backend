@@ -26,10 +26,13 @@ import type { BrokerId } from "../brokers/types.js";
 import { BoxEngine } from "./engine.js";
 import type { PriceChargeGroupsFn } from "./charges.js";
 import type {
+  BoxChargeCalculatorLike,
+  BoxFeedProvider,
   BoxLiveAdapterFactory,
   BoxMarginProvider,
   BoxMarketDataProvider,
 } from "./brokerContext.js";
+import { LocalChargeCalculator } from "./localCharges.js";
 import type { BoxBoardItem } from "./instruments.js";
 import { registerBoxRoutes } from "./routes.js";
 
@@ -83,6 +86,16 @@ export interface BoxModuleDeps {
   /** Overrides the margin provider. When absent, adapted from `getBasketMargin`. */
   margins?: BoxMarginProvider;
   /**
+   * Overrides the live feed. When absent the Kite ticker hub is used directly,
+   * preserving current behaviour for a Zerodha-only deployment.
+   */
+  feed?: BoxFeedProvider;
+  /**
+   * Overrides the charge calculator. When absent the Zerodha local calculator is
+   * used — the existing behaviour, bit for bit.
+   */
+  charges?: BoxChargeCalculatorLike;
+  /**
    * Builds the live order adapter for the active broker.
    *
    * Required for `BOX_EXECUTION_MODE=live`: the engine no longer knows how to
@@ -122,7 +135,10 @@ export function registerBoxModule(app: Express, deps: BoxModuleDeps): BoxModule 
   const engine = new BoxEngine({
     marketData: deps.marketData ?? kiteMarketData(deps.kite),
     activeBroker: deps.activeBroker ?? (() => "zerodha" as const),
-    tickerHub: deps.tickerHub,
+    // The hub already satisfies BoxFeedProvider structurally, so a Zerodha-only
+    // deployment needs no adapter at all.
+    feed: deps.feed ?? deps.tickerHub,
+    charges: deps.charges ?? new LocalChargeCalculator(),
     getAllInstruments: deps.getAllInstruments,
     getBoard: deps.getBoard,
     priceChargeGroups: deps.priceChargeGroups,

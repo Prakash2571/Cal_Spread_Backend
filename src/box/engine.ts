@@ -15,9 +15,10 @@
 
 import type { Response } from "express";
 import type { Instrument } from "../kite.js";
-import type { TickerHub } from "../hub.js";
 import type { BrokerId } from "../brokers/types.js";
 import type {
+  BoxChargeCalculatorLike,
+  BoxFeedProvider,
   BoxLiveAdapterFactory,
   BoxMarginProvider,
   BoxMarketDataProvider,
@@ -41,7 +42,6 @@ import { BoxChargeReconciler } from "./chargeReconciler.js";
 import { BoxExecutionSimulator } from "./executionSimulator.js";
 import { CentralBoxExecutionGateway, type BoxExecutionGateway } from "./executionGateway.js";
 import { BoxOrderManager, orderManagerLimitsFromConfig, type OrderManagerReconcileReport } from "./orderManager.js";
-import { LocalChargeCalculator } from "./localCharges.js";
 import { BoxMetrics } from "./metrics.js";
 import {
   buildUnderlyingState,
@@ -145,7 +145,19 @@ export interface BoxEngineDeps {
    * reconstructing the engine.
    */
   activeBroker: () => BrokerId;
-  tickerHub: TickerHub;
+  /**
+   * The ACTIVE broker's live feed. Not a TickerHub: the engine must not be able to
+   * reach a specific broker's socket (see brokerContext.ts).
+   */
+  feed: BoxFeedProvider;
+  /**
+   * The ACTIVE broker's charge calculator.
+   *
+   * Injected rather than constructed, because the expected-net gate spends whatever
+   * this says — costing a Dhan trade with Zerodha brokerage would make the gate
+   * quietly wrong.
+   */
+  charges: BoxChargeCalculatorLike;
   getAllInstruments: () => Promise<Instrument[]>;
   getBoard: () => Promise<BoxBoardItem[]>;
   /**
@@ -185,7 +197,7 @@ export class BoxEngine {
   private spots = new SpotStore();
   private positions = new BoxPositionBook();
   private charges: BoxChargeEstimator;
-  private localCharges: LocalChargeCalculator;
+  private localCharges: BoxChargeCalculatorLike;
   private executionSim: BoxExecutionSimulator;
   private execution: BoxExecutionGateway;
   private orderManager: BoxOrderManager | null = null;
@@ -332,7 +344,8 @@ export class BoxEngine {
   constructor(private deps: BoxEngineDeps) {
     this.cfg = loadBoxConfig();
     this.charges = new BoxChargeEstimator(deps.priceChargeGroups, this.cfg);
-    this.localCharges = new LocalChargeCalculator();
+    // The ACTIVE broker's fee schedule, injected by the registry.
+    this.localCharges = deps.charges;
     this.metrics = new BoxMetrics(this.cfg.metricsWindow);
     this.directions = this.cfg.enableShortBox ? BOX_DIRECTIONS : (["LONG_BOX"] as const);
     this.strikeLevel = this.cfg.defaultStrikeLevel;
@@ -1236,17 +1249,17 @@ export class BoxEngine {
   /** Attach to the shared feed (tick/lifecycle listeners + retainer + publish loop). */
   private ensureFeed(): void {
     if (!this.removeTickListener) {
-      this.removeTickListener = this.deps.tickerHub.addTickListener((ticks) =>
+      this.removeTickListener = this.deps.feed.addTickListener((ticks) =>
         this.onTicks(ticks),
       );
     }
     if (!this.removeConnectionListener) {
-      this.removeConnectionListener = this.deps.tickerHub.addConnectionListener(() =>
+      this.removeConnectionListener = this.deps.feed.addConnectionListener(() =>
         this.invalidateFeedGeneration(),
       );
     }
     if (!this.releaseRetainer) {
-      this.releaseRetainer = this.deps.tickerHub.retain();
+      this.releaseRetainer = this.deps.feed.retain();
     }
     if (!this.publishTimer) {
       this.publishTimer = setInterval(() => this.publish(), this.cfg.publishIntervalMs);
@@ -1629,9 +1642,9 @@ export class BoxEngine {
     this.subscribedOptionTokens = wantOption;
     this.subscribedSpotTokens = wantSpot;
 
-    if (toAdd.length > 0) this.deps.tickerHub.subscribeTokens(toAdd);
+    if (toAdd.length > 0) this.deps.feed.subscribeTokens(toAdd);
     if (toDrop.length > 0) {
-      this.deps.tickerHub.unsubscribeTokens(toDrop);
+      this.deps.feed.unsubscribeTokens(toDrop);
       this.quotes.forget(toDrop);
     }
   }
@@ -3126,8 +3139,8 @@ export class BoxEngine {
       monitored_tokens: this.scanner.monitoredTokenCount,
       subscribed_option_tokens: this.subscribedOptionTokens.size,
       subscribed_spot_tokens: this.subscribedSpotTokens.size,
-      hub_subscribed: this.deps.tickerHub.subscribedCount(),
-      hub_connected: this.deps.tickerHub.isConnected(),
+      hub_subscribed: this.deps.feed.subscribedCount(),
+      hub_connected: this.deps.feed.isConnected(),
       quotes: this.quotes.size,
       quote_updates: this.quotes.updateCount,
       /** Feed liveness: age of the newest tick anywhere, and the verdict. */
@@ -3183,6 +3196,73 @@ export class BoxEngine {
       last_error: this.lastError,
       config: this.getConfig(),
     };
+  }
+
+  /**
+   * The raw BoxConfig, for collaborators that must build broker adapters from it.
+   *
+   * Distinct from `getConfig()`, which is the UI's curated view. Exposed read-only so
+   * the broker registry can construct an execution adapter with the same limits the
+   * engine is running under, without re-reading the environment (which could have
+   * drifted from what this process actually loaded).
+   */
+  getConfigRaw(): BoxConfig {
+    return this.cfg;
+  }
+
+  /** Live exposure, for the broker-switch guard. Cheap: all in-memory. */
+  exposureSummary(): {
+    scannerRunning: boolean;
+    openPositions: number;
+    brokersWithOpenPositions: BrokerId[];
+    workingOrders: number;
+    executionInFlight: boolean;
+    reconciliationComplete: boolean;
+    residualLegs: number;
+    unknownOrders: number;
+  } {
+    const live = this.orderManager?.status() ?? null;
+    return {
+      scannerRunning: this.running,
+      openPositions: this.positions.size,
+      brokersWithOpenPositions: this.positions.brokersInUse(),
+      // In-flight + queued is the honest "still working" count the manager exposes.
+      workingOrders: live ? live.inFlight + live.queued : 0,
+      // A simulated pipeline counts too: deleting the feed under an in-flight paper
+      // entry would leave the attempt unable to resolve.
+      executionInFlight: this.executionSim.activeCount > 0,
+      reconciliationComplete: live?.health.reconciliation_complete ?? true,
+      residualLegs: this.residualLegCount(),
+      unknownOrders: live?.unknownOrders ?? 0,
+    };
+  }
+
+  /**
+   * Drop every cached book and bump the feed generation.
+   *
+   * Called on a broker switch. This is what guarantees a Zerodha depth ladder can
+   * never price a Dhan decision: the quote store is emptied and every token's
+   * warm-generation marker is invalidated, so nothing is treated as executable until
+   * the NEW broker has published a fresh book for it.
+   */
+  invalidateBooks(): void {
+    this.invalidateFeedGeneration();
+    this.quotes.clear();
+    this.spots.clear();
+    this.scanner.clearOpportunities();
+    this.subscribedOptionTokens.clear();
+    this.subscribedSpotTokens.clear();
+  }
+
+  /** Force a universe rebuild for the newly active broker. */
+  async reloadUniverse(): Promise<void> {
+    this.forceWindowRebuild = true;
+    await this.refreshUniverse();
+  }
+
+  /** Push the current snapshot to every SSE client immediately. */
+  publishNow(): void {
+    this.publish();
   }
 
   getOpportunities(limit?: number): BoxOpportunity[] {

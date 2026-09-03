@@ -287,6 +287,40 @@ export class TickerHub {
     }
   }
 
+  /**
+   * Publish ticks that came from ANOTHER broker's feed (currently Dhan).
+   *
+   * WHY REUSE THIS HUB RATHER THAN BUILD A SECOND FAN-OUT
+   * Every consumer in the app already reads prices from here: the Box quote store via
+   * `addTickListener`, browsers via `addClient`, analytics via `getLatestTick` /
+   * `getFreshLadder`. Routing Dhan through the same caches and the same fan-out means
+   * NO consumer needs to know which broker produced a tick — which is the whole point
+   * of the broker-neutral design. A parallel hub would have duplicated the SSE
+   * plumbing, the ladder cache and the freshness bookkeeping, and the two would have
+   * drifted.
+   *
+   * This does NOT open a socket and does not touch `subscribed`: the Dhan feed owns
+   * its own subscription state. This is purely the publish half.
+   *
+   * SAFETY: only ONE broker is ever active, and `stop()` clears `latest`/`latestLadder`
+   * on a switch, so a Zerodha book can never survive into a Dhan session or vice
+   * versa.
+   */
+  ingestExternalTicks(ticks: Tick[]): void {
+    if (ticks.length === 0) return;
+    this.broadcast(ticks);
+  }
+
+  /**
+   * Report an external feed's connection state through the hub's own listeners.
+   *
+   * Lets the Box engine's existing connection listener invalidate its books on a Dhan
+   * reconnect exactly as it does for Kite, with no broker-specific branch.
+   */
+  setExternalConnected(connected: boolean): void {
+    this.notifyConnection(connected);
+  }
+
   private fail(message: string): void {
     this.onDead();
     const frame = `event: kite_error\ndata: ${JSON.stringify({ message })}\n\n`;

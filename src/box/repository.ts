@@ -594,6 +594,34 @@ export async function loadNonterminalBoxOrderIntents(): Promise<BoxOrderIntentRe
     .lean<BoxOrderIntentRecord[]>();
 }
 
+/**
+ * Count unresolved LIVE order intents belonging to ONE broker.
+ *
+ * BROKER-SCOPED ON PURPOSE. Dhan order ids and Zerodha order ids are unrelated
+ * identifier spaces, so an intent can only ever be reconciled through the broker that
+ * created it. A cross-broker lookup would either 404 (and be misread as "the order
+ * never existed", losing real exposure) or — far worse — collide with an unrelated
+ * real order at the other broker.
+ *
+ * The broker-switch guard uses this to refuse leaving a broker that still has
+ * unresolved intents, because after the switch its adapter no longer exists.
+ *
+ * Legacy intents have no `broker` field and are Zerodha's, so a "zerodha" query must
+ * also match documents where the field is absent.
+ */
+export async function countUnresolvedBoxOrderIntentsForBroker(broker: string): Promise<number> {
+  if (!isBoxDbEnabled()) return 0;
+  const brokerFilter =
+    broker === "zerodha"
+      ? { $or: [{ broker: "zerodha" }, { broker: { $exists: false } }, { broker: null }] }
+      : { broker };
+  return BoxOrderIntent.countDocuments({
+    broker_mode: "live",
+    state: { $in: NONTERMINAL_ORDER_STATES },
+    ...brokerFilter,
+  });
+}
+
 export async function loadOwnedBoxOrderIntents(): Promise<BoxOrderIntentRecord[]> {
   if (!isBoxDbEnabled()) {
     throw new Error("Box persistence is unavailable while loading owned live order intents.");

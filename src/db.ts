@@ -578,6 +578,138 @@ export async function clearKiteSession(): Promise<void> {
 }
 
 // ============================================================================
+//  DhanSession — the persisted DhanHQ v2 session.
+//
+//  SEPARATE COLLECTION, not a `broker` field on kite_session. The two brokers'
+//  sessions have genuinely different shapes (Dhan carries a client UCC and a
+//  power-of-attorney flag; Zerodha carries a user id and name) and — more
+//  importantly — different EXPIRY RULES. A Zerodha token is discarded unless it
+//  was generated on the same IST day; Dhan states an explicit `expiry_time`, so
+//  it is honoured directly rather than guessed at from a login date.
+//
+//  Both may be stored at once: only one broker is ACTIVE, but keeping the
+//  inactive broker's session lets an operator switch back without re-logging in
+//  while it is still valid.
+// ============================================================================
+
+export interface IDhanSession {
+  _id: string; // fixed "current" — single-document store
+  access_token: string;
+  dhan_client_id: string;
+  dhan_client_name: string;
+  dhan_client_ucc: string;
+  given_power_of_attorney: boolean;
+  /**
+   * When Dhan says the token stops working (epoch ms), or null when it did not say.
+   *
+   * Null must be treated as "unknown expiry", never as "never expires": the token
+   * is then validated by using it, and a 401 is what retires it.
+   */
+  expiry_time: number | null;
+  login_at: Date;
+  login_date: string; // IST YYYY-MM-DD, for display and day-roll reporting
+  updated_at: Date;
+}
+
+const dhanSessionSchema = new mongoose.Schema<IDhanSession>(
+  {
+    _id: { type: String },
+    access_token: { type: String, required: true },
+    dhan_client_id: { type: String, default: "" },
+    dhan_client_name: { type: String, default: "" },
+    dhan_client_ucc: { type: String, default: "" },
+    given_power_of_attorney: { type: Boolean, default: false },
+    expiry_time: { type: Number, default: null },
+    login_at: { type: Date, default: () => new Date() },
+    login_date: { type: String, required: true },
+    updated_at: { type: Date, default: () => new Date() },
+  },
+  { collection: "dhan_session" },
+);
+
+/** Single-doc model for the persisted Dhan session. */
+export const DhanSession = mongoose.model<IDhanSession>("DhanSession", dhanSessionSchema);
+
+/** Persist (upsert) the current Dhan session. No-op if DB is disabled. */
+export async function saveDhanSession(data: {
+  access_token: string;
+  dhan_client_id: string;
+  dhan_client_name: string;
+  dhan_client_ucc: string;
+  given_power_of_attorney: boolean;
+  expiry_time: number | null;
+  login_date: string;
+}): Promise<void> {
+  if (!isDbEnabled()) return;
+  await DhanSession.updateOne(
+    { _id: "current" },
+    {
+      $set: {
+        ...data,
+        _id: "current",
+        login_at: new Date(),
+        updated_at: new Date(),
+      },
+    },
+    { upsert: true },
+  );
+}
+
+/** Load the persisted Dhan session (or null). No-op if DB is disabled. */
+export async function loadDhanSession(): Promise<IDhanSession | null> {
+  if (!isDbEnabled()) return null;
+  return DhanSession.findById("current").lean<IDhanSession>();
+}
+
+/** Remove the persisted Dhan session (on logout / auth failure / expiry). */
+export async function clearDhanSession(): Promise<void> {
+  if (!isDbEnabled()) return;
+  await DhanSession.deleteOne({ _id: "current" });
+}
+
+// ============================================================================
+//  ActiveBroker — which broker owns the feed, scanner and execution.
+//
+//  Persisted so a restart resumes the broker the operator selected rather than
+//  silently reverting to Zerodha and starting to price trades from the wrong
+//  venue. A single document, exactly like the session stores.
+// ============================================================================
+
+export interface IActiveBroker {
+  _id: string; // fixed "current"
+  broker: string; // BrokerId; validated on read, never trusted blindly
+  selected_at: Date;
+  selected_by: string;
+}
+
+const activeBrokerSchema = new mongoose.Schema<IActiveBroker>(
+  {
+    _id: { type: String },
+    broker: { type: String, required: true },
+    selected_at: { type: Date, default: () => new Date() },
+    selected_by: { type: String, default: "admin" },
+  },
+  { collection: "active_broker" },
+);
+
+export const ActiveBrokerDoc = mongoose.model<IActiveBroker>("ActiveBroker", activeBrokerSchema);
+
+export async function saveActiveBroker(broker: string, selectedBy: string): Promise<void> {
+  if (!isDbEnabled()) return;
+  await ActiveBrokerDoc.updateOne(
+    { _id: "current" },
+    { $set: { _id: "current", broker, selected_by: selectedBy, selected_at: new Date() } },
+    { upsert: true },
+  );
+}
+
+export async function loadActiveBroker(): Promise<string | null> {
+  if (!isDbEnabled()) return null;
+  const doc = await ActiveBrokerDoc.findById("current").lean<IActiveBroker>();
+  return doc?.broker ?? null;
+}
+
+// ============================================================================
 //  AdminSession — persist admin/trade-access sessions so an admin who logged
 //  in for the day stays logged in across backend restarts/redeploys (rather
 //  than the in-memory session map being wiped and forcing a fresh secret entry).
