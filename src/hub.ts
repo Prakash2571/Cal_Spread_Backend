@@ -346,7 +346,14 @@ export class TickerHub {
     }
   }
 
-  private stop(): void {
+  /**
+   * Tear the socket down and DISCARD every cached book.
+   *
+   * Public because the broker registry must be able to stop this feed when switching
+   * away from Zerodha. Dropping `subscribed` and `latest` is the point: a Zerodha
+   * depth ladder must never survive into a Dhan session and be treated as executable.
+   */
+  stop(): void {
     const handle = this.handle;
     this.handle = null;
     handle?.close();

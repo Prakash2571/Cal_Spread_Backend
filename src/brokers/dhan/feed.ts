@@ -198,7 +198,9 @@ export class DhanFeed {
       // scheduling two reconnects for one failure.
     };
 
-    ws.onclose = (ev: CloseEvent) => {
+    // Typed structurally: the backend's lib is esnext-only, so the DOM CloseEvent
+    // type is unavailable even though the runtime (undici) provides the object.
+    ws.onclose = (ev: { code?: number }) => {
       if (this.ws !== ws) return;
       this.ws = null;
       this.connected = false;
@@ -206,13 +208,14 @@ export class DhanFeed {
       this.opts.onConnection?.(false);
       // 1008/4401-style auth rejections will never succeed on retry, so surface
       // them as a lost session instead of reconnecting forever.
-      if (isAuthClose(ev.code)) {
+      const closeCode = ev.code ?? 0;
+      if (isAuthClose(closeCode)) {
         this.opts.onSessionLost?.(
-          `Dhan feed rejected the session (close code ${ev.code}) — the access token is invalid or expired.`,
+          `Dhan feed rejected the session (close code ${closeCode}) — the access token is invalid or expired.`,
         );
         return;
       }
-      this.scheduleReconnect(`socket closed (code ${ev.code})`);
+      this.scheduleReconnect(`socket closed (code ${closeCode})`);
     };
   }
 

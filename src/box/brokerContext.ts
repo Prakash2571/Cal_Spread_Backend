@@ -150,6 +150,8 @@ export interface BoxChargeCalculatorLike {
     entry_total: number;
     estimated_exit_total: number;
   };
+  /** Total charges for a set of orders — the hot-path helper the simulator uses. */
+  totals(orders: BoxChargeCalcOrder[]): number;
   /** The stamped rate-card version, so a historical trade stays interpretable. */
   readonly rates: { rateVersion: string };
 }

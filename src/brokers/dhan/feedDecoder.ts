@@ -171,7 +171,12 @@ export function decodeDhanFeed(buffer: ArrayBuffer): DhanDecodeResult {
             break;
           }
           base.last_price = view.getFloat32(offset + 8, true);
-          base.last_trade_time = readEpochSeconds(view, offset + 12);
+          // `exactOptionalPropertyTypes` forbids assigning `undefined` to an
+          // optional property, and "absent" must stay absent rather than become 0.
+          {
+            const ltt = readEpochSeconds(view, offset + 12);
+            if (ltt !== undefined) base.last_trade_time = ltt;
+          }
           packets.push(base);
           break;
         }
@@ -266,7 +271,8 @@ export function decodeDhanFeed(buffer: ArrayBuffer): DhanDecodeResult {
 function readQuoteCore(view: DataView, offset: number, out: DhanFeedPacket): void {
   out.last_price = view.getFloat32(offset + 8, true);
   out.last_quantity = view.getInt16(offset + 12, true);
-  out.last_trade_time = readEpochSeconds(view, offset + 14);
+  const ltt = readEpochSeconds(view, offset + 14);
+  if (ltt !== undefined) out.last_trade_time = ltt;
   out.average_price = view.getFloat32(offset + 18, true);
   out.volume = view.getInt32(offset + 22, true);
   out.total_sell_quantity = view.getInt32(offset + 26, true);
