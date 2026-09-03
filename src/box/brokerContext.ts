@@ -84,10 +84,40 @@ export interface BoxMarginOrder {
  * offsetting legs are most of the point — so this must always be asked about all
  * four legs at once, whichever broker answers.
  */
+/**
+ * Where a margin figure came from.
+ *
+ * Recorded because the two Dhan paths are NOT equivalent: the multi-order calculator
+ * returns a hedge-adjusted basket figure, whereas summing four standalone legs ignores
+ * the offsetting benefit and can over-state the requirement several-fold. An operator
+ * comparing margins across days needs to know which one they are looking at.
+ */
+export type BoxMarginSource =
+  /** Zerodha's basket-margin API. */
+  | "kite_basket"
+  /** Dhan's POST /margincalculator/multi — hedge-adjusted, preferred. */
+  | "dhan_multi"
+  /** Dhan per-leg margins summed. Conservative UPPER bound; fallback only. */
+  | "dhan_per_leg_fallback"
+  /** No figure could be obtained. */
+  | "unavailable";
+
+export interface BoxBasketMargin {
+  initial: number;
+  final: number;
+  total: number;
+  /** Which calculation produced `total`. */
+  source: BoxMarginSource;
+  /** Benefit attributable to offsetting legs (₹), when the broker reports it. */
+  hedge_benefit?: number | null;
+  span?: number | null;
+  exposure?: number | null;
+}
+
 export interface BoxMarginProvider {
   /** Which broker's margin model produced the figure (for provenance display). */
   readonly broker: BrokerId;
-  basketMargin(orders: BoxMarginOrder[]): Promise<{ initial: number; final: number; total: number }>;
+  basketMargin(orders: BoxMarginOrder[]): Promise<BoxBasketMargin>;
 }
 
 /**

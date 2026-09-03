@@ -519,7 +519,7 @@ const boxOrderIntentSchema = new mongoose.Schema(
      * indexed and treated as immutable (see IMMUTABLE_INTENT_FIELDS).
      */
     broker: { type: String, enum: BROKER_IDS, default: "zerodha", index: true },
-    /** Bounded broker-side correlation identity (Dhan caps it at 25 chars). */
+    /** Bounded broker-side correlation identity (Dhan caps it at 30 chars). */
     broker_correlation_id: { type: String, default: null },
     trade_id: { type: String, default: null },
     attempt_id: { type: String, required: true },

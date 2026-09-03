@@ -1020,7 +1020,7 @@ export interface IBoxOrderIntent {
   /**
    * The bounded broker-side correlation identity, when the broker constrains it.
    *
-   * Dhan's correlationId is limited to 25 characters, which a Box client order id
+   * Dhan's correlationId is limited to 30 characters, which a Box client order id
    * ("BOX:<24-char-oid>:ENTRY:k1_ce:attempt-1") comfortably exceeds. Both are
    * persisted so the original strategy identity is never lost and the broker-side
    * handle stays recoverable.

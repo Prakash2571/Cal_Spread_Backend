@@ -40,7 +40,7 @@ export type DhanOrderStatus =
 
 export interface DhanPlaceOrderRequest {
   dhanClientId: string;
-  /** Our bounded idempotency handle. Dhan caps this well below a Box client id. */
+  /** Our bounded idempotency handle. Dhan caps this at 30 chars — see correlation.ts. */
   correlationId: string;
   transactionType: DhanTransactionType;
   exchangeSegment: DhanExchangeSegment;
@@ -176,6 +176,89 @@ export interface DhanMarginResponse {
   insufficientBalance: number;
   brokerage: number;
   leverage?: string;
+}
+
+/**
+ * The MULTI-ORDER margin response.
+ *
+ * Field names are read defensively (see `normalizeDhanMultiMargin`) because Dhan has
+ * used more than one spelling for the combined total across revisions, and a missing
+ * total must fall back to the per-leg estimate rather than silently read as ₹0 — an
+ * understated margin is the one error mode that actually matters here.
+ */
+export interface DhanMultiMarginResponse {
+  /** The hedge-adjusted combined requirement. Several spellings are accepted. */
+  totalMargin?: number;
+  totalMarginRequired?: number;
+  total_margin?: number;
+  spanMargin?: number;
+  span_margin?: number;
+  exposureMargin?: number;
+  exposure_margin?: number;
+  /** The F&O component, where Dhan separates it. */
+  foMargin?: number;
+  fo_margin?: number;
+  optionPremium?: number;
+  /** The benefit the offsetting legs earn — the whole reason to use this endpoint. */
+  marginBenefit?: number;
+  margin_benefit?: number;
+  hedgeBenefit?: number;
+  hedge_benefit?: number;
+  availableBalance?: number;
+  insufficientBalance?: number;
+  [key: string]: unknown;
+}
+
+/** The normalized multi-order margin, or null when no total could be read. */
+export interface NormalizedDhanMargin {
+  /** Hedge-adjusted total (₹). */
+  total: number;
+  span: number | null;
+  exposure: number | null;
+  foMargin: number | null;
+  /** Benefit attributable to the offsetting legs (₹), when Dhan reports it. */
+  hedgeBenefit: number | null;
+  availableBalance: number | null;
+  insufficientBalance: number | null;
+}
+
+/** First finite candidate, or null. */
+function pickNumber(source: Record<string, unknown>, ...keys: string[]): number | null {
+  for (const key of keys) {
+    const raw = source[key];
+    const n = typeof raw === "number" ? raw : Number(raw);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+/**
+ * Normalize Dhan's multi-order margin response.
+ *
+ * Returns null when NO combined total can be read. That is deliberately distinct from
+ * returning 0: the caller must then fall back to the conservative per-leg sum, because
+ * treating an unreadable response as "no margin required" would understate the
+ * figure — and an understated margin is worse than an over-stated one.
+ */
+export function normalizeDhanMultiMargin(
+  res: DhanMultiMarginResponse | null | undefined,
+): NormalizedDhanMargin | null {
+  if (!res || typeof res !== "object") return null;
+  // Dhan sometimes wraps the payload in `data`.
+  const body = ((res as { data?: unknown }).data ?? res) as Record<string, unknown>;
+  const total = pickNumber(body, "totalMargin", "totalMarginRequired", "total_margin");
+  // A zero or negative total is not a credible requirement for a four-leg F&O basket;
+  // treat it as unreadable so the caller falls back rather than recording ₹0.
+  if (total === null || !(total > 0)) return null;
+  return {
+    total,
+    span: pickNumber(body, "spanMargin", "span_margin"),
+    exposure: pickNumber(body, "exposureMargin", "exposure_margin"),
+    foMargin: pickNumber(body, "foMargin", "fo_margin"),
+    hedgeBenefit: pickNumber(body, "marginBenefit", "margin_benefit", "hedgeBenefit", "hedge_benefit"),
+    availableBalance: pickNumber(body, "availableBalance", "available_balance"),
+    insufficientBalance: pickNumber(body, "insufficientBalance", "insufficient_balance"),
+  };
 }
 
 /* --------------------------------- quotes --------------------------------- */
@@ -405,13 +488,48 @@ export class DhanClient {
 
   /* ---- margin ---- */
 
-  /** Margin for ONE order leg. */
+  /** Margin for ONE order leg. Only a FALLBACK — prefer `calculateMultiMargin`. */
   calculateMargin(leg: Omit<DhanMarginRequestLeg, "dhanClientId">): Promise<DhanMarginResponse> {
     return this.http.read<DhanMarginResponse>({
       method: "POST",
       path: "/margincalculator",
       body: { ...leg, dhanClientId: this.clientId() },
     });
+  }
+
+  /**
+   * MULTI-ORDER margin — the correct call for a four-leg Box basket.
+   *
+   * A box is margined as a BASKET: the offsetting legs earn a hedge benefit that is
+   * most of the point of the structure. Summing four standalone margins ignores that
+   * benefit entirely and can over-state the requirement several-fold, so this endpoint
+   * is always preferred and the per-leg sum exists only as a labelled fallback.
+   *
+   * All four intended orders are sent together, each carrying its real BUY/SELL
+   * direction — sending them as four buys (or omitting direction) would defeat the
+   * hedge recognition this call exists for.
+   */
+  calculateMultiMargin(
+    legs: Omit<DhanMarginRequestLeg, "dhanClientId">[],
+  ): Promise<DhanMultiMarginResponse> {
+    const dhanClientId = this.clientId();
+    return this.http.read<DhanMultiMarginResponse>({
+      method: "POST",
+      path: "/margincalculator/multi",
+      body: { dhanClientId, orders: legs.map((leg) => ({ ...leg, dhanClientId })) },
+    });
+  }
+
+  /**
+   * The static IPs Dhan has whitelisted for this account.
+   *
+   * Used to VERIFY the operator's declared server IP rather than trusting a boolean.
+   * Dhan refuses order placement from a non-whitelisted address, so confirming it
+   * against the broker's own record is the difference between a checked precondition
+   * and a hopeful one.
+   */
+  getStaticIp(): Promise<{ primaryIP?: string; secondaryIP?: string; [key: string]: unknown }> {
+    return this.http.read({ path: "/ip/getIP" });
   }
 
   /* ---- market data ---- */

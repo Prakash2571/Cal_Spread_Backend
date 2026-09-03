@@ -779,7 +779,8 @@ guard the Zerodha flow uses. **The API secret and the access token never reach t
 `GET /api/dhan/status` returns only account identifiers and timestamps.
 
 Other routes: `GET /api/dhan/status`, `POST /api/dhan/logout`,
-`GET /api/dhan/access-token` (full admin), `POST /api/dhan/postback`.
+`POST /api/dhan/verify-ip` (full admin), `GET /api/dhan/access-token` (full admin),
+`POST /api/dhan/postback`.
 
 ### Token expiry
 
@@ -791,22 +792,33 @@ not necessarily). An **absent** expiry means UNKNOWN — validated by using it, 
 On expiry the system **fails closed**: the feed stops, executable books are invalidated, live
 execution is blocked, and the UI shows **"Dhan session expired — reconnect Dhan"**.
 
-### Static IP is required for live Dhan orders
+### Static IP is required for live Dhan orders — and is API-verified
 
 Dhan requires the server's **public IP to be whitelisted** before it accepts order placement,
-modification or cancellation. There is no API to query this, so it is an explicit operator
-declaration via `DHAN_STATIC_IP_EXPECTED`, which **defaults to false and fails closed**.
+modification or cancellation. Dhan **does** expose its own whitelist (`GET /ip/getIP` →
+`primaryIP` / `secondaryIP`), so readiness is evidence-based rather than declared:
 
-Setting it to `true` without actually whitelisting the IP does not make orders work — it only
-removes the local guard, and Dhan then rejects orders at the edge, potentially part-way
-through building a four-leg box. Whitelist the IP in the Dhan API dashboard first.
+| Configuration | How readiness is decided |
+|---|---|
+| `DHAN_STATIC_PUBLIC_IP` set | **Preferred.** Verified against Dhan's whitelist. `DHAN_STATIC_IP_EXPECTED` then acts only as a kill switch — an explicit `false` still blocks. |
+| `DHAN_STATIC_PUBLIC_IP` unset | Falls back to `DHAN_STATIC_IP_EXPECTED` alone, and the health report says so, because a declaration is materially weaker evidence. |
+
+Verification runs at boot (when Dhan is active) and on every switch to Dhan.
+`POST /api/dhan/verify-ip` re-checks after whitelisting a new address without a restart.
+
+**Fails closed at every step.** A mismatch, an unreachable check, a missing session, or a
+configured-but-not-yet-verified IP all yield `trading_ready: false` and no orders. Note that
+setting the manual flag true without actually whitelisting does not make orders work — it only
+removes the local guard, and Dhan then rejects them at the edge, potentially part-way through
+building a four-leg box.
 
 Readiness is reported per capability, because data and trading fail independently:
 
 ```json
-{ "broker": "dhan", "authenticated": true, "data_ready": true,
-  "static_ip_configured": false, "trading_ready": false,
-  "problems": ["Static IP not configured — Dhan live order placement is blocked"] }
+{ "broker": "dhan", "authenticated": true, "data_ready": true, "trading_ready": false,
+  "static_ip": { "ready": false, "declared": true, "configured_ip": "203.0.113.7",
+                 "api_verified": false, "primary_ip": "198.51.100.1",
+                 "secondary_ip": null, "error": "DHAN_STATIC_PUBLIC_IP (203.0.113.7) does not match Dhan's whitelist (primary 198.51.100.1, secondary unset)." } }
 ```
 
 ### Switching brokers
@@ -874,10 +886,23 @@ entry gate. Dhan trades are therefore costed with Dhan's rate card and labelled
 `computed_by: "dhan_estimate"`, `broker: "dhan"` — never as `local` (the Zerodha calculator) or
 `kite`. The Box expected-net gate always spends the **active** broker's charges.
 
-Margin uses Dhan's calculator, summed across the four legs. That is a conservative **upper**
-bound — it ignores the offsetting benefit a real box receives — so the figure can only be too
-high, never too low. Under-stating margin would be dangerous; over-stating it is merely
-pessimistic, and the figure is display/accounting only and never gates a trade.
+Margin uses Dhan's **multi-order** calculator (`POST /margincalculator/multi`) for the whole
+four-leg basket. A box is margined as a basket — the offsetting legs earn a hedge benefit that
+is most of the point of the structure — so all four orders go in one request carrying their
+real BUY/SELL direction and the `MARGIN` (carry-forward) product. Summing four standalone
+margins would ignore that benefit and can over-state the requirement several-fold.
+
+`span`, `exposure`, the F&O component and the reported hedge benefit are preserved.
+
+**Fallback:** if the multi endpoint genuinely fails or returns no readable total, the per-leg
+sum is used and tagged `dhan_per_leg_fallback`. That is a conservative **upper** bound by
+construction, so a failed multi call can never produce an *understated* figure — the direction
+of the error is what matters, and understating margin is the one outcome worth avoiding. If
+nothing can be priced at all the result is `unavailable` rather than ₹0, so the dashboard
+counts it as unknown instead of treating the box as margin-free.
+
+Provenance is exposed as `last_margin_source`: `kite_basket` · `dhan_multi` ·
+`dhan_per_leg_fallback` · `unavailable`.
 
 ### Dhan market data
 
@@ -912,11 +937,15 @@ strategy and no second order manager.
   POSTs again — a second POST is how a four-leg box grows a fifth leg. A definitive 4xx (not
   429) is recorded as a rejection; anything it cannot prove becomes
   `RECONCILIATION_REQUIRED` rather than a guessed terminal state.
-- **Correlation IDs.** Dhan caps `correlationId` at 25 characters, well below a Box client
+- **Correlation IDs.** Dhan caps `correlationId` at 30 characters, well below a Box client
   order id. Truncating would be catastrophic — the trade id sits in the *middle*, so two
   different trades' `k1_ce` legs share a prefix and could collide. Instead a deterministic
-  64-bit hash of the whole client id is used, so it is recomputable after a crash with no
-  stored mapping. Both ids are persisted (`client_order_id`, `broker_correlation_id`).
+  **96-bit** hash of the whole client id is used, so it is recomputable after a crash with
+  no stored mapping. The room Dhan's 30-char limit allows over a 64-bit digest is spent on a
+  third hash lane (more collision resistance), not on padding or on carrying more of the raw
+  client id — a partial raw id is precisely the prefix-collision hazard above. Both ids are
+  persisted (`client_order_id`, `broker_correlation_id`), and adoption/refresh PREFER the
+  persisted id over recomputing, so changing the algorithm cannot orphan an older intent.
 - **Status normalization** maps `TRANSIT / PENDING / PART_TRADED / TRADED / CANCELLED /
   REJECTED / EXPIRED` onto the existing `BrokerOrderState`, consulting filled quantity rather
   than trusting the label (Dhan reports some partial fills as `PENDING`). An unrecognised

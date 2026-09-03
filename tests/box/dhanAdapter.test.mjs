@@ -33,10 +33,28 @@ import {
 
 const CLIENT_ID = "BOX:6512f0a0a0a0a0a0a0a0a0a0:ENTRY:k1_ce:attempt-1";
 
-test("a correlation id fits Dhan's 25-character limit", () => {
+test("Dhan's correlation-id limit is 30 characters", () => {
+  // Per the current DhanHQ v2 docs. Pinned as a constant test because the whole
+  // hashing design exists to fit inside it.
+  assert.equal(DHAN_CORRELATION_MAX_LENGTH, 30);
+});
+
+test("a correlation id fits Dhan's 30-character limit", () => {
   const id = dhanCorrelationId(CLIENT_ID);
   assert.ok(id.length <= DHAN_CORRELATION_MAX_LENGTH, `${id} is ${id.length} chars`);
   assert.ok(isValidDhanCorrelationId(id));
+});
+
+test("the extra room over a 64-bit digest is spent on STRENGTH, not padding", () => {
+  // A 96-bit digest base36-encodes to ~15-21 chars, so a real id is comfortably
+  // longer than the 14 a 64-bit digest produced — evidence the third lane is
+  // actually present rather than the id being padded out to look longer.
+  const id = dhanCorrelationId(CLIENT_ID);
+  assert.ok(id.length >= 16, `expected a wider digest, got ${id} (${id.length})`);
+  // And it must NOT carry raw client-id characters, which would reintroduce the
+  // prefix-collision hazard the hash exists to remove.
+  assert.ok(!id.includes("ENTRY"));
+  assert.ok(!id.includes("6512f0a0"));
 });
 
 test("a correlation id is DETERMINISTIC — the reconciliation key must be recomputable", () => {
@@ -72,6 +90,35 @@ test("correlation ids stay alphanumeric and bounded across many inputs", () => {
     const id = dhanCorrelationId(`BOX:trade${i}:ENTRY:k2_pe:attempt-${i % 7}`);
     assert.ok(isValidDhanCorrelationId(id), `${id} is not a valid Dhan correlation id`);
   }
+});
+
+test("no collisions across a realistic population of Box orders", () => {
+  // 4 roles x 2 purposes x 3 attempts x 400 trades = 9,600 distinct client ids.
+  // A collision here would attribute one box's fill to another, so this is the
+  // property the 96-bit digest is actually for.
+  const ids = new Set();
+  let n = 0;
+  for (let t = 0; t < 400; t++) {
+    for (const role of ["k1_ce", "k2_ce", "k2_pe", "k1_pe"]) {
+      for (const purpose of ["ENTRY", "EXIT"]) {
+        for (let a = 1; a <= 3; a++) {
+          const id = dhanCorrelationId(`BOX:6512f0a0a0a0a0a0a0a0a${String(t).padStart(3, "0")}:${purpose}:${role}:attempt-${a}`);
+          assert.ok(isValidDhanCorrelationId(id), id);
+          ids.add(id);
+          n++;
+        }
+      }
+    }
+  }
+  assert.equal(ids.size, n, `expected ${n} distinct correlation ids, got ${ids.size}`);
+});
+
+test("ids differing only in a TRAILING character still differ", () => {
+  // The digest folds in the input length and mixes by position, so a shared prefix
+  // cannot collapse two ids together.
+  const a = dhanCorrelationId("BOX:t1:ENTRY:k1_ce:attempt-1");
+  const b = dhanCorrelationId("BOX:t1:ENTRY:k1_ce:attempt-11");
+  assert.notEqual(a, b);
 });
 
 test("isValidDhanCorrelationId rejects over-long and non-alphanumeric ids", () => {

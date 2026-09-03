@@ -147,7 +147,10 @@ export function registerBoxModule(app: Express, deps: BoxModuleDeps): BoxModule 
     isMarketOpen: deps.isMarketOpen,
     margins: deps.margins ?? {
       broker: "zerodha" as const,
-      basketMargin: (orders) => deps.getBasketMargin(orders),
+      basketMargin: async (orders) => ({
+        ...(await deps.getBasketMargin(orders)),
+        source: "kite_basket" as const,
+      }),
     },
     ...(deps.createLiveAdapter ? { createLiveAdapter: deps.createLiveAdapter } : {}),
   });

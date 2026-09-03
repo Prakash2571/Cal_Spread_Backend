@@ -32,13 +32,16 @@ import type { Instrument, KiteClient } from "../kite.js";
 import type { TickerHub } from "../hub.js";
 import type { BrokerAdapter } from "../box/brokerAdapter.js";
 import type {
+  BoxBasketMargin,
   BoxMarginOrder,
+  BoxMarginProvider,
+  BoxMarginSource,
   BoxMarketDataProvider,
   BoxRestQuote,
 } from "../box/brokerContext.js";
 import { BROKER_IDS, type BrokerHealthState, type BrokerId, type BrokerSessionState } from "./types.js";
 import { createZerodhaLiveAdapter } from "./zerodha/liveAdapter.js";
-import { DhanClient } from "./dhan/client.js";
+import { DhanClient, normalizeDhanMultiMargin } from "./dhan/client.js";
 import { DhanHttp, dhanHttpConfigFromEnv } from "./dhan/http.js";
 import { DhanFeed } from "./dhan/feed.js";
 import { DhanInstrumentStore, dhanInternalToken, type DhanInstrument } from "./dhan/instruments.js";
@@ -151,6 +154,19 @@ export class ActiveBrokerManager {
     loginAt: number;
   } | null = null;
   private dhanProblems: string[] = [];
+  /** Provenance of the most recent margin figure, for the status endpoints. */
+  private lastMarginSource: BoxMarginSource | null = null;
+  /**
+   * Static-IP verification verdict: true (matched), false (mismatch/unreachable),
+   * null (never checked, or no IP configured to check).
+   *
+   * `null` is NOT treated as ready when an IP is configured — see dhanStaticIpReady.
+   */
+  private dhanIpVerified: boolean | null = null;
+  private dhanIpPrimary: string | null = null;
+  private dhanIpSecondary: string | null = null;
+  private dhanIpCheckedAt: number | null = null;
+  private dhanIpError: string | null = null;
 
   constructor(private deps: ActiveBrokerManagerDeps) {
     this.dhanHttp = new DhanHttp(
@@ -306,17 +322,157 @@ export class ActiveBrokerManager {
 
   /* ----------------------------- readiness ------------------------------- */
 
+  /** The operator's manual declaration. Retained as an additional gate. */
+  private dhanStaticIpDeclared(): boolean {
+    const raw = process.env.DHAN_STATIC_IP_EXPECTED?.trim().toLowerCase() ?? "";
+    return raw === "1" || raw === "true" || raw === "yes";
+  }
+
+  /** The server's public IP as the operator configured it, or "" when unset. */
+  private dhanConfiguredIp(): string {
+    return process.env.DHAN_STATIC_PUBLIC_IP?.trim() ?? "";
+  }
+
   /**
    * Whether Dhan's static-IP requirement is satisfied.
    *
-   * Dhan cannot be asked this over the API, so it is an explicit operator
-   * declaration (`DHAN_STATIC_IP_EXPECTED`). Defaulting to "not configured" is the
-   * fail-closed choice: assuming it is fine would let live orders be attempted and
-   * refused at the edge mid-box.
+   * TWO SOURCES OF EVIDENCE, API-VERIFIED PREFERRED.
+   *
+   * Dhan refuses order placement from a non-whitelisted address, and it DOES expose
+   * the whitelist (`GET /ip/getIP` → primaryIP / secondaryIP). So when the operator
+   * configures `DHAN_STATIC_PUBLIC_IP`, readiness is decided by whether that address
+   * actually appears in Dhan's own record — a checked precondition rather than a
+   * hopeful boolean. `DHAN_STATIC_IP_EXPECTED` then acts only as an additional kill
+   * switch: setting it false still blocks trading.
+   *
+   * Without a configured IP it falls back to the manual declaration alone, and the
+   * health report says so, because a declaration is materially weaker evidence.
+   *
+   * FAIL CLOSED throughout: an unverified, mismatched or not-yet-checked state is not
+   * ready. Synchronous by necessity (the order adapter calls it per submission), so it
+   * reads a cached verification that `verifyDhanStaticIp()` refreshes.
    */
   dhanStaticIpReady(): boolean {
-    const raw = process.env.DHAN_STATIC_IP_EXPECTED?.trim().toLowerCase() ?? "";
-    return raw === "1" || raw === "true" || raw === "yes";
+    const declared = this.dhanStaticIpDeclared();
+    const configuredIp = this.dhanConfiguredIp();
+    if (configuredIp === "") {
+      // No IP to verify: the declaration is all the evidence there is.
+      return declared;
+    }
+    // An explicit `false` remains an operator override that stops trading.
+    if (process.env.DHAN_STATIC_IP_EXPECTED !== undefined && !declared) return false;
+    // Otherwise require positive API confirmation. `null` (never checked) is NOT ready.
+    return this.dhanIpVerified === true;
+  }
+
+  /**
+   * Confirm the configured server IP against Dhan's whitelist.
+   *
+   * Called before live Dhan startup and on a switch to Dhan. Best-effort in the sense
+   * that it never throws — but a failure sets the verdict to `false`, not to unknown,
+   * so an unreachable check blocks trading instead of quietly permitting it.
+   */
+  async verifyDhanStaticIp(): Promise<{
+    verified: boolean;
+    configured_ip: string;
+    primary_ip: string | null;
+    secondary_ip: string | null;
+    checked_at: number;
+    error: string | null;
+  }> {
+    const configuredIp = this.dhanConfiguredIp();
+    const checkedAt = Date.now();
+    this.dhanIpCheckedAt = checkedAt;
+
+    if (configuredIp === "") {
+      // Nothing to compare. Leave the verdict UNKNOWN rather than false: readiness
+      // then falls back to the manual declaration, which is the documented behaviour.
+      this.dhanIpVerified = null;
+      this.dhanIpPrimary = null;
+      this.dhanIpSecondary = null;
+      this.dhanIpError = null;
+      return {
+        verified: false,
+        configured_ip: "",
+        primary_ip: null,
+        secondary_ip: null,
+        checked_at: checkedAt,
+        error: null,
+      };
+    }
+    if (this.usableDhanToken() === null) {
+      this.dhanIpVerified = false;
+      this.dhanIpError = "Cannot verify the static IP without a Dhan session.";
+      return {
+        verified: false,
+        configured_ip: configuredIp,
+        primary_ip: null,
+        secondary_ip: null,
+        checked_at: checkedAt,
+        error: this.dhanIpError,
+      };
+    }
+
+    try {
+      const res = await this.dhanClient.getStaticIp();
+      const primary = typeof res.primaryIP === "string" ? res.primaryIP.trim() : "";
+      const secondary = typeof res.secondaryIP === "string" ? res.secondaryIP.trim() : "";
+      this.dhanIpPrimary = primary || null;
+      this.dhanIpSecondary = secondary || null;
+      const matched = configuredIp === primary || configuredIp === secondary;
+      this.dhanIpVerified = matched;
+      this.dhanIpError = matched
+        ? null
+        : `DHAN_STATIC_PUBLIC_IP (${configuredIp}) does not match Dhan's whitelist ` +
+          `(primary ${primary || "unset"}, secondary ${secondary || "unset"}).`;
+      if (!matched) console.warn(`[Dhan] ${this.dhanIpError}`);
+      this.dhanProblems = this.computeDhanProblems();
+      return {
+        verified: matched,
+        configured_ip: configuredIp,
+        primary_ip: this.dhanIpPrimary,
+        secondary_ip: this.dhanIpSecondary,
+        checked_at: checkedAt,
+        error: this.dhanIpError,
+      };
+    } catch (err) {
+      // FAIL CLOSED: an unreachable check is not permission to trade.
+      this.dhanIpVerified = false;
+      this.dhanIpError = `Static-IP verification failed: ${err instanceof Error ? err.message : String(err)}`;
+      this.dhanProblems = this.computeDhanProblems();
+      return {
+        verified: false,
+        configured_ip: configuredIp,
+        primary_ip: null,
+        secondary_ip: null,
+        checked_at: checkedAt,
+        error: this.dhanIpError,
+      };
+    }
+  }
+
+  /** The static-IP readiness detail, for the status endpoints. */
+  dhanStaticIpState(): {
+    ready: boolean;
+    declared: boolean;
+    configured_ip: string | null;
+    api_verified: boolean | null;
+    primary_ip: string | null;
+    secondary_ip: string | null;
+    checked_at: number | null;
+    error: string | null;
+  } {
+    const configuredIp = this.dhanConfiguredIp();
+    return {
+      ready: this.dhanStaticIpReady(),
+      declared: this.dhanStaticIpDeclared(),
+      configured_ip: configuredIp === "" ? null : configuredIp,
+      api_verified: this.dhanIpVerified,
+      primary_ip: this.dhanIpPrimary,
+      secondary_ip: this.dhanIpSecondary,
+      checked_at: this.dhanIpCheckedAt,
+      error: this.dhanIpError,
+    };
   }
 
   private dhanDataEnabled(): boolean {
@@ -336,8 +492,27 @@ export class ActiveBrokerManager {
     if (!this.dhanAccessToken) problems.push("Dhan is not connected");
     else if (isDhanTokenExpired(this.dhanTokenExpiry)) problems.push("Dhan session expired — reconnect Dhan");
     if (!this.dhanDataEnabled()) problems.push("Dhan data API is disabled (DHAN_DATA_ENABLED=false)");
-    if (!this.dhanStaticIpReady()) problems.push("Static IP not configured — Dhan live order placement is blocked");
-    else if (!this.dhanLiveTradingEnabled()) problems.push("Dhan live trading is disabled (DHAN_LIVE_TRADING_ENABLED=false)");
+    if (!this.dhanStaticIpReady()) {
+      // Say WHICH check failed: "not configured" and "configured but does not match
+      // Dhan's whitelist" need completely different operator actions.
+      if (this.dhanIpError) problems.push(this.dhanIpError);
+      else if (this.dhanConfiguredIp() === "") {
+        problems.push(
+          "Static IP not configured — set DHAN_STATIC_PUBLIC_IP (preferred, API-verified) " +
+            "or DHAN_STATIC_IP_EXPECTED=true. Dhan live order placement is blocked.",
+        );
+      } else {
+        problems.push("Static IP not yet verified against Dhan — live order placement is blocked.");
+      }
+    } else if (!this.dhanLiveTradingEnabled()) {
+      problems.push("Dhan live trading is disabled (DHAN_LIVE_TRADING_ENABLED=false)");
+    } else if (this.dhanConfiguredIp() === "") {
+      // Ready, but on the weaker evidence. Worth saying so.
+      problems.push(
+        "Static IP is accepted on the manual DHAN_STATIC_IP_EXPECTED flag only — " +
+          "set DHAN_STATIC_PUBLIC_IP to have it verified against Dhan.",
+      );
+    }
     if (this.dhanFeed && !this.dhanFeed.isConnected() && this.dhanAccessToken) {
       problems.push("Feed reconnecting");
     }
@@ -494,56 +669,139 @@ export class ActiveBrokerManager {
   }
 
   /** The ACTIVE broker's basket-margin provider. */
-  margins(): { broker: BrokerId; basketMargin: (orders: BoxMarginOrder[]) => Promise<{ initial: number; final: number; total: number }> } {
+  margins(): BoxMarginProvider {
     return {
       broker: this.active,
-      basketMargin: (orders) =>
-        this.active === "zerodha"
-          ? this.deps.kite.getBasketMargin(orders)
-          : this.dhanBasketMargin(orders),
+      basketMargin: async (orders) => {
+        if (this.active === "zerodha") {
+          const res = await this.deps.kite.getBasketMargin(orders);
+          this.lastMarginSource = "kite_basket";
+          return { ...res, source: "kite_basket" as const };
+        }
+        return this.dhanBasketMargin(orders);
+      },
     };
   }
 
   /**
    * Dhan basket margin for the four box legs.
    *
-   * Dhan's calculator is PER-LEG, so the legs are summed. That is a conservative
-   * UPPER bound: it ignores the offsetting benefit a real four-leg box receives, so
-   * the reported margin can only ever be too high, never too low. Under-stating
-   * margin would be dangerous; over-stating it is merely pessimistic, and the figure
-   * is display/accounting only — it never gates a trade.
+   * PREFERS the MULTI-ORDER calculator (`POST /margincalculator/multi`). A box is
+   * margined as a BASKET: the offsetting legs earn a hedge benefit that is most of the
+   * point of the structure, and summing four standalone margins ignores it entirely —
+   * which can over-state the requirement several-fold and make the dashboard's margin
+   * figures useless for comparison.
+   *
+   * All four orders go in one request carrying their REAL BUY/SELL direction and the
+   * `MARGIN` (carry-forward) product; sending them one-directionally would defeat the
+   * hedge recognition this call exists for.
+   *
+   * FALLBACK, clearly labelled: if the multi endpoint genuinely fails, the per-leg sum
+   * is used and tagged `dhan_per_leg_fallback`. That is a conservative UPPER bound, so
+   * a failed multi call can never produce an UNDERSTATED figure — the direction of the
+   * error matters, and understating margin is the one outcome worth avoiding.
    */
-  private async dhanBasketMargin(
-    orders: BoxMarginOrder[],
-  ): Promise<{ initial: number; final: number; total: number }> {
+  private async dhanBasketMargin(orders: BoxMarginOrder[]): Promise<BoxBasketMargin> {
     await this.dhanInstruments.load().catch(() => undefined);
     const bySymbol = new Map<string, DhanInstrument>();
     for (const inst of this.dhanInstruments.instruments) {
       bySymbol.set(`${inst.exchange}:${inst.tradingsymbol}`, inst);
     }
-    let total = 0;
-    let span = 0;
+
+    // Resolve every leg first. A partially resolved basket must NOT be sent: the
+    // hedge benefit of three legs is not the hedge benefit of four, and quietly
+    // margining a subset would understate the requirement.
+    const legs: {
+      exchangeSegment: DhanExchangeSegment;
+      transactionType: "BUY" | "SELL";
+      quantity: number;
+      productType: "MARGIN";
+      securityId: string;
+      price: number;
+    }[] = [];
     for (const order of orders) {
       const inst = bySymbol.get(`${order.exchange}:${order.tradingsymbol}`);
-      if (!inst) continue;
-      const segment = inst.dhan_segment ?? dhanSegmentFor(order.exchange);
-      if (!segment) continue;
+      const segment = inst?.dhan_segment ?? dhanSegmentFor(order.exchange);
+      if (!inst || !segment) continue;
+      legs.push({
+        exchangeSegment: segment,
+        transactionType: order.transaction_type,
+        quantity: order.quantity,
+        // Carry-forward, matching what the Box actually trades. INTRADAY would be
+        // margined differently AND auto-squared-off.
+        productType: "MARGIN",
+        securityId: String(inst.dhan_security_id),
+        price: order.price > 0 ? order.price : 0.05,
+      });
+    }
+    if (legs.length === 0) {
+      return { initial: 0, final: 0, total: 0, source: "unavailable" };
+    }
+
+    const allResolved = legs.length === orders.length;
+
+    // ---- preferred path: one hedge-aware multi-order request ----
+    if (allResolved) {
       try {
-        const res = await this.dhanClient.calculateMargin({
-          exchangeSegment: segment,
-          transactionType: order.transaction_type,
-          quantity: order.quantity,
-          productType: "MARGIN",
-          securityId: String(inst.dhan_security_id),
-          price: order.price > 0 ? order.price : 0.05,
-        });
+        const raw = await this.dhanClient.calculateMultiMargin(legs);
+        const normalized = normalizeDhanMultiMargin(raw);
+        if (normalized) {
+          this.lastMarginSource = "dhan_multi";
+          return {
+            initial: Math.round(normalized.span ?? 0),
+            final: Math.round(normalized.total),
+            total: Math.round(normalized.total),
+            source: "dhan_multi",
+            hedge_benefit: normalized.hedgeBenefit,
+            span: normalized.span,
+            exposure: normalized.exposure,
+          };
+        }
+        console.warn(
+          "[Dhan] multi-order margin returned no readable total — falling back to the per-leg sum.",
+        );
+      } catch (err) {
+        console.warn("[Dhan] multi-order margin failed — falling back to the per-leg sum:", err);
+      }
+    } else {
+      console.warn(
+        `[Dhan] only ${legs.length}/${orders.length} basket legs resolved to a security id — ` +
+          "using the conservative per-leg sum rather than margining a partial basket.",
+      );
+    }
+
+    // ---- fallback: sum standalone legs. Conservative by construction. ----
+    let total = 0;
+    let span = 0;
+    let priced = 0;
+    for (const leg of legs) {
+      try {
+        const res = await this.dhanClient.calculateMargin(leg);
         total += Number(res.totalMargin) || 0;
         span += Number(res.spanMargin) || 0;
+        priced++;
       } catch (err) {
-        console.warn(`[Dhan] margin calculation failed for ${order.tradingsymbol}:`, err);
+        console.warn(`[Dhan] per-leg margin failed for securityId ${leg.securityId}:`, err);
       }
     }
-    return { initial: Math.round(span), final: Math.round(total), total: Math.round(total) };
+    if (priced === 0) {
+      // Nothing priced at all. Report UNAVAILABLE rather than ₹0, so the dashboard
+      // counts it as unknown instead of treating the box as margin-free.
+      this.lastMarginSource = "unavailable";
+      return { initial: 0, final: 0, total: 0, source: "unavailable" };
+    }
+    this.lastMarginSource = "dhan_per_leg_fallback";
+    return {
+      initial: Math.round(span),
+      final: Math.round(total),
+      total: Math.round(total),
+      source: "dhan_per_leg_fallback",
+      // No hedge benefit is recognised in this path — that is precisely why it is a
+      // fallback, and stating null is more honest than implying zero benefit exists.
+      hedge_benefit: null,
+      span,
+      exposure: null,
+    };
   }
 
   /**
@@ -789,6 +1047,9 @@ export class ActiveBrokerManager {
     try {
       if (target === "dhan") {
         await this.dhanInstruments.load(true);
+        // Confirm the whitelist against Dhan now, so `trading_ready` is truthful the
+        // moment the switch completes rather than at the first order attempt.
+        await this.verifyDhanStaticIp().catch(() => undefined);
       }
       await hooks?.reloadUniverse();
     } catch (err) {
@@ -810,6 +1071,8 @@ export class ActiveBrokerManager {
     dhan_configured: boolean;
     dhan_instruments: number;
     dhan_instruments_loaded_at: number | null;
+    dhan_static_ip: ReturnType<ActiveBrokerManager["dhanStaticIpState"]>;
+    last_margin_source: BoxMarginSource | null;
   } {
     return {
       broker: this.active,
@@ -818,6 +1081,9 @@ export class ActiveBrokerManager {
       dhan_configured: readDhanCredentials().ok,
       dhan_instruments: this.dhanInstruments.size,
       dhan_instruments_loaded_at: this.dhanInstruments.lastLoadedAt,
+      dhan_static_ip: this.dhanStaticIpState(),
+      /** Which margin calculation produced the most recent figure. */
+      last_margin_source: this.lastMarginSource,
     };
   }
 }

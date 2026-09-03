@@ -174,12 +174,30 @@ export function registerBrokerRoutes(app: Express, deps: BrokerRouteDeps): void 
         data_ready: health.data_ready,
         trading_ready: health.trading_ready,
         static_ip_configured: health.static_ip_configured,
+        /** The full static-IP picture: declared vs API-verified against Dhan. */
+        static_ip: manager.dhanStaticIpState(),
         feed_connected: health.feed_connected,
         feed_age_ms: health.feed_age_ms,
         problems: health.problems,
         instruments: manager.dhanInstrumentStore.size,
         session: stored ? redactedSession(stored) : null,
       });
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  /**
+   * Re-verify the configured server IP against Dhan's whitelist.
+   *
+   * Exists so an operator who has just whitelisted an address can confirm it without
+   * restarting the process — otherwise the cached verdict would keep blocking trading
+   * until the next switch or boot.
+   */
+  app.post("/api/dhan/verify-ip", requireFullAdmin, async (_req: Request, res: Response) => {
+    try {
+      const result = await manager.verifyDhanStaticIp();
+      res.json({ ok: result.verified, ...result, static_ip: manager.dhanStaticIpState() });
     } catch (err) {
       fail(res, err);
     }

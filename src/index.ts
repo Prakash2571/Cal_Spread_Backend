@@ -5273,6 +5273,12 @@ app.listen(PORT, () => {
       console.warn("[Broker] failed to restore the active broker:", err),
     );
     brokerManager.startActiveFeed();
+    // Confirm the Dhan whitelist at boot when Dhan is the active broker, so
+    // `trading_ready` is truthful from the first status read rather than only after
+    // the first order attempt.
+    if (brokerManager.activeBroker === "dhan") {
+      await brokerManager.verifyDhanStaticIp().catch(() => undefined);
+    }
     // Restore persisted admin/trade sessions so an admin who logged in earlier
     // today stays logged in across a backend restart (no re-entering the secret).
     try {
