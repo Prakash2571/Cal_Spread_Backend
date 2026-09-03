@@ -22,7 +22,7 @@ import {
   type BoxChargeLeg,
 } from "./charges.js";
 import type { BoxExecutionGateway } from "./executionGateway.js";
-import { LocalChargeCalculator } from "./localCharges.js";
+import type { BoxChargeCalculatorLike } from "./brokerContext.js";
 import type { BoxMetrics } from "./metrics.js";
 import {
   evaluateCandidate,
@@ -53,7 +53,8 @@ export interface BoxScannerDeps {
   /** Zerodha estimator — used ONLY for asynchronous reconciliation now. */
   charges: BoxChargeEstimator;
   /** The synchronous, deterministic charge calculator for the hot path. */
-  localCharges: LocalChargeCalculator;
+  /** The ACTIVE broker's charge calculator (see brokerContext.ts). */
+  localCharges: BoxChargeCalculatorLike;
   /** Central mode-neutral execution gateway. */
   executionSim: BoxExecutionGateway;
   positions: BoxPositionBook;

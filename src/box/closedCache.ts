@@ -100,4 +100,27 @@ export class BoxClosedTradeCache {
     const map = await hGetAllJson<SerializedBoxTrade>(dayKey(day));
     return sortClosedNewestFirst([...map.values()]);
   }
+
+  /**
+   * Evict one trade from a day's cache (HDEL).
+   *
+   * Needed because a deletion is the ONLY operation that removes a trade. Every
+   * other write path is additive or overwrites in place, which is why this cache
+   * had no eviction until now: HSET made re-mirroring idempotent and nothing ever
+   * disappeared. A deleted trade left behind here would keep being served to the
+   * Closed-trades tab from the fast path — the cache would outlive the record and
+   * quietly contradict Mongo.
+   *
+   * Best-effort like every other method: a failed HDEL returns false and the
+   * caller carries on, because the in-memory list and Mongo have already been
+   * corrected and are authoritative.
+   */
+  async evictTrade(day: string, tradeId: string): Promise<boolean> {
+    if (!this.enabled()) return false;
+    // `hashWriteCommands` takes the stale fields to drop as its third argument, so
+    // an eviction is expressed with no entries to write and one field to delete.
+    const cmds = hashWriteCommands(dayKey(day), new Map(), [tradeId], this.cfg.closedCacheTtlSec);
+    if (cmds.length === 0) return false;
+    return (await pipeline(cmds)) !== null;
+  }
 }

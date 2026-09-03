@@ -116,6 +116,26 @@ export class BoxPnlCache {
       .sort((a, b) => a.day.localeCompare(b.day));
   }
 
+  /**
+   * Evict one trade's row from a day's cached P&L (HDEL).
+   *
+   * The day hash is rewritten every cycle, but `writeSnapshot` only ever HSETs the
+   * rows it currently knows about — it never removes fields that vanished. So a
+   * deleted trade's row would SURVIVE indefinitely and, because the nightly
+   * archiver prefers the cache over a fresh query, could later be drained into
+   * `box_daily_pnl` as though the trade still existed. This closes that path.
+   *
+   * The summary field is deliberately left alone: the caller rewrites it from the
+   * recomputed totals immediately afterwards, and deleting it here would briefly
+   * make the day look summary-less to a concurrent reader.
+   */
+  async evictTrade(day: string, tradeId: string): Promise<boolean> {
+    if (!this.enabled()) return false;
+    const cmds = hashWriteCommands(dayKey(day), new Map(), [tradeId], this.cfg.pnlCacheTtlSec);
+    if (cmds.length === 0) return false;
+    return (await pipeline(cmds)) !== null;
+  }
+
   /** Flag a day as archived in the index (keeps it readable for verify). */
   async markArchived(day: string, rowCount: number, nowIso: string): Promise<void> {
     if (!this.enabled()) return;

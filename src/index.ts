@@ -56,6 +56,12 @@ import { startEodScheduler, backfillStockFutures, checkAndRecomputeSummary } fro
 // cache and charge estimator by injection. It owns its own routes, models and
 // collections; the calendar strategy remains unchanged.
 import { registerBoxModule, type BoxModule } from "./box/index.js";
+import { ActiveBrokerManager } from "./brokers/registry.js";
+import { registerBrokerRoutes } from "./brokers/routes.js";
+import { HistoryProvider } from "./brokers/history.js";
+import { parseBrokerId, type BrokerId } from "./brokers/types.js";
+import { LocalChargeCalculator } from "./box/localCharges.js";
+import { countUnresolvedBoxOrderIntentsForBroker } from "./box/repository.js";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
@@ -95,6 +101,44 @@ const tickerHub = new TickerHub(
     onFeedSessionLost?.();
   },
 );
+
+/**
+ * THE ACTIVE BROKER MANAGER — the single authority on which broker owns the system.
+ *
+ * Constructed here (not inside the box module) because it is the app's broker
+ * registry, and both the calendar routes and the Box module consume its providers.
+ * `attach()` is called once the box engine exists, which is what lets the manager
+ * inspect exposure before allowing a switch.
+ */
+const brokerManager = new ActiveBrokerManager({
+  kite,
+  tickerHub,
+  boxConfig: () => boxModule.engine.getConfigRaw(),
+  istDayKey,
+  // Dhan ticks are pushed into the shared hub's caches so EVERY existing consumer
+  // (the Box quote store, SSE clients, analytics) sees them through the same path it
+  // already uses. No consumer needs to know which broker produced a tick.
+  onDhanTicks: (ticks) => tickerHub.ingestExternalTicks(ticks),
+  onDhanConnection: (connected) => tickerHub.setExternalConnected(connected),
+  onSessionLost: (broker, reason) => {
+    console.warn(`[Broker] ${broker} session lost: ${reason}`);
+    onFeedSessionLost?.();
+  },
+});
+
+/**
+ * Broker-neutral historical candles.
+ *
+ * Same method signatures and return shapes as the KiteClient methods it replaces, so
+ * every existing chart route — and therefore the frontend's response contracts — is
+ * untouched while the DATA now comes from whichever broker is active.
+ */
+const history = new HistoryProvider({
+  activeBroker: () => brokerManager.activeBroker,
+  kite,
+  dhan: brokerManager.dhan,
+  dhanInstruments: brokerManager.dhanInstrumentStore,
+});
 
 // Capture-scheduler deps, held at module scope so a login (which happens after
 // startup) can immediately trigger a backfill of any slots missed while down.
@@ -921,7 +965,12 @@ app.set("etag", false);
 // --- CORS (so the Vite frontend can call this API) ---
 app.use((req: Request, res: Response, next: NextFunction) => {
   res.header("Access-Control-Allow-Origin", FRONTEND_URL);
-  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  // DELETE is in the list for the destructive Box-trade and calendar-trade
+  // endpoints. Without it the browser's preflight fails and the request never
+  // reaches Express — which is why the existing manual-close endpoint had to be a
+  // POST. Adding the verb here does not widen access: every destructive route is
+  // still behind full-admin authentication.
+  res.header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, x-admin-token");
   res.header("Access-Control-Allow-Credentials", "true");
   // Prevent browser/proxy caching of API responses (no 304 revalidation).
@@ -1094,19 +1143,41 @@ app.post(
     max: 10,
     message: "Too many attempts. Try again in a few minutes.",
   }),
-  (req: Request, res: Response) => {
-  const { secret } = req.body;
-  
+  async (req: Request, res: Response) => {
+  const { secret, broker: requestedBroker } = req.body ?? {};
+
   if (!ADMIN_SECRET) {
     res.status(500).json({ error: "Admin secret not configured on server" });
     return;
   }
-  
+
   if (secret !== ADMIN_SECRET) {
     res.status(401).json({ error: "Invalid admin secret" });
     return;
   }
-  
+
+  // The broker is OPTIONAL so an existing client that only sends `secret` keeps
+  // working. When present it must be valid — silently ignoring a typo would log the
+  // operator in against a different broker than the one they picked.
+  let broker = brokerManager.activeBroker;
+  let switchBlockers: unknown[] = [];
+  if (requestedBroker !== undefined && requestedBroker !== null && requestedBroker !== "") {
+    const parsed = parseBrokerId(requestedBroker);
+    if (!parsed) {
+      res.status(400).json({ error: 'broker must be "zerodha" or "dhan".' });
+      return;
+    }
+    // Authenticate FIRST, then attempt the switch: a refused switch must not also
+    // deny the login, or an operator could never reach the UI to clear the exposure
+    // that is blocking it.
+    const result = await brokerManager.switchBroker(parsed, "full");
+    if (result.ok) {
+      broker = result.broker;
+    } else {
+      switchBlockers = result.blockers;
+    }
+  }
+
   const token = generateAdminToken();
   const expiry = Date.now() + ADMIN_SESSION_TTL_MS;
   adminSessions.set(token, { expiry, role: "full" });
@@ -1116,6 +1187,15 @@ app.post(
     success: true,
     token,
     role: "full",
+    broker,
+    // Present only when a requested switch was refused, so the UI can explain why
+    // the session is still on the previous broker.
+    ...(switchBlockers.length > 0
+      ? {
+          broker_switch_refused: true,
+          broker_switch_blockers: switchBlockers,
+        }
+      : {}),
     expiresIn: ADMIN_SESSION_TTL_MS,
   });
 });
@@ -1149,6 +1229,9 @@ app.post(
       success: true,
       token,
       role: "trade",
+      // INHERITED, never selected. A trade-access user must not be able to move the
+      // whole system onto a different broker.
+      broker: brokerManager.activeBroker,
       expiresIn: ADMIN_SESSION_TTL_MS,
     });
   },
@@ -1158,7 +1241,11 @@ app.post(
 app.get("/api/admin/status", (req: Request, res: Response) => {
   const token = req.headers["x-admin-token"] as string | undefined;
   const role = getAdminRole(token);
-  res.json({ authenticated: role !== null, role });
+  // The broker is reported to BOTH roles: a trade-access user inherits the active
+  // broker and needs to know which one they are looking at — they just cannot change
+  // it. `authenticated` here means an ADMIN session, never a broker session; the
+  // broker's own connectivity is reported by /api/broker/status.
+  res.json({ authenticated: role !== null, role, broker: brokerManager.activeBroker });
 });
 
 // --- Step 1: send the user to Zerodha's login page ---
@@ -1608,7 +1695,7 @@ app.get("/api/history/:symbol", async (req: Request, res: Response) => {
       points: { date: string; oi: number; close: number }[];
     }[] = [];
     for (const f of item.futures) {
-      const candles = await kite.getHistoricalOi(f.token, fmtDate(from), fmtDate(to));
+      const candles = await history.getHistoricalOi(f.token, fmtDate(from), fmtDate(to));
       futures.push({
         token: f.token,
         expiry: f.expiry,
@@ -1668,7 +1755,7 @@ app.get("/api/spread-history/:symbol", async (req: Request, res: Response) => {
     const futureCandles: Map<string, number>[] = []; // date -> close per future
     for (let i = 0; i < item.futures.length; i++) {
       if (i > 0) await delay(200);
-      const candles = await kite.getHistorical(item.futures[i]!.token, fromStr, toStr, "day");
+      const candles = await history.getHistorical(item.futures[i]!.token, fromStr, toStr, "day");
       const map = new Map<string, number>();
       for (const c of candles) {
         map.set(c.t.slice(0, 10), c.close);
@@ -1768,7 +1855,7 @@ app.get("/api/intraday/:symbol", async (req: Request, res: Response) => {
       points: { t: string; close: number }[];
     }[] = [];
     for (const f of item.futures) {
-      const candles = await kite.getHistorical(
+      const candles = await history.getHistorical(
         f.token,
         fmtDate(from),
         fmtDate(to),
@@ -1829,7 +1916,7 @@ app.get("/api/minute/:symbol", async (req: Request, res: Response) => {
       points: { t: string; close: number }[];
     }[] = [];
     for (const f of item.futures) {
-      const candles = await kite.getHistorical(
+      const candles = await history.getHistorical(
         f.token,
         istDateTime(fromD),
         istDateTime(toD),
@@ -1887,7 +1974,7 @@ app.get("/api/fivemin/:symbol", async (req: Request, res: Response) => {
       points: { t: string; close: number }[];
     }[] = [];
     for (const f of item.futures) {
-      const candles = await kite.getHistorical(f.token, today, today, "5minute");
+      const candles = await history.getHistorical(f.token, today, today, "5minute");
       futures.push({
         token: f.token,
         expiry: f.expiry,
@@ -3719,7 +3806,7 @@ async function backfillPrevClose(): Promise<void> {
     }
     if (!ref) {
       try {
-        const spotDaily = await kite.getHistoricalOiSeries(
+        const spotDaily = await history.getHistoricalOiSeries(
           sel.spotToken,
           fromStr,
           toStr,
@@ -3766,7 +3853,7 @@ async function backfillPrevClose(): Promise<void> {
       // A previous close never changes, so a retry only fetches what's missing.
       if (tokens[token]) continue;
       try {
-        const candles = await kite.getHistoricalOiSeries(
+        const candles = await history.getHistoricalOiSeries(
           token,
           fromStr,
           toStr,
@@ -4462,7 +4549,7 @@ async function backfillOiFrames(fromMsOverride?: number): Promise<void> {
     const toStr = istDateTime(new Date(now));
 
     // 1) Spot minute candles → close per minute (drives ATM per timestamp).
-    const spotCandles = await kite.getHistorical(
+    const spotCandles = await history.getHistorical(
       sel.spotToken,
       fromStr,
       toStr,
@@ -4516,7 +4603,7 @@ async function backfillOiFrames(fromMsOverride?: number): Promise<void> {
       if (tok == null || oiByToken.has(tok)) return;
       let candles: { t: string; close: number; oi: number }[] = [];
       try {
-        candles = await kite.getHistoricalOiSeries(
+        candles = await history.getHistoricalOiSeries(
           tok,
           fromStr,
           toStr,
@@ -4528,7 +4615,7 @@ async function backfillOiFrames(fromMsOverride?: number): Promise<void> {
         // minute of the window, so pay for a single retry before giving up on it.
         await delay(1200);
         try {
-          candles = await kite.getHistoricalOiSeries(
+          candles = await history.getHistoricalOiSeries(
           tok,
           fromStr,
           toStr,
@@ -4909,7 +4996,7 @@ async function backfillFutOiFrames(fromMsOverride?: number): Promise<void> {
     const byExpiry = new Map<string, Map<string, { oi: number; close: number }>>();
     const tsByMin = new Map<string, string>();
     for (const c of sel.contracts) {
-      const candles = await kite.getHistoricalOiSeries(
+      const candles = await history.getHistoricalOiSeries(
         c.token,
         fromStr,
         toStr,
@@ -5104,8 +5191,67 @@ const boxModule: BoxModule = registerBoxModule(app, {
   getBasketMargin: (orders) => kite.getBasketMargin(orders),
   requireAdmin,
   getAdminRole,
+  // ---- broker-neutral wiring: every one of these routes to the ACTIVE broker ----
+  activeBroker: () => brokerManager.activeBroker,
+  marketData: brokerManager.marketData(),
+  margins: brokerManager.margins(),
+  // Subscriptions go to whichever feed is active; the hub is still the publish path
+  // for both brokers (see TickerHub.ingestExternalTicks).
+  feed: {
+    addTickListener: (fn) => tickerHub.addTickListener(fn),
+    addConnectionListener: (fn) => tickerHub.addConnectionListener(fn),
+    retain: () => tickerHub.retain(),
+    subscribeTokens: (tokens) => brokerManager.subscribeTokens(tokens),
+    unsubscribeTokens: (tokens) => brokerManager.unsubscribeTokens(tokens),
+    subscribedCount: () => brokerManager.subscribedCount(),
+    isConnected: () => brokerManager.feedConnected(),
+  },
+  // The ACTIVE broker's fee schedule. A Dhan trade costed with Zerodha brokerage
+  // would make the expected-net gate spend money it does not have.
+  charges: brokerManager.activeBroker === "dhan"
+    ? brokerManager.dhanChargeCalculator()
+    : new LocalChargeCalculator(),
+  // The engine no longer builds broker transports itself. The registry assembles the
+  // ACTIVE broker's adapter and REFUSES to build one for any other broker.
+  createLiveAdapter: (ctx) => brokerManager.createLiveAdapter(ctx),
 });
 onFeedSessionLost = () => boxModule.engine.onSessionLost();
+
+/**
+ * Give the broker manager its view of live exposure, and the teardown hooks a switch
+ * needs. Done here rather than in the constructor because the engine must exist first
+ * — the manager inspects it, and the engine consumes the manager's providers.
+ */
+brokerManager.attach(
+  {
+    scannerRunning: () => boxModule.engine.exposureSummary().scannerRunning,
+    openPositionCount: () => boxModule.engine.exposureSummary().openPositions,
+    brokersWithOpenPositions: () => boxModule.engine.exposureSummary().brokersWithOpenPositions,
+    workingOrderCount: () => boxModule.engine.exposureSummary().workingOrders,
+    executionInFlight: () => boxModule.engine.exposureSummary().executionInFlight,
+    reconciliationComplete: () => boxModule.engine.exposureSummary().reconciliationComplete,
+    residualLegCount: () => boxModule.engine.exposureSummary().residualLegs,
+    unknownOrderCount: () => boxModule.engine.exposureSummary().unknownOrders,
+    // Broker-scoped: an intent may only ever be reconciled through the broker that
+    // created it, so leaving a broker with unresolved intents is refused.
+    unresolvedIntentsFor: (broker) => countUnresolvedBoxOrderIntentsForBroker(broker),
+  },
+  {
+    stopScanner: () => boxModule.engine.stop(),
+    invalidateBooks: () => boxModule.engine.invalidateBooks(),
+    reloadUniverse: () => boxModule.engine.reloadUniverse(),
+    publish: () => boxModule.engine.publishNow(),
+  },
+);
+
+registerBrokerRoutes(app, {
+  manager: brokerManager,
+  requireAdmin,
+  requireFullAdmin,
+  getAdminRole,
+  // Every open tab must see a broker change immediately, not on the next poll.
+  onBrokerChanged: () => boxModule.engine.publishNow(),
+});
 
 app.listen(PORT, () => {
   console.log(`Cal_Spread backend listening on http://localhost:${PORT}`);
@@ -5119,6 +5265,20 @@ app.listen(PORT, () => {
     // Restore a same-day Zerodha session BEFORE the schedulers run, so hourly
     // capture / backfill have a session immediately after a restart.
     await restoreSessionOnStartup();
+    // Restore the broker the operator selected BEFORE anything can price a trade.
+    // Without this a restart would silently revert to Zerodha and stamp new trades
+    // `broker: "zerodha"` while the operator believed Dhan was active — a mistake
+    // that becomes invisible once written.
+    await brokerManager.restore().catch((err) =>
+      console.warn("[Broker] failed to restore the active broker:", err),
+    );
+    brokerManager.startActiveFeed();
+    // Confirm the Dhan whitelist at boot when Dhan is the active broker, so
+    // `trading_ready` is truthful from the first status read rather than only after
+    // the first order attempt.
+    if (brokerManager.activeBroker === "dhan") {
+      await brokerManager.verifyDhanStaticIp().catch(() => undefined);
+    }
     // Restore persisted admin/trade sessions so an admin who logged in earlier
     // today stays logged in across a backend restart (no re-entering the secret).
     try {

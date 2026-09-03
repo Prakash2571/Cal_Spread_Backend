@@ -14,8 +14,15 @@
  */
 
 import type { Response } from "express";
-import type { Instrument, KiteClient } from "../kite.js";
-import type { TickerHub } from "../hub.js";
+import type { Instrument } from "../kite.js";
+import type { BrokerId } from "../brokers/types.js";
+import type {
+  BoxChargeCalculatorLike,
+  BoxFeedProvider,
+  BoxLiveAdapterFactory,
+  BoxMarginProvider,
+  BoxMarketDataProvider,
+} from "./brokerContext.js";
 import type { Tick } from "../ticker.js";
 import {
   BOX_TUNING_KEYS,
@@ -34,9 +41,7 @@ import { BoxChargeEstimator, buildEntryChargeLegs, type BoxChargeLeg, type Price
 import { BoxChargeReconciler } from "./chargeReconciler.js";
 import { BoxExecutionSimulator } from "./executionSimulator.js";
 import { CentralBoxExecutionGateway, type BoxExecutionGateway } from "./executionGateway.js";
-import { KiteBrokerAdapter, KiteHttpTransport, kiteAdapterConfigFromBoxConfig } from "./kiteBrokerAdapter.js";
 import { BoxOrderManager, orderManagerLimitsFromConfig, type OrderManagerReconcileReport } from "./orderManager.js";
-import { LocalChargeCalculator } from "./localCharges.js";
 import { BoxMetrics } from "./metrics.js";
 import {
   buildUnderlyingState,
@@ -58,10 +63,15 @@ import {
   applyBoxPartialExit,
   applyBoxReconciledProjection,
   closeBoxTrade,
+  deleteBoxDailyPnlForTrade,
+  deleteBoxTrade,
+  findBoxTradeById,
   insertBoxExecutionAttempt,
   insertBoxTrade,
   isBoxDbEnabled,
+  isValidBoxId,
   loadBoxDailyPnlTradeIds,
+  loadBoxMarginIntervalsSince,
   loadBoxExecutionAttempts,
   loadBoxLiveRiskSeed,
   loadBoxSettings,
@@ -118,31 +128,57 @@ import {
 } from "./types.js";
 import type { BoxExecutionFailureReason } from "./types.js";
 import { entrySideFor } from "./math.js";
+import { brokerOf } from "../brokers/types.js";
+import { peakConcurrentMargin, usableMarginIntervals } from "./marginReplay.js";
 
 export interface BoxEngineDeps {
-  kite: KiteClient;
-  tickerHub: TickerHub;
+  /**
+   * Broker-neutral market data. NOT a KiteClient: the engine must not be able to
+   * name a venue. See brokerContext.ts for why the surface is this small.
+   */
+  marketData: BoxMarketDataProvider;
+  /**
+   * Which broker currently owns the feed, the scanner and execution.
+   *
+   * A function rather than a value because it is read at decision time: a broker
+   * switch must be visible to the very next trade the engine stamps, without
+   * reconstructing the engine.
+   */
+  activeBroker: () => BrokerId;
+  /**
+   * The ACTIVE broker's live feed. Not a TickerHub: the engine must not be able to
+   * reach a specific broker's socket (see brokerContext.ts).
+   */
+  feed: BoxFeedProvider;
+  /**
+   * The ACTIVE broker's charge calculator.
+   *
+   * Injected rather than constructed, because the expected-net gate spends whatever
+   * this says — costing a Dhan trade with Zerodha brokerage would make the gate
+   * quietly wrong.
+   */
+  charges: BoxChargeCalculatorLike;
   getAllInstruments: () => Promise<Instrument[]>;
   getBoard: () => Promise<BoxBoardItem[]>;
-  /** The calendar engine's Zerodha charge estimator, injected UNCHANGED. */
+  /**
+   * The ACTIVE broker's charge estimator.
+   *
+   * Broker-scoped on purpose: a Dhan trade costed with Zerodha brokerage would
+   * make the expected-net gate spend money it does not have. The registry swaps
+   * this with the broker.
+   */
   priceChargeGroups: PriceChargeGroupsFn;
   istDayKey: (at?: number) => string;
   makeIdResolver: (all: Instrument[]) => (token: number) => string | null;
   /** NSE equity-derivatives hours, reused from the calendar engine. */
   isMarketOpen: () => boolean;
-  /** Zerodha basket-margin API, reused unchanged from the calendar engine. */
-  getBasketMargin: (
-    orders: {
-      exchange: string;
-      tradingsymbol: string;
-      transaction_type: "BUY" | "SELL";
-      variety: string;
-      product: string;
-      order_type: string;
-      quantity: number;
-      price: number;
-    }[],
-  ) => Promise<{ initial: number; final: number; total: number }>;
+  /** The ACTIVE broker's basket-margin provider. */
+  margins: BoxMarginProvider;
+  /**
+   * Builds the live order adapter. Absent ⇒ live execution is impossible, which
+   * is the correct default: no injected adapter means no way to place an order.
+   */
+  createLiveAdapter?: BoxLiveAdapterFactory;
 }
 
 /** Minutes past IST midnight, right now. */
@@ -161,7 +197,7 @@ export class BoxEngine {
   private spots = new SpotStore();
   private positions = new BoxPositionBook();
   private charges: BoxChargeEstimator;
-  private localCharges: LocalChargeCalculator;
+  private localCharges: BoxChargeCalculatorLike;
   private executionSim: BoxExecutionSimulator;
   private execution: BoxExecutionGateway;
   private orderManager: BoxOrderManager | null = null;
@@ -308,7 +344,8 @@ export class BoxEngine {
   constructor(private deps: BoxEngineDeps) {
     this.cfg = loadBoxConfig();
     this.charges = new BoxChargeEstimator(deps.priceChargeGroups, this.cfg);
-    this.localCharges = new LocalChargeCalculator();
+    // The ACTIVE broker's fee schedule, injected by the registry.
+    this.localCharges = deps.charges;
     this.metrics = new BoxMetrics(this.cfg.metricsWindow);
     this.directions = this.cfg.enableShortBox ? BOX_DIRECTIONS : (["LONG_BOX"] as const);
     this.strikeLevel = this.cfg.defaultStrikeLevel;
@@ -326,20 +363,17 @@ export class BoxEngine {
     });
 
     if (this.cfg.executionMode === "live") {
-      const apiKey = process.env.KITE_API_KEY?.trim() ?? "";
-      if (!apiKey) {
-        throw new Error("[Box] live execution blocked: KITE_API_KEY is missing.");
+      // The strategy does not build broker transports. The registry assembles the
+      // active broker's adapter and injects the factory; a missing factory means
+      // live execution is not possible, and that must stop startup rather than
+      // quietly fall back to simulated fills.
+      const createAdapter = this.deps.createLiveAdapter;
+      if (!createAdapter) {
+        throw new Error(
+          "[Box] live execution blocked: no live execution adapter was injected for the active broker.",
+        );
       }
-      const transport = new KiteHttpTransport({
-        apiKey,
-        accessToken: () => {
-          const token = this.deps.kite.getAccessToken();
-          if (!token) throw new Error("[Box] live execution blocked: Kite access-token session is missing.");
-          return token;
-        },
-        timeoutMs: this.cfg.liveHttpTimeoutMs,
-      });
-      const adapter = new KiteBrokerAdapter(transport, kiteAdapterConfigFromBoxConfig(this.cfg));
+      const adapter = createAdapter({ broker: this.deps.activeBroker(), cfg: this.cfg });
       this.orderManager = new BoxOrderManager({
         adapter,
         persistence: boxOrderIntentPersistence,
@@ -370,7 +404,7 @@ export class BoxEngine {
       cfg: this.cfg,
       charges: this.charges,
       metrics: this.metrics,
-      isAuthenticated: () => this.deps.kite.getAccessToken() !== null,
+      isAuthenticated: () => this.deps.marketData.isAuthenticated(),
       persist: (tradeId, phase, verdict) =>
         setBoxChargeReconciliation(tradeId, phase, verdict),
       onReconciled: (tradeId, phase, verdict, warned) => {
@@ -527,8 +561,10 @@ export class BoxEngine {
       if (!isBoxDbEnabled()) {
         throw new Error("[Box] live execution blocked: Box database is not ready.");
       }
-      if (!this.deps.kite.getAccessToken()) {
-        throw new Error("[Box] live execution blocked: Kite access-token session is missing.");
+      if (!this.deps.marketData.isAuthenticated()) {
+        throw new Error(
+          `[Box] live execution blocked: the ${this.deps.activeBroker()} broker session is missing.`,
+        );
       }
     }
     // Admin-saved thresholds override the env defaults, before anything can be
@@ -663,7 +699,7 @@ export class BoxEngine {
     // would empty the page when Zerodha is disconnected, with nothing able to
     // repopulate it — a control documented as affecting only new discovery should
     // not be able to blank the view.
-    if (this.deps.kite.getAccessToken()) {
+    if (this.deps.marketData.isAuthenticated()) {
       try {
         // The published list describes the OLD window, so it has to go: leaving it
         // up would show boxes at strikes that are no longer monitored, which is
@@ -828,7 +864,7 @@ export class BoxEngine {
 
   /** RUN: start discovering qualified boxes; execution remains gated separately. */
   async start(): Promise<{ ok: boolean; error?: string }> {
-    if (!this.deps.kite.getAccessToken()) {
+    if (!this.deps.marketData.isAuthenticated()) {
       return { ok: false, error: "Connect to Zerodha before starting the box scanner." };
     }
     if (!isBoxDbEnabled()) {
@@ -1118,7 +1154,7 @@ export class BoxEngine {
    */
   private async refreshClosedMarketView(): Promise<void> {
     if (this.marketOpen) return;
-    if (!this.deps.kite.getAccessToken()) return;
+    if (!this.deps.marketData.isAuthenticated()) return;
     try {
       await this.refreshUniverse();
     } catch (err) {
@@ -1136,7 +1172,7 @@ export class BoxEngine {
    * but never traded.
    */
   async refreshIndicative(): Promise<void> {
-    if (!this.deps.kite.getAccessToken()) return;
+    if (!this.deps.marketData.isAuthenticated()) return;
     // Price every leg of every monitored WINDOW, not just the tokens that happen to
     // be streaming. With discovery off the feed carries only open positions' legs,
     // so keying off subscriptions meant the last-close view could see almost
@@ -1156,7 +1192,7 @@ export class BoxEngine {
         .filter((s): s is string => typeof s === "string");
       if (ids.length === 0) return;
       // Chunked at 500 identifiers per request inside the client.
-      const quotes = await this.deps.kite.getQuoteFull(ids);
+      const quotes = await this.deps.marketData.getQuoteFull(ids);
 
       // Only legs that traded in the LATEST session may be compared.
       //
@@ -1213,17 +1249,17 @@ export class BoxEngine {
   /** Attach to the shared feed (tick/lifecycle listeners + retainer + publish loop). */
   private ensureFeed(): void {
     if (!this.removeTickListener) {
-      this.removeTickListener = this.deps.tickerHub.addTickListener((ticks) =>
+      this.removeTickListener = this.deps.feed.addTickListener((ticks) =>
         this.onTicks(ticks),
       );
     }
     if (!this.removeConnectionListener) {
-      this.removeConnectionListener = this.deps.tickerHub.addConnectionListener(() =>
+      this.removeConnectionListener = this.deps.feed.addConnectionListener(() =>
         this.invalidateFeedGeneration(),
       );
     }
     if (!this.releaseRetainer) {
-      this.releaseRetainer = this.deps.tickerHub.retain();
+      this.releaseRetainer = this.deps.feed.retain();
     }
     if (!this.publishTimer) {
       this.publishTimer = setInterval(() => this.publish(), this.cfg.publishIntervalMs);
@@ -1386,7 +1422,7 @@ export class BoxEngine {
    *     last-close prices over REST and subscribed to nothing.
    */
   async refreshUniverse(): Promise<void> {
-    if (!this.deps.kite.getAccessToken()) return;
+    if (!this.deps.marketData.isAuthenticated()) return;
     const now = Date.now();
     const today = this.deps.istDayKey();
 
@@ -1581,7 +1617,7 @@ export class BoxEngine {
       .filter((s): s is string => typeof s === "string");
     if (ids.length === 0) return;
     try {
-      const quotes = await this.deps.kite.getQuoteFull(ids);
+      const quotes = await this.deps.marketData.getQuoteFull(ids);
       const at = Date.now();
       const bySymbol = new Map(quotes.map((q) => [q.instrument_token, q]));
       for (const b of missing) {
@@ -1606,9 +1642,9 @@ export class BoxEngine {
     this.subscribedOptionTokens = wantOption;
     this.subscribedSpotTokens = wantSpot;
 
-    if (toAdd.length > 0) this.deps.tickerHub.subscribeTokens(toAdd);
+    if (toAdd.length > 0) this.deps.feed.subscribeTokens(toAdd);
     if (toDrop.length > 0) {
-      this.deps.tickerHub.unsubscribeTokens(toDrop);
+      this.deps.feed.unsubscribeTokens(toDrop);
       this.quotes.forget(toDrop);
     }
   }
@@ -1833,8 +1869,12 @@ export class BoxEngine {
     // The recorded net edge is the expected NET profit the entry qualified on.
     const recordedNetEdge =
       decision.expected_net_profit ?? round2(evaluation.gross_edge! - this.cfg.safetyBuffer);
+    const broker = this.deps.activeBroker();
     const payload: IBoxTrade = {
       execution_mode: this.cfg.executionMode,
+      // Stamped at creation and never changed again. Which broker's feed priced
+      // these legs, and whose fee schedule costed them, is not recoverable later.
+      broker,
       underlying: candidate.underlying,
       name: candidate.name,
       is_index: candidate.is_index,
@@ -1929,6 +1969,8 @@ export class BoxEngine {
     const position: BoxOpenPosition = {
       id,
       key: candidate.key,
+      broker,
+      execution_mode: this.cfg.executionMode,
       underlying: candidate.underlying,
       name: candidate.name,
       is_index: candidate.is_index,
@@ -2302,10 +2344,10 @@ export class BoxEngine {
     try {
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
-          const res = await this.deps.getBasketMargin(orders);
+          const res = await this.deps.margins.basketMargin(orders);
           // Accept whatever the API returns, INCLUDING a small or zero figure: a
-          // long box is a hedged position, so Zerodha's position-aware margin can
-          // legitimately be low. Only a thrown error (network / auth / rate
+          // long box is a hedged position, so a position-aware basket margin can
+          // legitimately be low, whichever broker computed it. Only a thrown error (network / auth / rate
           // limit) is a miss worth retrying — a successful small number is real.
           if (!Number.isFinite(res.total)) {
             throw new Error(`basket margin returned a non-numeric total`);
@@ -2348,7 +2390,7 @@ export class BoxEngine {
    * rounds it is left null and reported as unknown.
    */
   private backfillMissingMargins(): void {
-    if (!this.deps.kite.getAccessToken()) return;
+    if (!this.deps.marketData.isAuthenticated()) return;
     for (const pos of this.positions.list()) {
       if (pos.margin !== null) continue;
       if (this.marginInFlight.has(pos.id)) continue;
@@ -2406,6 +2448,12 @@ export class BoxEngine {
     this.positions.add({
       id: doc._id.toString(),
       key: tradeKey(doc),
+      // Read from the DOCUMENT, never from the running config. An adopted position
+      // may predate a broker switch or an execution-mode change, and the delete
+      // guard and the foreign-exposure guard both depend on the truth of what this
+      // position actually is — not on how the process happens to be configured now.
+      broker: brokerOf(doc),
+      execution_mode: doc.execution_mode,
       underlying: doc.underlying,
       name: doc.name,
       is_index: doc.is_index,
@@ -2452,6 +2500,209 @@ export class BoxEngine {
       config: doc.scanner_config_snapshot,
     });
     return true;
+  }
+
+  /* ------------------------------ deletion -------------------------------- */
+
+  /**
+   * PERMANENTLY delete a PAPER box trade — open, closed or errored — and correct
+   * every trade-derived statistic from what actually remains.
+   *
+   * WHY DELETION IS NOT "CLOSE WITH EXTRA STEPS"
+   * A close is a market event: it produces fills, realises P&L and belongs in the
+   * day's history. A delete is an ADMINISTRATIVE correction: the trade should never
+   * have counted at all. So nothing about it may survive in any statistic, in any
+   * of the four places box state lives (in-process memory, Redis, Mongo, and the
+   * P&L archive) — and the numbers must be RECOMPUTED, not adjusted.
+   *
+   * WHY LIVE TRADES ARE REFUSED
+   * A live box may have real broker exposure attached. Deleting the record would
+   * orphan it: the position would still exist at the broker with nothing in our
+   * database pointing at it, so no reconciliation, no monitor and no flatten could
+   * ever find it again. An open live trade must be flattened first. A CLOSED live
+   * trade is retained too, deliberately — it is the audit record of real money
+   * moving, and `deleteBoxTrade`'s query guard refuses both cases.
+   *
+   * Returns a `{ ok, code, error }` result in the same shape as `closeManually`, so
+   * the route surfaces it with `res.status(result.code)` exactly as it already does.
+   */
+  async deleteTrade(
+    id: string,
+    opts: { actor: string; reason?: string | null } = { actor: "admin" },
+  ): Promise<{ ok: boolean; code: number; error?: string; deleted?: SerializedBoxTrade | null }> {
+    if (!isValidBoxId(id)) {
+      return { ok: false, code: 400, error: "Invalid trade id." };
+    }
+    if (!isBoxDbEnabled()) {
+      return { ok: false, code: 503, error: "The Box database is not available." };
+    }
+
+    // Read first — but ONLY to choose the right status code and to capture the
+    // audit fields before they vanish. The delete itself is guarded in its own
+    // query, so this read is never load-bearing for the safety decision.
+    const doc = await findBoxTradeById(id);
+    if (!doc) {
+      return { ok: false, code: 404, error: "No such Box trade." };
+    }
+    const serialized = serializeBoxTrade(doc);
+
+    if (doc.execution_mode === "live") {
+      // Distinct messages: an open live position is a live-exposure problem the
+      // operator can act on, whereas a closed live trade is a retention decision.
+      const message = doc.status === "open"
+        ? "Cannot delete an open live trade because broker exposure may still exist. Flatten/close it first."
+        : "Closed LIVE trades are retained as the audit record of real executed orders and cannot be deleted.";
+      return { ok: false, code: 409, error: message };
+    }
+
+    const position = this.positions.get(id);
+
+    // A paper position mid-exit is still refused. `closing` means an exit is in
+    // flight and `pendingFinalPersists` may already hold a CONFIRMED fill; deleting
+    // underneath that would race the persist and could resurrect the document.
+    if (position?.closing) {
+      return {
+        ok: false,
+        code: 409,
+        error: "This trade is currently being closed. Wait for the exit to finish, then delete it.",
+      };
+    }
+
+    const deletedCount = await deleteBoxTrade(id);
+    if (deletedCount === 0) {
+      // The guarded filter refused it or it vanished between the read and here.
+      return { ok: false, code: 409, error: "The trade could not be deleted." };
+    }
+
+    /* ---- 1. in-memory position book, and everything keyed off it ---- */
+    if (position) {
+      this.positions.remove(id);          // also frees the byKey / reserved entry
+      this.syncManagerExposure();         // exposure counts the manager enforces
+      this.marginBackfillTries.delete(id);
+      this.marginInFlight.delete(id);
+      // Interrupt any retry/evaluation state the monitor still holds, or the next
+      // cycle would re-persist the trade we just removed.
+      const wasHeld = this.monitor.forgetPosition(id);
+      if (wasHeld) {
+        console.warn(`[Box] deletion of ${id} interrupted in-flight monitor work for that trade.`);
+      }
+      // Release feed subscriptions this position was the last claimant of. With the
+      // scanner stopped this narrows the token set; with it running the scanner's
+      // own universe keeps whatever it still wants, so nothing it needs is dropped.
+      if (!this.running) this.shrinkToOpenPositions();
+      else this.maybeReleaseFeed();
+    }
+
+    /* ---- 2. Redis mirrors (the only paths that ever remove a trade) ---- */
+    const day = this.deps.istDayKey();
+    await this.closedCache.evictTrade(day, id).catch(() => false);
+    await this.pnlCache.evictTrade(day, id).catch(() => false);
+
+    /* ---- 3. the P&L archive, so a regenerated day cannot resurrect it ---- */
+    await deleteBoxDailyPnlForTrade(id).catch((err) =>
+      console.warn(`[Box] failed to drop box_daily_pnl rows for deleted trade ${id}:`, err),
+    );
+
+    /* ---- 4. RECOMPUTE every trade-derived figure from what remains ---- */
+    await this.recomputeTradeDerivedStatistics();
+
+    /* ---- 5. audit, then tell every browser ---- */
+    void appendBoxEvent({
+      event: "TRADE_DELETED",
+      trade_id: id,
+      candidate_key: tradeKey(doc),
+      underlying: doc.underlying,
+      expiry: doc.expiry,
+      direction: directionOf(doc),
+      broker: brokerOf(doc),
+      lower_strike: doc.lower_strike,
+      upper_strike: doc.upper_strike,
+      lot_size: doc.lot_size,
+      quantity: doc.quantity,
+      execution_mode: doc.execution_mode,
+      box_width: doc.box_width,
+      gross_pnl: doc.gross_pnl,
+      net_pnl: doc.net_pnl,
+      reason: `deleted_by:${opts.actor}`,
+      detail:
+        `status_before=${doc.status} mode=${doc.execution_mode} broker=${brokerOf(doc)} ` +
+        `opened_at=${doc.opened_at.toISOString()} ` +
+        `closed_at=${doc.closed_at ? doc.closed_at.toISOString() : "null"} ` +
+        `deleted_at=${new Date().toISOString()}` +
+        (opts.reason ? ` reason=${opts.reason}` : ""),
+    });
+
+    console.log(
+      `[Box] TRADE DELETED ${id} (${doc.underlying} ${directionLabel(directionOf(doc))}, ` +
+        `${doc.status}, ${doc.execution_mode}, ${brokerOf(doc)}) by ${opts.actor}.`,
+    );
+
+    this.broadcast("trade_deleted", { id, trade: serialized });
+    // A full snapshot immediately after, so every open tab shows the corrected
+    // counts, P&L and margin without waiting for the next publish tick or a reload.
+    this.publish();
+
+    return { ok: true, code: 200, deleted: serialized };
+  }
+
+  /**
+   * Rebuild every trade-derived statistic from the surviving records.
+   *
+   * RECOMPUTED, NEVER ADJUSTED. Subtracting a deleted trade's fields from the
+   * running tallies is wrong in at least three ways, and the peak is the clearest
+   * case: `peak -= deleted.margin` is simply not what a maximum is. If the deleted
+   * trade set the previous high-water mark, the true peak is whatever the highest
+   * remaining OVERLAP is — which can only be found by replaying the intervals.
+   *
+   * The open side needs no work: `computeDayPnl()` derives it from the position
+   * book on every read, so removing the position already corrected it.
+   */
+  private async recomputeTradeDerivedStatistics(): Promise<void> {
+    // Closed-today tallies and the fast list: re-read the day from Mongo rather
+    // than decrementing counters. This is the same query the boot seed uses, so
+    // there is exactly one definition of "today's closed set" in the engine.
+    await this.refreshClosedTodayFromDb().catch((err) =>
+      console.warn("[Box] closed-today recompute after deletion failed:", err),
+    );
+    await this.recomputePeakConcurrentMargin();
+  }
+
+  /**
+   * Recompute peak concurrent margin by REPLAYING the surviving trade intervals.
+   *
+   * Each trade blocks its margin over [opened_at, closed_at) — or to now while it
+   * is still open. The peak concurrent figure is the largest sum of margins whose
+   * intervals overlap at a single instant. That maximum can only occur at an
+   * interval START (adding exposure is the only thing that can raise the sum), so
+   * sweeping the start points is exact rather than sampled.
+   *
+   * Trades with an unknown (null) margin are EXCLUDED, never counted as zero —
+   * consistent with `computeDayPnl`, which reports them separately. Including them
+   * as zero would understate the peak and quietly present a guess as a measurement.
+   *
+   * This replaces the process-lifetime sampled high-water mark for the day being
+   * recomputed: after a deletion the sampled value may reflect a trade that no
+   * longer exists, and an honest recomputation is strictly better than a stale
+   * observation.
+   */
+  private async recomputePeakConcurrentMargin(): Promise<void> {
+    try {
+      const dayStart = istDayStartMs(this.deps.istDayKey());
+      const rows = await loadBoxMarginIntervalsSince(dayStart);
+      const now = Date.now();
+      // The arithmetic itself lives in the pure marginReplay module so it can be
+      // unit-tested offline; this method only supplies the data.
+      const intervals = usableMarginIntervals(
+        rows.map((r) => ({
+          from: r.opened_at.getTime(),
+          to: r.closed_at ? r.closed_at.getTime() : now,
+          margin: r.margin,
+        })),
+      );
+      this.peakConcurrentMargin = peakConcurrentMargin(intervals);
+    } catch (err) {
+      console.warn("[Box] peak-concurrent-margin replay failed:", err);
+    }
   }
 
   /**
@@ -2861,7 +3112,11 @@ export class BoxEngine {
       indicative_session_day: this.indicativeSessionDay,
       indicative_stale_legs: this.indicativeStaleLegs,
       execution_mode: this.cfg.executionMode,
-      authenticated: this.deps.kite.getAccessToken() !== null,
+      /** The broker that owns the feed, the scanner and execution right now. */
+      broker: this.deps.activeBroker(),
+      /** Distinct brokers holding open exposure — normally just the active one. */
+      brokers_with_open_positions: this.positions.brokersInUse(),
+      authenticated: this.deps.marketData.isAuthenticated(),
       broker_auth_healthy: live ? live.health.broker_auth === "healthy" : null,
       broker_orders_api_healthy: live ? live.health.broker_orders_api === "healthy" : null,
       broker_positions_api_healthy: live ? live.health.broker_positions_api === "healthy" : null,
@@ -2884,8 +3139,8 @@ export class BoxEngine {
       monitored_tokens: this.scanner.monitoredTokenCount,
       subscribed_option_tokens: this.subscribedOptionTokens.size,
       subscribed_spot_tokens: this.subscribedSpotTokens.size,
-      hub_subscribed: this.deps.tickerHub.subscribedCount(),
-      hub_connected: this.deps.tickerHub.isConnected(),
+      hub_subscribed: this.deps.feed.subscribedCount(),
+      hub_connected: this.deps.feed.isConnected(),
       quotes: this.quotes.size,
       quote_updates: this.quotes.updateCount,
       /** Feed liveness: age of the newest tick anywhere, and the verdict. */
@@ -2941,6 +3196,73 @@ export class BoxEngine {
       last_error: this.lastError,
       config: this.getConfig(),
     };
+  }
+
+  /**
+   * The raw BoxConfig, for collaborators that must build broker adapters from it.
+   *
+   * Distinct from `getConfig()`, which is the UI's curated view. Exposed read-only so
+   * the broker registry can construct an execution adapter with the same limits the
+   * engine is running under, without re-reading the environment (which could have
+   * drifted from what this process actually loaded).
+   */
+  getConfigRaw(): BoxConfig {
+    return this.cfg;
+  }
+
+  /** Live exposure, for the broker-switch guard. Cheap: all in-memory. */
+  exposureSummary(): {
+    scannerRunning: boolean;
+    openPositions: number;
+    brokersWithOpenPositions: BrokerId[];
+    workingOrders: number;
+    executionInFlight: boolean;
+    reconciliationComplete: boolean;
+    residualLegs: number;
+    unknownOrders: number;
+  } {
+    const live = this.orderManager?.status() ?? null;
+    return {
+      scannerRunning: this.running,
+      openPositions: this.positions.size,
+      brokersWithOpenPositions: this.positions.brokersInUse(),
+      // In-flight + queued is the honest "still working" count the manager exposes.
+      workingOrders: live ? live.inFlight + live.queued : 0,
+      // A simulated pipeline counts too: deleting the feed under an in-flight paper
+      // entry would leave the attempt unable to resolve.
+      executionInFlight: this.executionSim.activeCount > 0,
+      reconciliationComplete: live?.health.reconciliation_complete ?? true,
+      residualLegs: this.residualLegCount(),
+      unknownOrders: live?.unknownOrders ?? 0,
+    };
+  }
+
+  /**
+   * Drop every cached book and bump the feed generation.
+   *
+   * Called on a broker switch. This is what guarantees a Zerodha depth ladder can
+   * never price a Dhan decision: the quote store is emptied and every token's
+   * warm-generation marker is invalidated, so nothing is treated as executable until
+   * the NEW broker has published a fresh book for it.
+   */
+  invalidateBooks(): void {
+    this.invalidateFeedGeneration();
+    this.quotes.clear();
+    this.spots.clear();
+    this.scanner.clearOpportunities();
+    this.subscribedOptionTokens.clear();
+    this.subscribedSpotTokens.clear();
+  }
+
+  /** Force a universe rebuild for the newly active broker. */
+  async reloadUniverse(): Promise<void> {
+    this.forceWindowRebuild = true;
+    await this.refreshUniverse();
+  }
+
+  /** Push the current snapshot to every SSE client immediately. */
+  publishNow(): void {
+    this.publish();
   }
 
   getOpportunities(limit?: number): BoxOpportunity[] {
@@ -3314,7 +3636,10 @@ export class BoxEngine {
       return {
         id: pos.id,
         key: pos.key,
-        execution_mode: this.cfg.executionMode,
+        // The position's OWN mode/broker, not the engine's current config, so an
+        // adopted trade is never mislabelled after a switch.
+        execution_mode: pos.execution_mode,
+        broker: pos.broker,
         underlying: pos.underlying,
         name: pos.name,
         is_index: pos.is_index,

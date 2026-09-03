@@ -24,6 +24,8 @@ import {
   type BoxOptionInstrument,
   type BoxPositionState,
   type BoxScannerConfigSnapshot,
+  type BrokerId,
+  type ExecutionMode,
   type IBoxExitAttempt,
 } from "./types.js";
 
@@ -32,6 +34,24 @@ export interface BoxOpenPosition {
   id: string;
   /** underlying|expiry|K1|K2|DIRECTION */
   key: string;
+  /**
+   * The broker that created this position, carried in memory as well as in Mongo.
+   *
+   * Needed here because several decisions read the live book rather than the
+   * document: the delete guard, the foreign-exposure check that blocks a broker
+   * switch, and the per-broker margin/P&L totals. Reading `cfg` instead would be
+   * wrong the moment a position adopted at boot predates a broker change.
+   */
+  broker: BrokerId;
+  /**
+   * How this position's fills were produced (simulated vs real).
+   *
+   * Also carried per-position rather than read from `cfg.executionMode`, because
+   * the config can differ from what an ADOPTED position was actually opened
+   * under — and the delete guard must never let a live position be removed just
+   * because the process happens to be configured for paper today.
+   */
+  execution_mode: ExecutionMode;
   underlying: string;
   name: string;
   is_index: boolean;
@@ -165,6 +185,27 @@ export class BoxPositionBook {
     if (this.byKey.get(pos.key) === id) this.byKey.delete(pos.key);
     this.reserved.delete(pos.key);
     return pos;
+  }
+
+  /**
+   * The distinct brokers that currently hold open exposure.
+   *
+   * The broker-switch guard reads this: activating Dhan while a Zerodha box is
+   * still open would leave a position nobody is watching with the right feed, and
+   * would invite reconciliation against the wrong order-id space.
+   */
+  brokersInUse(): BrokerId[] {
+    return [...new Set(this.list().map((pos) => pos.broker))];
+  }
+
+  /** Open positions belonging to a broker other than `active`. */
+  foreignPositions(active: BrokerId): BoxOpenPosition[] {
+    return this.list().filter((pos) => pos.broker !== active);
+  }
+
+  /** Open positions whose fills are REAL (as opposed to simulated). */
+  livePositions(): BoxOpenPosition[] {
+    return this.list().filter((pos) => pos.execution_mode === "live");
   }
 
   /** Every option token of every open position — always kept subscribed. */

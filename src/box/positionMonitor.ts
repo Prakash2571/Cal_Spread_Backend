@@ -25,7 +25,8 @@
 import type { BoxConfig } from "./config.js";
 import type { BoxExecutionGateway } from "./executionGateway.js";
 import type { BoxMetrics } from "./metrics.js";
-import { LocalChargeCalculator, ordersFromLegs } from "./localCharges.js";
+import { ordersFromLegs } from "./localCharges.js";
+import type { BoxChargeCalculatorLike } from "./brokerContext.js";
 import {
   computeExitMetrics,
   entrySideFor,
@@ -58,7 +59,8 @@ import {
 export interface BoxMonitorDeps {
   cfg: BoxConfig;
   quotes: BoxQuoteStore;
-  localCharges: LocalChargeCalculator;
+  /** The ACTIVE broker's charge calculator (see brokerContext.ts). */
+  localCharges: BoxChargeCalculatorLike;
   executionSim: BoxExecutionGateway;
   positions: BoxPositionBook;
   /** Bounded metrics sink (optional; absent in some tests). */
@@ -145,6 +147,43 @@ export class BoxPositionMonitor {
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+  }
+
+  /**
+   * Forget every trace of a position the monitor may still be holding.
+   *
+   * Called when a trade is DELETED rather than closed. Removing it from the
+   * position book is not enough on its own: this class keeps five id-keyed
+   * structures, and two of them (`pendingFinalPersists`, `pendingPartialPersists`)
+   * are RETRY QUEUES that are drained on every cycle and deliberately do NOT
+   * consult the book — that is the whole point of them, since a confirmed fill must
+   * be persisted even if the position has already left memory.
+   *
+   * So a deleted trade left in those maps would be re-persisted on the next cycle,
+   * silently resurrecting the document a moment after the administrator deleted it.
+   * `closingIds` would likewise make a later close attempt look already-in-flight.
+   *
+   * Returns true when anything was actually being held, so the caller can log the
+   * fact that a deletion interrupted in-flight work.
+   */
+  forgetPosition(id: string): boolean {
+    const held =
+      this.closingIds.has(id) ||
+      this.pendingFinalPersists.has(id) ||
+      this.pendingPartialPersists.has(id) ||
+      this.pendingEvaluationIds.has(id) ||
+      this.evaluationTasks.has(id);
+    this.closingIds.delete(id);
+    this.pendingFinalPersists.delete(id);
+    this.pendingPartialPersists.delete(id);
+    this.pendingEvaluationIds.delete(id);
+    // The in-flight evaluation promise is intentionally NOT cancelled — it cannot
+    // be. It is safe to drop the handle: requestEvaluation re-reads the book on
+    // every iteration and breaks when the position is gone (see its loop), so the
+    // task observes the deletion and exits on its own.
+    this.evaluationTasks.delete(id);
+    this.lastBlockedKey.delete(id);
+    return held;
   }
 
   getStats() {
