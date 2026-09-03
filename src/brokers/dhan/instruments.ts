@@ -157,9 +157,13 @@ export function normalizeDhanInstrumentType(instrument: string, optionType: stri
 
 /** Kite-style `segment` string, which some existing filters read. */
 function internalSegment(exchange: string, instrumentType: string): string {
-  if (exchange === "NFO") return "NFO-OPT";
   if (exchange === "INDICES") return "INDICES";
+  // Kite distinguishes "NFO-FUT" from "NFO-OPT", and this value is meant to be
+  // Kite-shaped. Labelling every derivative "NFO-OPT" made futures indistinguishable
+  // from options to any filter that reads `segment` — a landmine even though today's
+  // callers happen to key off `instrument_type` instead.
   if (instrumentType === "FUT") return `${exchange}-FUT`;
+  if (exchange === "NFO" || exchange === "BFO") return `${exchange}-OPT`;
   return exchange;
 }
 
@@ -203,6 +207,17 @@ export interface DhanParseReport {
   byExchange: Record<string, number>;
   byInstrumentType: Record<string, number>;
   fnoFutures: number;
+  nfoCalls: number;
+  nfoPuts: number;
+  nseEquities: number;
+  indices: number;
+  distinctFutureUnderlyings: number;
+  underlyingResolution: {
+    byForeignKey: number;
+    bySymbolColumn: number;
+    byStrip: number;
+    unresolved: number;
+  };
   samples: { tradingsymbol: string; name: string; exchange: string; instrument_type: string; expiry: string; token: number; securityId: number }[];
 }
 
@@ -257,7 +272,11 @@ export function parseDhanScripMaster(csv: string): DhanInstrument[] {
     totalRows: lines.length - 1,
     parsed: 0, skippedTest: 0, skippedNoSecurityId: 0, skippedNoSymbol: 0,
     skippedSegment: 0, skippedImplausibleExpiry: 0,
-    byExchange: {}, byInstrumentType: {}, fnoFutures: 0, samples: [],
+    byExchange: {}, byInstrumentType: {}, fnoFutures: 0,
+    nfoCalls: 0, nfoPuts: 0, nseEquities: 0, indices: 0,
+    distinctFutureUnderlyings: 0,
+    underlyingResolution: { byForeignKey: 0, bySymbolColumn: 0, byStrip: 0, unresolved: 0 },
+    samples: [],
   };
   const now = Date.now();
 
@@ -339,6 +358,10 @@ export function parseDhanScripMaster(csv: string): DhanInstrument[] {
     report.parsed++;
     report.byExchange[exchange] = (report.byExchange[exchange] ?? 0) + 1;
     report.byInstrumentType[instrumentType] = (report.byInstrumentType[instrumentType] ?? 0) + 1;
+    if (exchange === "NFO" && instrumentType === "CE") report.nfoCalls++;
+    if (exchange === "NFO" && instrumentType === "PE") report.nfoPuts++;
+    if (exchange === "NSE" && instrumentType === "EQ") report.nseEquities++;
+    if (instrumentType === "INDEX") report.indices++;
     if (exchange === "NFO" && instrumentType === "FUT") {
       report.fnoFutures++;
       // Sample real F&O futures specifically: they are what the calendar board needs,
@@ -358,6 +381,103 @@ export function parseDhanScripMaster(csv: string): DhanInstrument[] {
     }
   }
 
+  // ---------------- SECOND PASS: canonical underlying resolution ----------------
+  //
+  // Done as a second pass because a derivative's underlying spot row may appear ANYWHERE
+  // in the file, including after it. Resolving during the first pass would depend on file
+  // ordering, which is not something to rely on.
+  //
+  // NOTE ON THE TWO JOIN CONVENTIONS. The board resolves an equity underlying and an
+  // index underlying DIFFERENTLY, and conflating them breaks one or the other:
+  //
+  //   equity: futures.name must equal the EQUITY'S TRADING SYMBOL ("BHEL"), because
+  //           the board looks it up with eqBySymbol.get(name).
+  //   index:  futures.name must equal the DERIVATIVE UNDERLYING SYMBOL ("NIFTY"), NOT
+  //           the index spot's trading symbol ("NIFTY 50"), because the board looks it
+  //           up with INDEX_SPOT_MAP[name] — a map keyed by "NIFTY" that RETURNS
+  //           "NIFTY 50".
+  //
+  // So the foreign key is followed to the spot row only to read an EQUITY's symbol.
+  // For an index it is used solely to confirm the underlying IS an index; the name then
+  // comes from the underlying-symbol column (or the stripped contract symbol), both of
+  // which yield "NIFTY". Resolving an index future to "NIFTY 50" would silently drop
+  // every index from the board.
+  const spotBySecurityId = new Map<number, { symbol: string; isIndex: boolean }>();
+  const equitySpotSymbols = new Set<string>();
+  for (const inst of out) {
+    const isIndexSpot = inst.instrument_type === "INDEX";
+    if (inst.instrument_type === "EQ" || isIndexSpot) {
+      spotBySecurityId.set(inst.dhan_security_id, {
+        symbol: normalizeUnderlyingKey(inst.tradingsymbol),
+        isIndex: isIndexSpot,
+      });
+      if (!isIndexSpot) equitySpotSymbols.add(normalizeUnderlyingKey(inst.tradingsymbol));
+    }
+  }
+
+  let resolvedByForeignKey = 0;
+  let resolvedBySymbolColumn = 0;
+  let resolvedByStrip = 0;
+  let unresolvedUnderlying = 0;
+
+  for (const inst of out) {
+    const isDerivative =
+      inst.instrument_type === "FUT" || inst.instrument_type === "CE" || inst.instrument_type === "PE";
+    if (!isDerivative) continue;
+
+    const declared = normalizeUnderlyingKey(inst.name);
+    const stripped = stripContractSuffix(inst.tradingsymbol);
+    const spot =
+      inst.dhan_underlying_security_id !== null
+        ? spotBySecurityId.get(inst.dhan_underlying_security_id)
+        : undefined;
+
+    // 1. The numeric foreign key into an EQUITY row — immune to column renames and to
+    //    display formatting, and it yields exactly the symbol the board joins on.
+    if (spot && !spot.isIndex) {
+      inst.name = spot.symbol;
+      resolvedByForeignKey++;
+      continue;
+    }
+    // 1b. The foreign key points at an INDEX. The board needs the underlying symbol
+    //     here, not the index's trading symbol, so take the declared/stripped form.
+    if (spot?.isIndex) {
+      const indexUnderlying = declared !== "" ? declared : stripped;
+      if (indexUnderlying !== "") {
+        inst.name = indexUnderlying;
+        resolvedByForeignKey++;
+        continue;
+      }
+    }
+    // 2. The underlying-symbol column, when it named something we recognise as a spot.
+    if (declared !== "" && equitySpotSymbols.has(declared)) {
+      inst.name = declared;
+      resolvedBySymbolColumn++;
+      continue;
+    }
+    // 3. Strip the contract suffix off the symbol. Accepted only if it lands on a real
+    //    spot, so a mangled guess cannot invent an underlying.
+    if (stripped !== "" && equitySpotSymbols.has(stripped)) {
+      inst.name = stripped;
+      resolvedByStrip++;
+      continue;
+    }
+    // Keep whatever the master declared, so an index underlying whose spot row is
+    // missing entirely still groups together and can be matched downstream.
+    inst.name = declared !== "" ? declared : stripped;
+    if (inst.name === "") unresolvedUnderlying++;
+  }
+
+  report.underlyingResolution = {
+    byForeignKey: resolvedByForeignKey,
+    bySymbolColumn: resolvedBySymbolColumn,
+    byStrip: resolvedByStrip,
+    unresolved: unresolvedUnderlying,
+  };
+  report.distinctFutureUnderlyings = new Set(
+    out.filter((i) => i.instrument_type === "FUT").map((i) => i.name).filter(Boolean),
+  ).size;
+
   lastParseReport = report;
   console.log(
     `[Dhan] instrument master parsed: ${report.parsed}/${report.totalRows} rows, ` +
@@ -372,16 +492,99 @@ export function parseDhanScripMaster(csv: string): DhanInstrument[] {
         `Header was: ${header.slice(0, 20).join(",")}`,
     );
   }
-  if (report.fnoFutures < 50) {
+  console.log(
+    `[Dhan] underlying resolution: ${resolvedByForeignKey} by foreign key, ` +
+      `${resolvedBySymbolColumn} by symbol column, ${resolvedByStrip} by suffix strip, ` +
+      `${unresolvedUnderlying} unresolved; ${report.distinctFutureUnderlyings} distinct ` +
+      `futures underlyings.`,
+  );
+  if (report.distinctFutureUnderlyings < 50) {
+    console.error(
+      `[Dhan] ONLY ${report.distinctFutureUnderlyings} distinct futures underlyings resolved ` +
+        `(expected 180+). The board will be almost empty. This is an underlying-JOIN failure, ` +
+        `not a market condition — inspect GET /api/dhan/instruments/diagnostics.`,
+    );
+  }
+  if (report.fnoFutures < 100) {
     // The real F&O universe is ~200 underlyings x 3 expiries. Far fewer means the
     // classification is wrong, not that the market is quiet.
     console.error(
-      `[Dhan] ONLY ${report.fnoFutures} NFO futures were classified — the instrument master ` +
+      `[Dhan] ONLY ${report.fnoFutures} NFO futures were classified (expected 500+) — the master ` +
         `layout has probably changed. Board and scanner will be incomplete. ` +
         `Inspect GET /api/dhan/instruments/diagnostics.`,
     );
   }
   return out;
+}
+
+/**
+ * The canonical underlying symbol of an instrument — the board's join key.
+ *
+ * THIS IS THE ROOT CAUSE OF THE ONE-STOCK BOARD.
+ *
+ * `deriveFnoBoard()` groups futures by `instrument.name` and then joins to a spot with
+ * `eqBySymbol.get(name)`, keyed on the equity's TRADING SYMBOL. That works for Kite,
+ * where an NFO future's `name` is exactly the underlying symbol ("BHEL"). It is a Kite
+ * naming convention, and Dhan does not follow it: if the underlying-symbol column is
+ * absent or named differently, `name` fell back to the DISPLAY name — something like
+ * "BHEL 25 SEP FUT" — which can never equal an equity trading symbol. Every future
+ * whose display name did not happen to be a bare symbol therefore matched nothing and
+ * was silently dropped, collapsing 200+ underlyings to the handful that coincidentally
+ * did match.
+ *
+ * So the underlying is resolved by three mechanisms, strongest first:
+ *
+ *   1. `UNDERLYING_SECURITY_ID` → the spot row's own trading symbol. A NUMERIC FOREIGN
+ *      KEY, so it is immune to column renames and display-name formatting. This is the
+ *      reliable join and the reason the fix does not depend on guessing a column name.
+ *   2. `UNDERLYING_SYMBOL`, when the master supplies it.
+ *   3. The contract symbol with its expiry/instrument suffix stripped — a last resort,
+ *      used only so a partially-formed master still yields a usable board.
+ */
+export function stripContractSuffix(tradingsymbol: string): string {
+  // Dhan contract symbols take shapes like "BHEL-Sep2026-FUT", "BHEL26SEPFUT",
+  // "BHEL 25 SEP FUT", "BHEL 300 CE", "RELIANCE-Sep2026-2500-PE".
+  const MONTH = "JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC";
+  const upper = tradingsymbol.trim().toUpperCase();
+
+  // STAGE 1 — drop trailing contract components as WHOLE TOKENS.
+  //
+  // Token-wise is essential, because a substring rule silently corrupts real symbols:
+  // an unconditional `(FUT|CE|PE)$` strip turns RELIANCE into RELIAN, since RELIANCE
+  // genuinely ends in "CE". Only ever discarding a complete token makes that impossible.
+  // Splitting on "-" also decomposes an ISO expiry into numeric tokens, which the
+  // numeric rule then drops for free.
+  const tokens = upper.split(/[\s_\-]+/).filter((t) => t !== "");
+  const contractToken = new RegExp(
+    `^(?:FUT|CE|PE|\\d+(?:\\.\\d+)?|(?:${MONTH})\\d{0,4}|\\d{2,4}(?:${MONTH}))$`,
+  );
+  let end = tokens.length;
+  // Never consume the last token: something must remain to be the underlying.
+  while (end > 1 && contractToken.test(tokens[end - 1]!)) end--;
+  // Rejoin with "-" so genuinely hyphenated underlyings ("BAJAJ-AUTO") survive.
+  let value = tokens.slice(0, end).join("-");
+
+  // STAGE 2 — the same components may be CONCATENATED into a single token
+  // ("BHEL26SEPFUT"), where there is no separator to split on. Peel them off, but only
+  // where a digit or a month name marks the boundary, which is what keeps RELIANCE safe.
+  const inToken: RegExp[] = [
+    new RegExp(`(?<=\\d|${MONTH})(?:FUT|CE|PE)$`), // instrument suffix
+    new RegExp(`(?<=[A-Z0-9])(?:${MONTH})$`), // month
+    /(?<=[A-Z])\d{2,8}(?:\.\d+)?$/, // strike or 2-4 digit expiry
+  ];
+  // Bounded: a contract symbol has only a handful of components, and an unbounded loop
+  // over adversarial input is not a risk worth taking.
+  for (let pass = 0; pass < 8; pass++) {
+    const before = value;
+    for (const re of inToken) value = value.replace(re, "");
+    if (value === before) break;
+  }
+  return value.replace(/[-\s]+$/, "");
+}
+
+/** Normalize an underlying symbol for use as a join key. */
+export function normalizeUnderlyingKey(value: string): string {
+  return value.trim().toUpperCase().replace(/\s+/g, " ");
 }
 
 /** Combine Dhan's exchange id and segment code into a REST segment name. */
