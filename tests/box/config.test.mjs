@@ -118,3 +118,78 @@ test("charge-reconciliation retry is bounded by default", () => {
   assert.ok(cfg.chargeReconcileMaxAttempts <= 10, "must stay bounded — never a hot retry loop");
   assert.ok(cfg.chargeReconcileRetryBaseMs > 0, "backoff must space the retries out");
 });
+
+
+/* --------------------- paper live-parity profile config --------------------- */
+
+/** Set/restore an arbitrary set of env keys around fn. */
+function withEnv(values, fn) {
+  const previous = new Map();
+  for (const [key, value] of Object.entries(values)) {
+    previous.set(
+      key,
+      Object.prototype.hasOwnProperty.call(process.env, key)
+        ? { present: true, value: process.env[key] }
+        : { present: false },
+    );
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [key, old] of previous) {
+      if (old.present) process.env[key] = old.value;
+      else delete process.env[key];
+    }
+  }
+}
+
+test("the paper profile DEFAULTS to standard — existing deployments are unchanged", () => {
+  withEnv(
+    {
+      BOX_PAPER_EXECUTION_PROFILE: undefined,
+      BOX_PAPER_LATENCY_MODE: undefined,
+      BOX_PAPER_LATENCY_SAMPLES: undefined,
+    },
+    () => {
+      const cfg = loadBoxConfig();
+      assert.equal(cfg.paperExecutionProfile, "standard");
+      assert.equal(cfg.paperLatencyMode, "constant");
+      assert.deepEqual(cfg.paperLatencySamples, []);
+    },
+  );
+});
+
+test("live_parity is accepted and an unknown profile falls back to standard", () => {
+  withEnv({ BOX_PAPER_EXECUTION_PROFILE: "live_parity" }, () => {
+    assert.equal(loadBoxConfig().paperExecutionProfile, "live_parity");
+  });
+  withEnv({ BOX_PAPER_EXECUTION_PROFILE: "nonsense" }, () => {
+    assert.equal(loadBoxConfig().paperExecutionProfile, "standard");
+  });
+});
+
+test("paper concurrency defaults to the LIVE cap (conservative baseline)", () => {
+  withEnv(
+    { BOX_PAPER_MAX_CONCURRENT_EXECUTIONS: undefined, BOX_LIVE_MAX_CONCURRENT_EXECUTIONS: "1" },
+    () => {
+      assert.equal(loadBoxConfig().paperMaxConcurrentExecutions, 1);
+    },
+  );
+  withEnv({ BOX_PAPER_MAX_CONCURRENT_EXECUTIONS: "3" }, () => {
+    assert.equal(loadBoxConfig().paperMaxConcurrentExecutions, 3);
+  });
+});
+
+test("recorded latency samples parse into a clean numeric array", () => {
+  withEnv(
+    { BOX_PAPER_LATENCY_MODE: "recorded_samples", BOX_PAPER_LATENCY_SAMPLES: "180, 210, bad, -5, 420" },
+    () => {
+      const cfg = loadBoxConfig();
+      assert.equal(cfg.paperLatencyMode, "recorded_samples");
+      // "bad" dropped, negative dropped, order preserved.
+      assert.deepEqual(cfg.paperLatencySamples, [180, 210, 420]);
+    },
+  );
+});

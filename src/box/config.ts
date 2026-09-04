@@ -94,6 +94,37 @@ function queueModel(name: string, fallback: BoxQueueModel): BoxQueueModel {
   return fallback;
 }
 
+/** The paper execution profile: `standard` (today's behaviour) or `live_parity`. */
+function paperProfile(name: string, fallback: "standard" | "live_parity"): "standard" | "live_parity" {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = raw.trim().toLowerCase();
+  if (value === "standard" || value === "live_parity") return value;
+  console.warn(`[Box] ignoring unknown ${name}="${raw}" — using ${fallback}.`);
+  return fallback;
+}
+
+/** Latency-source mode for live-parity paper. */
+function latencyMode(name: string, fallback: "constant" | "recorded_samples"): "constant" | "recorded_samples" {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = raw.trim().toLowerCase();
+  if (value === "constant" || value === "recorded_samples") return value;
+  console.warn(`[Box] ignoring unknown ${name}="${raw}" — using ${fallback}.`);
+  return fallback;
+}
+
+/** A comma-separated list of non-negative millisecond samples. */
+function msSamples(name: string): number[] {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return [];
+  return raw
+    .split(",")
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n >= 0)
+    .map((n) => Math.round(n));
+}
+
 function executionMode(name: string, fallback: ExecutionMode): ExecutionMode {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
@@ -141,6 +172,27 @@ export interface BoxConfig {
   executionPollMs: number;
   /** Cap on simultaneous simulated execution pipelines. */
   maxConcurrentExecutions: number;
+
+  // ---- Paper live-parity profile (default OFF; layered on paper_legging) ----
+  /**
+   * `standard` keeps today's paper behaviour byte-for-byte. `live_parity` layers a
+   * shared-liquidity reservation ledger, a deterministic latency source and the live
+   * concurrency cap onto `paper_legging`, to make paper a closer shadow of live. Only
+   * meaningful when `executionMode` is a paper mode; ignored under `live`.
+   */
+  paperExecutionProfile: "standard" | "live_parity";
+  /**
+   * Cap on simultaneous paper pipelines under live_parity. Defaults to the LIVE value
+   * (`liveMaxConcurrentExecutions`) so the recommended validation baseline mirrors the
+   * conservative live deployment; override with BOX_PAPER_MAX_CONCURRENT_EXECUTIONS.
+   */
+  paperMaxConcurrentExecutions: number;
+  /** Latency source for live_parity: `constant` (default) or `recorded_samples`. */
+  paperLatencyMode: "constant" | "recorded_samples";
+  /** Observed latency samples (ms) for `recorded_samples`; empty ⇒ fall back to constant. */
+  paperLatencySamples: number[];
+  /** Deterministic starting offset into the samples. No randomness anywhere. */
+  paperLatencySeed: number;
 
   // ---- Live execution safety envelope (env-only, fail-closed) ----
   /** Deployment kill switch. `executionMode=live` is invalid unless this is true. */
@@ -547,6 +599,22 @@ export function loadBoxConfig(): BoxConfig {
     executionPollMs: num("BOX_EXECUTION_POLL_MS", 20),
     maxConcurrentExecutions: num("BOX_MAX_CONCURRENT_EXECUTIONS", 8),
 
+    // Paper live-parity profile. All default to preserving today's behaviour: the
+    // profile is `standard`, and the ledger/latency-source are only ever consulted when
+    // it is explicitly set to `live_parity`.
+    paperExecutionProfile: paperProfile("BOX_PAPER_EXECUTION_PROFILE", "standard"),
+    // Default to the LIVE concurrency cap (1) so the recommended validation baseline
+    // matches a conservative live deployment; explicit override wins.
+    paperMaxConcurrentExecutions: clampInt(
+      "BOX_PAPER_MAX_CONCURRENT_EXECUTIONS",
+      clampInt("BOX_LIVE_MAX_CONCURRENT_EXECUTIONS", 1, 1, 4),
+      1,
+      8,
+    ),
+    paperLatencyMode: latencyMode("BOX_PAPER_LATENCY_MODE", "constant"),
+    paperLatencySamples: msSamples("BOX_PAPER_LATENCY_SAMPLES"),
+    paperLatencySeed: num("BOX_PAPER_LATENCY_SEED", 0),
+
     liveTradingEnabled,
     liveReconcileIntervalMs: clampInt("BOX_LIVE_RECONCILE_INTERVAL_MS", 60_000, 5_000, 15 * 60_000),
     liveFeedReconnectWarmupMs: clampInt("BOX_LIVE_FEED_RECONNECT_WARMUP_MS", 5_000, 0, 5 * 60_000),
@@ -702,6 +770,7 @@ export function configSnapshot(cfg: BoxConfig): BoxScannerConfigSnapshot {
     execution_mode: cfg.executionMode,
     simulated_decision_ms: cfg.simulatedDecisionMs,
     simulated_latency_ms: cfg.simulatedLatencyMs,
+    paper_execution_profile: cfg.paperExecutionProfile,
     live_trading_enabled: cfg.liveTradingEnabled,
     live_reconcile_interval_ms: cfg.liveReconcileIntervalMs,
     live_feed_reconnect_warmup_ms: cfg.liveFeedReconnectWarmupMs,

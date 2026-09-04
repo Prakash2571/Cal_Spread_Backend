@@ -1259,6 +1259,8 @@ export interface BoxScannerConfigSnapshot {
   execution_mode: ExecutionMode;
   simulated_decision_ms?: number;
   simulated_latency_ms?: number;
+  /** Paper execution profile ("standard" | "live_parity"); absent on legacy documents. */
+  paper_execution_profile?: "standard" | "live_parity";
   /** Live safety envelope captured for audit; absent on legacy paper documents. */
   live_trading_enabled?: boolean;
   live_reconcile_interval_ms?: number;
