@@ -780,7 +780,26 @@ guard the Zerodha flow uses. **The API secret and the access token never reach t
 
 Other routes: `GET /api/dhan/status`, `POST /api/dhan/logout`,
 `POST /api/dhan/verify-ip` (full admin), `GET /api/dhan/access-token` (full admin),
-`POST /api/dhan/postback`.
+`GET /api/dhan/token` (passcode), `POST /api/dhan/postback`.
+
+**Token sharing.** The access token is returned by exactly two routes, both named for it so
+the exposure stays greppable: `GET /api/dhan/access-token` (full admin) and
+`GET /api/dhan/token`, guarded by a dedicated `DHAN_TOKEN_ROUTE_SECRET` passcode:
+
+```
+curl "https://<host>/api/dhan/token?passcode=YOUR_PASSCODE"
+curl -H "x-token-passcode: YOUR_PASSCODE" https://<host>/api/dhan/token
+```
+
+The passcode route exists for unattended consumers on another host: an admin session token
+expires after 24h and cannot be baked into a script, while sharing `ADMIN_SECRET` would grant
+that host trade placement, deletion and broker switching. The secret is separate from
+Zerodha's `TOKEN_ROUTE_SECRET` so the two brokers stay independently revocable, and the route
+is **disabled (503) when unset** — an absent secret never means "no passcode required".
+Answers 409 when there is no live, unexpired session, rather than serving a dead token.
+
+Treat what it returns as a trading credential: a Dhan access token plus the client id can
+place and cancel orders, limited to the whitelisted `DHAN_STATIC_PUBLIC_IP`.
 
 ### Token expiry
 
