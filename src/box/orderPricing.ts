@@ -141,8 +141,16 @@ export function walkDepth(args: {
   haircutPct: number;
   at: number;
   quoteVersion: number | null;
+  /**
+   * OPTIONAL, live-parity paper only: quantity already reserved by earlier concurrent
+   * paper attempts at (price, version), subtracted from each level's queue-adjusted
+   * effective quantity so two attempts cannot double-consume one observed level. When
+   * omitted the walk is byte-identical to before — standard paper and the live precheck
+   * never pass it.
+   */
+  reserved?: ((price: number, quoteVersion: number | null) => number) | undefined;
 }): DepthWalkResult {
-  const { side, levels, remainingQty, limitPrice, queueModel, haircutPct, at, quoteVersion } = args;
+  const { side, levels, remainingQty, limitPrice, queueModel, haircutPct, at, quoteVersion, reserved } = args;
   const slices: PaperFillSlice[] = [];
   let remaining = Math.max(0, remainingQty);
   let filled = 0;
@@ -157,7 +165,12 @@ export function walkDepth(args: {
 
   for (const lv of ordered) {
     if (!withinLimit(side, lv.price, limitPrice)) break; // deeper levels are only worse
-    const effective = effectiveQty(lv.qty, queueModel, haircutPct);
+    const effectiveRaw = effectiveQty(lv.qty, queueModel, haircutPct);
+    // Subtract liquidity earlier concurrent paper attempts already reserved at this
+    // exact level+version. `reserved` is undefined outside live-parity paper, so this is
+    // a no-op and the result is identical to before.
+    const already = reserved ? Math.max(0, reserved(lv.price, quoteVersion)) : 0;
+    const effective = Math.max(0, effectiveRaw - already);
     executableWithinLimit += effective;
     if (remaining <= 0 || effective <= 0) continue;
     const take = Math.min(remaining, effective);

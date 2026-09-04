@@ -1,0 +1,75 @@
+{
+  "category": "execution-parity",
+  "operation": "createLatencySource",
+  "description": "Constant and recorded-sample latency, consumed in a fixed order; a seed only rotates the start.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "constant",
+      "input": {
+        "config": {
+          "mode": "constant",
+          "constantMs": 250
+        },
+        "draws": 4
+      },
+      "expected": {
+        "sequence": [
+          250,
+          250,
+          250,
+          250
+        ]
+      }
+    },
+    {
+      "name": "recorded samples cycle in order",
+      "input": {
+        "config": {
+          "mode": "recorded_samples",
+          "constantMs": 250,
+          "samples": [
+            180,
+            210,
+            420
+          ]
+        },
+        "draws": 5
+      },
+      "expected": {
+        "sequence": [
+          180,
+          210,
+          420,
+          180,
+          210
+        ]
+      }
+    },
+    {
+      "name": "seed rotates the start deterministically",
+      "input": {
+        "config": {
+          "mode": "recorded_samples",
+          "constantMs": 250,
+          "samples": [
+            10,
+            20,
+            30,
+            40
+          ],
+          "seed": 2
+        },
+        "draws": 4
+      },
+      "expected": {
+        "sequence": [
+          30,
+          40,
+          10,
+          20
+        ]
+      }
+    }
+  ]
+}

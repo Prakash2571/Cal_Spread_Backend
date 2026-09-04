@@ -137,6 +137,12 @@ Mode: `BOX_EXECUTION_MODE` (`paper_touch`/`paper_latency`/`paper_legging`/`live`
 `BOX_SIMULATED_DECISION_MS`, `BOX_LEG_TIMEOUT_MS`, `BOX_LEG_MAX_CHASE_TICKS`,
 `BOX_LEG_UNWIND_LATENCY_MS`, `BOX_UNWIND_MAX_CHASE_TICKS`, `BOX_MAX_CONCURRENT_EXECUTIONS`.
 
+Paper live-parity profile (default OFF; layered on `paper_legging`, never changes
+`standard`): `BOX_PAPER_EXECUTION_PROFILE` (`standard`|`live_parity`),
+`BOX_PAPER_MAX_CONCURRENT_EXECUTIONS` (default = `BOX_LIVE_MAX_CONCURRENT_EXECUTIONS`),
+`BOX_PAPER_LATENCY_MODE` (`constant`|`recorded_samples`), `BOX_PAPER_LATENCY_SAMPLES`
+(comma-separated ms), `BOX_PAPER_LATENCY_SEED`. See `src/box/LIVE_EXECUTION.md`.
+
 Live-only limits (all under the `BOX_LIVE_*` prefix — order pacing, timeouts, and the
 risk caps below).
 

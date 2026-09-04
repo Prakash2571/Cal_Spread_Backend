@@ -256,6 +256,28 @@ operations.
 >
 > These are **simulated fills at observed quotes**, not exchange fills, and are labelled as such
 > in the API and the UI.
+>
+> **`paper_legging` + `BOX_PAPER_EXECUTION_PROFILE=live_parity` (opt-in, default `standard`).** A
+> conservative layer on top of `paper_legging` that makes paper a closer *shadow* of live, WITHOUT
+> changing `paper_legging`'s existing results — the profile defaults to `standard`, and every
+> live-parity behaviour is gated on it being explicitly set to `live_parity`. It adds:
+> - **Shared-liquidity reservation.** Concurrent paper attempts can no longer both consume the same
+>   displayed depth. Each fill reserves what it took, keyed by `(feed generation, token, side,
+>   price, quote version)`; a second attempt at the same observed level only sees the remainder. A
+>   **new book version is fresh liquidity**, so an old reservation never suppresses newly published
+>   depth. This is a bound on *our own* double-spend — **not** a model of NSE queue position.
+> - **Deterministic latency distribution.** Instead of one constant per-leg latency, arrivals are
+>   drawn from `BOX_PAPER_LATENCY_MODE=recorded_samples` (`BOX_PAPER_LATENCY_SAMPLES`) in a fixed,
+>   seeded order — ready to be fed real measured `server→ACK`/`server→fill` samples. No randomness.
+> - **Live-equivalent concurrency cap.** Paper pipelines are capped at
+>   `BOX_PAPER_MAX_CONCURRENT_EXECUTIONS`, which **defaults to the live cap**
+>   (`BOX_LIVE_MAX_CONCURRENT_EXECUTIONS`, 1) so the recommended validation baseline matches a
+>   conservative live deployment.
+>
+> It reuses the *identical* bounded-LIMIT pricing, the same queue haircut, the same timeout/unwind/
+> abort-after-fill policy and the same metrics as `paper_legging`. **It remains a simulator**: it
+> cannot reproduce true NSE queue position, hidden liquidity, broker OMS/RMS behaviour, or exchange
+> matching. See `src/box/LIVE_EXECUTION.md` for the full parity model and remaining gaps.
 
 ### The box — LONG and SHORT
 
@@ -518,6 +540,11 @@ Every threshold is env-overridable; the defaults are the shipped specification.
 | `BOX_SIMULATED_LATENCY_MS` | `250` | Simulated order-send → exchange arrival delay |
 | `BOX_SIMULATED_DECISION_MS` | `40` | Simulated internal decision time before an order is "sent" |
 | `BOX_EXECUTION_MAX_WAIT_MS` | `1500` | Bound on how long the simulator waits to reach the arrival instant |
+| `BOX_PAPER_EXECUTION_PROFILE` | `standard` | `standard` (unchanged paper) or `live_parity` (shared-liquidity ledger + latency distribution + live concurrency cap on top of `paper_legging`) |
+| `BOX_PAPER_MAX_CONCURRENT_EXECUTIONS` | live cap (`1`) | Concurrent paper pipelines under `live_parity`; defaults to `BOX_LIVE_MAX_CONCURRENT_EXECUTIONS` |
+| `BOX_PAPER_LATENCY_MODE` | `constant` | `live_parity` latency source: `constant` or `recorded_samples` |
+| `BOX_PAPER_LATENCY_SAMPLES` | (empty) | Comma-separated observed latency samples (ms) for `recorded_samples` |
+| `BOX_PAPER_LATENCY_SEED` | `0` | Deterministic starting offset into the samples (no randomness) |
 | `BOX_LEG_EXECUTION_MODE` | `parallel` | `paper_legging` leg submission: `parallel` or `sequential` |
 | `BOX_LEG_TIMEOUT_MS` | `500` | `paper_legging` per-leg rest time before it is deemed unfilled |
 | `BOX_LEG_UNWIND_LATENCY_MS` | `150` | Simulated latency of the emergency unwind of partial fills |

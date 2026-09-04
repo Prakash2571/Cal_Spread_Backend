@@ -123,3 +123,79 @@ Recommended incident sequence:
 5. Confirm broker positions and Box status are flat, remediate the root cause, and restart if the sticky circuit breaker must be cleared.
 
 Emergency flatten requires the explicit runtime arm plus completed reconciliation or the narrower safe-attributed-reduction proof. It does not flatten unrelated account positions.
+
+
+---
+
+## Paper live-parity profile (`BOX_PAPER_EXECUTION_PROFILE=live_parity`)
+
+Default is `standard` — today's paper behaviour, byte-for-byte. `live_parity` is an
+opt-in layer **on top of `paper_legging`** that makes paper a closer shadow of the live
+path. It changes nothing about the box maths, thresholds, fees, direction logic, exit
+logic, live behaviour, API shapes or schemas.
+
+### What each paper mode is
+
+- **PAPER_LATENCY** — simplified: one simulated decision + send delay, then fill the four
+  legs from the first book at/after arrival. Atomic-ish.
+- **PAPER_LEGGING** — four genuinely independent bounded-LIMIT orders, each with its own
+  arrival, resting, partial fills and timeout; emergency unwind on a partial; abort after
+  a 4/4 fill whose executed economics no longer qualify.
+- **PAPER LIVE PARITY** — `paper_legging` plus:
+  - **shared-liquidity reservation** (`liquidityLedger.ts`) — concurrent attempts cannot
+    double-consume one observed level; a new quote version is fresh liquidity;
+  - **deterministic latency source** (`latencySource.ts`) — `constant | recorded_samples`,
+    consumed in a fixed seeded order, ready for real measured samples;
+  - **live-equivalent concurrency cap** — `BOX_PAPER_MAX_CONCURRENT_EXECUTIONS`, defaulting
+    to the live cap (`BOX_LIVE_MAX_CONCURRENT_EXECUTIONS`).
+
+### How it stays safe
+
+- **Default off.** The profile is `standard` unless explicitly set. Every live-parity
+  behaviour is gated on `paperExecutionProfile === "live_parity"`; the leg executor gets
+  the ledger/latency deps only then, so the `standard` fill and submit paths are
+  unchanged (proven by the existing execution suites passing untouched).
+- **No new broker contact.** Paper still routes entirely through the simulator; the order
+  manager and broker adapter are only constructed in `live` mode (`tests/box/
+  paperNeverReachesBroker.test.mjs` pins this with a poison manager).
+- **Same LIMIT pricing.** Reuses `orderPricing.buildOrderPricing` / `walkDepth`; the
+  reservation only *subtracts already-reserved quantity* from a level's effective depth —
+  it never widens a limit or turns a LIMIT into a market order.
+
+### Config
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BOX_PAPER_EXECUTION_PROFILE` | `standard` | `standard` or `live_parity` |
+| `BOX_PAPER_MAX_CONCURRENT_EXECUTIONS` | live cap (`1`) | concurrent paper pipelines under `live_parity` |
+| `BOX_PAPER_LATENCY_MODE` | `constant` | `constant` or `recorded_samples` |
+| `BOX_PAPER_LATENCY_SAMPLES` | (empty) | comma-separated observed latencies (ms) |
+| `BOX_PAPER_LATENCY_SEED` | `0` | deterministic start offset into the samples |
+
+Timeouts are inherited from the existing live/`paper_legging` config
+(`BOX_LEG_TIMEOUT_MS`, and the `BOX_LIVE_*_TIMEOUT_MS` family for the live path); the
+profile does not invent separate paper timeout numbers.
+
+### What it still CANNOT simulate (honest gaps)
+
+It only uses what actually arrived: real WebSocket books, the configured conservative
+queue haircut, and measured/supplied latency. It does **not** and will not fabricate:
+
+- true NSE order-level queue position (level-2 depth cannot reveal it — the haircut is a
+  deliberate approximation, not a reconstruction);
+- hidden/iceberg liquidity, or other participants consuming a level;
+- broker OMS/RMS acceptance quirks, or random rejects;
+- microsecond exchange matching order or market impact;
+- price movement that was never observed on the feed.
+
+### Deferred (not in this change), with rationale
+
+- **Mirroring the live `OrderManager` scheduler exactly** (serialising the four legs
+  through the same priority queue + `BOX_LIVE_BROKER_MIN_INTERVAL_MS` pacing). The
+  concurrency cap is mirrored; full scheduler mirroring would mean threading live-adjacent
+  scheduling into the paper leg loop, which risks drifting existing `paper_legging` results
+  and cannot be responsibly validated without a real run. Tracked as follow-up.
+- **A dedicated parity-report HTTP endpoint** and additional metrics percentile fields
+  beyond those already exposed in `/api/box/status`. The existing metrics infra already
+  records execution/legging latency percentiles; a separate report is additive and can be
+  layered without touching execution code.
