@@ -8,6 +8,7 @@ import {
   type BrokerOrderState,
 } from "./brokerAdapter.js";
 import type { BoxConfig } from "./config.js";
+import { BOX_ORDER_PRIORITY } from "./executionSchedulingPolicy.js";
 import type {
   BoxOrderIntentAudit,
   BoxOrderIntentPatch,
@@ -146,12 +147,10 @@ interface CancelQueueAction {
 
 type QueueAction = SubmitQueueAction | CancelQueueAction;
 
-const PRIORITY: Readonly<Record<BoxOrderPurpose, number>> = {
-  EMERGENCY_RESIDUAL: 0,
-  PROTECTIVE_CANCEL: 1,
-  EXIT: 2,
-  ENTRY: 3,
-};
+// The scheduling priority is defined once, in executionSchedulingPolicy, and shared with
+// the paper live_parity scheduler so the two can never drift. Same values, same ordering
+// the manager has always used — this is a source move, not a behaviour change.
+const PRIORITY = BOX_ORDER_PRIORITY;
 
 const RECONCILE_STATES: ReadonlySet<BrokerOrderState> = new Set([
   "UNKNOWN",
