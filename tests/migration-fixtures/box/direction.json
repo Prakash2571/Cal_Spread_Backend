@@ -1,0 +1,96 @@
+{
+  "category": "box-direction",
+  "operation": "entrySideFor / exitSideFor",
+  "description": "Which side each of the four legs trades on entry and on exit, per direction. SHORT_BOX is the exact mirror of LONG_BOX; exit is always the reverse of entry.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "LONG_BOX k1_ce",
+      "input": {
+        "role": "k1_ce",
+        "direction": "LONG_BOX"
+      },
+      "expected": {
+        "entry_side": "BUY",
+        "exit_side": "SELL"
+      }
+    },
+    {
+      "name": "LONG_BOX k2_ce",
+      "input": {
+        "role": "k2_ce",
+        "direction": "LONG_BOX"
+      },
+      "expected": {
+        "entry_side": "SELL",
+        "exit_side": "BUY"
+      }
+    },
+    {
+      "name": "LONG_BOX k2_pe",
+      "input": {
+        "role": "k2_pe",
+        "direction": "LONG_BOX"
+      },
+      "expected": {
+        "entry_side": "BUY",
+        "exit_side": "SELL"
+      }
+    },
+    {
+      "name": "LONG_BOX k1_pe",
+      "input": {
+        "role": "k1_pe",
+        "direction": "LONG_BOX"
+      },
+      "expected": {
+        "entry_side": "SELL",
+        "exit_side": "BUY"
+      }
+    },
+    {
+      "name": "SHORT_BOX k1_ce",
+      "input": {
+        "role": "k1_ce",
+        "direction": "SHORT_BOX"
+      },
+      "expected": {
+        "entry_side": "SELL",
+        "exit_side": "BUY"
+      }
+    },
+    {
+      "name": "SHORT_BOX k2_ce",
+      "input": {
+        "role": "k2_ce",
+        "direction": "SHORT_BOX"
+      },
+      "expected": {
+        "entry_side": "BUY",
+        "exit_side": "SELL"
+      }
+    },
+    {
+      "name": "SHORT_BOX k2_pe",
+      "input": {
+        "role": "k2_pe",
+        "direction": "SHORT_BOX"
+      },
+      "expected": {
+        "entry_side": "SELL",
+        "exit_side": "BUY"
+      }
+    },
+    {
+      "name": "SHORT_BOX k1_pe",
+      "input": {
+        "role": "k1_pe",
+        "direction": "SHORT_BOX"
+      },
+      "expected": {
+        "entry_side": "BUY",
+        "exit_side": "SELL"
+      }
+    }
+  ]
+}

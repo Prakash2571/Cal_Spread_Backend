@@ -1,0 +1,2515 @@
+{
+  "category": "quotes",
+  "operation": "evaluateCandidate",
+  "description": "Four-leg evaluation over one instant's books. Note the reject PRECEDENCE: the first failing leg in role order (k1_ce, k2_ce, k2_pe, k1_pe) determines the reason.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "valid fresh four-leg book (LONG_BOX)",
+      "input": {
+        "candidate": {
+          "key": "NIFTY|2026-09-29|25000|25200|LONG_BOX",
+          "underlying": "NIFTY",
+          "name": "NIFTY 50",
+          "is_index": true,
+          "expiry": "2026-09-29",
+          "direction": "LONG_BOX",
+          "lower_strike": 25000,
+          "upper_strike": 25200,
+          "box_width": 200,
+          "lot_size": 50,
+          "legs": {
+            "k1_ce": {
+              "token": 1001,
+              "tradingsymbol": "NIFTY26SEP25000CE",
+              "exchange": "NFO",
+              "strike": 25000,
+              "instrument_type": "CE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k2_ce": {
+              "token": 1002,
+              "tradingsymbol": "NIFTY26SEP25200CE",
+              "exchange": "NFO",
+              "strike": 25200,
+              "instrument_type": "CE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k2_pe": {
+              "token": 1003,
+              "tradingsymbol": "NIFTY26SEP25200PE",
+              "exchange": "NFO",
+              "strike": 25200,
+              "instrument_type": "PE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k1_pe": {
+              "token": 1004,
+              "tradingsymbol": "NIFTY26SEP25000PE",
+              "exchange": "NFO",
+              "strike": 25000,
+              "instrument_type": "PE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            }
+          }
+        },
+        "quotes": [
+          {
+            "token": 1001,
+            "bid": 260,
+            "bid_qty": 500,
+            "ask": 260.5,
+            "ask_qty": 500,
+            "last": 260.25,
+            "bids": [
+              {
+                "price": 260,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 260.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": 1759999999880,
+            "source": "ws"
+          },
+          {
+            "token": 1002,
+            "bid": 130,
+            "bid_qty": 500,
+            "ask": 130.5,
+            "ask_qty": 500,
+            "last": 130.25,
+            "bids": [
+              {
+                "price": 130,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 130.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": 1759999999880,
+            "source": "ws"
+          },
+          {
+            "token": 1003,
+            "bid": 95,
+            "bid_qty": 500,
+            "ask": 95.5,
+            "ask_qty": 500,
+            "last": 95.25,
+            "bids": [
+              {
+                "price": 95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 95.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": 1759999999880,
+            "source": "ws"
+          },
+          {
+            "token": 1004,
+            "bid": 30,
+            "bid_qty": 500,
+            "ask": 30.5,
+            "ask_qty": 500,
+            "last": 30.25,
+            "bids": [
+              {
+                "price": 30,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 30.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": 1759999999880,
+            "source": "ws"
+          }
+        ],
+        "now": 1760000000000,
+        "maxAgeMs": 1500
+      },
+      "expected": {
+        "entry_net_debit_per_unit": 196,
+        "gross_edge_per_unit": 4,
+        "gross_edge": 200,
+        "tradable": true,
+        "depth_ok": true,
+        "worst_age_ms": 100,
+        "quote_version": 10,
+        "reject": null,
+        "legs": [
+          {
+            "role": "k1_ce",
+            "side": "BUY",
+            "price": 260.5,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          },
+          {
+            "role": "k2_ce",
+            "side": "SELL",
+            "price": 130,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          },
+          {
+            "role": "k2_pe",
+            "side": "BUY",
+            "price": 95.5,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          },
+          {
+            "role": "k1_pe",
+            "side": "SELL",
+            "price": 30,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "same books, SHORT_BOX mirrors every side",
+      "input": {
+        "candidate": {
+          "key": "NIFTY|2026-09-29|25000|25200|SHORT_BOX",
+          "underlying": "NIFTY",
+          "name": "NIFTY 50",
+          "is_index": true,
+          "expiry": "2026-09-29",
+          "direction": "SHORT_BOX",
+          "lower_strike": 25000,
+          "upper_strike": 25200,
+          "box_width": 200,
+          "lot_size": 50,
+          "legs": {
+            "k1_ce": {
+              "token": 1001,
+              "tradingsymbol": "NIFTY26SEP25000CE",
+              "exchange": "NFO",
+              "strike": 25000,
+              "instrument_type": "CE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k2_ce": {
+              "token": 1002,
+              "tradingsymbol": "NIFTY26SEP25200CE",
+              "exchange": "NFO",
+              "strike": 25200,
+              "instrument_type": "CE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k2_pe": {
+              "token": 1003,
+              "tradingsymbol": "NIFTY26SEP25200PE",
+              "exchange": "NFO",
+              "strike": 25200,
+              "instrument_type": "PE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k1_pe": {
+              "token": 1004,
+              "tradingsymbol": "NIFTY26SEP25000PE",
+              "exchange": "NFO",
+              "strike": 25000,
+              "instrument_type": "PE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            }
+          }
+        },
+        "quotes": [
+          {
+            "token": 1001,
+            "bid": 260,
+            "bid_qty": 500,
+            "ask": 260.5,
+            "ask_qty": 500,
+            "last": 260.25,
+            "bids": [
+              {
+                "price": 260,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 260.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": 1759999999880,
+            "source": "ws"
+          },
+          {
+            "token": 1002,
+            "bid": 130,
+            "bid_qty": 500,
+            "ask": 130.5,
+            "ask_qty": 500,
+            "last": 130.25,
+            "bids": [
+              {
+                "price": 130,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 130.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": 1759999999880,
+            "source": "ws"
+          },
+          {
+            "token": 1003,
+            "bid": 95,
+            "bid_qty": 500,
+            "ask": 95.5,
+            "ask_qty": 500,
+            "last": 95.25,
+            "bids": [
+              {
+                "price": 95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 95.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": 1759999999880,
+            "source": "ws"
+          },
+          {
+            "token": 1004,
+            "bid": 30,
+            "bid_qty": 500,
+            "ask": 30.5,
+            "ask_qty": 500,
+            "last": 30.25,
+            "bids": [
+              {
+                "price": 30,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 30.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": 1759999999880,
+            "source": "ws"
+          }
+        ],
+        "now": 1760000000000,
+        "maxAgeMs": 1500
+      },
+      "expected": {
+        "entry_net_debit_per_unit": -194,
+        "gross_edge_per_unit": -6,
+        "gross_edge": -300,
+        "tradable": true,
+        "depth_ok": true,
+        "worst_age_ms": 100,
+        "quote_version": 10,
+        "reject": null,
+        "legs": [
+          {
+            "role": "k1_ce",
+            "side": "SELL",
+            "price": 260,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          },
+          {
+            "role": "k2_ce",
+            "side": "BUY",
+            "price": 130.5,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          },
+          {
+            "role": "k2_pe",
+            "side": "SELL",
+            "price": 95,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          },
+          {
+            "role": "k1_pe",
+            "side": "BUY",
+            "price": 30.5,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "one stale leg rejects the candidate",
+      "input": {
+        "candidate": {
+          "key": "NIFTY|2026-09-29|25000|25200|LONG_BOX",
+          "underlying": "NIFTY",
+          "name": "NIFTY 50",
+          "is_index": true,
+          "expiry": "2026-09-29",
+          "direction": "LONG_BOX",
+          "lower_strike": 25000,
+          "upper_strike": 25200,
+          "box_width": 200,
+          "lot_size": 50,
+          "legs": {
+            "k1_ce": {
+              "token": 1001,
+              "tradingsymbol": "NIFTY26SEP25000CE",
+              "exchange": "NFO",
+              "strike": 25000,
+              "instrument_type": "CE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k2_ce": {
+              "token": 1002,
+              "tradingsymbol": "NIFTY26SEP25200CE",
+              "exchange": "NFO",
+              "strike": 25200,
+              "instrument_type": "CE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k2_pe": {
+              "token": 1003,
+              "tradingsymbol": "NIFTY26SEP25200PE",
+              "exchange": "NFO",
+              "strike": 25200,
+              "instrument_type": "PE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k1_pe": {
+              "token": 1004,
+              "tradingsymbol": "NIFTY26SEP25000PE",
+              "exchange": "NFO",
+              "strike": 25000,
+              "instrument_type": "PE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            }
+          }
+        },
+        "quotes": [
+          {
+            "token": 1001,
+            "bid": 260,
+            "bid_qty": 500,
+            "ask": 260.5,
+            "ask_qty": 500,
+            "last": 260.25,
+            "bids": [
+              {
+                "price": 260,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 260.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999991000,
+            "exchange_at": null,
+            "source": "ws"
+          },
+          {
+            "token": 1002,
+            "bid": 130,
+            "bid_qty": 500,
+            "ask": 130.5,
+            "ask_qty": 500,
+            "last": 130.25,
+            "bids": [
+              {
+                "price": 130,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 130.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": null,
+            "source": "ws"
+          },
+          {
+            "token": 1003,
+            "bid": 95,
+            "bid_qty": 500,
+            "ask": 95.5,
+            "ask_qty": 500,
+            "last": 95.25,
+            "bids": [
+              {
+                "price": 95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 95.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": null,
+            "source": "ws"
+          },
+          {
+            "token": 1004,
+            "bid": 30,
+            "bid_qty": 500,
+            "ask": 30.5,
+            "ask_qty": 500,
+            "last": 30.25,
+            "bids": [
+              {
+                "price": 30,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 30.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": null,
+            "source": "ws"
+          }
+        ],
+        "now": 1760000000000,
+        "maxAgeMs": 1500
+      },
+      "expected": {
+        "entry_net_debit_per_unit": 196,
+        "gross_edge_per_unit": 4,
+        "gross_edge": 200,
+        "tradable": false,
+        "depth_ok": true,
+        "worst_age_ms": 9000,
+        "quote_version": 10,
+        "reject": "stale_quote",
+        "legs": [
+          {
+            "role": "k1_ce",
+            "side": "BUY",
+            "price": 260.5,
+            "qty_at_touch": 500,
+            "age_ms": 9000,
+            "fresh": false,
+            "executable": true
+          },
+          {
+            "role": "k2_ce",
+            "side": "SELL",
+            "price": 130,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          },
+          {
+            "role": "k2_pe",
+            "side": "BUY",
+            "price": 95.5,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          },
+          {
+            "role": "k1_pe",
+            "side": "SELL",
+            "price": 30,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "missing ask on a leg we must BUY",
+      "input": {
+        "candidate": {
+          "key": "NIFTY|2026-09-29|25000|25200|LONG_BOX",
+          "underlying": "NIFTY",
+          "name": "NIFTY 50",
+          "is_index": true,
+          "expiry": "2026-09-29",
+          "direction": "LONG_BOX",
+          "lower_strike": 25000,
+          "upper_strike": 25200,
+          "box_width": 200,
+          "lot_size": 50,
+          "legs": {
+            "k1_ce": {
+              "token": 1001,
+              "tradingsymbol": "NIFTY26SEP25000CE",
+              "exchange": "NFO",
+              "strike": 25000,
+              "instrument_type": "CE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k2_ce": {
+              "token": 1002,
+              "tradingsymbol": "NIFTY26SEP25200CE",
+              "exchange": "NFO",
+              "strike": 25200,
+              "instrument_type": "CE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k2_pe": {
+              "token": 1003,
+              "tradingsymbol": "NIFTY26SEP25200PE",
+              "exchange": "NFO",
+              "strike": 25200,
+              "instrument_type": "PE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k1_pe": {
+              "token": 1004,
+              "tradingsymbol": "NIFTY26SEP25000PE",
+              "exchange": "NFO",
+              "strike": 25000,
+              "instrument_type": "PE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            }
+          }
+        },
+        "quotes": [
+          {
+            "token": 1001,
+            "bid": 260,
+            "bid_qty": 500,
+            "ask": 0,
+            "ask_qty": 500,
+            "last": 130,
+            "bids": [
+              {
+                "price": 260,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": null,
+            "source": "ws"
+          },
+          {
+            "token": 1002,
+            "bid": 130,
+            "bid_qty": 500,
+            "ask": 130.5,
+            "ask_qty": 500,
+            "last": 130.25,
+            "bids": [
+              {
+                "price": 130,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 130.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": null,
+            "source": "ws"
+          },
+          {
+            "token": 1003,
+            "bid": 95,
+            "bid_qty": 500,
+            "ask": 95.5,
+            "ask_qty": 500,
+            "last": 95.25,
+            "bids": [
+              {
+                "price": 95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 95.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": null,
+            "source": "ws"
+          },
+          {
+            "token": 1004,
+            "bid": 30,
+            "bid_qty": 500,
+            "ask": 30.5,
+            "ask_qty": 500,
+            "last": 30.25,
+            "bids": [
+              {
+                "price": 30,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 30.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": null,
+            "source": "ws"
+          }
+        ],
+        "now": 1760000000000,
+        "maxAgeMs": 1500
+      },
+      "expected": {
+        "entry_net_debit_per_unit": null,
+        "gross_edge_per_unit": null,
+        "gross_edge": null,
+        "tradable": false,
+        "depth_ok": false,
+        "worst_age_ms": 100,
+        "quote_version": 10,
+        "reject": "missing_ask",
+        "legs": [
+          {
+            "role": "k1_ce",
+            "side": "BUY",
+            "price": null,
+            "qty_at_touch": 0,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": false
+          },
+          {
+            "role": "k2_ce",
+            "side": "SELL",
+            "price": 130,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          },
+          {
+            "role": "k2_pe",
+            "side": "BUY",
+            "price": 95.5,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          },
+          {
+            "role": "k1_pe",
+            "side": "SELL",
+            "price": 30,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "missing bid on a leg we must SELL",
+      "input": {
+        "candidate": {
+          "key": "NIFTY|2026-09-29|25000|25200|LONG_BOX",
+          "underlying": "NIFTY",
+          "name": "NIFTY 50",
+          "is_index": true,
+          "expiry": "2026-09-29",
+          "direction": "LONG_BOX",
+          "lower_strike": 25000,
+          "upper_strike": 25200,
+          "box_width": 200,
+          "lot_size": 50,
+          "legs": {
+            "k1_ce": {
+              "token": 1001,
+              "tradingsymbol": "NIFTY26SEP25000CE",
+              "exchange": "NFO",
+              "strike": 25000,
+              "instrument_type": "CE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k2_ce": {
+              "token": 1002,
+              "tradingsymbol": "NIFTY26SEP25200CE",
+              "exchange": "NFO",
+              "strike": 25200,
+              "instrument_type": "CE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k2_pe": {
+              "token": 1003,
+              "tradingsymbol": "NIFTY26SEP25200PE",
+              "exchange": "NFO",
+              "strike": 25200,
+              "instrument_type": "PE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k1_pe": {
+              "token": 1004,
+              "tradingsymbol": "NIFTY26SEP25000PE",
+              "exchange": "NFO",
+              "strike": 25000,
+              "instrument_type": "PE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            }
+          }
+        },
+        "quotes": [
+          {
+            "token": 1001,
+            "bid": 260,
+            "bid_qty": 500,
+            "ask": 260.5,
+            "ask_qty": 500,
+            "last": 260.25,
+            "bids": [
+              {
+                "price": 260,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 260.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": null,
+            "source": "ws"
+          },
+          {
+            "token": 1002,
+            "bid": 0,
+            "bid_qty": 500,
+            "ask": 130.5,
+            "ask_qty": 500,
+            "last": 65.25,
+            "bids": [],
+            "asks": [
+              {
+                "price": 130.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": null,
+            "source": "ws"
+          },
+          {
+            "token": 1003,
+            "bid": 95,
+            "bid_qty": 500,
+            "ask": 95.5,
+            "ask_qty": 500,
+            "last": 95.25,
+            "bids": [
+              {
+                "price": 95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 94.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 95.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 95.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": null,
+            "source": "ws"
+          },
+          {
+            "token": 1004,
+            "bid": 30,
+            "bid_qty": 500,
+            "ask": 30.5,
+            "ask_qty": 500,
+            "last": 30.25,
+            "bids": [
+              {
+                "price": 30,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 30.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": null,
+            "source": "ws"
+          }
+        ],
+        "now": 1760000000000,
+        "maxAgeMs": 1500
+      },
+      "expected": {
+        "entry_net_debit_per_unit": null,
+        "gross_edge_per_unit": null,
+        "gross_edge": null,
+        "tradable": false,
+        "depth_ok": false,
+        "worst_age_ms": 100,
+        "quote_version": 10,
+        "reject": "missing_bid",
+        "legs": [
+          {
+            "role": "k1_ce",
+            "side": "BUY",
+            "price": 260.5,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          },
+          {
+            "role": "k2_ce",
+            "side": "SELL",
+            "price": null,
+            "qty_at_touch": 0,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": false
+          },
+          {
+            "role": "k2_pe",
+            "side": "BUY",
+            "price": 95.5,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          },
+          {
+            "role": "k1_pe",
+            "side": "SELL",
+            "price": 30,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "insufficient depth for one lot",
+      "input": {
+        "candidate": {
+          "key": "NIFTY|2026-09-29|25000|25200|LONG_BOX",
+          "underlying": "NIFTY",
+          "name": "NIFTY 50",
+          "is_index": true,
+          "expiry": "2026-09-29",
+          "direction": "LONG_BOX",
+          "lower_strike": 25000,
+          "upper_strike": 25200,
+          "box_width": 200,
+          "lot_size": 50,
+          "legs": {
+            "k1_ce": {
+              "token": 1001,
+              "tradingsymbol": "NIFTY26SEP25000CE",
+              "exchange": "NFO",
+              "strike": 25000,
+              "instrument_type": "CE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k2_ce": {
+              "token": 1002,
+              "tradingsymbol": "NIFTY26SEP25200CE",
+              "exchange": "NFO",
+              "strike": 25200,
+              "instrument_type": "CE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k2_pe": {
+              "token": 1003,
+              "tradingsymbol": "NIFTY26SEP25200PE",
+              "exchange": "NFO",
+              "strike": 25200,
+              "instrument_type": "PE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k1_pe": {
+              "token": 1004,
+              "tradingsymbol": "NIFTY26SEP25000PE",
+              "exchange": "NFO",
+              "strike": 25000,
+              "instrument_type": "PE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            }
+          }
+        },
+        "quotes": [
+          {
+            "token": 1001,
+            "bid": 260,
+            "bid_qty": 10,
+            "ask": 260.5,
+            "ask_qty": 10,
+            "last": 260.25,
+            "bids": [
+              {
+                "price": 260,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 259.95,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 259.9,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 259.85,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 259.8,
+                "qty": 10,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 260.5,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 260.55,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 260.6,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 260.65,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 260.7,
+                "qty": 10,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": null,
+            "source": "ws"
+          },
+          {
+            "token": 1002,
+            "bid": 130,
+            "bid_qty": 10,
+            "ask": 130.5,
+            "ask_qty": 10,
+            "last": 130.25,
+            "bids": [
+              {
+                "price": 130,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 129.95,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 129.9,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 129.85,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 129.8,
+                "qty": 10,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 130.5,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 130.55,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 130.6,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 130.65,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 130.7,
+                "qty": 10,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": null,
+            "source": "ws"
+          },
+          {
+            "token": 1003,
+            "bid": 95,
+            "bid_qty": 10,
+            "ask": 95.5,
+            "ask_qty": 10,
+            "last": 95.25,
+            "bids": [
+              {
+                "price": 95,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 94.95,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 94.9,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 94.85,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 94.8,
+                "qty": 10,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 95.5,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 95.55,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 95.6,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 95.65,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 95.7,
+                "qty": 10,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": null,
+            "source": "ws"
+          },
+          {
+            "token": 1004,
+            "bid": 30,
+            "bid_qty": 10,
+            "ask": 30.5,
+            "ask_qty": 10,
+            "last": 30.25,
+            "bids": [
+              {
+                "price": 30,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 29.95,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 29.9,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 29.85,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 29.8,
+                "qty": 10,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 30.5,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 30.55,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 30.6,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 30.65,
+                "qty": 10,
+                "orders": 3
+              },
+              {
+                "price": 30.7,
+                "qty": 10,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": null,
+            "source": "ws"
+          }
+        ],
+        "now": 1760000000000,
+        "maxAgeMs": 1500
+      },
+      "expected": {
+        "entry_net_debit_per_unit": 196,
+        "gross_edge_per_unit": 4,
+        "gross_edge": 200,
+        "tradable": false,
+        "depth_ok": false,
+        "worst_age_ms": 100,
+        "quote_version": 10,
+        "reject": "insufficient_qty",
+        "legs": [
+          {
+            "role": "k1_ce",
+            "side": "BUY",
+            "price": 260.5,
+            "qty_at_touch": 10,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": false
+          },
+          {
+            "role": "k2_ce",
+            "side": "SELL",
+            "price": 130,
+            "qty_at_touch": 10,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": false
+          },
+          {
+            "role": "k2_pe",
+            "side": "BUY",
+            "price": 95.5,
+            "qty_at_touch": 10,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": false
+          },
+          {
+            "role": "k1_pe",
+            "side": "SELL",
+            "price": 30,
+            "qty_at_touch": 10,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "no quote at all for one leg",
+      "input": {
+        "candidate": {
+          "key": "NIFTY|2026-09-29|25000|25200|LONG_BOX",
+          "underlying": "NIFTY",
+          "name": "NIFTY 50",
+          "is_index": true,
+          "expiry": "2026-09-29",
+          "direction": "LONG_BOX",
+          "lower_strike": 25000,
+          "upper_strike": 25200,
+          "box_width": 200,
+          "lot_size": 50,
+          "legs": {
+            "k1_ce": {
+              "token": 1001,
+              "tradingsymbol": "NIFTY26SEP25000CE",
+              "exchange": "NFO",
+              "strike": 25000,
+              "instrument_type": "CE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k2_ce": {
+              "token": 1002,
+              "tradingsymbol": "NIFTY26SEP25200CE",
+              "exchange": "NFO",
+              "strike": 25200,
+              "instrument_type": "CE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k2_pe": {
+              "token": 1003,
+              "tradingsymbol": "NIFTY26SEP25200PE",
+              "exchange": "NFO",
+              "strike": 25200,
+              "instrument_type": "PE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            },
+            "k1_pe": {
+              "token": 1004,
+              "tradingsymbol": "NIFTY26SEP25000PE",
+              "exchange": "NFO",
+              "strike": 25000,
+              "instrument_type": "PE",
+              "expiry": "2026-09-29",
+              "lot_size": 50,
+              "tick_size": 0.05
+            }
+          }
+        },
+        "quotes": [
+          {
+            "token": 1001,
+            "bid": 260,
+            "bid_qty": 500,
+            "ask": 260.5,
+            "ask_qty": 500,
+            "last": 260.25,
+            "bids": [
+              {
+                "price": 260,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 259.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 260.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 260.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": 1759999999880,
+            "source": "ws"
+          },
+          {
+            "token": 1002,
+            "bid": 130,
+            "bid_qty": 500,
+            "ask": 130.5,
+            "ask_qty": 500,
+            "last": 130.25,
+            "bids": [
+              {
+                "price": 130,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 129.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 130.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 130.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": 1759999999880,
+            "source": "ws"
+          },
+          {
+            "token": 1004,
+            "bid": 30,
+            "bid_qty": 500,
+            "ask": 30.5,
+            "ask_qty": 500,
+            "last": 30.25,
+            "bids": [
+              {
+                "price": 30,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.95,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.9,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.85,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 29.8,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "asks": [
+              {
+                "price": 30.5,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.55,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.6,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.65,
+                "qty": 500,
+                "orders": 3
+              },
+              {
+                "price": 30.7,
+                "qty": 500,
+                "orders": 3
+              }
+            ],
+            "version": 10,
+            "at": 1759999999900,
+            "exchange_at": 1759999999880,
+            "source": "ws"
+          }
+        ],
+        "now": 1760000000000,
+        "maxAgeMs": 1500
+      },
+      "expected": {
+        "entry_net_debit_per_unit": null,
+        "gross_edge_per_unit": null,
+        "gross_edge": null,
+        "tradable": false,
+        "depth_ok": false,
+        "worst_age_ms": null,
+        "quote_version": 10,
+        "reject": "no_quote",
+        "legs": [
+          {
+            "role": "k1_ce",
+            "side": "BUY",
+            "price": 260.5,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          },
+          {
+            "role": "k2_ce",
+            "side": "SELL",
+            "price": 130,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          },
+          {
+            "role": "k2_pe",
+            "side": "BUY",
+            "price": null,
+            "qty_at_touch": 0,
+            "age_ms": null,
+            "fresh": false,
+            "executable": false
+          },
+          {
+            "role": "k1_pe",
+            "side": "SELL",
+            "price": 30,
+            "qty_at_touch": 500,
+            "age_ms": 100,
+            "fresh": true,
+            "executable": true
+          }
+        ]
+      }
+    }
+  ]
+}

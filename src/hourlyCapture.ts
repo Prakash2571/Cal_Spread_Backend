@@ -1,3 +1,4 @@
+import { trackInterval } from "./trackedTimers.js";
 import { HourlyPrice } from "./db.js";
 import type { IHourlyPrice } from "./db.js";
 import type { KiteClient } from "./kite.js";
@@ -337,7 +338,7 @@ function currentCaptureSlot(ist: Date): string | null {
 export function startHourlyScheduler(deps: HourlySchedulerDeps): void {
   const { getBoard, getLatestTick, kite, getAllInstruments } = deps;
 
-  setInterval(() => {
+  trackInterval("hourly-capture", setInterval(() => {
     void (async () => {
       try {
         if (!isMarketOpen()) return;
@@ -358,7 +359,7 @@ export function startHourlyScheduler(deps: HourlySchedulerDeps): void {
         console.error("[HourlyCapture] Scheduler error:", err);
       }
     })();
-  }, 60_000);
+  }, 60_000));
 
   console.log("[HourlyCapture] Hourly scheduler started (checking every 60s).");
 }
@@ -721,7 +722,7 @@ export function startDayReviewScheduler(deps: HourlySchedulerDeps): void {
   const reviewH = Number.isFinite(Number(parts[0])) ? Number(parts[0]) : 16;
   const reviewM = Number.isFinite(Number(parts[1])) ? Number(parts[1]) : 30;
 
-  setInterval(() => {
+  trackInterval("day-review", setInterval(() => {
     void (async () => {
       try {
         const ist = istNow();
@@ -740,7 +741,7 @@ export function startDayReviewScheduler(deps: HourlySchedulerDeps): void {
         console.error("[DayReview] Scheduler error:", err);
       }
     })();
-  }, 60_000);
+  }, 60_000));
 
   console.log(
     `[DayReview] End-of-day review scheduler started (checking for ${String(reviewH).padStart(2, "0")}:${String(reviewM).padStart(2, "0")} IST).`,

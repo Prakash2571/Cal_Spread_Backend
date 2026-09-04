@@ -61,6 +61,10 @@ import { registerMarketDataRoutes } from "./marketDataRoutes.js";
 import { INDEX_SPOT_MAP, indexSpotCandidates, resolveIndexSpotSymbol } from "./indexSpot.js";
 import { MarketDataSessionStore } from "./marketDataSession.js";
 import { checkTokenPasscode, readPasscode } from "./tokenRouteAuth.js";
+import { generateAdminToken } from "./adminToken.js";
+import { ShutdownCoordinator, shutdownExitCode } from "./shutdown.js";
+import { clearTrackedIntervals, trackInterval } from "./trackedTimers.js";
+import { closeDbConnections } from "./db.js";
 import { HistoryProvider } from "./brokers/history.js";
 import { parseBrokerId, type BrokerId } from "./brokers/types.js";
 import { LocalChargeCalculator } from "./box/localCharges.js";
@@ -220,9 +224,9 @@ interface AdminSession {
 const adminSessions = new Map<string, AdminSession>();
 const ADMIN_SESSION_TTL_MS = 1000 * 60 * 60 * 24; // 24 hours
 
-function generateAdminToken(): string {
-  return Math.random().toString(36).substring(2) + Date.now().toString(36);
-}
+// generateAdminToken now lives in ./adminToken.js — see that file for why Math.random()
+// was unacceptable for a full-admin bearer credential. Behaviour of everything around it
+// (TTL, middleware, persistence, header names, role split) is unchanged.
 
 /** The role of a token, or null if missing/expired. */
 function getAdminRole(token: string | undefined): AdminRole | null {
@@ -669,10 +673,10 @@ async function flushRedisWrites(): Promise<void> {
  */
 function startRedisFlushRetry(): void {
   if (!isRedisEnabled()) return;
-  setInterval(() => {
+  trackInterval("redis-flush-retry", setInterval(() => {
     if (pendingHashWrites.size === 0 && pendingPlainWrites.size === 0) return;
     void flushRedisWrites();
-  }, 60 * 1000);
+  }, 60 * 1000));
 }
 
 /** Put a failed batch back, letting anything queued since take precedence. */
@@ -5110,7 +5114,7 @@ function startOptionOiCapture(): void {
     coarsenFrames();
     await flushRedisWrites();
   })();
-  setInterval(() => {
+  trackInterval("option-oi-capture", setInterval(() => {
     if (!isIstMarketHours()) return;
     // Snapshot both windows up front. The option backfill can pace hundreds of
     // historical calls, and a minute-tick capture landing before the futures run
@@ -5126,7 +5130,7 @@ function startOptionOiCapture(): void {
       coarsenFrames();
       await flushRedisWrites();
     })();
-  }, 30 * 60 * 1000);
+  }, 30 * 60 * 1000));
 }
 
 /** Persist the Zerodha access token so it survives a restart (best-effort). */
@@ -5280,7 +5284,7 @@ registerBrokerRoutes(app, {
   indexSpotMap: INDEX_SPOT_MAP,
 });
 
-app.listen(PORT, () => {
+const httpServer = app.listen(PORT, () => {
   console.log(`Cal_Spread backend listening on http://localhost:${PORT}`);
   if (!process.env.KITE_API_KEY || !process.env.KITE_API_SECRET) {
     console.warn(
@@ -5375,3 +5379,104 @@ app.listen(PORT, () => {
     void checkAndRecomputeSummary();
   });
 });
+
+
+// ---------------------------------------------------------------------------
+// GRACEFUL SHUTDOWN
+//
+// Ordering is the point. Discovery is disabled BEFORE anything else so no new box can
+// be opened while the process is winding down, and the database connections close LAST
+// so every earlier step can still persist.
+//
+// IT DOES NOT FLATTEN POSITIONS. A signal is not an instruction to liquidate: open
+// boxes stay open and the durable recovery path adopts them on restart, exactly as it
+// does after a crash today. Every hook used below was checked against that rule — see
+// src/shutdown.ts.
+// ---------------------------------------------------------------------------
+const shutdownCoordinator = new ShutdownCoordinator({
+  timeoutMs: Number(process.env.SHUTDOWN_TIMEOUT_MS ?? 12_000),
+  steps: [
+    {
+      // FIRST, and before the HTTP server stops accepting connections: an in-flight
+      // request must not be able to start a new box on the way out.
+      name: "disable new Box entry discovery",
+      run: () => boxModule.engine.stop(),
+    },
+    {
+      /**
+       * Stop accepting NEW connections, let in-flight requests drain briefly, then force
+       * the stragglers.
+       *
+       * `server.close()` does not resolve until every connection has ended, and SSE
+       * connections never end on their own — a browser with the board open holds one
+       * indefinitely. Awaiting it naively would make EVERY shutdown hang to the deadline
+       * and exit non-zero, which is exactly the false alarm that teaches operators to
+       * ignore exit codes.
+       *
+       * So: stop listening, release idle keep-alive sockets, give real in-flight requests
+       * a short grace period, then destroy what remains. Dropping an SSE socket is
+       * correct here — the client reconnects to the replacement process, which is what a
+       * redeploy is supposed to look like.
+       */
+      name: "stop accepting new HTTP connections",
+      run: () =>
+        new Promise<void>((resolve) => {
+          const HTTP_DRAIN_GRACE_MS = 3000;
+          let settled = false;
+          const done = (): void => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(graceTimer);
+            resolve();
+          };
+
+          httpServer.close(done);
+          // Keep-alive sockets with no request in flight can go immediately.
+          httpServer.closeIdleConnections?.();
+
+          const graceTimer = setTimeout(() => {
+            // Long-lived SSE responses (and anything wedged) are destroyed here.
+            httpServer.closeAllConnections?.();
+            console.log(
+              `[shutdown] HTTP drain grace of ${HTTP_DRAIN_GRACE_MS}ms elapsed; ` +
+                `remaining connections (SSE clients) closed.`,
+            );
+            done();
+          }, HTTP_DRAIN_GRACE_MS);
+        }),
+    },
+    {
+      name: "stop capture/flush schedulers",
+      run: () => {
+        const cleared = clearTrackedIntervals();
+        if (cleared.length > 0) console.log(`[shutdown] cleared timers: ${cleared.join(", ")}`);
+      },
+    },
+    {
+      // Disables entries again (belt and braces), stops the scanner, position monitor,
+      // metrics sampler and P&L archiver, and clears every timer the engine owns.
+      // Queued order actions that never reached the broker are rejected and their
+      // reservations released — no fill is invented for them.
+      name: "dispose Box engine (positions preserved)",
+      run: () => boxModule.engine.dispose(),
+    },
+    {
+      name: "stop broker market-data feeds",
+      run: () => brokerManager.stopFeeds(),
+    },
+    {
+      // LAST: everything above may still have written on its way out.
+      name: "close MongoDB connections",
+      run: () => closeDbConnections(),
+    },
+  ],
+});
+
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.on(signal, () => {
+    void shutdownCoordinator.run(signal).then((result) => {
+      // The coordinator never calls process.exit itself, so it stays unit-testable.
+      process.exit(shutdownExitCode(result));
+    });
+  });
+}

@@ -1,0 +1,324 @@
+{
+  "category": "charges",
+  "operation": "calculateBoxCharges / calculateRoundTrip",
+  "description": "Per-leg Indian F&O option charges and their sum. STT applies to SELLS only and is rounded to the NEAREST RUPEE (a contract-note behaviour, not paise rounding). Stamp duty applies to BUYS only. IPFT is per crore of turnover, folded into the exchange head. GST applies to brokerage + exchange + sebi.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "four-leg long-box entry charges",
+      "input": {
+        "orders": [
+          {
+            "side": "BUY",
+            "tradingsymbol": "NIFTY26SEP25000CE",
+            "price": 260.5,
+            "quantity": 50
+          },
+          {
+            "side": "SELL",
+            "tradingsymbol": "NIFTY26SEP25200CE",
+            "price": 130,
+            "quantity": 50
+          },
+          {
+            "side": "BUY",
+            "tradingsymbol": "NIFTY26SEP25200PE",
+            "price": 95.5,
+            "quantity": 50
+          },
+          {
+            "side": "SELL",
+            "tradingsymbol": "NIFTY26SEP25000PE",
+            "price": 30,
+            "quantity": 50
+          }
+        ],
+        "rates": {
+          "brokeragePerOrder": 20,
+          "brokerageMaxPct": 0,
+          "sttSellPct": 0.15,
+          "sttRoundNearestRupee": true,
+          "exchangeTxnPct": 0.03503,
+          "ipftPerCrore": 50,
+          "ipftPct": 0,
+          "sebiPct": 0.0001,
+          "stampDutyBuyPct": 0.003,
+          "gstPct": 18,
+          "sttType": "stt",
+          "rateVersion": "zerodha-nse-options-2026-04-01"
+        }
+      },
+      "expected": {
+        "legs": [
+          {
+            "side": "BUY",
+            "tradingsymbol": "NIFTY26SEP25000CE",
+            "quantity": 50,
+            "price": 260.5,
+            "value": 13025,
+            "brokerage": 20,
+            "stt": 0,
+            "stt_type": "",
+            "exchange_txn": 4.63,
+            "sebi": 0.01,
+            "stamp_duty": 0.39,
+            "gst": 4.44,
+            "total": 29.47
+          },
+          {
+            "side": "SELL",
+            "tradingsymbol": "NIFTY26SEP25200CE",
+            "quantity": 50,
+            "price": 130,
+            "value": 6500,
+            "brokerage": 20,
+            "stt": 10,
+            "stt_type": "stt",
+            "exchange_txn": 2.31,
+            "sebi": 0.01,
+            "stamp_duty": 0,
+            "gst": 4.02,
+            "total": 36.34
+          },
+          {
+            "side": "BUY",
+            "tradingsymbol": "NIFTY26SEP25200PE",
+            "quantity": 50,
+            "price": 95.5,
+            "value": 4775,
+            "brokerage": 20,
+            "stt": 0,
+            "stt_type": "",
+            "exchange_txn": 1.69,
+            "sebi": 0,
+            "stamp_duty": 0.14,
+            "gst": 3.9,
+            "total": 25.73
+          },
+          {
+            "side": "SELL",
+            "tradingsymbol": "NIFTY26SEP25000PE",
+            "quantity": 50,
+            "price": 30,
+            "value": 1500,
+            "brokerage": 20,
+            "stt": 2,
+            "stt_type": "stt",
+            "exchange_txn": 0.54,
+            "sebi": 0,
+            "stamp_duty": 0,
+            "gst": 3.7,
+            "total": 26.24
+          }
+        ],
+        "value": 25800,
+        "brokerage": 80,
+        "stt": 12,
+        "exchange_txn": 9.17,
+        "sebi": 0.02,
+        "stamp_duty": 0.53,
+        "gst": 16.06,
+        "total": 117.78,
+        "source": "kite",
+        "computed_by": "local"
+      }
+    },
+    {
+      "name": "round trip: entry plus the reversed estimated exit",
+      "input": {
+        "orders": [
+          {
+            "side": "BUY",
+            "tradingsymbol": "NIFTY26SEP25000CE",
+            "price": 260.5,
+            "quantity": 50
+          },
+          {
+            "side": "SELL",
+            "tradingsymbol": "NIFTY26SEP25200CE",
+            "price": 130,
+            "quantity": 50
+          },
+          {
+            "side": "BUY",
+            "tradingsymbol": "NIFTY26SEP25200PE",
+            "price": 95.5,
+            "quantity": 50
+          },
+          {
+            "side": "SELL",
+            "tradingsymbol": "NIFTY26SEP25000PE",
+            "price": 30,
+            "quantity": 50
+          }
+        ],
+        "rates": {
+          "brokeragePerOrder": 20,
+          "brokerageMaxPct": 0,
+          "sttSellPct": 0.15,
+          "sttRoundNearestRupee": true,
+          "exchangeTxnPct": 0.03503,
+          "ipftPerCrore": 50,
+          "ipftPct": 0,
+          "sebiPct": 0.0001,
+          "stampDutyBuyPct": 0.003,
+          "gstPct": 18,
+          "sttType": "stt",
+          "rateVersion": "zerodha-nse-options-2026-04-01"
+        }
+      },
+      "expected": {
+        "entry": {
+          "legs": [
+            {
+              "side": "BUY",
+              "tradingsymbol": "NIFTY26SEP25000CE",
+              "quantity": 50,
+              "price": 260.5,
+              "value": 13025,
+              "brokerage": 20,
+              "stt": 0,
+              "stt_type": "",
+              "exchange_txn": 4.63,
+              "sebi": 0.01,
+              "stamp_duty": 0.39,
+              "gst": 4.44,
+              "total": 29.47
+            },
+            {
+              "side": "SELL",
+              "tradingsymbol": "NIFTY26SEP25200CE",
+              "quantity": 50,
+              "price": 130,
+              "value": 6500,
+              "brokerage": 20,
+              "stt": 10,
+              "stt_type": "stt",
+              "exchange_txn": 2.31,
+              "sebi": 0.01,
+              "stamp_duty": 0,
+              "gst": 4.02,
+              "total": 36.34
+            },
+            {
+              "side": "BUY",
+              "tradingsymbol": "NIFTY26SEP25200PE",
+              "quantity": 50,
+              "price": 95.5,
+              "value": 4775,
+              "brokerage": 20,
+              "stt": 0,
+              "stt_type": "",
+              "exchange_txn": 1.69,
+              "sebi": 0,
+              "stamp_duty": 0.14,
+              "gst": 3.9,
+              "total": 25.73
+            },
+            {
+              "side": "SELL",
+              "tradingsymbol": "NIFTY26SEP25000PE",
+              "quantity": 50,
+              "price": 30,
+              "value": 1500,
+              "brokerage": 20,
+              "stt": 2,
+              "stt_type": "stt",
+              "exchange_txn": 0.54,
+              "sebi": 0,
+              "stamp_duty": 0,
+              "gst": 3.7,
+              "total": 26.24
+            }
+          ],
+          "value": 25800,
+          "brokerage": 80,
+          "stt": 12,
+          "exchange_txn": 9.17,
+          "sebi": 0.02,
+          "stamp_duty": 0.53,
+          "gst": 16.06,
+          "total": 117.78,
+          "source": "kite",
+          "computed_by": "local"
+        },
+        "estimated_exit": {
+          "legs": [
+            {
+              "side": "SELL",
+              "tradingsymbol": "NIFTY26SEP25000CE",
+              "quantity": 50,
+              "price": 260.5,
+              "value": 13025,
+              "brokerage": 20,
+              "stt": 20,
+              "stt_type": "stt",
+              "exchange_txn": 4.63,
+              "sebi": 0.01,
+              "stamp_duty": 0,
+              "gst": 4.44,
+              "total": 49.08
+            },
+            {
+              "side": "BUY",
+              "tradingsymbol": "NIFTY26SEP25200CE",
+              "quantity": 50,
+              "price": 130,
+              "value": 6500,
+              "brokerage": 20,
+              "stt": 0,
+              "stt_type": "",
+              "exchange_txn": 2.31,
+              "sebi": 0.01,
+              "stamp_duty": 0.2,
+              "gst": 4.02,
+              "total": 26.54
+            },
+            {
+              "side": "SELL",
+              "tradingsymbol": "NIFTY26SEP25200PE",
+              "quantity": 50,
+              "price": 95.5,
+              "value": 4775,
+              "brokerage": 20,
+              "stt": 7,
+              "stt_type": "stt",
+              "exchange_txn": 1.69,
+              "sebi": 0,
+              "stamp_duty": 0,
+              "gst": 3.9,
+              "total": 32.59
+            },
+            {
+              "side": "BUY",
+              "tradingsymbol": "NIFTY26SEP25000PE",
+              "quantity": 50,
+              "price": 30,
+              "value": 1500,
+              "brokerage": 20,
+              "stt": 0,
+              "stt_type": "",
+              "exchange_txn": 0.54,
+              "sebi": 0,
+              "stamp_duty": 0.05,
+              "gst": 3.7,
+              "total": 24.29
+            }
+          ],
+          "value": 25800,
+          "brokerage": 80,
+          "stt": 27,
+          "exchange_txn": 9.17,
+          "sebi": 0.02,
+          "stamp_duty": 0.25,
+          "gst": 16.06,
+          "total": 132.5,
+          "source": "kite_estimate",
+          "computed_by": "local"
+        },
+        "entry_total": 117.78,
+        "estimated_exit_total": 132.5
+      }
+    }
+  ]
+}

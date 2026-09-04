@@ -26,11 +26,17 @@
     "exactOptionalPropertyTypes": true,
 
     // Style Options
-    // "noImplicitReturns": true,
+    // Enabled: the codebase already passes both with ZERO changes (verified across
+    // every file in src), and they are the two most valuable for trading correctness —
+    // a code path that forgets to return, or a switch case that falls through, is a bug
+    // class worth failing the build on. The others stay off deliberately: enabling
+    // noUnusedLocals/Parameters or noPropertyAccessFromIndexSignature would force broad
+    // stylistic churn on code that is about to be replaced by the Go rewrite.
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
     // "noImplicitOverride": true,
     // "noUnusedLocals": true,
     // "noUnusedParameters": true,
-    // "noFallthroughCasesInSwitch": true,
     // "noPropertyAccessFromIndexSignature": true,
 
     // Recommended Options

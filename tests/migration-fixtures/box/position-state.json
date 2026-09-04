@@ -1,0 +1,159 @@
+{
+  "category": "position-state",
+  "operation": "deriveBoxPositionState / isBoxPositionFlat / outstandingRoles",
+  "description": "A box is CLOSED only when EVERY role is flat — a 1/4, 2/4 or 3/4 exit is not a closed box. RECOVERY is sticky until the exposure is genuinely flat.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "all four legs at full lot is a BOX",
+      "input": {
+        "remaining_qty_by_role": {
+          "k1_ce": 50,
+          "k2_ce": 50,
+          "k2_pe": 50,
+          "k1_pe": 50
+        }
+      },
+      "expected": {
+        "state": "BOX",
+        "flat": false,
+        "outstanding": [
+          {
+            "role": "k1_ce",
+            "quantity": 50
+          },
+          {
+            "role": "k2_ce",
+            "quantity": 50
+          },
+          {
+            "role": "k2_pe",
+            "quantity": 50
+          },
+          {
+            "role": "k1_pe",
+            "quantity": 50
+          }
+        ]
+      }
+    },
+    {
+      "name": "two legs exited leaves residual exposure",
+      "input": {
+        "remaining_qty_by_role": {
+          "k1_ce": 50,
+          "k2_ce": 0,
+          "k2_pe": 50,
+          "k1_pe": 0
+        }
+      },
+      "expected": {
+        "state": "PARTIALLY_EXITED",
+        "flat": false,
+        "outstanding": [
+          {
+            "role": "k1_ce",
+            "quantity": 50
+          },
+          {
+            "role": "k2_pe",
+            "quantity": 50
+          }
+        ]
+      }
+    },
+    {
+      "name": "unequal quantities are PARTIALLY_EXITED, not a BOX",
+      "input": {
+        "remaining_qty_by_role": {
+          "k1_ce": 50,
+          "k2_ce": 25,
+          "k2_pe": 50,
+          "k1_pe": 50
+        }
+      },
+      "expected": {
+        "state": "PARTIALLY_EXITED",
+        "flat": false,
+        "outstanding": [
+          {
+            "role": "k1_ce",
+            "quantity": 50
+          },
+          {
+            "role": "k2_ce",
+            "quantity": 25
+          },
+          {
+            "role": "k2_pe",
+            "quantity": 50
+          },
+          {
+            "role": "k1_pe",
+            "quantity": 50
+          }
+        ]
+      }
+    },
+    {
+      "name": "every role zero is FLAT",
+      "input": {
+        "remaining_qty_by_role": {
+          "k1_ce": 0,
+          "k2_ce": 0,
+          "k2_pe": 0,
+          "k1_pe": 0
+        }
+      },
+      "expected": {
+        "state": "FLAT",
+        "flat": true,
+        "outstanding": []
+      }
+    },
+    {
+      "name": "RECOVERY is sticky while exposure remains",
+      "input": {
+        "remaining_qty_by_role": {
+          "k1_ce": 50,
+          "k2_ce": 0,
+          "k2_pe": 50,
+          "k1_pe": 0
+        },
+        "current": "RECOVERY"
+      },
+      "expected": {
+        "state": "RECOVERY"
+      }
+    },
+    {
+      "name": "RECOVERY still becomes FLAT once genuinely flat",
+      "input": {
+        "remaining_qty_by_role": {
+          "k1_ce": 0,
+          "k2_ce": 0,
+          "k2_pe": 0,
+          "k1_pe": 0
+        },
+        "current": "RECOVERY"
+      },
+      "expected": {
+        "state": "FLAT"
+      }
+    },
+    {
+      "name": "fullLotByRole spreads one quantity across all four roles",
+      "input": {
+        "quantity": 50
+      },
+      "expected": {
+        "by_role": {
+          "k1_ce": 50,
+          "k2_ce": 50,
+          "k2_pe": 50,
+          "k1_pe": 50
+        }
+      }
+    }
+  ]
+}
