@@ -36,6 +36,7 @@ import type { Tick } from "./ticker.js";
 import type { TickerHub } from "./hub.js";
 import type { ActiveBrokerManager } from "./brokers/registry.js";
 import { MarketDataSessionStore, parseTokenList, MAX_SESSION_TOKENS } from "./marketDataSession.js";
+import { BoundedTtlCache } from "./boundedCache.js";
 
 /** Cap for a single REST quote request. Generous, but bounded. */
 const MAX_QUOTE_TOKENS = 4000;
@@ -61,8 +62,18 @@ export function registerMarketDataRoutes(app: Express, deps: MarketDataDeps): vo
    * Keyed by BROKER and GENERATION as well as the token set: the same integer means a
    * different instrument at each broker, so a shared key would serve Zerodha prices
    * for Dhan tokens after a switch.
+   *
+   * BOUNDED, because the key contains the caller's token set and this route is
+   * unauthenticated — a plain Map here leaked one permanent entry (with full depth
+   * ladders) per distinct token permutation until the process ran out of memory.
    */
-  const quotesCache = new Map<string, { at: number; ticks: Tick[] }>();
+  const quotesCache = new BoundedTtlCache<Tick[]>({
+    ttlMs: QUOTES_TTL_MS,
+    // Comfortably more than the handful of distinct token sets a real UI produces
+    // (full board, filtered board, one detail page, one option chain), while still a
+    // hard ceiling under abuse.
+    maxEntries: 256,
+  });
 
   /** The one path both quote transports take, so they cannot diverge. */
   async function serveQuotes(tokens: number[], res: Response): Promise<void> {
@@ -96,9 +107,10 @@ export function registerMarketDataRoutes(app: Express, deps: MarketDataDeps): vo
     const cacheKey =
       `${brokerManager.activeBroker}:${brokerManager.generation}:` +
       tokens.slice().sort((a, b) => a - b).join(",");
+    // The cache itself enforces the TTL and deletes what it expires.
     const cached = quotesCache.get(cacheKey);
-    if (cached && Date.now() - cached.at < QUOTES_TTL_MS) {
-      res.json({ ticks: cached.ticks, broker: brokerManager.activeBroker, cached: true });
+    if (cached) {
+      res.json({ ticks: cached, broker: brokerManager.activeBroker, cached: true });
       return;
     }
 
@@ -106,7 +118,7 @@ export function registerMarketDataRoutes(app: Express, deps: MarketDataDeps): vo
       // Routed to the ACTIVE broker. Dhan's REST quote also carries depth, so bid/ask
       // arrive here rather than only from the socket.
       const ticks = await brokerManager.quoteProvider.quotesByToken(tokens);
-      quotesCache.set(cacheKey, { at: Date.now(), ticks });
+      quotesCache.set(cacheKey, ticks);
       // Warm the shared hub cache so late-joining SSE clients get instant data.
       tickerHub.seed(ticks);
       console.log(

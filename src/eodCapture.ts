@@ -666,18 +666,21 @@ export function startEodScheduler(deps: EodSchedulerDeps): void {
         // Trigger EOD capture at 15:45-15:47 IST (3-min window).
         if (hh === 15 && mm >= 45 && mm <= 47) {
           if (today !== lastCapturedDay) {
-            lastCapturedDay = today;
             console.log("[EODCapture] Triggering EOD capture at 15:45 IST...");
             await captureEodData(deps);
+            // Marked AFTER success: marking first meant a single transient error at 15:45
+            // lost the whole day's closing capture, because the remaining window then
+            // short-circuited on the day guard.
+            lastCapturedDay = today;
           }
         }
 
         // Trigger summary recomputation at 16:00-16:02 IST (3-min window).
         if (hh === 16 && mm >= 0 && mm <= 2) {
           if (today !== lastComputedDay) {
-            lastComputedDay = today;
             console.log("[EODCapture] Triggering spread summary recomputation at 16:00 IST...");
             await recomputeSpreadSummary();
+            lastComputedDay = today;
           }
         }
       } catch (err) {

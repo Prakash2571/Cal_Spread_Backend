@@ -394,5 +394,16 @@ export class TickerHub {
     this.notifyConnection(false);
     this.subscribed.clear();
     this.latest.clear();
+    // The DEPTH LADDERS must go too, or the guarantee above is false.
+    //
+    // These were left behind, so after a Zerodha→Dhan switch a token integer that exists
+    // in both namespaces could still hand a caller of `getLadderSnapshot()` a ZERODHA
+    // book — and that method deliberately delegates the freshness policy to its caller.
+    // Separately, Dhan ticks arrive through `ingestExternalTicks`, which never populates
+    // `subscribed`, so `unsubscribeTokens` could never evict these maps for a Dhan
+    // session and they grew for the process lifetime as the strike window rolled.
+    this.latestLadder.clear();
+    this.latestLadderAt.clear();
+    this.latestAt.clear();
   }
 }

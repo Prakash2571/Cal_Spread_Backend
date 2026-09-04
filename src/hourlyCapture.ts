@@ -349,12 +349,16 @@ export function startHourlyScheduler(deps: HourlySchedulerDeps): void {
 
         const slotKey = `${istDayKey()}_${slot}`;
         if (slotKey === lastCapturedSlot) return;
-        lastCapturedSlot = slotKey;
 
         const board = await getBoard();
         const instruments = await getAllInstruments();
         await captureHourlyPrices(board, getLatestTick, kite, instruments, slot);
         await drainCacheToDB();
+        // Marked AFTER the work succeeds. Marking first meant one transient Kite error
+        // burnt the slot: the catch below logged it, but the guard above then skipped the
+        // rest of the capture window and that slot was never captured for the day. The
+        // window is a few minutes wide precisely so a retry is possible.
+        lastCapturedSlot = slotKey;
       } catch (err) {
         console.error("[HourlyCapture] Scheduler error:", err);
       }
@@ -517,16 +521,24 @@ export async function backfillMissedHours(deps: HourlySchedulerDeps): Promise<vo
     }
   }
 
-  if (pendingWrites.length > 0) {
-    console.log(
-      `[HourlyCapture] Backfill queued ${pendingWrites.length} records. Draining...`,
-    );
-    await drainCacheToDB();
-  } else {
-    console.log("[HourlyCapture] Backfill: no missing slots found.");
+  // try/finally, NOT a trailing assignment. `drainCacheToDB()` can reject (a write during
+  // shutdown, a replica-set step-down), and a plain statement here would then be skipped,
+  // leaving `backfilling === true` for the life of the process. Every later backfill —
+  // including the post-login one — would hit the guard at the top and return silently, so
+  // missed hourly slots would never be recovered. Permanent, invisible data loss from one
+  // transient error.
+  try {
+    if (pendingWrites.length > 0) {
+      console.log(
+        `[HourlyCapture] Backfill queued ${pendingWrites.length} records. Draining...`,
+      );
+      await drainCacheToDB();
+    } else {
+      console.log("[HourlyCapture] Backfill: no missing slots found.");
+    }
+  } finally {
+    backfilling = false;
   }
-
-  backfilling = false;
 }
 
 // ============================================================================

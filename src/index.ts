@@ -104,7 +104,9 @@ const tickerHub = new TickerHub(
     // Token was rejected by Zerodha — clear both memory and the persisted copy
     // so we don't restore a dead token on the next restart.
     kite.clearSession();
-    void clearKiteSession();
+    void clearKiteSession().catch((e) =>
+      console.warn("[Session] clearKiteSession failed:", e),
+    );
     onFeedSessionLost?.();
   },
 );
@@ -235,7 +237,12 @@ function getAdminRole(token: string | undefined): AdminRole | null {
   if (!s || Date.now() > s.expiry) {
     if (token) {
       adminSessions.delete(token);
-      void deleteAdminSession(token); // best-effort cleanup of the persisted copy
+      // best-effort cleanup of the persisted copy. MUST be caught: this runs on the
+      // expiry path of EVERY authenticated request, so an unhandled rejection here
+      // would let a brief Mongo outage take the whole backend down.
+      void deleteAdminSession(token).catch((e) =>
+        console.warn("[Admin] deleteAdminSession failed:", e),
+      );
     }
     return null;
   }
@@ -1245,12 +1252,20 @@ app.post(
   async (req: Request, res: Response) => {
   const { secret, broker: requestedBroker } = req.body ?? {};
 
-  if (!ADMIN_SECRET) {
+  // Constant-time, via the same guard the token routes use. A plain `!==` on the
+  // credential that grants the FULL admin role (place/close/delete trades, switch
+  // broker) was the one comparison the codebase had not converted — brokers/routes.ts
+  // even documents why the weakest comparison defines the real exposure. Status codes
+  // are preserved exactly: 500 unconfigured, 401 wrong.
+  const adminCheck = checkTokenPasscode(
+    ADMIN_SECRET,
+    typeof secret === "string" ? secret : undefined,
+  );
+  if (adminCheck === "not_configured") {
     res.status(500).json({ error: "Admin secret not configured on server" });
     return;
   }
-
-  if (secret !== ADMIN_SECRET) {
+  if (adminCheck === "forbidden") {
     res.status(401).json({ error: "Invalid admin secret" });
     return;
   }
@@ -1280,7 +1295,9 @@ app.post(
   const token = generateAdminToken();
   const expiry = Date.now() + ADMIN_SESSION_TTL_MS;
   adminSessions.set(token, { expiry, role: "full" });
-  void saveAdminSession(token, "full", expiry); // survive backend restarts
+  void saveAdminSession(token, "full", expiry).catch((e) =>
+    console.warn("[Admin] saveAdminSession(full) failed:", e),
+  ); // survive backend restarts
 
   res.json({
     success: true,
@@ -1310,11 +1327,16 @@ app.post(
   (req: Request, res: Response) => {
     const { secret } = req.body;
 
-    if (!ACCESS_SECRET) {
+    // Constant-time, same guard as the admin and token routes.
+    const accessCheck = checkTokenPasscode(
+      ACCESS_SECRET,
+      typeof secret === "string" ? secret : undefined,
+    );
+    if (accessCheck === "not_configured") {
       res.status(500).json({ error: "Access secret not configured on server" });
       return;
     }
-    if (secret !== ACCESS_SECRET) {
+    if (accessCheck === "forbidden") {
       res.status(401).json({ error: "Invalid access code" });
       return;
     }
@@ -1322,7 +1344,9 @@ app.post(
     const token = generateAdminToken();
     const expiry = Date.now() + ADMIN_SESSION_TTL_MS;
     adminSessions.set(token, { expiry, role: "trade" });
-    void saveAdminSession(token, "trade", expiry); // survive backend restarts
+    void saveAdminSession(token, "trade", expiry).catch((e) =>
+      console.warn("[Admin] saveAdminSession(trade) failed:", e),
+    ); // survive backend restarts
 
     res.json({
       success: true,
@@ -1416,7 +1440,9 @@ app.get("/callback", async (req: Request, res: Response) => {
 // --- Logout: forget the stored Kite session (full admin only). ---
 app.post("/api/logout", requireFullAdmin, (_req: Request, res: Response) => {
   kite.clearSession();
-  void clearKiteSession();
+  void clearKiteSession().catch((e) =>
+    console.warn("[Session] clearKiteSession failed:", e),
+  );
   res.json({ authenticated: false });
 });
 
@@ -3303,7 +3329,9 @@ function sendError(res: Response, err: unknown): void {
     // dead token on the next restart.
     if (err.status === 401 || err.status === 403) {
       kite.clearSession();
-      void clearKiteSession();
+      void clearKiteSession().catch((e) =>
+      console.warn("[Session] clearKiteSession failed:", e),
+    );
     }
     res.status(err.status).json({ error: err.message });
     return;
@@ -3329,7 +3357,9 @@ function triggerPostLoginBackfill(): void {
     void backfillStockFutures(eodBackfillDeps).catch((e) =>
       console.error("[EODCapture] post-login backfill failed:", e),
     );
-    void checkAndRecomputeSummary();
+    void checkAndRecomputeSummary().catch((e) =>
+      console.warn("[EODCapture] post-login summary recompute failed:", e),
+    );
   }
   // Seed the intraday option-OI cache right away so a baseline exists soon
   // after connecting Zerodha (rather than waiting for the next minute tick).
@@ -5342,7 +5372,9 @@ const httpServer = app.listen(PORT, () => {
       getAllInstruments: getAllInstrumentsCached,
     };
     startHourlyScheduler(hourlyBackfillDeps);
-    void backfillMissedHours(hourlyBackfillDeps);
+    void backfillMissedHours(hourlyBackfillDeps).catch((e) =>
+      console.warn("[HourlyCapture] startup backfill failed:", e),
+    );
     // End-of-day review (default 16:30 IST): verify today's full day is stored;
     // backfill the gaps if not.
     startDayReviewScheduler(hourlyBackfillDeps);
@@ -5360,24 +5392,40 @@ const httpServer = app.listen(PORT, () => {
     // monitor. Discovery of NEW boxes stays off until an admin presses RUN,
     // but an OPEN position must be managed from the moment the process is up.
     void boxModule.boot().catch((e) => console.warn("[Box] boot failed:", e));
-  });
+  })
+    // The startup chain had NO catch. A rejection anywhere in it (the Redis warm-load
+    // pings run outside their own try) skipped the flush retry, the hourly and option-OI
+    // captures and the Box position adoption — leaving a process that listened on the
+    // port and answered /api/status as healthy while doing none of its work — and then
+    // killed it as an unhandled rejection. Failing loudly and staying up beats both.
+    .catch((e) => console.error("[Startup] initialisation chain failed:", e));
 
   // Open the dedicated trade/charges ledger connection (no-op when TRADE_LOG_URI
   // is unset — the ledger then rides on the main connection).
-  void initTradeLogConnection();
+  void initTradeLogConnection().catch((e) =>
+    console.warn("[Startup] trade-log connection failed:", e),
+  );
 
   // Connect to the split nse_fno databases (archive, current, spread) and start EOD capture scheduler + backfill.
-  void initNseFnoConnections().then(() => {
+  void initNseFnoConnections()
+    .then(() => {
     eodBackfillDeps = {
       getBoard: async () => deriveFnoBoard(await getAllInstrumentsCached()),
       kite,
       getAllInstruments: getAllInstrumentsCached,
     };
     startEodScheduler(eodBackfillDeps);
-    void backfillStockFutures(eodBackfillDeps);
+    void backfillStockFutures(eodBackfillDeps).catch((e) =>
+      console.warn("[EODCapture] startup stock-futures backfill failed:", e),
+    );
     // Startup reconciliation: recompute summary if spread_daily has newer data.
-    void checkAndRecomputeSummary();
-  });
+    void checkAndRecomputeSummary().catch((e) =>
+      console.warn("[EODCapture] startup summary recompute failed:", e),
+    );
+    })
+    // Without this, a failed nse_fno connect skipped the EOD scheduler AND became an
+    // unhandled rejection that killed the process — after it had already begun serving.
+    .catch((e) => console.error("[Startup] nse_fno initialisation failed:", e));
 });
 
 
@@ -5480,3 +5528,35 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) {
     });
   });
 }
+
+
+// ---------------------------------------------------------------------------
+// LAST-RESORT PROCESS SAFETY NET
+//
+// Node's default `unhandledRejection` behaviour since v15 is to THROW, which terminates
+// the process. In a trading backend that turns any stray un-awaited promise — a Mongo
+// blip on a session write, a Kite 401 inside a capture job — into a total outage that
+// drops every SSE client and stops the Box position monitor.
+//
+// The individual offenders have been given their own `.catch()` handlers; this is the net
+// under them. It logs LOUDLY rather than silently swallowing, so a new offender is
+// obvious in the logs instead of invisible.
+//
+// `uncaughtException` is deliberately treated as FATAL: an unknown synchronous throw
+// leaves the process in an undefined state, and continuing to price or execute trades
+// from there is far more dangerous than exiting and letting the supervisor restart into
+// the durable recovery path.
+// ---------------------------------------------------------------------------
+process.on("unhandledRejection", (reason) => {
+  console.error(
+    "[FATAL-GUARD] Unhandled promise rejection — the process survived, but this is a bug " +
+      "and the promise's work did NOT complete:",
+    reason,
+  );
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL] Uncaught exception — exiting so the supervisor can restart:", err);
+  // No trading state is altered or invented here; open positions are adopted on restart.
+  process.exit(1);
+});
