@@ -64,6 +64,21 @@ export class RingBuffer {
     return m;
   }
 
+  /**
+   * Every currently-retained sample in chronological order (oldest first). Allocates a
+   * fresh array — COLD PATH ONLY (calibration export / diagnostics), never the hot path.
+   */
+  values(): number[] {
+    const out: number[] = new Array(this.filled);
+    if (this.filled === 0) return out;
+    // When full, the oldest sample sits at `cursor`; otherwise samples fill [0, filled).
+    const start = this.filled === this.buf.length ? this.cursor : 0;
+    for (let i = 0; i < this.filled; i++) {
+      out[i] = this.buf[(start + i) % this.buf.length]!;
+    }
+    return out;
+  }
+
   /** Nearest-rank percentile (0..1). Sorts a copy — call from cold paths only. */
   percentile(p: number): number | null {
     if (this.filled === 0) return null;
