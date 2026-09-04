@@ -61,6 +61,7 @@ import { registerMarketDataRoutes } from "./marketDataRoutes.js";
 import { INDEX_SPOT_MAP, indexSpotCandidates, resolveIndexSpotSymbol } from "./indexSpot.js";
 import { MarketDataSessionStore } from "./marketDataSession.js";
 import { checkTokenPasscode, readPasscode } from "./tokenRouteAuth.js";
+import { generateAdminToken } from "./adminToken.js";
 import { HistoryProvider } from "./brokers/history.js";
 import { parseBrokerId, type BrokerId } from "./brokers/types.js";
 import { LocalChargeCalculator } from "./box/localCharges.js";
@@ -220,9 +221,9 @@ interface AdminSession {
 const adminSessions = new Map<string, AdminSession>();
 const ADMIN_SESSION_TTL_MS = 1000 * 60 * 60 * 24; // 24 hours
 
-function generateAdminToken(): string {
-  return Math.random().toString(36).substring(2) + Date.now().toString(36);
-}
+// generateAdminToken now lives in ./adminToken.js — see that file for why Math.random()
+// was unacceptable for a full-admin bearer credential. Behaviour of everything around it
+// (TTL, middleware, persistence, header names, role split) is unchanged.
 
 /** The role of a token, or null if missing/expired. */
 function getAdminRole(token: string | undefined): AdminRole | null {
