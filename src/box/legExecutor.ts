@@ -80,6 +80,21 @@ export interface LegOrderRequest {
  * simultaneous executions. NOTHING run-specific may live on the executor instance
  * — see the note on `run()`.
  */
+/**
+ * Shared paper liquidity reservation (live-parity only). Satisfied by
+ * `PaperLiquidityLedger`; kept as a narrow interface so the executor does not depend on
+ * the concrete class and tests can inject a stub.
+ */
+export interface LegLiquidityReservation {
+  reservedAt(gen: number, token: number, side: OrderSide, price: number, version: number): number;
+  reserve(gen: number, token: number, side: OrderSide, price: number, version: number, qty: number): number;
+}
+
+/** A deterministic per-order latency source (live-parity only). */
+export interface LegLatencySource {
+  next(): number;
+}
+
 export interface LegExecutorDeps {
   policy: BoxExecutionPolicy;
   quotes: BoxQuoteStore;
@@ -87,6 +102,19 @@ export interface LegExecutorDeps {
   wait: (ms: number) => Promise<void>;
   /** Optional: records an internal per-order retry. Never a new strategy attempt. */
   metrics?: { recordLogicalRetry: () => void } | undefined;
+  /**
+   * LIVE-PARITY ONLY. When present, displayed liquidity is a shared finite resource:
+   * each fill reserves what it consumed so a concurrent attempt cannot take it again.
+   * Undefined in standard paper ⇒ the fill path is byte-identical to before.
+   */
+  reservation?: LegLiquidityReservation | undefined;
+  /**
+   * LIVE-PARITY ONLY. Per-order latency draw; undefined ⇒ the run-level constant is
+   * used exactly as before.
+   */
+  latency?: LegLatencySource | undefined;
+  /** Feed/broker generation for reservation keys; defaults to 0. */
+  generation?: (() => number) | undefined;
 }
 
 /** What the run produced. */
@@ -266,9 +294,12 @@ export class LegExecutor {
   /* ------------------------------- internals ------------------------------ */
 
   private submit(st: LegState, submitAt: number, latencyMs: number): void {
+    // Live-parity draws a per-order latency from the deterministic source; standard uses
+    // the single run-level constant, unchanged.
+    const latency = this.deps.latency ? Math.max(0, this.deps.latency.next()) : latencyMs;
     st.leg.status = "IN_FLIGHT";
     st.leg.submit_at = submitAt;
-    st.leg.arrival_at = submitAt + latencyMs;
+    st.leg.arrival_at = submitAt + latency;
   }
 
   /** Sequential mode: release the order after `afterState`, timed from its fill. */
@@ -391,6 +422,14 @@ export class LegExecutor {
     }
 
     const levels = req.side === "BUY" ? quote.asks : quote.bids;
+    // Live-parity: shrink each level by what concurrent attempts already reserved.
+    // Undefined in standard paper ⇒ walkDepth receives no `reserved` and is unchanged.
+    const gen = this.deps.generation?.() ?? 0;
+    const reservation = this.deps.reservation;
+    const reservedLookup = reservation
+      ? (price: number, version: number | null): number =>
+          reservation.reservedAt(gen, req.inst.token, req.side, price, version ?? quote.version)
+      : undefined;
     const walk = walkDepth({
       side: req.side,
       levels,
@@ -400,6 +439,7 @@ export class LegExecutor {
       haircutPct: this.deps.policy.queueHaircutPct,
       at,
       quoteVersion: quote.version,
+      reserved: reservedLookup,
     });
 
     if (walk.filled_qty <= 0) {
@@ -411,6 +451,14 @@ export class LegExecutor {
           ? `touch ${touch} is past the limit ${leg.pricing.limit_price}`
           : `no executable quantity within the limit ${leg.pricing.limit_price}`;
       return "none";
+    }
+
+    // Live-parity: commit what we consumed so a concurrent attempt sees it gone. Done
+    // before aggregating (order irrelevant; both are synchronous). No-op in standard.
+    if (reservation) {
+      for (const s of walk.slices) {
+        reservation.reserve(gen, req.inst.token, req.side, s.price, s.quote_version ?? quote.version, s.qty);
+      }
     }
 
     // Apply the slices and update the running aggregate.

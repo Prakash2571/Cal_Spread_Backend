@@ -42,6 +42,8 @@ import type { BoxConfig } from "./config.js";
 import { BoxExecutionPolicy } from "./executionPolicy.js";
 import type { BoxMetrics } from "./metrics.js";
 import { LegExecutor, fillTiming, type LegOrderRequest } from "./legExecutor.js";
+import { PaperLiquidityLedger } from "./liquidityLedger.js";
+import { createLatencySource } from "./latencySource.js";
 import {
   cloneDepth,
   entrySideFor,
@@ -91,6 +93,12 @@ export interface BoxExecutionSimulatorDeps {
   now?: () => number;
   /** Injected sleep. Tests advance their clock (and push ticks) inside it. */
   wait?: (ms: number) => Promise<void>;
+  /**
+   * Feed/broker generation, for the live-parity liquidity ledger's keys so a broker
+   * switch invalidates reservations. Optional; defaults to a constant 0 (single
+   * generation) when absent, which is correct for tests and single-broker runs.
+   */
+  feedGeneration?: () => number;
 }
 
 /** The result of a paper_legging entry attempt. */
@@ -154,17 +162,40 @@ export class BoxExecutionSimulator {
   private readonly policy: BoxExecutionPolicy;
   /** Independent per-leg order lifecycles (paper_legging). */
   private readonly legExecutor: LegExecutor;
+  /** True only under the live_parity paper profile. */
+  private readonly liveParity: boolean;
+  /** Shared liquidity ledger, non-null only under live_parity. */
+  private readonly ledger: PaperLiquidityLedger | null;
 
   constructor(private deps: BoxExecutionSimulatorDeps) {
     this.now = deps.now ?? Date.now;
     this.wait = deps.wait ?? sleep;
     this.policy = new BoxExecutionPolicy(deps.cfg);
+
+    // LIVE-PARITY layering. Only when the profile is explicitly `live_parity` do we build
+    // the shared-liquidity ledger and the deterministic latency source and hand them to
+    // the leg executor. In `standard` (the default) these stay undefined, so the leg
+    // executor's fill and submit paths are byte-for-byte what they were before.
+    this.liveParity = deps.cfg.paperExecutionProfile === "live_parity";
+    this.ledger = this.liveParity ? new PaperLiquidityLedger() : null;
+    const latencySource = this.liveParity
+      ? createLatencySource({
+          mode: deps.cfg.paperLatencyMode,
+          constantMs: deps.cfg.simulatedLatencyMs,
+          samples: deps.cfg.paperLatencySamples,
+          seed: deps.cfg.paperLatencySeed,
+        })
+      : null;
+
     this.legExecutor = new LegExecutor({
       policy: this.policy,
       quotes: deps.quotes,
       now: this.now,
       wait: this.wait,
       metrics: deps.metrics,
+      reservation: this.ledger ?? undefined,
+      latency: latencySource ?? undefined,
+      generation: deps.feedGeneration,
     });
   }
 
@@ -216,7 +247,12 @@ export class BoxExecutionSimulator {
 
   /** True when another pipeline may start right now. */
   hasCapacity(): boolean {
-    return this.active < this.deps.cfg.maxConcurrentExecutions;
+    // Live-parity mirrors the LIVE concurrency cap (default 1) so the paper validation
+    // baseline matches a conservative live deployment; standard keeps its own cap.
+    const cap = this.liveParity
+      ? this.deps.cfg.paperMaxConcurrentExecutions
+      : this.deps.cfg.maxConcurrentExecutions;
+    return this.active < cap;
   }
 
   /** True when this exact candidate/position already has a pipeline running. */
