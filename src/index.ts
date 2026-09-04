@@ -60,6 +60,7 @@ import { registerBrokerRoutes } from "./brokers/routes.js";
 import { registerMarketDataRoutes } from "./marketDataRoutes.js";
 import { INDEX_SPOT_MAP, indexSpotCandidates, resolveIndexSpotSymbol } from "./indexSpot.js";
 import { MarketDataSessionStore } from "./marketDataSession.js";
+import { checkTokenPasscode, readPasscode } from "./tokenRouteAuth.js";
 import { HistoryProvider } from "./brokers/history.js";
 import { parseBrokerId, type BrokerId } from "./brokers/types.js";
 import { LocalChargeCalculator } from "./box/localCharges.js";
@@ -1098,14 +1099,17 @@ app.get(
   "/api/internal/kite-token",
   rateLimit({ windowMs: 60_000, max: 30 }),
   (req: Request, res: Response) => {
-    if (!INTERNAL_TOKEN_SECRET) {
+    // Shared guard: constant-time, and it FAILS CLOSED on an unset secret rather than
+    // treating "no secret configured" as "no secret required".
+    const check = checkTokenPasscode(
+      INTERNAL_TOKEN_SECRET,
+      readPasscode(req.headers["x-internal-secret"], req.query.secret),
+    );
+    if (check === "not_configured") {
       res.status(503).json({ error: "Internal token sharing is not configured." });
       return;
     }
-    const provided =
-      (req.headers["x-internal-secret"] as string | undefined) ??
-      (req.query.secret as string | undefined);
-    if (provided !== INTERNAL_TOKEN_SECRET) {
+    if (check === "forbidden") {
       res.status(403).json({ error: "Forbidden." });
       return;
     }
@@ -1132,16 +1136,19 @@ app.get(
   "/api/kite/token",
   rateLimit({ windowMs: 60_000, max: 30 }),
   (req: Request, res: Response) => {
-    if (!TOKEN_ROUTE_SECRET) {
+    // Same guard as /api/dhan/token, which SHARES this secret. Using one implementation
+    // means the two brokers cannot end up with different comparison strength.
+    const check = checkTokenPasscode(
+      TOKEN_ROUTE_SECRET,
+      readPasscode(req.headers["x-token-passcode"], req.query.passcode),
+    );
+    if (check === "not_configured") {
       res.status(503).json({
         error: "Token route is not configured. Set TOKEN_ROUTE_SECRET on the server.",
       });
       return;
     }
-    const provided =
-      (req.headers["x-token-passcode"] as string | undefined) ??
-      (req.query.passcode as string | undefined);
-    if (provided !== TOKEN_ROUTE_SECRET) {
+    if (check === "forbidden") {
       res.status(403).json({ error: "Invalid or missing passcode." });
       return;
     }
@@ -1196,16 +1203,19 @@ app.get(
   "/api/rf",
   rateLimit({ windowMs: 60_000, max: 30 }),
   (req: Request, res: Response) => {
-    if (!TOKEN_ROUTE_SECRET) {
+    // Same shared secret as the token routes, so it gets the same guard: a brute force
+    // succeeding here would hand over both brokers' access tokens.
+    const check = checkTokenPasscode(
+      TOKEN_ROUTE_SECRET,
+      readPasscode(req.headers["x-token-passcode"], req.query.passcode),
+    );
+    if (check === "not_configured") {
       res.status(503).json({
         error: "Token route is not configured. Set TOKEN_ROUTE_SECRET on the server.",
       });
       return;
     }
-    const provided =
-      (req.headers["x-token-passcode"] as string | undefined) ??
-      (req.query.passcode as string | undefined);
-    if (provided !== TOKEN_ROUTE_SECRET) {
+    if (check === "forbidden") {
       res.status(403).json({ error: "Invalid or missing passcode." });
       return;
     }
