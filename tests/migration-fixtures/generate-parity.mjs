@@ -16,6 +16,9 @@ import { fileURLToPath } from "node:url";
 import { PaperLiquidityLedger } from "../../dist/box/liquidityLedger.js";
 import { createLatencySource } from "../../dist/box/latencySource.js";
 import { walkDepth } from "../../dist/box/orderPricing.js";
+import { createSchedulingPolicy } from "../../dist/box/executionSchedulingPolicy.js";
+import { planPaperSchedule } from "../../dist/box/paperScheduler.js";
+import { createStructuredLatencySource, classifyCalibration } from "../../dist/box/latencyModel.js";
 
 const OUT_DIR = join(dirname(fileURLToPath(import.meta.url)), "box-parity");
 
@@ -162,6 +165,109 @@ fixture(
         },
       },
     ];
+  })(),
+);
+
+/* 4 ─ paper scheduler: mirrors the live OrderManager queue + pacing --------- */
+
+fixture(
+  "paper-scheduler.json",
+  "planPaperSchedule",
+  "Whole-lifecycle serialisation under cap=1, exactly N concurrent under cap=N, shared transport pacing between POSTs, and priority pre-emption of the queue (never of an in-flight op).",
+  (() => {
+    const fourEntry = ["k1_ce", "k2_ce", "k2_pe", "k1_pe"].map((role, i) => ({
+      id: role,
+      purpose: "ENTRY",
+      sequence: i,
+      readyAt: 0,
+      postToAckMs: 80,
+      ackToTerminalMs: 120,
+    }));
+    const pick = (s) => ({ id: s.id, dequeued_at: s.dequeued_at, post_started_at: s.post_started_at, ack_at: s.ack_at, terminal_at: s.terminal_at });
+
+    const singleSlot = planPaperSchedule(fourEntry, createSchedulingPolicy({ maxConcurrentOperations: 1, minBrokerIntervalMs: 0 }));
+    const twoSlot = planPaperSchedule(fourEntry, createSchedulingPolicy({ maxConcurrentOperations: 2, minBrokerIntervalMs: 0 }));
+    const spaced = planPaperSchedule(fourEntry, createSchedulingPolicy({ maxConcurrentOperations: 2, minBrokerIntervalMs: 250 }));
+
+    const priorityOps = [
+      { id: "entryA", purpose: "ENTRY", sequence: 0, readyAt: 0, postToAckMs: 80, ackToTerminalMs: 120 },
+      { id: "entryB", purpose: "ENTRY", sequence: 1, readyAt: 0, postToAckMs: 80, ackToTerminalMs: 120 },
+      { id: "unwind", purpose: "EMERGENCY_RESIDUAL", sequence: 2, readyAt: 50, postToAckMs: 80, ackToTerminalMs: 120 },
+    ];
+    const priority = planPaperSchedule(priorityOps, createSchedulingPolicy({ maxConcurrentOperations: 1, minBrokerIntervalMs: 0 }));
+
+    return [
+      {
+        name: "scheduler-single-slot: cap=1 serialises whole lifecycles",
+        input: { operations: fourEntry, policy: { maxConcurrentOperations: 1, minBrokerIntervalMs: 0 } },
+        expected: { schedule: singleSlot.map(pick) },
+      },
+      {
+        name: "scheduler-two-slot: exactly two lifecycles overlap",
+        input: { operations: fourEntry, policy: { maxConcurrentOperations: 2, minBrokerIntervalMs: 0 } },
+        expected: { schedule: twoSlot.map(pick) },
+      },
+      {
+        name: "transport-spacing: POSTs are paced even under cap=2",
+        input: { operations: fourEntry, policy: { maxConcurrentOperations: 2, minBrokerIntervalMs: 250 } },
+        expected: { schedule: spaced.map(pick), posts: spaced.map((s) => s.post_started_at).sort((a, b) => a - b) },
+      },
+      {
+        name: "priority-unwind-before-entry: emergency jumps a queued ENTRY",
+        input: { operations: priorityOps, policy: { maxConcurrentOperations: 1, minBrokerIntervalMs: 0 } },
+        expected: { schedule: priority.map(pick) },
+      },
+    ];
+  })(),
+);
+
+/* 5 ─ structured broker latency: POST->ACK and ACK->terminal ---------------- */
+
+fixture(
+  "structured-latency.json",
+  "createStructuredLatencySource",
+  "POST->ACK and ACK->terminal are drawn independently from their own recorded samples, in a fixed order; the constant fallback separates the two stages instead of collapsing them.",
+  (() => {
+    const draw = (config, n) => {
+      const s = createStructuredLatencySource(config);
+      return Array.from({ length: n }, () => s.next());
+    };
+    const recorded = { mode: "recorded_samples", constantMs: 250, postToAckSamples: [90, 110, 130], ackToTerminalSamples: [200, 400] };
+    const constant = { mode: "constant", constantMs: 250 };
+    return [
+      {
+        name: "recorded components cycle independently",
+        input: { config: recorded, draws: 4 },
+        expected: { sequence: draw(recorded, 4), calibrated: createStructuredLatencySource(recorded).calibrated },
+      },
+      {
+        name: "constant fallback still separates the two stages",
+        input: { config: constant, draws: 2 },
+        expected: { sequence: draw(constant, 2), calibrated: createStructuredLatencySource(constant).calibrated },
+      },
+    ];
+  })(),
+);
+
+/* 6 ─ calibration status classification ------------------------------------ */
+
+fixture(
+  "calibration-status.json",
+  "classifyCalibration",
+  "UNCALIBRATED / PARTIALLY_CALIBRATED / CALIBRATED / STALE from sample count and the age of the newest sample.",
+  (() => {
+    const th = { calibratedMinSamples: 200, staleAfterMs: 8 * 60 * 60 * 1000 };
+    const rows = [
+      { sampleCount: 0, lastSampleAgeMs: null },
+      { sampleCount: 17, lastSampleAgeMs: 1000 },
+      { sampleCount: 500, lastSampleAgeMs: 1000 },
+      { sampleCount: 500, lastSampleAgeMs: th.staleAfterMs + 1 },
+    ];
+    return rows.map((r) => ({
+      name: `count=${r.sampleCount} age=${r.lastSampleAgeMs}`,
+      input: { ...r, thresholds: th },
+      expected: { status: classifyCalibration(r.sampleCount, r.lastSampleAgeMs, th) },
+    }));
   })(),
 );
 
