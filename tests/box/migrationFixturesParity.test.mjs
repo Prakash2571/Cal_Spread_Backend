@@ -17,7 +17,7 @@ import { PaperLiquidityLedger } from "../../dist/box/liquidityLedger.js";
 import { createLatencySource } from "../../dist/box/latencySource.js";
 import { walkDepth } from "../../dist/box/orderPricing.js";
 
-const DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "migration-fixtures", "box");
+const DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "migration-fixtures", "box-parity");
 const load = (f) => JSON.parse(readFileSync(join(DIR, f), "utf8"));
 
 test("liquidity-ledger.json: reproduces the recorded reservations", () => {

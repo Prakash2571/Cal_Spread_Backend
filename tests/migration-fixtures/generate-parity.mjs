@@ -17,7 +17,7 @@ import { PaperLiquidityLedger } from "../../dist/box/liquidityLedger.js";
 import { createLatencySource } from "../../dist/box/latencySource.js";
 import { walkDepth } from "../../dist/box/orderPricing.js";
 
-const OUT_DIR = join(dirname(fileURLToPath(import.meta.url)), "box");
+const OUT_DIR = join(dirname(fileURLToPath(import.meta.url)), "box-parity");
 
 const files = [];
 function fixture(file, operation, description, cases) {
