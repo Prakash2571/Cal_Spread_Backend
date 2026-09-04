@@ -193,3 +193,45 @@ test("recorded latency samples parse into a clean numeric array", () => {
     },
   );
 });
+
+
+test("ACK→terminal latency samples parse independently of the POST→ACK samples", () => {
+  withEnv(
+    {
+      BOX_PAPER_LATENCY_MODE: "recorded_samples",
+      BOX_PAPER_LATENCY_SAMPLES: "80, 90",
+      BOX_PAPER_LATENCY_ACK_TERMINAL_SAMPLES: "200, 400, bad",
+    },
+    () => {
+      const cfg = loadBoxConfig();
+      assert.deepEqual(cfg.paperLatencySamples, [80, 90]);
+      assert.deepEqual(cfg.paperLatencyAckToTerminalSamples, [200, 400]);
+    },
+  );
+});
+
+test("execution timing metrics default on, with a bounded window", () => {
+  withEnv({ BOX_EXECUTION_TIMING_METRICS_ENABLED: undefined, BOX_EXECUTION_TIMING_WINDOW: undefined }, () => {
+    const cfg = loadBoxConfig();
+    assert.equal(cfg.executionTimingMetricsEnabled, true);
+    assert.equal(cfg.executionTimingWindow, 500);
+  });
+  withEnv({ BOX_EXECUTION_TIMING_METRICS_ENABLED: "false", BOX_EXECUTION_TIMING_WINDOW: "1000" }, () => {
+    const cfg = loadBoxConfig();
+    assert.equal(cfg.executionTimingMetricsEnabled, false);
+    assert.equal(cfg.executionTimingWindow, 1000);
+  });
+});
+
+test("deployment region is null unless explicitly configured (never auto-detected)", () => {
+  withEnv({ BOX_DEPLOYMENT_REGION: undefined, BOX_EXECUTION_CALIBRATION_REGION: undefined }, () => {
+    assert.equal(loadBoxConfig().deploymentRegion, null);
+  });
+  withEnv({ BOX_DEPLOYMENT_REGION: "mumbai" }, () => {
+    assert.equal(loadBoxConfig().deploymentRegion, "mumbai");
+  });
+  // The calibration-region alias is honoured when the primary is unset.
+  withEnv({ BOX_DEPLOYMENT_REGION: undefined, BOX_EXECUTION_CALIBRATION_REGION: "singapore" }, () => {
+    assert.equal(loadBoxConfig().deploymentRegion, "singapore");
+  });
+});
