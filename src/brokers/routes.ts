@@ -10,13 +10,18 @@
  * named for it, so the exposure is auditable by grepping for them:
  *
  *   GET /api/dhan/access-token  full admin (a 24h admin session token)
- *   GET /api/dhan/token         a dedicated passcode, DHAN_TOKEN_ROUTE_SECRET
+ *   GET /api/dhan/token         passcode, TOKEN_ROUTE_SECRET — SHARED with Zerodha's
+ *                               /api/kite/token
  *
  * The second exists because an admin session token expires daily and cannot be baked
  * into an unattended script, while sharing ADMIN_SECRET with another host would grant
- * it trade placement, deletion and broker switching. A separate passcode grants only
- * the token read. It mirrors /api/kite/token, but with its OWN secret so the two
- * brokers stay independently revocable.
+ * it trade placement, deletion and broker switching. A passcode grants only the token
+ * read.
+ *
+ * That passcode is shared with Zerodha's route by choice, so one secret covers both
+ * brokers. The tradeoff is deliberate and worth stating: they are NOT independently
+ * revocable, and the weakest passcode comparison anywhere defines the exposure for
+ * both. Hence every route accepting it uses the constant-time `checkTokenPasscode`.
  *
  * The consent and session-consumption routes are rate limited separately from the
  * global /api bucket because each one spends the app credentials.
@@ -361,22 +366,27 @@ export function registerBrokerRoutes(app: Express, deps: BrokerRouteDeps): void 
    *   curl "https://<host>/api/dhan/token?passcode=YOUR_PASSCODE"
    *   curl -H "x-token-passcode: YOUR_PASSCODE" https://<host>/api/dhan/token
    *
-   * Mirrors /api/kite/token, with its OWN secret (DHAN_TOKEN_ROUTE_SECRET) so revoking
-   * one broker's passcode does not touch the other. The env var is read per request
-   * rather than at import time, so rotating it takes a restart of nothing but the
-   * process that owns it — and so tests can set it.
+   * Mirrors /api/kite/token exactly, including SHARING its passcode
+   * (TOKEN_ROUTE_SECRET) so an operator manages one secret for both brokers rather than
+   * two. The consequence is that the two are not independently revocable: rotating it
+   * rotates access to both brokers' tokens at once.
+   *
+   * Because the secret is shared, the WEAKEST comparison across the routes that accept
+   * it defines the real exposure — which is why all of them now go through
+   * `checkTokenPasscode` rather than an inline `!==`.
+   *
+   * The env var is read per request rather than at import time, so tests can set it.
    *
    * NOT full admin on purpose: the point is to grant a token READ without granting
    * trade placement, deletion or broker switching.
    */
   app.get("/api/dhan/token", tokenRouteRateLimit, async (req: Request, res: Response) => {
     const passcode = readPasscode(req.headers["x-token-passcode"], req.query.passcode);
-    const check = checkTokenPasscode(process.env.DHAN_TOKEN_ROUTE_SECRET, passcode);
+    const check = checkTokenPasscode(process.env.TOKEN_ROUTE_SECRET, passcode);
     if (check === "not_configured") {
       // Fails CLOSED: an unset secret disables the route rather than opening it.
       res.status(503).json({
-        error:
-          "Dhan token route is not configured. Set DHAN_TOKEN_ROUTE_SECRET on the server.",
+        error: "Token route is not configured. Set TOKEN_ROUTE_SECRET on the server.",
       });
       return;
     }
