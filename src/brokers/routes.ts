@@ -2,11 +2,24 @@
  * Broker management HTTP surface: /api/broker/* and /api/dhan/*.
  *
  * SECURITY POSTURE
- * Every mutating route is FULL-ADMIN only. `DHAN_API_SECRET` and the Dhan access
- * token never appear in a response — the only session data published is
- * `redactedSession()`, which is account identifiers and timestamps. The consent and
- * session-consumption routes are rate limited separately from the global /api
- * bucket because each one spends the app credentials.
+ * Every mutating route is FULL-ADMIN only. `DHAN_API_SECRET` never appears in any
+ * response. Status and session routes publish only `redactedSession()` — account
+ * identifiers and timestamps.
+ *
+ * The Dhan ACCESS TOKEN is returned by exactly two routes, both deliberate and both
+ * named for it, so the exposure is auditable by grepping for them:
+ *
+ *   GET /api/dhan/access-token  full admin (a 24h admin session token)
+ *   GET /api/dhan/token         a dedicated passcode, DHAN_TOKEN_ROUTE_SECRET
+ *
+ * The second exists because an admin session token expires daily and cannot be baked
+ * into an unattended script, while sharing ADMIN_SECRET with another host would grant
+ * it trade placement, deletion and broker switching. A separate passcode grants only
+ * the token read. It mirrors /api/kite/token, but with its OWN secret so the two
+ * brokers stay independently revocable.
+ *
+ * The consent and session-consumption routes are rate limited separately from the
+ * global /api bucket because each one spends the app credentials.
  */
 
 import type { Express, Request, RequestHandler, Response } from "express";
@@ -16,6 +29,7 @@ import { isDhanTokenExpired, redactedSession } from "./dhan/auth.js";
 import { getDhanParseReport } from "./dhan/instruments.js";
 import { checkKnownSymbols, diagnoseBoard } from "./boardDiagnostics.js";
 import { loadDhanSession } from "../db.js";
+import { checkTokenPasscode, readPasscode } from "../tokenRouteAuth.js";
 import { parseBrokerId, type BrokerId } from "./types.js";
 import type { ActiveBrokerManager } from "./registry.js";
 
@@ -42,6 +56,16 @@ const switchRateLimit = rateLimit({
   windowMs: 60_000,
   max: 10,
   message: "Too many broker switch attempts. Slow down.",
+});
+
+/**
+ * The passcode token route is guessable-by-brute-force in principle, so it gets the
+ * same tight bucket as its Zerodha counterpart.
+ */
+const tokenRouteRateLimit = rateLimit({
+  windowMs: 60_000,
+  max: 30,
+  message: "Too many token requests. Slow down.",
 });
 
 function fail(res: Response, err: unknown): void {
@@ -325,6 +349,58 @@ export function registerBrokerRoutes(app: Express, deps: BrokerRouteDeps): void 
         client_id: stored.dhan_client_id,
         access_token: stored.access_token,
         expires_at: stored.expiry_time,
+      });
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  /**
+   * The same token, for an unattended script on another host.
+   *
+   *   curl "https://<host>/api/dhan/token?passcode=YOUR_PASSCODE"
+   *   curl -H "x-token-passcode: YOUR_PASSCODE" https://<host>/api/dhan/token
+   *
+   * Mirrors /api/kite/token, with its OWN secret (DHAN_TOKEN_ROUTE_SECRET) so revoking
+   * one broker's passcode does not touch the other. The env var is read per request
+   * rather than at import time, so rotating it takes a restart of nothing but the
+   * process that owns it — and so tests can set it.
+   *
+   * NOT full admin on purpose: the point is to grant a token READ without granting
+   * trade placement, deletion or broker switching.
+   */
+  app.get("/api/dhan/token", tokenRouteRateLimit, async (req: Request, res: Response) => {
+    const passcode = readPasscode(req.headers["x-token-passcode"], req.query.passcode);
+    const check = checkTokenPasscode(process.env.DHAN_TOKEN_ROUTE_SECRET, passcode);
+    if (check === "not_configured") {
+      // Fails CLOSED: an unset secret disables the route rather than opening it.
+      res.status(503).json({
+        error:
+          "Dhan token route is not configured. Set DHAN_TOKEN_ROUTE_SECRET on the server.",
+      });
+      return;
+    }
+    if (check === "forbidden") {
+      res.status(403).json({ error: "Invalid or missing passcode." });
+      return;
+    }
+    try {
+      const stored = await loadDhanSession().catch(() => null);
+      // An expired token is worse than none: a caller would use it and get opaque 401s
+      // from Dhan rather than being told to reconnect.
+      if (!stored || isDhanTokenExpired(stored.expiry_time)) {
+        res.status(409).json({
+          authenticated: false,
+          error: "No live Dhan session. The admin must connect Dhan first.",
+        });
+        return;
+      }
+      res.json({
+        authenticated: true,
+        client_id: stored.dhan_client_id,
+        access_token: stored.access_token,
+        expires_at: stored.expiry_time,
+        login_date: stored.login_date,
       });
     } catch (err) {
       fail(res, err);
