@@ -189,10 +189,37 @@ export interface BoxConfig {
   paperMaxConcurrentExecutions: number;
   /** Latency source for live_parity: `constant` (default) or `recorded_samples`. */
   paperLatencyMode: "constant" | "recorded_samples";
-  /** Observed latency samples (ms) for `recorded_samples`; empty ⇒ fall back to constant. */
+  /**
+   * Observed POST→ACK latency samples (ms) for `recorded_samples` — the time from an order
+   * leaving the wire to the broker acknowledging it (the leg becoming live at the exchange).
+   * Empty ⇒ fall back to the constant. These are the primary calibration feed; export them
+   * from the live broker-timing store.
+   */
   paperLatencySamples: number[];
+  /**
+   * Observed ACK→terminal latency samples (ms) — how long an order works at the exchange
+   * after acknowledgement before it resolves. Feeds the scheduler's slot-hold model so paper
+   * concurrency matches live. Empty ⇒ derived from a fraction of the constant.
+   */
+  paperLatencyAckToTerminalSamples: number[];
   /** Deterministic starting offset into the samples. No randomness anywhere. */
   paperLatencySeed: number;
+
+  // ---- Live execution timing observability (for latency calibration) ----
+  /**
+   * Collect high-resolution timing of live broker operations for calibration. Purely
+   * observational and FAIL-OPEN: a metrics failure never affects trading. Default true.
+   */
+  executionTimingMetricsEnabled: boolean;
+  /** Bounded RingBuffer window for each execution-timing distribution. Default 500. */
+  executionTimingWindow: number;
+  /**
+   * Explicitly-configured deployment region label (e.g. "mumbai"), stamped onto calibration
+   * datasets so Virginia samples never silently calibrate Mumbai paper. NEVER auto-detected
+   * from cloud metadata; null unless BOX_DEPLOYMENT_REGION / BOX_EXECUTION_CALIBRATION_REGION
+   * is set.
+   */
+  deploymentRegion: string | null;
 
   // ---- Live execution safety envelope (env-only, fail-closed) ----
   /** Deployment kill switch. `executionMode=live` is invalid unless this is true. */
@@ -613,7 +640,14 @@ export function loadBoxConfig(): BoxConfig {
     ),
     paperLatencyMode: latencyMode("BOX_PAPER_LATENCY_MODE", "constant"),
     paperLatencySamples: msSamples("BOX_PAPER_LATENCY_SAMPLES"),
+    paperLatencyAckToTerminalSamples: msSamples("BOX_PAPER_LATENCY_ACK_TERMINAL_SAMPLES"),
     paperLatencySeed: num("BOX_PAPER_LATENCY_SEED", 0),
+    executionTimingMetricsEnabled: bool("BOX_EXECUTION_TIMING_METRICS_ENABLED", true),
+    executionTimingWindow: clampInt("BOX_EXECUTION_TIMING_WINDOW", 500, 50, 100_000),
+    deploymentRegion:
+      (process.env.BOX_DEPLOYMENT_REGION?.trim() ||
+        process.env.BOX_EXECUTION_CALIBRATION_REGION?.trim() ||
+        "") || null,
 
     liveTradingEnabled,
     liveReconcileIntervalMs: clampInt("BOX_LIVE_RECONCILE_INTERVAL_MS", 60_000, 5_000, 15 * 60_000),

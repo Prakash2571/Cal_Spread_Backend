@@ -1,0 +1,64 @@
+{
+  "category": "execution-parity",
+  "operation": "classifyCalibration",
+  "description": "UNCALIBRATED / PARTIALLY_CALIBRATED / CALIBRATED / STALE from sample count and the age of the newest sample.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "count=0 age=null",
+      "input": {
+        "sampleCount": 0,
+        "lastSampleAgeMs": null,
+        "thresholds": {
+          "calibratedMinSamples": 200,
+          "staleAfterMs": 28800000
+        }
+      },
+      "expected": {
+        "status": "UNCALIBRATED"
+      }
+    },
+    {
+      "name": "count=17 age=1000",
+      "input": {
+        "sampleCount": 17,
+        "lastSampleAgeMs": 1000,
+        "thresholds": {
+          "calibratedMinSamples": 200,
+          "staleAfterMs": 28800000
+        }
+      },
+      "expected": {
+        "status": "PARTIALLY_CALIBRATED"
+      }
+    },
+    {
+      "name": "count=500 age=1000",
+      "input": {
+        "sampleCount": 500,
+        "lastSampleAgeMs": 1000,
+        "thresholds": {
+          "calibratedMinSamples": 200,
+          "staleAfterMs": 28800000
+        }
+      },
+      "expected": {
+        "status": "CALIBRATED"
+      }
+    },
+    {
+      "name": "count=500 age=28800001",
+      "input": {
+        "sampleCount": 500,
+        "lastSampleAgeMs": 28800001,
+        "thresholds": {
+          "calibratedMinSamples": 200,
+          "staleAfterMs": 28800000
+        }
+      },
+      "expected": {
+        "status": "STALE"
+      }
+    }
+  ]
+}

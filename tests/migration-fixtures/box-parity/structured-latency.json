@@ -1,0 +1,71 @@
+{
+  "category": "execution-parity",
+  "operation": "createStructuredLatencySource",
+  "description": "POST->ACK and ACK->terminal are drawn independently from their own recorded samples, in a fixed order; the constant fallback separates the two stages instead of collapsing them.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "recorded components cycle independently",
+      "input": {
+        "config": {
+          "mode": "recorded_samples",
+          "constantMs": 250,
+          "postToAckSamples": [
+            90,
+            110,
+            130
+          ],
+          "ackToTerminalSamples": [
+            200,
+            400
+          ]
+        },
+        "draws": 4
+      },
+      "expected": {
+        "sequence": [
+          {
+            "postToAckMs": 90,
+            "ackToTerminalMs": 200
+          },
+          {
+            "postToAckMs": 110,
+            "ackToTerminalMs": 400
+          },
+          {
+            "postToAckMs": 130,
+            "ackToTerminalMs": 200
+          },
+          {
+            "postToAckMs": 90,
+            "ackToTerminalMs": 400
+          }
+        ],
+        "calibrated": true
+      }
+    },
+    {
+      "name": "constant fallback still separates the two stages",
+      "input": {
+        "config": {
+          "mode": "constant",
+          "constantMs": 250
+        },
+        "draws": 2
+      },
+      "expected": {
+        "sequence": [
+          {
+            "postToAckMs": 250,
+            "ackToTerminalMs": 100
+          },
+          {
+            "postToAckMs": 250,
+            "ackToTerminalMs": 100
+          }
+        ],
+        "calibrated": false
+      }
+    }
+  ]
+}

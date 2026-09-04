@@ -16,6 +16,9 @@ import { fileURLToPath } from "node:url";
 import { PaperLiquidityLedger } from "../../dist/box/liquidityLedger.js";
 import { createLatencySource } from "../../dist/box/latencySource.js";
 import { walkDepth } from "../../dist/box/orderPricing.js";
+import { createSchedulingPolicy } from "../../dist/box/executionSchedulingPolicy.js";
+import { planPaperSchedule } from "../../dist/box/paperScheduler.js";
+import { createStructuredLatencySource, classifyCalibration } from "../../dist/box/latencyModel.js";
 
 const DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "migration-fixtures", "box-parity");
 const load = (f) => JSON.parse(readFileSync(join(DIR, f), "utf8"));
@@ -79,5 +82,42 @@ test("bounded-limit-walk.json: reproduces the recorded fills", () => {
     };
     if (c.expected.average_price !== undefined) actual.average_price = walk.average_price;
     assert.deepEqual(actual, c.expected);
+  }
+});
+
+test("paper-scheduler.json: reproduces the recorded schedule", () => {
+  const { cases } = load("paper-scheduler.json");
+  for (const c of cases) {
+    const policy = createSchedulingPolicy(c.input.policy);
+    const scheduled = planPaperSchedule(c.input.operations, policy);
+    const pick = (s) => ({
+      id: s.id,
+      dequeued_at: s.dequeued_at,
+      post_started_at: s.post_started_at,
+      ack_at: s.ack_at,
+      terminal_at: s.terminal_at,
+    });
+    const actual = { schedule: scheduled.map(pick) };
+    if (c.expected.posts !== undefined) {
+      actual.posts = scheduled.map((s) => s.post_started_at).sort((a, b) => a - b);
+    }
+    assert.deepEqual(actual, c.expected, c.name);
+  }
+});
+
+test("structured-latency.json: reproduces the recorded component sequences", () => {
+  const { cases } = load("structured-latency.json");
+  for (const c of cases) {
+    const s = createStructuredLatencySource(c.input.config);
+    const sequence = Array.from({ length: c.input.draws }, () => s.next());
+    assert.deepEqual({ sequence, calibrated: s.calibrated }, c.expected, c.name);
+  }
+});
+
+test("calibration-status.json: reproduces the recorded classifications", () => {
+  const { cases } = load("calibration-status.json");
+  for (const c of cases) {
+    const status = classifyCalibration(c.input.sampleCount, c.input.lastSampleAgeMs, c.input.thresholds);
+    assert.deepEqual({ status }, c.expected, c.name);
   }
 });

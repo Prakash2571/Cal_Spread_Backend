@@ -43,7 +43,11 @@ import { BoxExecutionPolicy } from "./executionPolicy.js";
 import type { BoxMetrics } from "./metrics.js";
 import { LegExecutor, fillTiming, type LegOrderRequest } from "./legExecutor.js";
 import { PaperLiquidityLedger } from "./liquidityLedger.js";
-import { createLatencySource } from "./latencySource.js";
+import { createStructuredLatencySource, type StructuredLatencySource } from "./latencyModel.js";
+import { createSchedulingPolicy, type ExecutionSchedulingPolicy } from "./executionSchedulingPolicy.js";
+import { planPaperSchedule, type SchedulableOperation } from "./paperScheduler.js";
+import type { ExecutionPhase } from "./executionPolicy.js";
+import type { BoxOrderPurpose } from "./types.js";
 import {
   cloneDepth,
   entrySideFor,
@@ -166,6 +170,10 @@ export class BoxExecutionSimulator {
   private readonly liveParity: boolean;
   /** Shared liquidity ledger, non-null only under live_parity. */
   private readonly ledger: PaperLiquidityLedger | null;
+  /** Structured broker-latency source (POST→ACK, ACK→terminal), non-null only under live_parity. */
+  private readonly structuredLatency: StructuredLatencySource | null;
+  /** Shared scheduling policy (cap + min-interval + priority), non-null only under live_parity. */
+  private readonly schedulingPolicy: ExecutionSchedulingPolicy | null;
 
   constructor(private deps: BoxExecutionSimulatorDeps) {
     this.now = deps.now ?? Date.now;
@@ -178,12 +186,26 @@ export class BoxExecutionSimulator {
     // executor's fill and submit paths are byte-for-byte what they were before.
     this.liveParity = deps.cfg.paperExecutionProfile === "live_parity";
     this.ledger = this.liveParity ? new PaperLiquidityLedger() : null;
-    const latencySource = this.liveParity
-      ? createLatencySource({
+
+    // LIVE-PARITY: structured broker latency (POST→ACK and ACK→terminal drawn independently
+    // from measured samples when available) feeds the shared scheduler, so the four legs
+    // pass through the same priority queue + concurrency cap + transport pacing the live
+    // OrderManager enforces — instead of all arriving at `submit + one latency`. In
+    // `standard` both are null and no arrival planner is wired, so the leg executor's
+    // submit/fill path is byte-for-byte what it was before.
+    this.structuredLatency = this.liveParity
+      ? createStructuredLatencySource({
           mode: deps.cfg.paperLatencyMode,
           constantMs: deps.cfg.simulatedLatencyMs,
-          samples: deps.cfg.paperLatencySamples,
+          postToAckSamples: deps.cfg.paperLatencySamples,
+          ackToTerminalSamples: deps.cfg.paperLatencyAckToTerminalSamples,
           seed: deps.cfg.paperLatencySeed,
+        })
+      : null;
+    this.schedulingPolicy = this.liveParity
+      ? createSchedulingPolicy({
+          maxConcurrentOperations: deps.cfg.paperMaxConcurrentExecutions,
+          minBrokerIntervalMs: deps.cfg.liveBrokerMinIntervalMs,
         })
       : null;
 
@@ -194,9 +216,39 @@ export class BoxExecutionSimulator {
       wait: this.wait,
       metrics: deps.metrics,
       reservation: this.ledger ?? undefined,
-      latency: latencySource ?? undefined,
+      arrivalPlanner: this.liveParity ? (a) => this.planArrivals(a) : undefined,
       generation: deps.feedGeneration,
     });
+  }
+
+  /**
+   * LIVE-PARITY arrival planner. Runs the run's legs through the shared paper scheduler
+   * (same policy the live OrderManager uses) and returns each leg's simulated
+   * EXCHANGE-ARRIVAL time — its ACK, when the order is live and can start filling from
+   * observed books. The broker-side latency components (POST→ACK, ACK→terminal) are drawn
+   * from the structured, calibration-fed source; the queue wait and transport pacing are
+   * computed by the scheduler from the cap + min-interval. No randomness, fully reproducible.
+   */
+  private planArrivals(args: { count: number; submitAt: number; phase: ExecutionPhase }): number[] {
+    const source = this.structuredLatency;
+    const policy = this.schedulingPolicy;
+    if (!source || !policy) return []; // unreachable under live_parity; keeps types honest
+    // Within one run all legs share a purpose, so this only sets the priority band for
+    // diagnostics/fixtures; intra-run ordering is FIFO by leg. Unwinds carry the
+    // emergency-residual band, everything else the entry band.
+    const purpose: BoxOrderPurpose = args.phase === "unwind" ? "EMERGENCY_RESIDUAL" : "ENTRY";
+    const ops: SchedulableOperation[] = Array.from({ length: args.count }, (_, i) => {
+      const draw = source.next();
+      return {
+        id: String(i),
+        purpose,
+        sequence: i,
+        readyAt: args.submitAt,
+        postToAckMs: draw.postToAckMs,
+        ackToTerminalMs: draw.ackToTerminalMs,
+      };
+    });
+    return planPaperSchedule(ops, policy).map((s) => s.ack_at);
   }
 
   /**

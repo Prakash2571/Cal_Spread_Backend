@@ -1,0 +1,299 @@
+{
+  "category": "execution-parity",
+  "operation": "planPaperSchedule",
+  "description": "Whole-lifecycle serialisation under cap=1, exactly N concurrent under cap=N, shared transport pacing between POSTs, and priority pre-emption of the queue (never of an in-flight op).",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "scheduler-single-slot: cap=1 serialises whole lifecycles",
+      "input": {
+        "operations": [
+          {
+            "id": "k1_ce",
+            "purpose": "ENTRY",
+            "sequence": 0,
+            "readyAt": 0,
+            "postToAckMs": 80,
+            "ackToTerminalMs": 120
+          },
+          {
+            "id": "k2_ce",
+            "purpose": "ENTRY",
+            "sequence": 1,
+            "readyAt": 0,
+            "postToAckMs": 80,
+            "ackToTerminalMs": 120
+          },
+          {
+            "id": "k2_pe",
+            "purpose": "ENTRY",
+            "sequence": 2,
+            "readyAt": 0,
+            "postToAckMs": 80,
+            "ackToTerminalMs": 120
+          },
+          {
+            "id": "k1_pe",
+            "purpose": "ENTRY",
+            "sequence": 3,
+            "readyAt": 0,
+            "postToAckMs": 80,
+            "ackToTerminalMs": 120
+          }
+        ],
+        "policy": {
+          "maxConcurrentOperations": 1,
+          "minBrokerIntervalMs": 0
+        }
+      },
+      "expected": {
+        "schedule": [
+          {
+            "id": "k1_ce",
+            "dequeued_at": 0,
+            "post_started_at": 0,
+            "ack_at": 80,
+            "terminal_at": 200
+          },
+          {
+            "id": "k2_ce",
+            "dequeued_at": 200,
+            "post_started_at": 200,
+            "ack_at": 280,
+            "terminal_at": 400
+          },
+          {
+            "id": "k2_pe",
+            "dequeued_at": 400,
+            "post_started_at": 400,
+            "ack_at": 480,
+            "terminal_at": 600
+          },
+          {
+            "id": "k1_pe",
+            "dequeued_at": 600,
+            "post_started_at": 600,
+            "ack_at": 680,
+            "terminal_at": 800
+          }
+        ]
+      }
+    },
+    {
+      "name": "scheduler-two-slot: exactly two lifecycles overlap",
+      "input": {
+        "operations": [
+          {
+            "id": "k1_ce",
+            "purpose": "ENTRY",
+            "sequence": 0,
+            "readyAt": 0,
+            "postToAckMs": 80,
+            "ackToTerminalMs": 120
+          },
+          {
+            "id": "k2_ce",
+            "purpose": "ENTRY",
+            "sequence": 1,
+            "readyAt": 0,
+            "postToAckMs": 80,
+            "ackToTerminalMs": 120
+          },
+          {
+            "id": "k2_pe",
+            "purpose": "ENTRY",
+            "sequence": 2,
+            "readyAt": 0,
+            "postToAckMs": 80,
+            "ackToTerminalMs": 120
+          },
+          {
+            "id": "k1_pe",
+            "purpose": "ENTRY",
+            "sequence": 3,
+            "readyAt": 0,
+            "postToAckMs": 80,
+            "ackToTerminalMs": 120
+          }
+        ],
+        "policy": {
+          "maxConcurrentOperations": 2,
+          "minBrokerIntervalMs": 0
+        }
+      },
+      "expected": {
+        "schedule": [
+          {
+            "id": "k1_ce",
+            "dequeued_at": 0,
+            "post_started_at": 0,
+            "ack_at": 80,
+            "terminal_at": 200
+          },
+          {
+            "id": "k2_ce",
+            "dequeued_at": 0,
+            "post_started_at": 0,
+            "ack_at": 80,
+            "terminal_at": 200
+          },
+          {
+            "id": "k2_pe",
+            "dequeued_at": 200,
+            "post_started_at": 200,
+            "ack_at": 280,
+            "terminal_at": 400
+          },
+          {
+            "id": "k1_pe",
+            "dequeued_at": 200,
+            "post_started_at": 200,
+            "ack_at": 280,
+            "terminal_at": 400
+          }
+        ]
+      }
+    },
+    {
+      "name": "transport-spacing: POSTs are paced even under cap=2",
+      "input": {
+        "operations": [
+          {
+            "id": "k1_ce",
+            "purpose": "ENTRY",
+            "sequence": 0,
+            "readyAt": 0,
+            "postToAckMs": 80,
+            "ackToTerminalMs": 120
+          },
+          {
+            "id": "k2_ce",
+            "purpose": "ENTRY",
+            "sequence": 1,
+            "readyAt": 0,
+            "postToAckMs": 80,
+            "ackToTerminalMs": 120
+          },
+          {
+            "id": "k2_pe",
+            "purpose": "ENTRY",
+            "sequence": 2,
+            "readyAt": 0,
+            "postToAckMs": 80,
+            "ackToTerminalMs": 120
+          },
+          {
+            "id": "k1_pe",
+            "purpose": "ENTRY",
+            "sequence": 3,
+            "readyAt": 0,
+            "postToAckMs": 80,
+            "ackToTerminalMs": 120
+          }
+        ],
+        "policy": {
+          "maxConcurrentOperations": 2,
+          "minBrokerIntervalMs": 250
+        }
+      },
+      "expected": {
+        "schedule": [
+          {
+            "id": "k1_ce",
+            "dequeued_at": 0,
+            "post_started_at": 0,
+            "ack_at": 80,
+            "terminal_at": 200
+          },
+          {
+            "id": "k2_ce",
+            "dequeued_at": 0,
+            "post_started_at": 250,
+            "ack_at": 330,
+            "terminal_at": 450
+          },
+          {
+            "id": "k2_pe",
+            "dequeued_at": 200,
+            "post_started_at": 500,
+            "ack_at": 580,
+            "terminal_at": 700
+          },
+          {
+            "id": "k1_pe",
+            "dequeued_at": 450,
+            "post_started_at": 750,
+            "ack_at": 830,
+            "terminal_at": 950
+          }
+        ],
+        "posts": [
+          0,
+          250,
+          500,
+          750
+        ]
+      }
+    },
+    {
+      "name": "priority-unwind-before-entry: emergency jumps a queued ENTRY",
+      "input": {
+        "operations": [
+          {
+            "id": "entryA",
+            "purpose": "ENTRY",
+            "sequence": 0,
+            "readyAt": 0,
+            "postToAckMs": 80,
+            "ackToTerminalMs": 120
+          },
+          {
+            "id": "entryB",
+            "purpose": "ENTRY",
+            "sequence": 1,
+            "readyAt": 0,
+            "postToAckMs": 80,
+            "ackToTerminalMs": 120
+          },
+          {
+            "id": "unwind",
+            "purpose": "EMERGENCY_RESIDUAL",
+            "sequence": 2,
+            "readyAt": 50,
+            "postToAckMs": 80,
+            "ackToTerminalMs": 120
+          }
+        ],
+        "policy": {
+          "maxConcurrentOperations": 1,
+          "minBrokerIntervalMs": 0
+        }
+      },
+      "expected": {
+        "schedule": [
+          {
+            "id": "entryA",
+            "dequeued_at": 0,
+            "post_started_at": 0,
+            "ack_at": 80,
+            "terminal_at": 200
+          },
+          {
+            "id": "entryB",
+            "dequeued_at": 400,
+            "post_started_at": 400,
+            "ack_at": 480,
+            "terminal_at": 600
+          },
+          {
+            "id": "unwind",
+            "dequeued_at": 200,
+            "post_started_at": 200,
+            "ack_at": 280,
+            "terminal_at": 400
+          }
+        ]
+      }
+    }
+  ]
+}
