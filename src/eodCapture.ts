@@ -1,3 +1,4 @@
+import { trackInterval } from "./trackedTimers.js";
 import {
   isNseFnoDbEnabled,
   isArchiveDbEnabled,
@@ -649,7 +650,7 @@ let lastComputedDay = "";
 export function startEodScheduler(deps: EodSchedulerDeps): void {
   if (schedulerInterval) return; // Already started
 
-  schedulerInterval = setInterval(() => {
+  schedulerInterval = trackInterval("eod-capture", setInterval(() => {
     void (async () => {
       try {
         if (!isNseFnoDbEnabled()) return;
@@ -683,7 +684,7 @@ export function startEodScheduler(deps: EodSchedulerDeps): void {
         console.error("[EODCapture] Scheduler error:", err);
       }
     })();
-  }, 60_000);
+  }, 60_000));
 
   console.log("[EODCapture] EOD scheduler started (checking every 60s for 15:45 & 16:00 IST).");
 }
