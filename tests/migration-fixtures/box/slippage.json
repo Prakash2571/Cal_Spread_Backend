@@ -1,0 +1,52 @@
+{
+  "category": "slippage",
+  "operation": "slippagePerUnit",
+  "description": "POSITIVE always means WORSE FOR US: paying more on a BUY and receiving less on a SELL are both adverse, so the sign is normalised here rather than per call site.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "BUY filled above detection is adverse",
+      "input": {
+        "side": "BUY",
+        "detected": 100,
+        "executed": 100.5
+      },
+      "expected": {
+        "slippage_per_unit": 0.5
+      }
+    },
+    {
+      "name": "BUY filled below detection is favourable",
+      "input": {
+        "side": "BUY",
+        "detected": 100,
+        "executed": 99.5
+      },
+      "expected": {
+        "slippage_per_unit": -0.5
+      }
+    },
+    {
+      "name": "SELL filled below detection is adverse",
+      "input": {
+        "side": "SELL",
+        "detected": 100,
+        "executed": 99.5
+      },
+      "expected": {
+        "slippage_per_unit": 0.5
+      }
+    },
+    {
+      "name": "a missing price yields null, never zero",
+      "input": {
+        "side": "BUY",
+        "detected": null,
+        "executed": 100.5
+      },
+      "expected": {
+        "slippage_per_unit": null
+      }
+    }
+  ]
+}

@@ -1,0 +1,90 @@
+{
+  "category": "exit-economics",
+  "operation": "exitNetCreditPerUnit / convergenceThreshold",
+  "description": "The credit received by unwinding the four legs now, and the convergence threshold the exit must clear: max(floor, pct * entryNetEdge).",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "net credit from unwinding a long box",
+      "input": {
+        "legs": [
+          {
+            "role": "k1_ce",
+            "side": "SELL",
+            "price": 262
+          },
+          {
+            "role": "k2_ce",
+            "side": "BUY",
+            "price": 131
+          },
+          {
+            "role": "k2_pe",
+            "side": "SELL",
+            "price": 96
+          },
+          {
+            "role": "k1_pe",
+            "side": "BUY",
+            "price": 29
+          }
+        ]
+      },
+      "expected": {
+        "exit_net_credit_per_unit": 198
+      }
+    },
+    {
+      "name": "an unpriced leg makes the credit null, never zero",
+      "input": {
+        "legs": [
+          {
+            "role": "k1_ce",
+            "side": "SELL",
+            "price": 262
+          },
+          {
+            "role": "k2_ce",
+            "side": "BUY",
+            "price": 131
+          },
+          {
+            "role": "k2_pe",
+            "side": "SELL",
+            "price": 96
+          },
+          {
+            "role": "k1_pe",
+            "side": "BUY",
+            "price": null
+          }
+        ]
+      },
+      "expected": {
+        "exit_net_credit_per_unit": null
+      }
+    },
+    {
+      "name": "convergence threshold: percentage dominates the floor",
+      "input": {
+        "entryNetEdge": 1000,
+        "convergenceFloor": 50,
+        "convergencePct": 0.6
+      },
+      "expected": {
+        "threshold": 600
+      }
+    },
+    {
+      "name": "convergence threshold: floor dominates the percentage",
+      "input": {
+        "entryNetEdge": 50,
+        "convergenceFloor": 100,
+        "convergencePct": 0.6
+      },
+      "expected": {
+        "threshold": 100
+      }
+    }
+  ]
+}

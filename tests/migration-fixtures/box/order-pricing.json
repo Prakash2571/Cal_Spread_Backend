@@ -1,0 +1,137 @@
+{
+  "category": "order-pricing",
+  "operation": "computeLimitPrice / roundToTick / buildOrderPricing",
+  "description": "A marketable limit is the reference touch pushed AWAY from us by a whole number of ticks — dearer for a BUY, cheaper for a SELL — then snapped to the tick grid.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "BUY bounded limit, 2 ticks of chase",
+      "input": {
+        "side": "BUY",
+        "referencePrice": 101.3,
+        "tickSize": 0.05,
+        "maxChaseTicks": 2
+      },
+      "expected": {
+        "limit_price": 101.4,
+        "pricing": {
+          "order_type": "MARKETABLE_LIMIT",
+          "side": "BUY",
+          "quantity": 50,
+          "reference_price": 101.3,
+          "tick_size": 0.05,
+          "max_chase_ticks": 2,
+          "limit_price": 101.4
+        }
+      }
+    },
+    {
+      "name": "SELL bounded limit, 2 ticks of chase",
+      "input": {
+        "side": "SELL",
+        "referencePrice": 101.3,
+        "tickSize": 0.05,
+        "maxChaseTicks": 2
+      },
+      "expected": {
+        "limit_price": 101.2,
+        "pricing": {
+          "order_type": "MARKETABLE_LIMIT",
+          "side": "SELL",
+          "quantity": 50,
+          "reference_price": 101.3,
+          "tick_size": 0.05,
+          "max_chase_ticks": 2,
+          "limit_price": 101.2
+        }
+      }
+    },
+    {
+      "name": "zero chase leaves the reference on the grid",
+      "input": {
+        "side": "BUY",
+        "referencePrice": 100.02,
+        "tickSize": 0.05,
+        "maxChaseTicks": 0
+      },
+      "expected": {
+        "limit_price": 100
+      }
+    },
+    {
+      "name": "tick rounding: halfway, below and above",
+      "input": {
+        "cases": [
+          {
+            "price": 100.025,
+            "tick": 0.05
+          },
+          {
+            "price": 100.024,
+            "tick": 0.05
+          },
+          {
+            "price": 100.026,
+            "tick": 0.05
+          },
+          {
+            "price": 100.01,
+            "tick": 0.1
+          },
+          {
+            "price": 7.77,
+            "tick": 0.05
+          }
+        ]
+      },
+      "expected": {
+        "rounded": [
+          100.05,
+          100,
+          100.05,
+          100,
+          7.75
+        ]
+      }
+    },
+    {
+      "name": "a non-positive tick falls back to 2dp rounding",
+      "input": {
+        "price": 100.126,
+        "tick": 0
+      },
+      "expected": {
+        "rounded": 100.13
+      }
+    },
+    {
+      "name": "queue haircut floors to whole contracts",
+      "input": {
+        "cases": [
+          {
+            "displayed": 500,
+            "model": "none",
+            "haircutPct": 50
+          },
+          {
+            "displayed": 500,
+            "model": "haircut",
+            "haircutPct": 50
+          },
+          {
+            "displayed": 75,
+            "model": "haircut",
+            "haircutPct": 40
+          }
+        ]
+      },
+      "expected": {
+        "effective": [
+          500,
+          250,
+          45
+        ]
+      }
+    }
+  ]
+}

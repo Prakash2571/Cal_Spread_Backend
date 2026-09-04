@@ -1,0 +1,59 @@
+{
+  "category": "candidate-economics",
+  "operation": "projectedNetEdge",
+  "description": "projectedNetEdge = grossEdge - entryCharges - estimatedExitCharges - executionCost - safetyBuffer. Every term is deducted exactly once.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "clearly profitable",
+      "input": {
+        "grossEdge": 900,
+        "entryCharges": 120,
+        "estimatedExitCharges": 120,
+        "safetyBuffer": 50,
+        "executionCost": 60
+      },
+      "expected": {
+        "projected_net_edge": 550
+      }
+    },
+    {
+      "name": "unprofitable once costs are applied",
+      "input": {
+        "grossEdge": 200,
+        "entryCharges": 120,
+        "estimatedExitCharges": 120,
+        "safetyBuffer": 50,
+        "executionCost": 60
+      },
+      "expected": {
+        "projected_net_edge": -150
+      }
+    },
+    {
+      "name": "exactly break-even",
+      "input": {
+        "grossEdge": 350,
+        "entryCharges": 120,
+        "estimatedExitCharges": 120,
+        "safetyBuffer": 50,
+        "executionCost": 60
+      },
+      "expected": {
+        "projected_net_edge": 0
+      }
+    },
+    {
+      "name": "omitted executionCost defaults to zero",
+      "input": {
+        "grossEdge": 900,
+        "entryCharges": 120,
+        "estimatedExitCharges": 120,
+        "safetyBuffer": 50
+      },
+      "expected": {
+        "projected_net_edge": 610
+      }
+    }
+  ]
+}
