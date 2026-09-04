@@ -1,0 +1,57 @@
+{
+  "category": "execution-parity",
+  "operation": "PaperLiquidityLedger",
+  "description": "Two concurrent paper attempts share one observed level; a new book version is fresh.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "two attempts cannot double-consume one level",
+      "input": {
+        "effective": 70,
+        "wantA": 75,
+        "wantB": 75,
+        "gen": 0,
+        "token": 100,
+        "side": "BUY",
+        "price": 100.1,
+        "version": 7
+      },
+      "expected": {
+        "fillA": 70,
+        "fillB": 0,
+        "combined": 70
+      }
+    },
+    {
+      "name": "new book version is fresh liquidity",
+      "input": {
+        "gen": 0,
+        "token": 100,
+        "side": "BUY",
+        "price": 100.1,
+        "oldVersion": 7,
+        "newVersion": 8,
+        "effective": 70
+      },
+      "expected": {
+        "availableOldVersion": 0,
+        "availableNewVersion": 70
+      }
+    },
+    {
+      "name": "a superseded-version reserve is a no-op",
+      "input": {
+        "gen": 0,
+        "token": 100,
+        "side": "BUY",
+        "price": 100.1,
+        "currentVersion": 8,
+        "staleVersion": 7
+      },
+      "expected": {
+        "staleReserveResult": 0,
+        "currentAvailable": 30
+      }
+    }
+  ]
+}

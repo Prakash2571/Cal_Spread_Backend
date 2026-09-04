@@ -1,0 +1,95 @@
+{
+  "category": "execution-parity",
+  "operation": "walkDepth",
+  "description": "A BUY LIMIT never fills past its limit; the reserved lookup shrinks available depth.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "fills only within the limit, partial when depth is short",
+      "input": {
+        "side": "BUY",
+        "levels": [
+          {
+            "price": 100,
+            "qty": 25,
+            "orders": 2
+          },
+          {
+            "price": 100.05,
+            "qty": 20,
+            "orders": 2
+          },
+          {
+            "price": 100.1,
+            "qty": 10,
+            "orders": 1
+          },
+          {
+            "price": 100.2,
+            "qty": 999,
+            "orders": 9
+          }
+        ],
+        "limitPrice": 100.1,
+        "queueModel": "none",
+        "haircutPct": 0,
+        "at": 1000,
+        "quoteVersion": 3,
+        "remainingQty": 75
+      },
+      "expected": {
+        "filled_qty": 55,
+        "average_price": 100.04,
+        "executable_within_limit": 55,
+        "slice_prices": [
+          100,
+          100.05,
+          100.1
+        ]
+      }
+    },
+    {
+      "name": "reserved liquidity is subtracted from the walk",
+      "input": {
+        "side": "BUY",
+        "levels": [
+          {
+            "price": 100,
+            "qty": 25,
+            "orders": 2
+          },
+          {
+            "price": 100.05,
+            "qty": 20,
+            "orders": 2
+          },
+          {
+            "price": 100.1,
+            "qty": 10,
+            "orders": 1
+          },
+          {
+            "price": 100.2,
+            "qty": 999,
+            "orders": 9
+          }
+        ],
+        "limitPrice": 100.1,
+        "queueModel": "none",
+        "haircutPct": 0,
+        "at": 1000,
+        "quoteVersion": 3,
+        "remainingQty": 75,
+        "reservedAt10000": 25
+      },
+      "expected": {
+        "filled_qty": 30,
+        "executable_within_limit": 30,
+        "slice_prices": [
+          100.05,
+          100.1
+        ]
+      }
+    }
+  ]
+}
