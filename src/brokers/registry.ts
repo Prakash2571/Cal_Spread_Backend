@@ -1196,6 +1196,31 @@ export class ActiveBrokerManager {
     // Zerodha's hub connects lazily on subscribe/retain, so there is nothing to do.
   }
 
+  /**
+   * Stop BOTH brokers' feeds, for process shutdown.
+   *
+   * Stops both rather than just the active one: a switch earlier in the process's life
+   * can leave the previous broker's socket closed but its object present, and at exit
+   * there is no reason to reason about which. Both `stop()` methods are idempotent.
+   *
+   * DOES NOT touch positions, place orders, or alter persisted state — it closes sockets
+   * and drops in-memory books. Subscriptions are deliberately NOT reset here: the
+   * coordinator's table is meaningless once the process ends, and clearing it would
+   * issue pointless unsubscribes against sockets that are already gone.
+   */
+  stopFeeds(): void {
+    try {
+      this.deps.tickerHub.stop();
+    } catch (err) {
+      console.warn("[Broker] tickerHub.stop() failed during shutdown:", err);
+    }
+    try {
+      this.dhanFeed?.stop();
+    } catch (err) {
+      console.warn("[Broker] dhanFeed.stop() failed during shutdown:", err);
+    }
+  }
+
   /* ------------------------------ switching ------------------------------ */
 
   /**

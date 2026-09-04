@@ -993,3 +993,46 @@ export const SpreadSummary = registerModelOnConnection<ISpreadSummary>(
   "SpreadSummary",
   spreadSummarySchema,
 );
+
+
+/**
+ * Close every Mongo connection this module owns, for process shutdown.
+ *
+ * There are up to six: the default connection plus the five created with
+ * `createConnection` (archive, current, spread, trade-log, box). Closing only
+ * `mongoose.connection` — the obvious thing to write — would leave the other five open
+ * and the process would not exit.
+ *
+ * `force: false` lets in-flight operations drain rather than being cut mid-write, which
+ * matters because the position monitor's retry queues may be persisting a confirmed
+ * fill at exactly this moment.
+ *
+ * Each close is independent: one failing connection must not prevent the rest from
+ * closing. Errors are logged and swallowed for that reason — at this point in shutdown
+ * there is nothing useful left to do with them, and throwing would abort the remaining
+ * closes.
+ */
+export async function closeDbConnections(): Promise<void> {
+  const named: { name: string; conn: mongoose.Connection | null }[] = [
+    { name: "default", conn: mongoose.connection },
+    { name: "archive", conn: archiveConnection },
+    { name: "current", conn: currentConnection },
+    { name: "spread", conn: spreadConnection },
+    { name: "trade_log", conn: tradeLogConnection },
+    { name: "box", conn: boxConnection },
+  ];
+
+  await Promise.all(
+    named.map(async ({ name, conn }) => {
+      // readyState 0 === disconnected: nothing to close, and calling close() on an
+      // unused createConnection handle would otherwise log a spurious failure.
+      if (!conn || conn.readyState === 0) return;
+      try {
+        await conn.close(false);
+        console.log(`[shutdown] Mongo connection "${name}" closed.`);
+      } catch (err) {
+        console.warn(`[shutdown] Mongo connection "${name}" failed to close:`, err);
+      }
+    }),
+  );
+}
