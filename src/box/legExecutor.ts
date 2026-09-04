@@ -113,6 +113,20 @@ export interface LegExecutorDeps {
    * used exactly as before.
    */
   latency?: LegLatencySource | undefined;
+  /**
+   * LIVE-PARITY ONLY. Computes each leg's simulated EXCHANGE-ARRIVAL time from the shared
+   * scheduler — i.e. the four legs pass through the same priority queue + concurrency cap +
+   * transport pacing the live OrderManager enforces, instead of all arriving at
+   * `submit + latency`. Returns absolute arrival times per leg, in the run's leg order.
+   *
+   * When present (and the run is parallel) it OVERRIDES the per-leg `latency` draw for
+   * arrival timing. Undefined ⇒ arrivals fall back to `latency`/the constant exactly as
+   * before, so standard paper is byte-identical. Applied only to the initial parallel
+   * submit; sequential releases remain fill-gated.
+   */
+  arrivalPlanner?:
+    | ((args: { count: number; submitAt: number; phase: ExecutionPhase }) => number[])
+    | undefined;
   /** Feed/broker generation for reservation keys; defaults to 0. */
   generation?: (() => number) | undefined;
 }
@@ -195,9 +209,17 @@ export class LegExecutor {
       leg: blankLeg(req, args.orderIdPrefix, phase),
     }));
 
+    // LIVE-PARITY: when a scheduler is wired in, the legs' EXCHANGE-ARRIVAL times come from
+    // the shared queue + concurrency + transport-pacing model, not from an independent
+    // per-leg latency draw. Computed once, for the initial parallel submit only.
+    const plannedArrivals =
+      this.deps.arrivalPlanner && !sequential
+        ? this.deps.arrivalPlanner({ count: states.length, submitAt: args.submitAt, phase })
+        : null;
+
     // Submit: in parallel every order goes now; sequentially only the first does.
     for (const [i, st] of states.entries()) {
-      if (!sequential || i === 0) this.submit(st, args.submitAt, latency);
+      if (!sequential || i === 0) this.submit(st, args.submitAt, latency, plannedArrivals?.[i]);
     }
 
     const booksAtFill = new Map<number, BoxQuote>();
@@ -293,12 +315,19 @@ export class LegExecutor {
 
   /* ------------------------------- internals ------------------------------ */
 
-  private submit(st: LegState, submitAt: number, latencyMs: number): void {
+  private submit(st: LegState, submitAt: number, latencyMs: number, plannedArrivalAt?: number): void {
+    st.leg.status = "IN_FLIGHT";
+    st.leg.submit_at = submitAt;
+    // LIVE-PARITY: a scheduler-computed arrival reflects the leg's whole trip through the
+    // queue + transport pacing; it wins over any per-leg latency draw. Clamped so an
+    // arrival can never precede submission.
+    if (plannedArrivalAt !== undefined && Number.isFinite(plannedArrivalAt)) {
+      st.leg.arrival_at = Math.max(submitAt, plannedArrivalAt);
+      return;
+    }
     // Live-parity draws a per-order latency from the deterministic source; standard uses
     // the single run-level constant, unchanged.
     const latency = this.deps.latency ? Math.max(0, this.deps.latency.next()) : latencyMs;
-    st.leg.status = "IN_FLIGHT";
-    st.leg.submit_at = submitAt;
     st.leg.arrival_at = submitAt + latency;
   }
 

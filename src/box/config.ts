@@ -189,8 +189,19 @@ export interface BoxConfig {
   paperMaxConcurrentExecutions: number;
   /** Latency source for live_parity: `constant` (default) or `recorded_samples`. */
   paperLatencyMode: "constant" | "recorded_samples";
-  /** Observed latency samples (ms) for `recorded_samples`; empty ⇒ fall back to constant. */
+  /**
+   * Observed POST→ACK latency samples (ms) for `recorded_samples` — the time from an order
+   * leaving the wire to the broker acknowledging it (the leg becoming live at the exchange).
+   * Empty ⇒ fall back to the constant. These are the primary calibration feed; export them
+   * from the live broker-timing store.
+   */
   paperLatencySamples: number[];
+  /**
+   * Observed ACK→terminal latency samples (ms) — how long an order works at the exchange
+   * after acknowledgement before it resolves. Feeds the scheduler's slot-hold model so paper
+   * concurrency matches live. Empty ⇒ derived from a fraction of the constant.
+   */
+  paperLatencyAckToTerminalSamples: number[];
   /** Deterministic starting offset into the samples. No randomness anywhere. */
   paperLatencySeed: number;
 
@@ -613,6 +624,7 @@ export function loadBoxConfig(): BoxConfig {
     ),
     paperLatencyMode: latencyMode("BOX_PAPER_LATENCY_MODE", "constant"),
     paperLatencySamples: msSamples("BOX_PAPER_LATENCY_SAMPLES"),
+    paperLatencyAckToTerminalSamples: msSamples("BOX_PAPER_LATENCY_ACK_TERMINAL_SAMPLES"),
     paperLatencySeed: num("BOX_PAPER_LATENCY_SEED", 0),
 
     liveTradingEnabled,
