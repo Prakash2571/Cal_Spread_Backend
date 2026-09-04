@@ -141,7 +141,15 @@ Paper live-parity profile (default OFF; layered on `paper_legging`, never change
 `standard`): `BOX_PAPER_EXECUTION_PROFILE` (`standard`|`live_parity`),
 `BOX_PAPER_MAX_CONCURRENT_EXECUTIONS` (default = `BOX_LIVE_MAX_CONCURRENT_EXECUTIONS`),
 `BOX_PAPER_LATENCY_MODE` (`constant`|`recorded_samples`), `BOX_PAPER_LATENCY_SAMPLES`
-(comma-separated ms), `BOX_PAPER_LATENCY_SEED`. See `src/box/LIVE_EXECUTION.md`.
+(observed POST→ACK ms), `BOX_PAPER_LATENCY_ACK_TERMINAL_SAMPLES` (observed ACK→terminal
+ms), `BOX_PAPER_LATENCY_SEED`. Under `live_parity` the four legs are scheduled through the
+same priority queue + concurrency cap + `BOX_LIVE_BROKER_MIN_INTERVAL_MS` pacing as live.
+
+Execution timing observability / latency calibration (fail-open, off the trading hot path):
+`BOX_EXECUTION_TIMING_METRICS_ENABLED` (default `true`), `BOX_EXECUTION_TIMING_WINDOW`
+(default `500`), `BOX_DEPLOYMENT_REGION` / `BOX_EXECUTION_CALIBRATION_REGION` (region label
+stamped on calibration datasets; never auto-detected). See `src/box/LIVE_EXECUTION.md` for
+the recommended validation profile and calibration status.
 
 Live-only limits (all under the `BOX_LIVE_*` prefix — order pacing, timeouts, and the
 risk caps below).

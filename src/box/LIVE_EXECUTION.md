@@ -162,6 +162,47 @@ logic, live behaviour, API shapes or schemas.
   reservation only *subtracts already-reserved quantity* from a level's effective depth —
   it never widens a limit or turns a LIMIT into a market order.
 
+### Scheduling parity — legs go through the same scheduler as live
+
+Under `live_parity`, the four legs no longer all arrive at `submit + one latency`. Each
+leg's simulated **exchange arrival** is computed by `planPaperSchedule`
+(`src/box/paperScheduler.ts`) using the *same* policy the live `BoxOrderManager` enforces,
+defined once in `src/box/executionSchedulingPolicy.ts` and imported by both:
+
+- **Concurrency cap.** A slot is held for the whole lifecycle (submit → terminal), so
+  `BOX_PAPER_MAX_CONCURRENT_EXECUTIONS = 1` (the default, = the live cap) serialises whole
+  leg lifecycles, exactly as live cap=1 does — not just the POSTs.
+- **Transport pacing.** Successive POSTs are spaced by `BOX_LIVE_BROKER_MIN_INTERVAL_MS`
+  on a single shared transport channel, matching each adapter's `call()` throttle.
+- **Priority.** `EMERGENCY_RESIDUAL > PROTECTIVE_CANCEL > EXIT > ENTRY`. A higher-priority
+  operation claims the next free slot ahead of a queued lower one; an in-flight operation
+  is never pre-empted (neither live nor paper interrupts a call already at the broker).
+  Emergency unwinds run through the same planner (emergency-residual band).
+
+The broker-side spans that feed the scheduler — POST→ACK and ACK→terminal — come from a
+structured, calibration-fed latency source (below), not one opaque constant. Fills still
+come exclusively from real observed books after the scheduled arrival; the scheduler only
+decides *when* the order is live at the exchange, never at what price it fills.
+
+### Latency calibration — measured, per broker, never invented
+
+`src/box/latencyModel.ts` names the measurable latency stages (queue / transport /
+POST→ACK / ACK→first-fill / …) and provides a deterministic `StructuredLatencySource` that
+draws POST→ACK and ACK→terminal **independently** from supplied samples.
+`src/box/brokerTimingStore.ts` is a bounded, fail-open store that measures live broker
+operations per broker (`zerodha`/`dhan`, never mixed) and per kind, exposes rolling
+p50/p95/p99, execution-outcome rates, and exports a deterministic **calibration dataset**
+ready to feed back into paper via `BOX_PAPER_LATENCY_SAMPLES` /
+`BOX_PAPER_LATENCY_ACK_TERMINAL_SAMPLES`. `src/box/parityReport.ts` compares a live snapshot
+against a paper snapshot (p50/p95/p99 error + outcome rates), flagging low-confidence
+metrics rather than implying significance it lacks.
+
+**Calibration status** (`classifyCalibration`): `UNCALIBRATED` (no live samples → paper
+falls back to a conservative constant, and says so), `PARTIALLY_CALIBRATED` (some, below
+the confidence threshold, default 200), `CALIBRATED` (enough recent samples), `STALE` (the
+newest sample is older than the freshness window, default 8h — latency shifts by session,
+so a previous day's set does not silently calibrate today).
+
 ### Config
 
 | Variable | Default | Meaning |
@@ -169,12 +210,32 @@ logic, live behaviour, API shapes or schemas.
 | `BOX_PAPER_EXECUTION_PROFILE` | `standard` | `standard` or `live_parity` |
 | `BOX_PAPER_MAX_CONCURRENT_EXECUTIONS` | live cap (`1`) | concurrent paper pipelines under `live_parity` |
 | `BOX_PAPER_LATENCY_MODE` | `constant` | `constant` or `recorded_samples` |
-| `BOX_PAPER_LATENCY_SAMPLES` | (empty) | comma-separated observed latencies (ms) |
+| `BOX_PAPER_LATENCY_SAMPLES` | (empty) | observed POST→ACK latencies (ms), comma-separated |
+| `BOX_PAPER_LATENCY_ACK_TERMINAL_SAMPLES` | (empty) | observed ACK→terminal latencies (ms) |
 | `BOX_PAPER_LATENCY_SEED` | `0` | deterministic start offset into the samples |
+| `BOX_EXECUTION_TIMING_METRICS_ENABLED` | `true` | collect live timing for calibration (fail-open) |
+| `BOX_EXECUTION_TIMING_WINDOW` | `500` | bounded ring size per timing distribution |
+| `BOX_DEPLOYMENT_REGION` / `BOX_EXECUTION_CALIBRATION_REGION` | (none) | region label stamped on calibration datasets |
 
-Timeouts are inherited from the existing live/`paper_legging` config
-(`BOX_LEG_TIMEOUT_MS`, and the `BOX_LIVE_*_TIMEOUT_MS` family for the live path); the
-profile does not invent separate paper timeout numbers.
+The scheduler pacing/cap are sourced from the existing `BOX_LIVE_BROKER_MIN_INTERVAL_MS`
+and `BOX_PAPER_MAX_CONCURRENT_EXECUTIONS`; leg timeouts are inherited from
+`BOX_LEG_TIMEOUT_MS` (and the `BOX_LIVE_*_TIMEOUT_MS` family for the live path). The profile
+does not invent separate paper timeout numbers.
+
+### Recommended validation profile
+
+```
+BOX_EXECUTION_MODE=paper_legging
+BOX_PAPER_EXECUTION_PROFILE=live_parity
+BOX_PAPER_MAX_CONCURRENT_EXECUTIONS=1
+BOX_QUEUE_MODEL=haircut
+BOX_QUEUE_LIQUIDITY_HAIRCUT_PCT=30
+BOX_PAPER_LATENCY_MODE=recorded_samples   # once live samples exist
+```
+
+With no measured samples yet, leave `BOX_PAPER_LATENCY_MODE=constant`: the status is
+`UNCALIBRATED` and paper uses a conservative constant — it never pretends a constant is
+measured live latency.
 
 ### What it still CANNOT simulate (honest gaps)
 
@@ -188,14 +249,31 @@ queue haircut, and measured/supplied latency. It does **not** and will not fabri
 - microsecond exchange matching order or market impact;
 - price movement that was never observed on the feed.
 
-### Deferred (not in this change), with rationale
+### Remaining integration (designed, not yet wired), with rationale
 
-- **Mirroring the live `OrderManager` scheduler exactly** (serialising the four legs
-  through the same priority queue + `BOX_LIVE_BROKER_MIN_INTERVAL_MS` pacing). The
-  concurrency cap is mirrored; full scheduler mirroring would mean threading live-adjacent
-  scheduling into the paper leg loop, which risks drifting existing `paper_legging` results
-  and cannot be responsibly validated without a real run. Tracked as follow-up.
-- **A dedicated parity-report HTTP endpoint** and additional metrics percentile fields
-  beyond those already exposed in `/api/box/status`. The existing metrics infra already
-  records execution/legging latency percentiles; a separate report is additive and can be
-  layered without touching execution code.
+- **Populating the live timing store from real orders.** The store, model, calibration
+  export and parity report are built and unit-tested, but the calls that record real
+  per-leg timestamps live inside the live `OrderManager`/broker adapters — the highest-risk
+  live-trading surface, and one that cannot be responsibly validated here without a real
+  broker run. The hooks are fail-open by design; wiring them is the next step. Until then,
+  the calibration status is `UNCALIBRATED` and paper uses the conservative constant.
+- **A dedicated parity-report HTTP endpoint.** `buildParityReport`/`formatParityReport`
+  are ready; exposing them on an admin route is additive and can be layered without
+  touching execution code.
+- **An explicit ACK≠fill state machine and a cancel-latency fill/cancel race.** Today paper
+  models the ACK as the arrival instant (order live at the exchange) and then fills from
+  observed books; a distinct broker-cancel lifecycle that can race a late fill is not yet
+  modelled.
+
+### What it still CANNOT simulate (honest, unavoidable gaps)
+
+It only uses what actually arrived: real WebSocket books, the configured conservative queue
+haircut, and measured/supplied latency. It does **not** and will not fabricate:
+
+- true NSE order-level queue position (level-2 depth cannot reveal it — the haircut is a
+  deliberate approximation, not a reconstruction);
+- hidden/iceberg liquidity, or other participants consuming a level;
+- broker OMS/RMS acceptance quirks, or random rejects (deterministic only; no fault
+  injection yet);
+- microsecond exchange matching order or market impact from our own order;
+- price movement that was never observed on the feed; network packet loss.
