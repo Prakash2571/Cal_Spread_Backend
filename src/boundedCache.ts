@@ -77,6 +77,16 @@ export class BoundedTtlCache<V> {
     }
   }
 
+  /**
+   * Forget one key. Returns true when an entry was actually removed.
+   *
+   * Needed by callers that own an entry's lifecycle explicitly (for example a per-order timing
+   * trace that is retired the moment it is published) rather than relying on TTL expiry.
+   */
+  delete(key: string): boolean {
+    return this.entries.delete(key);
+  }
+
   get size(): number {
     return this.entries.size;
   }

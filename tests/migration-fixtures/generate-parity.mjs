@@ -19,6 +19,24 @@ import { walkDepth } from "../../dist/box/orderPricing.js";
 import { createSchedulingPolicy } from "../../dist/box/executionSchedulingPolicy.js";
 import { planPaperSchedule } from "../../dist/box/paperScheduler.js";
 import { createStructuredLatencySource, classifyCalibration } from "../../dist/box/latencyModel.js";
+import {
+  classifyConfidence,
+  classifyTimeOfDayBucket,
+  istSessionKey,
+} from "../../dist/box/latencyModel.js";
+import {
+  CumulativeFillLedger,
+  BOX_ORDER_STAGES,
+  durableStateForStage,
+  stageAcceptsFurtherFills,
+  stageFromCumulativeQuantity,
+  isTerminalStage,
+  outstandingQuantity,
+  terminalQuantityAccounting,
+} from "../../dist/box/orderLifecycle.js";
+import { ExecutionCalibrationStore } from "../../dist/box/executionCalibration.js";
+import { computeExecutionShortfall } from "../../dist/box/executionShortfall.js";
+import { classifyLiquidity, QueueCalibrationEstimator } from "../../dist/box/queueCalibration.js";
 
 const OUT_DIR = join(dirname(fileURLToPath(import.meta.url)), "box-parity");
 
@@ -268,6 +286,372 @@ fixture(
       input: { ...r, thresholds: th },
       expected: { status: classifyCalibration(r.sampleCount, r.lastSampleAgeMs, th) },
     }));
+  })(),
+);
+
+
+/* 7 ─ order lifecycle: stage vocabulary and the ACK-is-not-fill rule ------- */
+
+fixture(
+  "order-lifecycle-stages.json",
+  "BoxOrderStage",
+  "The observable stage vocabulary, its mapping onto durable state, terminality, and which stages still accept fills. A cancel in flight MUST still accept fills.",
+  BOX_ORDER_STAGES.map((stage) => ({
+    name: stage,
+    input: { stage },
+    expected: {
+      durable_state: durableStateForStage(stage),
+      terminal: isTerminalStage(stage),
+      accepts_further_fills: stageAcceptsFurtherFills(stage),
+    },
+  })),
+);
+
+fixture(
+  "cumulative-fill-ledger.json",
+  "CumulativeFillLedger",
+  "Idempotent, monotonic, cumulative-authoritative fill accounting: duplicates contribute nothing, out-of-order events cannot rewind quantity, and an overfill is applied but flagged.",
+  (() => {
+    const cases = [];
+
+    // The brief's cancel-race arithmetic, end to end.
+    const race = new CumulativeFillLedger("BOX:t:ENTRY:k1_ce:attempt-1", 75);
+    const raceSteps = [
+      { cumulativeQty: 40, eventId: "f1", sequence: 1, source: "order_update" },
+      { cumulativeQty: 52, eventId: "f2", sequence: 2, source: "order_update" },
+      { cumulativeQty: 52, eventId: "cancel-terminal", sequence: 3, source: "rest_poll" },
+    ];
+    const raceOutcomes = raceSteps.map((step) => {
+      const r = race.apply(step);
+      return { outcome: r.outcome, delta: r.delta, cumulative: r.cumulative, remaining: r.remaining };
+    });
+    cases.push({
+      name: "cancel race: 40 filled, cancel requested, 12 more fill, remainder cancelled",
+      input: { requestedQty: 75, steps: raceSteps, cumulativeAtCancelRequest: 40 },
+      expected: {
+        applied: raceOutcomes,
+        accounting: terminalQuantityAccounting({
+          requestedQty: 75,
+          finalCumulativeQty: race.cumulative,
+          cumulativeAtCancelRequest: 40,
+        }),
+      },
+    });
+
+    // Duplicate delivery.
+    const dup = new CumulativeFillLedger("BOX:t:ENTRY:k2_ce:attempt-1", 75);
+    const dupEvent = { cumulativeQty: 40, eventId: "dhan:TRADE-991", source: "order_update" };
+    const dupOutcomes = [dup.apply(dupEvent), dup.apply(dupEvent), dup.apply(dupEvent)].map((r) => ({
+      outcome: r.outcome,
+      delta: r.delta,
+      cumulative: r.cumulative,
+    }));
+    cases.push({
+      name: "a duplicate broker event contributes no quantity",
+      // The client order id is part of the INPUT, not the expectation: it is identity, not
+      // behaviour, and pinning the generator's own id would make the fixture unreplayable.
+      input: {
+        clientOrderId: "BOX:t:ENTRY:k2_ce:attempt-1",
+        requestedQty: 75,
+        event: dupEvent,
+        deliveries: 3,
+      },
+      expected: { applied: dupOutcomes, snapshot: dup.snapshot() },
+    });
+
+    // Out-of-order delivery.
+    const ooo = new CumulativeFillLedger("BOX:t:ENTRY:k2_pe:attempt-1", 75);
+    const oooSteps = [
+      { cumulativeQty: 52, eventId: "e9", sequence: 9, source: "order_update" },
+      { cumulativeQty: 40, eventId: "e7", sequence: 7, source: "order_update" },
+    ];
+    const oooOutcomes = oooSteps.map((step) => {
+      const r = ooo.apply(step);
+      return { outcome: r.outcome, delta: r.delta, cumulative: r.cumulative, sequenceRegression: r.sequenceRegression };
+    });
+    cases.push({
+      name: "an out-of-order event cannot reduce cumulative quantity",
+      input: { requestedQty: 75, steps: oooSteps },
+      expected: { applied: oooOutcomes },
+    });
+
+    // Overfill.
+    const over = new CumulativeFillLedger("BOX:t:ENTRY:k1_pe:attempt-1", 75);
+    const overResult = over.apply({ cumulativeQty: 80, source: "rest_poll" });
+    cases.push({
+      name: "an overfill is applied as broker truth and flagged, never clamped",
+      input: { requestedQty: 75, cumulativeQty: 80 },
+      expected: {
+        outcome: overResult.outcome,
+        cumulative: overResult.cumulative,
+        overfill: overResult.overfill,
+        remaining: overResult.remaining,
+      },
+    });
+
+    // Quantity derivation.
+    cases.push({
+      name: "outstanding quantity and stage from cumulative quantity",
+      input: [
+        { requestedQty: 75, cumulativeQty: 52 },
+        { requestedQty: 75, cumulativeQty: 75 },
+        { requestedQty: 75, cumulativeQty: 80 },
+        { requestedQty: 75, cumulativeQty: 0 },
+      ],
+      expected: [
+        { outstanding: outstandingQuantity(75, 52), stage: stageFromCumulativeQuantity({ requestedQty: 75, cumulativeQty: 52 }) },
+        { outstanding: outstandingQuantity(75, 75), stage: stageFromCumulativeQuantity({ requestedQty: 75, cumulativeQty: 75 }) },
+        { outstanding: outstandingQuantity(75, 80), stage: stageFromCumulativeQuantity({ requestedQty: 75, cumulativeQty: 80 }) },
+        {
+          outstanding: outstandingQuantity(75, 0),
+          stage: stageFromCumulativeQuantity({ requestedQty: 75, cumulativeQty: 0, cancelConfirmed: true }),
+        },
+      ],
+    });
+
+    return cases;
+  })(),
+);
+
+/* 8 ─ calibration resolution: fallback ladder, freshness, confidence ------- */
+
+fixture(
+  "calibration-resolution.json",
+  "ExecutionCalibrationStore.resolve",
+  "The fallback ladder (exact bucket -> pooled buckets -> pooled kinds -> unavailable), session freshness, and the honesty contract that an unmeasured resolution reports measured:false with null percentiles.",
+  (() => {
+    const DAY = 24 * 60 * 60 * 1000;
+    const T0 = Date.UTC(2026, 2, 2, 6, 30, 0); // 2026-03-02 12:00 IST
+    const dims = (over = {}) => ({
+      broker: "zerodha",
+      kind: "ENTRY",
+      profile: "MARKETABLE_LIMIT",
+      bucket: "NORMAL",
+      ...over,
+    });
+    const opts = (nowWall) => ({
+      minSamples: 10,
+      bucketMinSamples: 20,
+      maxAgeMs: 2 * DAY,
+      thresholds: { calibratedMinSamples: 50, staleAfterMs: DAY },
+      confidence: { highMinSamples: 100, mediumMinSamples: 10 },
+      nowWall: () => nowWall,
+    });
+    const strip = (r) => ({
+      fallback: r.fallback,
+      status: r.status,
+      confidence: r.confidence,
+      samples: r.samples,
+      measured: r.measured,
+      percentiles: r.percentiles,
+      newestSession: r.newestSession,
+    });
+    const seed = (store, count, valueMs, over, atWall) => {
+      for (let i = 0; i < count; i++) {
+        store.record({ ...dims(over), stage: "post_to_ack_ms", valueMs, atWall });
+      }
+    };
+
+    const cases = [];
+
+    const exact = new ExecutionCalibrationStore(opts(T0));
+    seed(exact, 25, 120, { bucket: "NORMAL" }, T0);
+    cases.push({
+      name: "an adequately-sampled bucket is used directly",
+      input: { bucketSamples: 25, bucketMinSamples: 20 },
+      expected: strip(exact.resolve(dims(), "post_to_ack_ms")),
+    });
+
+    const pooled = new ExecutionCalibrationStore(opts(T0));
+    seed(pooled, 5, 100, { bucket: "OPEN" }, T0);
+    seed(pooled, 30, 400, { bucket: "NORMAL" }, T0);
+    cases.push({
+      name: "a thin bucket pools across buckets rather than overfitting",
+      input: { openSamples: 5, normalSamples: 30 },
+      expected: strip(pooled.resolve(dims({ bucket: "OPEN" }), "post_to_ack_ms")),
+    });
+
+    const kinds = new ExecutionCalibrationStore(opts(T0));
+    seed(kinds, 4, 100, { kind: "CANCEL", bucket: "OPEN" }, T0);
+    seed(kinds, 30, 120, { kind: "ENTRY", bucket: "NORMAL" }, T0);
+    cases.push({
+      name: "a thin kind pools across kinds, still within one broker and profile",
+      input: { cancelSamples: 4, entrySamples: 30 },
+      expected: strip(kinds.resolve(dims({ kind: "CANCEL", bucket: "OPEN" }), "post_to_ack_ms")),
+    });
+
+    const otherBroker = new ExecutionCalibrationStore(opts(T0));
+    seed(otherBroker, 500, 100, { broker: "zerodha" }, T0);
+    cases.push({
+      name: "pooling NEVER crosses a broker",
+      input: { zerodhaSamples: 500, dhanSamples: 0 },
+      expected: strip(otherBroker.resolve(dims({ broker: "dhan" }), "post_to_ack_ms")),
+    });
+
+    const otherProfile = new ExecutionCalibrationStore(opts(T0));
+    seed(otherProfile, 500, 100, { profile: "MARKETABLE_LIMIT" }, T0);
+    cases.push({
+      name: "pooling NEVER crosses the marketable/passive boundary",
+      input: { marketableSamples: 500, passiveSamples: 0 },
+      expected: strip(otherProfile.resolve(dims({ profile: "PASSIVE_LIMIT" }), "post_to_ack_ms")),
+    });
+
+    const stale = new ExecutionCalibrationStore(opts(T0 + 1.5 * DAY));
+    seed(stale, 60, 100, { bucket: "NORMAL" }, T0);
+    cases.push({
+      name: "a calibrated set past the staleness window is STALE and LOW confidence",
+      input: { samples: 60, ageMs: 1.5 * DAY },
+      expected: strip(stale.resolve(dims(), "post_to_ack_ms")),
+    });
+
+    const expired = new ExecutionCalibrationStore(opts(T0 + 3 * DAY));
+    seed(expired, 60, 100, { bucket: "NORMAL" }, T0);
+    cases.push({
+      name: "a set beyond the retention window cannot calibrate today",
+      input: { samples: 60, ageMs: 3 * DAY },
+      expected: strip(expired.resolve(dims(), "post_to_ack_ms")),
+    });
+
+    return cases;
+  })(),
+);
+
+fixture(
+  "calibration-confidence.json",
+  "classifyConfidence",
+  "Confidence is LOW for anything unmeasured or stale, capped at MEDIUM for a fallback, and HIGH only for a large fresh non-fallback set.",
+  [
+    { status: "CALIBRATED", sampleCount: 100000, measured: false },
+    { status: "STALE", sampleCount: 100000, measured: true },
+    { status: "UNCALIBRATED", sampleCount: 0, measured: true },
+    { status: "PARTIALLY_CALIBRATED", sampleCount: 5, measured: true },
+    { status: "CALIBRATED", sampleCount: 500, measured: true, fellBack: true },
+    { status: "CALIBRATED", sampleCount: 500, measured: true, fellBack: false },
+  ].map((input) => ({
+    name: `${input.status} n=${input.sampleCount} measured=${input.measured} fellBack=${input.fellBack ?? false}`,
+    input,
+    expected: { confidence: classifyConfidence(input) },
+  })),
+);
+
+fixture(
+  "time-of-day-buckets.json",
+  "classifyTimeOfDayBucket",
+  "Coarse OPEN / NORMAL / CLOSE bucketing of the NSE session, and the IST session key used for freshness. Outside the session is NORMAL, never a fourth bucket.",
+  [555, 560, 569, 570, 720, 915, 916, 930, 360, 1320].map((minutes) => ({
+    name: `minute ${minutes}`,
+    input: { istMinutesOfDay: minutes },
+    expected: { bucket: classifyTimeOfDayBucket(minutes) },
+  })).concat([
+    {
+      name: "IST session key straddles the UTC day boundary correctly",
+      input: { atWall: Date.UTC(2026, 2, 2, 19, 0, 0) },
+      expected: { session: istSessionKey(Date.UTC(2026, 2, 2, 19, 0, 0)) },
+    },
+  ]),
+);
+
+/* 9 ─ implementation shortfall and queue calibration ---------------------- */
+
+fixture(
+  "implementation-shortfall.json",
+  "computeExecutionShortfall",
+  "The subtraction chain from detected edge to realised net, attributed per leg, with the unexplained residual surfaced. Positive always means COST, whichever side the leg was.",
+  (() => {
+    const complete = {
+      theoreticalDetectedEdge: 1875,
+      executedGrossEdge: 1700,
+      brokerage: 80,
+      taxesAndFees: 70,
+      unwindCost: 0,
+      realisedNetResult: 1425,
+      outcome: "filled_4_of_4",
+      legs: [
+        { role: "k1_ce", side: "BUY", detectedPrice: 100, submitPrice: 100.05, filledPrice: 100.1, requestedQty: 75, filledQty: 75 },
+        { role: "k2_ce", side: "SELL", detectedPrice: 50, submitPrice: 49.95, filledPrice: 49.9, requestedQty: 75, filledQty: 75 },
+      ],
+    };
+    const incomplete = {
+      theoreticalDetectedEdge: 1000,
+      executedGrossEdge: 0,
+      brokerage: 0,
+      taxesAndFees: 0,
+      unwindCost: 250,
+      realisedNetResult: -250,
+      outcome: "partial_unwound",
+      legs: [
+        { role: "k1_ce", side: "BUY", detectedPrice: 100, submitPrice: 101, filledPrice: null, requestedQty: 75, filledQty: 0 },
+      ],
+    };
+    return [
+      { name: "a complete 4/4 box", input: complete, expected: computeExecutionShortfall(complete) },
+      { name: "an incomplete box that had to be unwound", input: incomplete, expected: computeExecutionShortfall(incomplete) },
+    ];
+  })(),
+);
+
+fixture(
+  "queue-calibration.json",
+  "QueueCalibrationEstimator",
+  "Realisation ratio measured against VISIBLE executable depth, and the conservative haircut recommended from its p25. NOT a reconstruction of NSE queue position, and never applied automatically.",
+  (() => {
+    const observation = (over = {}) => ({
+      broker: "zerodha",
+      profile: "MARKETABLE_LIMIT",
+      side: "BUY",
+      tradingsymbol: "NIFTY26SEP19900CE",
+      displayedQtyAtSubmit: 300,
+      executableWithinLimitAtSubmit: 150,
+      requestedQty: 75,
+      limitOffsetTicks: 2,
+      immediatelyMarketable: true,
+      filledQty: 75,
+      fillLatencyMs: 120,
+      partial: false,
+      bookUpdatesWhileWorking: 3,
+      atWall: 1700000000000,
+      ...over,
+    });
+    const strip = (r) => ({
+      samples: r.samples,
+      realisationRatioP50: r.realisationRatioP50,
+      realisationRatioP25: r.realisationRatioP25,
+      realisationRatioP10: r.realisationRatioP10,
+      recommendedHaircutPct: r.recommendedHaircutPct,
+      currentHaircutPct: r.currentHaircutPct,
+      confidence: r.confidence,
+      partialFillRate: r.partialFillRate,
+      sizeExceededVisibleDepthRate: r.sizeExceededVisibleDepthRate,
+    });
+
+    const thin = new QueueCalibrationEstimator({ currentHaircutPct: 30, minSamples: 30 });
+    for (let i = 0; i < 10; i++) thin.record(observation());
+
+    const mixed = new QueueCalibrationEstimator({ currentHaircutPct: 30, minSamples: 10, highConfidenceSamples: 100 });
+    for (let i = 0; i < 40; i++) mixed.record(observation({ filledQty: 75 }));
+    for (let i = 0; i < 10; i++) mixed.record(observation({ filledQty: 37, partial: true }));
+
+    return [
+      {
+        name: "below the sample floor no recommendation is made",
+        input: { observations: 10, minSamples: 30 },
+        expected: strip(thin.recommend("zerodha", "MARKETABLE_LIMIT", "NORMAL")),
+      },
+      {
+        name: "40 full realisations and 10 half realisations",
+        input: { fullOrders: 40, halfOrders: 10, visible: 150, requested: 75 },
+        expected: strip(mixed.recommend("zerodha", "MARKETABLE_LIMIT", "NORMAL")),
+      },
+      {
+        name: "liquidity classification from visible depth vs requested",
+        input: [
+          { visible: 50, requested: 75 },
+          { visible: 150, requested: 75 },
+          { visible: 400, requested: 75 },
+        ],
+        expected: [classifyLiquidity(50, 75), classifyLiquidity(150, 75), classifyLiquidity(400, 75)],
+      },
+    ];
   })(),
 );
 

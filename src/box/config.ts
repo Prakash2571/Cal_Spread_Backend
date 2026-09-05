@@ -94,12 +94,28 @@ function queueModel(name: string, fallback: BoxQueueModel): BoxQueueModel {
   return fallback;
 }
 
-/** The paper execution profile: `standard` (today's behaviour) or `live_parity`. */
-function paperProfile(name: string, fallback: "standard" | "live_parity"): "standard" | "live_parity" {
+/**
+ * The paper execution profile.
+ *
+ *   standard    — today's behaviour, byte-for-byte.
+ *   live_parity — EVIDENCE-DRIVEN. Shared liquidity ledger, the live scheduling policy, and
+ *                 latency drawn from MEASURED live samples when calibration is valid. Nothing in
+ *                 this profile is ever fabricated.
+ *   stress      — RESILIENCE TESTING ONLY. Deliberately injects faults (broker slowdown, feed
+ *                 gaps, rejects, duplicate/out-of-order events). It is a separate profile
+ *                 precisely so that injected faults can never be mistaken for measured
+ *                 behaviour, and so "live parity" always means evidence.
+ *
+ * `stress` is never a fallback and is never reached by accident: it must be named explicitly,
+ * and {@link loadBoxConfig} refuses to start if it is combined with live execution.
+ */
+export type BoxPaperProfile = "standard" | "live_parity" | "stress";
+
+function paperProfile(name: string, fallback: BoxPaperProfile): BoxPaperProfile {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
   const value = raw.trim().toLowerCase();
-  if (value === "standard" || value === "live_parity") return value;
+  if (value === "standard" || value === "live_parity" || value === "stress") return value;
   console.warn(`[Box] ignoring unknown ${name}="${raw}" — using ${fallback}.`);
   return fallback;
 }
@@ -180,7 +196,7 @@ export interface BoxConfig {
    * concurrency cap onto `paper_legging`, to make paper a closer shadow of live. Only
    * meaningful when `executionMode` is a paper mode; ignored under `live`.
    */
-  paperExecutionProfile: "standard" | "live_parity";
+  paperExecutionProfile: BoxPaperProfile;
   /**
    * Cap on simultaneous paper pipelines under live_parity. Defaults to the LIVE value
    * (`liveMaxConcurrentExecutions`) so the recommended validation baseline mirrors the
@@ -204,6 +220,62 @@ export interface BoxConfig {
   paperLatencyAckToTerminalSamples: number[];
   /** Deterministic starting offset into the samples. No randomness anywhere. */
   paperLatencySeed: number;
+
+  // ---- Live-calibration consumption (live_parity only) ----
+  /**
+   * Minimum FRESH measured samples before paper will use a calibrated distribution at all.
+   * Below this it falls back to the documented constant and reports `measured: false`.
+   */
+  paperCalibrationMinSamples: number;
+  /**
+   * Minimum fresh samples before a TIME-OF-DAY bucket is used in preference to the pooled set.
+   * Deliberately higher than `paperCalibrationMinSamples`: activating a narrow bucket on a
+   * handful of observations is the definition of overfitting.
+   */
+  paperCalibrationBucketMinSamples: number;
+  /**
+   * Samples from sessions older than this are excluded from ACTIVE calibration. They are still
+   * retained for analytics and drift detection — yesterday's latency is not today's.
+   */
+  paperCalibrationMaxAgeMs: number;
+  /** Enable coarse OPEN/NORMAL/CLOSE bucketing at all. Buckets still need their own samples. */
+  paperCalibrationTimeBuckets: boolean;
+  /**
+   * Fallback cancel-request→terminal window (ms) used by paper's cancel-vs-fill race when no
+   * measured CANCEL latency exists.
+   *
+   * Deliberately NON-ZERO. Zero would mean "cancels are instantaneous", which is the optimistic
+   * assumption the race model exists to remove. Reported as an unmeasured constant, never as
+   * observed latency.
+   */
+  paperCancelLatencyMs: number;
+
+  // ---- Live timing persistence (Phase 25) ----
+  /**
+   * Persist calibration observations so they survive a restart. Default OFF: it is additive
+   * infrastructure, and a deployment must opt in.
+   */
+  liveTimingPersistEnabled: boolean;
+  /** Observations buffered before a flush. Bounded; never a synchronous hot-path write. */
+  liveTimingBatchSize: number;
+  /** Maximum time (ms) an observation waits in the buffer before being flushed. */
+  liveTimingFlushMs: number;
+
+  // ---- Execution environment diagnostics (Phases 13, 14) ----
+  /**
+   * Monitor event-loop delay and process pressure, so a Node stall is never recorded as broker
+   * latency. Cheap and fail-open, so default ON.
+   */
+  executionEventLoopMetricsEnabled: boolean;
+
+  // ---- Shadow validation (Phase 21) ----
+  /**
+   * SHADOW mode: the real feed and the real strategy run, paper live_parity produces simulated
+   * orders, and NO broker order is ever submitted.
+   *
+   * Default OFF, and structurally incapable of placing an order — see the shadow guard.
+   */
+  shadowModeEnabled: boolean;
 
   // ---- Live execution timing observability (for latency calibration) ----
   /**
@@ -618,6 +690,33 @@ export function loadBoxConfig(): BoxConfig {
     );
   }
 
+  const profile = paperProfile("BOX_PAPER_EXECUTION_PROFILE", "standard");
+  const shadow = bool("BOX_SHADOW_MODE_ENABLED", false);
+
+  // A FAULT-INJECTING PROFILE MUST NEVER BE NEAR REAL MONEY.
+  //
+  // The stress profile deliberately fabricates broker rejects, feed gaps, duplicate events and
+  // delays. Those are useful against a simulator and indefensible against a live account, so the
+  // combination stops startup rather than being quietly downgraded — the same reasoning as the
+  // execution-mode kill switch above.
+  if (mode === "live" && profile === "stress") {
+    throw new Error(
+      "[Box] BOX_PAPER_EXECUTION_PROFILE=stress cannot be combined with BOX_EXECUTION_MODE=live: " +
+        "the stress profile injects synthetic faults and must never run against a real account.",
+    );
+  }
+
+  // Shadow mode exists to run the real strategy against the real feed while submitting NOTHING.
+  // Pairing it with live execution is a contradiction, and resolving it silently in either
+  // direction would be dangerous: one way places unwanted orders, the other silently disables
+  // trading somebody believed was on.
+  if (mode === "live" && shadow) {
+    throw new Error(
+      "[Box] BOX_SHADOW_MODE_ENABLED=true cannot be combined with BOX_EXECUTION_MODE=live: " +
+        "shadow mode must never be able to submit a broker order.",
+    );
+  }
+
   return {
     executionMode: mode,
     simulatedDecisionMs: num("BOX_SIMULATED_DECISION_MS", 40),
@@ -629,7 +728,7 @@ export function loadBoxConfig(): BoxConfig {
     // Paper live-parity profile. All default to preserving today's behaviour: the
     // profile is `standard`, and the ledger/latency-source are only ever consulted when
     // it is explicitly set to `live_parity`.
-    paperExecutionProfile: paperProfile("BOX_PAPER_EXECUTION_PROFILE", "standard"),
+    paperExecutionProfile: profile,
     // Default to the LIVE concurrency cap (1) so the recommended validation baseline
     // matches a conservative live deployment; explicit override wins.
     paperMaxConcurrentExecutions: clampInt(
@@ -642,6 +741,32 @@ export function loadBoxConfig(): BoxConfig {
     paperLatencySamples: msSamples("BOX_PAPER_LATENCY_SAMPLES"),
     paperLatencyAckToTerminalSamples: msSamples("BOX_PAPER_LATENCY_ACK_TERMINAL_SAMPLES"),
     paperLatencySeed: num("BOX_PAPER_LATENCY_SEED", 0),
+
+    // Live-calibration consumption. The defaults are deliberately conservative: paper stays on
+    // its documented constant until there is a genuinely useful amount of recent evidence, and a
+    // narrow time bucket needs twice as much again before it is trusted on its own.
+    paperCalibrationMinSamples: clampInt("BOX_PAPER_CALIBRATION_MIN_SAMPLES", 30, 5, 100_000),
+    paperCalibrationBucketMinSamples: clampInt("BOX_PAPER_CALIBRATION_BUCKET_MIN_SAMPLES", 60, 5, 100_000),
+    // Three days: long enough to survive a weekend gap in evidence, short enough that a
+    // fortnight-old network regime never calibrates today.
+    paperCalibrationMaxAgeMs: clampInt(
+      "BOX_PAPER_CALIBRATION_MAX_AGE_MS",
+      3 * 24 * 60 * 60 * 1000,
+      60_000,
+      30 * 24 * 60 * 60 * 1000,
+    ),
+    paperCalibrationTimeBuckets: bool("BOX_PAPER_CALIBRATION_TIME_BUCKETS", true),
+    // 150ms is a conservative stand-in for a real cancel round trip. NOT zero: an instantaneous
+    // cancel is the optimistic assumption the race model exists to remove.
+    paperCancelLatencyMs: clampInt("BOX_PAPER_CANCEL_LATENCY_MS", 150, 0, 60_000),
+
+    liveTimingPersistEnabled: bool("BOX_LIVE_TIMING_PERSIST_ENABLED", false),
+    liveTimingBatchSize: clampInt("BOX_LIVE_TIMING_BATCH_SIZE", 50, 1, 10_000),
+    liveTimingFlushMs: clampInt("BOX_LIVE_TIMING_FLUSH_MS", 15_000, 250, 10 * 60_000),
+
+    executionEventLoopMetricsEnabled: bool("BOX_EXECUTION_EVENT_LOOP_METRICS_ENABLED", true),
+
+    shadowModeEnabled: shadow,
     executionTimingMetricsEnabled: bool("BOX_EXECUTION_TIMING_METRICS_ENABLED", true),
     executionTimingWindow: clampInt("BOX_EXECUTION_TIMING_WINDOW", 500, 50, 100_000),
     deploymentRegion:

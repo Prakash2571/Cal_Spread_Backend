@@ -171,13 +171,24 @@ test("placement timeout, 5xx, and malformed success are ambiguous and never retr
 
   for (const [name, response] of cases) {
     await t.test(name, async () => {
-      let calls = 0;
+      // Count PLACEMENTS specifically, not total HTTP calls: an ambiguous submission now READS
+      // the order book to look for its own tag before quarantining, and a read is emphatically
+      // not a retry. Counting every fetch would make this assertion fail for the wrong reason.
+      let placements = 0;
+      let orderBookReads = 0;
       const http = new KiteHttpTransport({
         apiKey: "key",
         accessToken: () => "token",
         timeoutMs: 250,
         baseUrl: "https://offline.invalid",
-        fetchImpl: async (...args) => { calls++; return response(...args); },
+        fetchImpl: async (url, init) => {
+          const method = init?.method ?? "GET";
+          if (method === "POST") placements++;
+          else orderBookReads++;
+          // The tag lookup must find nothing, so the outcome stays a quarantine.
+          if (method === "GET") return { ok: true, status: 200, json: async () => ({ data: [] }) };
+          return response(url, init);
+        },
       });
       const adapter = new KiteBrokerAdapter(http, adapterConfig(), fakeClock());
       const req = request({ client_order_id: `BOX:trade-${name}:ENTRY:k1_ce:attempt-1` });
@@ -186,11 +197,14 @@ test("placement timeout, 5xx, and malformed success are ambiguous and never retr
       assert.equal(error.name, "BrokerAmbiguousSubmitError", "outcome is not a definitive broker reject");
       assert.equal(error.order.state, "RECONCILIATION_REQUIRED");
       assert.equal(error.order.reject_family, null);
-      assert.equal(calls, 1, "placement is never blindly retried");
+      assert.equal(placements, 1, "placement is never blindly retried");
+      assert.ok(orderBookReads >= 1, "an ambiguous submission asks the broker rather than guessing");
+      // The quarantine message must explain WHY the outcome is unknown, for operator triage.
+      assert.match(error.message, /reconciliation is required and NO retry was attempted/);
 
       const quarantined = await adapter.submitOrder(req);
       assert.equal(quarantined.state, "RECONCILIATION_REQUIRED");
-      assert.equal(calls, 1, "same client ID returns quarantined evidence without a second placement");
+      assert.equal(placements, 1, "same client ID returns quarantined evidence without a second placement");
     });
   }
 });

@@ -74,6 +74,23 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
   });
 
   /**
+   * READ-ONLY execution diagnostics (Phase 32): calibration status per broker, measured latency
+   * percentiles, event-loop health, what paper is actually running on, outcome/reject rates, the
+   * advisory queue-haircut recommendation, and recent latency outliers.
+   *
+   * A GET with no side effects, behind the same admin auth as every other box route. It exposes
+   * only latency numbers, counts, statuses and explicitly-configured labels — never a token, key
+   * or session identifier.
+   */
+  app.get("/api/box/execution-diagnostics", requireAdmin, (_req: Request, res: Response) => {
+    try {
+      res.json(engine.getExecutionDiagnostics());
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  /**
    * ADMIN control: how many strikes each side of ATM are monitored/traded (1, 2
    * or 3). Guarded by the same admin auth as every other box route.
    *

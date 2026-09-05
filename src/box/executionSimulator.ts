@@ -44,6 +44,16 @@ import type { BoxMetrics } from "./metrics.js";
 import { LegExecutor, fillTiming, type LegOrderRequest } from "./legExecutor.js";
 import { PaperLiquidityLedger } from "./liquidityLedger.js";
 import { createStructuredLatencySource, type StructuredLatencySource } from "./latencyModel.js";
+import {
+  classifyTimeOfDayBucket,
+  type BrokerId,
+  type CalibrationConfidence,
+  type LatencyProfile,
+  type TimeOfDayBucket,
+} from "./latencyModel.js";
+import type { CalibrationDimensions, ExecutionCalibrationStore } from "./executionCalibration.js";
+import { CalibratedStructuredLatencySource, type CalibratedLatencyStatus } from "./calibratedLatencySource.js";
+import type { LegCancelRaceModel } from "./legExecutor.js";
 import { createSchedulingPolicy, type ExecutionSchedulingPolicy } from "./executionSchedulingPolicy.js";
 import { planPaperSchedule, type SchedulableOperation } from "./paperScheduler.js";
 import type { ExecutionPhase } from "./executionPolicy.js";
@@ -103,6 +113,22 @@ export interface BoxExecutionSimulatorDeps {
    * generation) when absent, which is correct for tests and single-broker runs.
    */
   feedGeneration?: () => number;
+  /**
+   * LIVE-CALIBRATION SOURCE (live_parity only).
+   *
+   * When supplied, paper's broker-side latency and its cancel-race window are drawn from
+   * MEASURED live observations instead of the configured constant — and the simulator reports
+   * which of the two it is actually using. Absent ⇒ the previous constant-driven behaviour,
+   * unchanged.
+   */
+  calibration?: ExecutionCalibrationStore;
+  /**
+   * Which broker paper is shadowing. Required for calibration to be usable at all: a sample can
+   * only be looked up under the broker it was measured on, and Zerodha and Dhan never mix.
+   */
+  broker?: () => BrokerId;
+  /** Minutes past IST midnight, for time-of-day calibration buckets. */
+  istMinutesOfDay?: () => number;
 }
 
 /** The result of a paper_legging entry attempt. */
@@ -166,8 +192,18 @@ export class BoxExecutionSimulator {
   private readonly policy: BoxExecutionPolicy;
   /** Independent per-leg order lifecycles (paper_legging). */
   private readonly legExecutor: LegExecutor;
-  /** True only under the live_parity paper profile. */
+  /** True under live_parity AND stress — both share the realism layering. */
   private readonly liveParity: boolean;
+  /**
+   * True ONLY under live_parity. The distinction matters for reporting: figures produced under
+   * the stress profile are the product of injected faults and must never be presented as
+   * evidence about real execution.
+   */
+  private readonly evidenceDriven: boolean;
+  /** Measured-latency source, non-null only when a calibration store was injected. */
+  private readonly calibratedLatency: CalibratedStructuredLatencySource | null;
+  /** The cancel-vs-fill race model handed to the leg executor. */
+  private readonly cancelRace: LegCancelRaceModel | null;
   /** Shared liquidity ledger, non-null only under live_parity. */
   private readonly ledger: PaperLiquidityLedger | null;
   /** Structured broker-latency source (POST→ACK, ACK→terminal), non-null only under live_parity. */
@@ -184,7 +220,15 @@ export class BoxExecutionSimulator {
     // the shared-liquidity ledger and the deterministic latency source and hand them to
     // the leg executor. In `standard` (the default) these stay undefined, so the leg
     // executor's fill and submit paths are byte-for-byte what they were before.
-    this.liveParity = deps.cfg.paperExecutionProfile === "live_parity";
+    // `live_parity` and `stress` share the same realism LAYERING (shared liquidity, the live
+    // scheduling policy, the cancel-race model). They differ in what feeds it: live_parity is
+    // driven by measured evidence, stress deliberately injects faults. Keeping the layering
+    // common and the INPUTS separate is what stops an injected fault from ever being reported as
+    // observed behaviour.
+    const profile = deps.cfg.paperExecutionProfile;
+    this.liveParity = profile === "live_parity" || profile === "stress";
+    /** True only for the evidence-driven profile — never for stress. */
+    this.evidenceDriven = profile === "live_parity";
     this.ledger = this.liveParity ? new PaperLiquidityLedger() : null;
 
     // LIVE-PARITY: structured broker latency (POST→ACK and ACK→terminal drawn independently
@@ -193,14 +237,39 @@ export class BoxExecutionSimulator {
     // OrderManager enforces — instead of all arriving at `submit + one latency`. In
     // `standard` both are null and no arrival planner is wired, so the leg executor's
     // submit/fill path is byte-for-byte what it was before.
-    this.structuredLatency = this.liveParity
-      ? createStructuredLatencySource({
-          mode: deps.cfg.paperLatencyMode,
-          constantMs: deps.cfg.simulatedLatencyMs,
-          postToAckSamples: deps.cfg.paperLatencySamples,
-          ackToTerminalSamples: deps.cfg.paperLatencyAckToTerminalSamples,
-          seed: deps.cfg.paperLatencySeed,
-        })
+    // LATENCY SOURCE. When a live calibration store is injected, paper draws from MEASURED
+    // observations (and says so); otherwise it keeps the previous config-driven source exactly as
+    // before. The calibrated source is itself responsible for falling back to the documented
+    // constant when calibration is UNCALIBRATED / too thin / STALE — and for never describing
+    // that constant as measured.
+    this.calibratedLatency =
+      this.liveParity && deps.calibration
+        ? new CalibratedStructuredLatencySource({
+            store: deps.calibration,
+            dimensions: () => this.calibrationDimensions("ENTRY"),
+            fallbackConstantMs: deps.cfg.simulatedLatencyMs,
+            seed: deps.cfg.paperLatencySeed,
+          })
+        : null;
+    this.structuredLatency =
+      this.calibratedLatency ??
+      (this.liveParity
+        ? createStructuredLatencySource({
+            mode: deps.cfg.paperLatencyMode,
+            constantMs: deps.cfg.simulatedLatencyMs,
+            postToAckSamples: deps.cfg.paperLatencySamples,
+            ackToTerminalSamples: deps.cfg.paperLatencyAckToTerminalSamples,
+            seed: deps.cfg.paperLatencySeed,
+          })
+        : null);
+
+    // CANCEL-RACE WINDOW. Sized from measured CANCEL latency when available, otherwise from the
+    // documented conservative constant. Deliberately non-zero either way: a zero window means
+    // "cancels are instantaneous", which is precisely the optimistic assumption this models away.
+    this.cancelRace = this.liveParity
+      ? {
+          latencyMs: () => this.cancelWindowMs(),
+        }
       : null;
     this.schedulingPolicy = this.liveParity
       ? createSchedulingPolicy({
@@ -218,7 +287,75 @@ export class BoxExecutionSimulator {
       reservation: this.ledger ?? undefined,
       arrivalPlanner: this.liveParity ? (a) => this.planArrivals(a) : undefined,
       generation: deps.feedGeneration,
+      cancelRace: this.cancelRace ?? undefined,
     });
+  }
+
+  /**
+   * The calibration dimensions to look latency up under.
+   *
+   * Re-read per resolution so the time-of-day bucket follows the session: the open really is a
+   * different regime from midday, and a sample from one is not evidence about the other.
+   *
+   * The profile is MARKETABLE_LIMIT because that is what this strategy submits — a bounded limit
+   * priced from the opposite touch with a non-negative chase band. It is stated explicitly rather
+   * than inferred so that passive statistics can never leak in.
+   */
+  private calibrationDimensions(kind: CalibrationDimensions["kind"]): CalibrationDimensions {
+    const broker: BrokerId = this.deps.broker?.() ?? "zerodha";
+    const profile: LatencyProfile = "MARKETABLE_LIMIT";
+    const bucket: TimeOfDayBucket = this.deps.cfg.paperCalibrationTimeBuckets
+      ? classifyTimeOfDayBucket(this.deps.istMinutesOfDay?.() ?? Number.NaN)
+      : "NORMAL";
+    return { broker, kind, profile, bucket };
+  }
+
+  /**
+   * How long a cancel takes to reach a confirmed terminal state, in ms.
+   *
+   * Measured CANCEL latency when calibration supports it (p50, because the window's typical
+   * length is what governs typical race exposure), else the documented constant. Never zero
+   * unless explicitly configured so.
+   */
+  private cancelWindowMs(): number {
+    const fallback = Math.max(0, this.deps.cfg.paperCancelLatencyMs);
+    const store = this.deps.calibration;
+    if (!store) return fallback;
+    const resolved = store.resolve(this.calibrationDimensions("CANCEL"), "cancel_request_to_terminal_ms");
+    if (!resolved.measured || resolved.percentiles.p50 === null) return fallback;
+    return Math.max(0, Math.round(resolved.percentiles.p50));
+  }
+
+  /**
+   * What paper is CURRENTLY running on, for the parity report and admin diagnostics.
+   *
+   * Deliberately explicit about the profile: a caller rendering this must be able to distinguish
+   * "measured live latency" from "a configured constant" and from "the stress profile's injected
+   * faults", without inferring anything.
+   */
+  calibrationStatus(): {
+    profile: BoxConfig["paperExecutionProfile"];
+    evidence_driven: boolean;
+    latency: CalibratedLatencyStatus | null;
+    cancel_window_ms: number;
+    cancel_window_measured: boolean;
+    confidence: CalibrationConfidence;
+  } {
+    const latency = this.calibratedLatency?.status() ?? null;
+    const store = this.deps.calibration;
+    const cancelResolved = store
+      ? store.resolve(this.calibrationDimensions("CANCEL"), "cancel_request_to_terminal_ms")
+      : null;
+    return {
+      profile: this.deps.cfg.paperExecutionProfile,
+      evidence_driven: this.evidenceDriven,
+      latency,
+      cancel_window_ms: this.cancelWindowMs(),
+      cancel_window_measured: cancelResolved?.measured === true && cancelResolved.percentiles.p50 !== null,
+      // The stress profile is never allowed to claim confidence: its numbers come from injected
+      // faults, not observations.
+      confidence: this.evidenceDriven ? (latency?.confidence ?? "LOW") : "LOW",
+    };
   }
 
   /**

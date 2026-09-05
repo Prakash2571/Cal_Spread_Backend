@@ -40,6 +40,16 @@ import {
 import { BoxChargeEstimator, buildEntryChargeLegs, type BoxChargeLeg, type PriceChargeGroupsFn } from "./charges.js";
 import { BoxChargeReconciler } from "./chargeReconciler.js";
 import { BoxExecutionSimulator } from "./executionSimulator.js";
+import { createExecutionClock, type ExecutionClock } from "./executionClock.js";
+import { ExecutionEnvironmentMonitor } from "./executionEnvironment.js";
+import { ExecutionCalibrationStore } from "./executionCalibration.js";
+import { ExecutionTimingRecorder } from "./executionTiming.js";
+import { BrokerTimingStore } from "./brokerTimingStore.js";
+import { ExecutionOutcomeStore } from "./executionOutcomes.js";
+import { QueueCalibrationEstimator } from "./queueCalibration.js";
+import { shadowModeStatus } from "./shadowMode.js";
+import { profileReportBanner } from "./stressProfile.js";
+import { formatCalibrationBlock } from "./calibratedLatencySource.js";
 import { CentralBoxExecutionGateway, type BoxExecutionGateway } from "./executionGateway.js";
 import { BoxOrderManager, orderManagerLimitsFromConfig, type OrderManagerReconcileReport } from "./orderManager.js";
 import { BoxMetrics } from "./metrics.js";
@@ -201,6 +211,24 @@ export class BoxEngine {
   private executionSim: BoxExecutionSimulator;
   private execution: BoxExecutionGateway;
   private orderManager: BoxOrderManager | null = null;
+  /**
+   * LIVE-CALIBRATION INFRASTRUCTURE (Phases 2, 7, 8, 13, 24).
+   *
+   * All four are additive and fail-open. The clock separates monotonic measurement from
+   * wall-clock audit; the environment monitor explains latency outliers; the calibration store
+   * accumulates dimensioned measured distributions that paper consumes; the timing recorder is
+   * the bridge that finally connects the live order path to both stores. None of them can affect
+   * whether or how an order is placed.
+   */
+  private readonly executionClock: ExecutionClock;
+  private readonly environmentMonitor: ExecutionEnvironmentMonitor;
+  private readonly calibration: ExecutionCalibrationStore;
+  private readonly brokerTiming: BrokerTimingStore;
+  private readonly timingRecorder: ExecutionTimingRecorder;
+  /** Measured outcome and reject-family rates (Phases 9, 19). */
+  private readonly outcomeStore = new ExecutionOutcomeStore();
+  /** Advisory queue/haircut recommender fed by live limit-order evidence (Phases 10, 26). */
+  private readonly queueEstimator: QueueCalibrationEstimator;
   private reconciler: BoxChargeReconciler;
   private metrics: BoxMetrics;
   private scanner: BoxScanner;
@@ -351,12 +379,51 @@ export class BoxEngine {
     this.strikeLevel = this.cfg.defaultStrikeLevel;
     this.baseMinGrossEdge = this.cfg.minGrossEdge;
 
+    // ── Calibration infrastructure, built before the simulator so it can consume it ──
+    this.executionClock = createExecutionClock();
+    this.environmentMonitor = new ExecutionEnvironmentMonitor({
+      enabled: this.cfg.executionEventLoopMetricsEnabled,
+      clock: this.executionClock,
+    });
+    this.calibration = new ExecutionCalibrationStore({
+      window: this.cfg.executionTimingWindow,
+      // The region is a LABEL, never auto-detected, and a store never merges another region's
+      // samples: two deployments have different physical RTTs to the broker.
+      region: this.cfg.deploymentRegion,
+      minSamples: this.cfg.paperCalibrationMinSamples,
+      bucketMinSamples: this.cfg.paperCalibrationBucketMinSamples,
+      maxAgeMs: this.cfg.paperCalibrationMaxAgeMs,
+      nowWall: () => this.executionClock.wall(),
+    });
+    this.brokerTiming = new BrokerTimingStore({
+      window: this.cfg.executionTimingWindow,
+      region: this.cfg.deploymentRegion,
+      now: () => this.executionClock.wall(),
+    });
+    this.queueEstimator = new QueueCalibrationEstimator({
+      currentHaircutPct: this.cfg.queueLiquidityHaircutPct,
+      minSamples: this.cfg.paperCalibrationMinSamples,
+    });
+    this.timingRecorder = new ExecutionTimingRecorder({
+      enabled: this.cfg.executionTimingMetricsEnabled,
+      clock: this.executionClock,
+      timingStore: this.brokerTiming,
+      calibration: this.calibration,
+      environment: this.environmentMonitor,
+    });
+
     this.executionSim = new BoxExecutionSimulator({
       cfg: this.cfg,
       quotes: this.quotes,
       metrics: this.metrics,
       isMarketOpen: () => this.marketOpen,
       isFeedHealthy: () => this.isFeedHealthy(),
+      // Paper consumes the SAME store the live path writes to. That single shared store is what
+      // makes the simulator progressively more accurate as real executions are observed — and it
+      // is scoped by broker so paper only ever draws the latency of the broker it is shadowing.
+      calibration: this.calibration,
+      broker: () => this.deps.activeBroker(),
+      istMinutesOfDay: () => istMinutesOfDay(),
       // The local charge calculator prices paper_legging partial-entry and unwind
       // charges synchronously — never a network call inside the fill.
       chargeTotal: (orders) => this.localCharges.legs(orders).total,
@@ -373,7 +440,11 @@ export class BoxEngine {
           "[Box] live execution blocked: no live execution adapter was injected for the active broker.",
         );
       }
-      const adapter = createAdapter({ broker: this.deps.activeBroker(), cfg: this.cfg });
+      const adapter = createAdapter({
+        broker: this.deps.activeBroker(),
+        cfg: this.cfg,
+        timing: this.timingRecorder,
+      });
       this.orderManager = new BoxOrderManager({
         adapter,
         persistence: boxOrderIntentPersistence,
@@ -390,6 +461,13 @@ export class BoxEngine {
         },
         onReconciliationIssue: (report) => this.markReconciliationRecovery(report),
         loadDailyRiskSeed: (day) => loadBoxLiveRiskSeed(istDayStartMs(day)),
+        // Live timing instrumentation. The manager owns the scheduler stages and the terminal
+        // publish; the adapter marks the transport/ACK/fill/cancel stages on the same trace.
+        timing: this.timingRecorder,
+        broker: () => this.deps.activeBroker(),
+        onBrokerReject: (order, reason) => {
+          this.outcomeStore.recordReject(this.deps.activeBroker(), order?.reject_family ?? null, reason);
+        },
       });
     }
     this.execution = new CentralBoxExecutionGateway({
@@ -878,6 +956,9 @@ export class BoxEngine {
     this.running = true;
     this.startedAt = Date.now();
     this.lastError = null;
+    // Event-loop / process diagnostics. Idempotent and fail-open: if it cannot attach it reports
+    // `enabled: false` and the engine carries on regardless.
+    this.environmentMonitor.start();
     this.scanner.setDiscovering(true);
     this.ensureFeed();
     this.startMarketWatch();
@@ -1040,6 +1121,7 @@ export class BoxEngine {
     this.orderManager?.setControls({ entryEnabled: false });
     this.stop();
     this.monitor.stop();
+    this.environmentMonitor.stop();
     this.metrics.stopSampling();
     this.pnlArchiver.stop();
     for (const t of [
@@ -3098,6 +3180,63 @@ export class BoxEngine {
         min_expected_net_profit: BOX_TUNING_LIMITS.minExpectedNetProfit,
         safety_buffer: BOX_TUNING_LIMITS.safetyBuffer,
       },
+    };
+  }
+
+  /**
+   * READ-ONLY execution diagnostics (Phase 32).
+   *
+   * Everything an operator needs to answer "is the simulator calibrated, and how much should I
+   * trust it?" — per-broker calibration status with sample counts and freshness, the measured
+   * latency percentiles, event-loop health, what paper is ACTUALLY running on, outcome and
+   * reject rates, the advisory haircut recommendation, and recent latency outliers.
+   *
+   * TWO PROPERTIES THIS METHOD MUST HAVE:
+   *
+   *  1. NO SECRETS. It exposes latency numbers, counts, statuses and explicitly-configured
+   *     labels. No access token, no API key, no session identifier, no credential of any kind is
+   *     reachable from here — the stores it reads never held one.
+   *  2. NO SIDE EFFECTS. Purely a read. It is a cold path: it sorts sample arrays to compute
+   *     percentiles, so it must never be called per tick or per order.
+   */
+  getExecutionDiagnostics(): Record<string, unknown> {
+    const paper = this.executionSim.calibrationStatus();
+    return {
+      // What paper is running on RIGHT NOW, stated so it cannot be misread. The banner is blunt
+      // about the stress profile precisely so its figures are never quoted as live parity.
+      profile: {
+        name: this.cfg.paperExecutionProfile,
+        execution_mode: this.cfg.executionMode,
+        evidence_driven: paper.evidence_driven,
+        banner: profileReportBanner(this.cfg.paperExecutionProfile),
+      },
+      paper_calibration: {
+        ...paper,
+        // The human-readable CALIBRATION block, so confidence never appears without its evidence.
+        rendered: paper.latency ? formatCalibrationBlock(paper.latency) : null,
+      },
+      // Per-broker calibration state. Zerodha and Dhan are always reported separately.
+      calibration_by_broker: this.calibration.allBrokerStatus(),
+      calibration_distributions: this.calibration.snapshot(),
+      calibration_dropped_samples: this.calibration.dropped,
+      // Measured live timing, per broker and operation kind.
+      live_timing: this.brokerTiming.snapshot(),
+      // Recent raw timelines — the outliers an operator wants to inspect.
+      recent_latency_outliers: this.brokerTiming.recentTimeline().slice(-20),
+      timing_recorder: this.timingRecorder.diagnostics(),
+      // Node scheduling health, so a stall is never mistaken for broker latency.
+      execution_environment: this.environmentMonitor.snapshot(),
+      event_loop_attach_failure: this.environmentMonitor.attachFailure,
+      // Measured outcome and reject rates for the active broker.
+      outcomes: this.outcomeStore.outcomeCounts(this.deps.activeBroker(), "MARKETABLE_LIMIT"),
+      rejects: this.outcomeStore.rejectCounts(this.deps.activeBroker()),
+      // Advisory only. Never applied automatically; never a claim about NSE queue position.
+      queue_calibration: this.queueEstimator.recommendAll(),
+      shadow_mode: shadowModeStatus({
+        shadowEnabled: this.cfg.shadowModeEnabled,
+        executionMode: this.cfg.executionMode,
+        hasOrderManager: this.orderManager !== null,
+      }),
     };
   }
 

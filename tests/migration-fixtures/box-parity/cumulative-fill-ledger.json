@@ -1,0 +1,202 @@
+{
+  "category": "execution-parity",
+  "operation": "CumulativeFillLedger",
+  "description": "Idempotent, monotonic, cumulative-authoritative fill accounting: duplicates contribute nothing, out-of-order events cannot rewind quantity, and an overfill is applied but flagged.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "cancel race: 40 filled, cancel requested, 12 more fill, remainder cancelled",
+      "input": {
+        "requestedQty": 75,
+        "steps": [
+          {
+            "cumulativeQty": 40,
+            "eventId": "f1",
+            "sequence": 1,
+            "source": "order_update"
+          },
+          {
+            "cumulativeQty": 52,
+            "eventId": "f2",
+            "sequence": 2,
+            "source": "order_update"
+          },
+          {
+            "cumulativeQty": 52,
+            "eventId": "cancel-terminal",
+            "sequence": 3,
+            "source": "rest_poll"
+          }
+        ],
+        "cumulativeAtCancelRequest": 40
+      },
+      "expected": {
+        "applied": [
+          {
+            "outcome": "applied",
+            "delta": 40,
+            "cumulative": 40,
+            "remaining": 35
+          },
+          {
+            "outcome": "applied",
+            "delta": 12,
+            "cumulative": 52,
+            "remaining": 23
+          },
+          {
+            "outcome": "stale_cumulative",
+            "delta": 0,
+            "cumulative": 52,
+            "remaining": 23
+          }
+        ],
+        "accounting": {
+          "requested": 75,
+          "filled": 52,
+          "cancelled": 23,
+          "filledAtCancelRequest": 40,
+          "racedQuantity": 12,
+          "cancelRaced": true
+        }
+      }
+    },
+    {
+      "name": "a duplicate broker event contributes no quantity",
+      "input": {
+        "clientOrderId": "BOX:t:ENTRY:k2_ce:attempt-1",
+        "requestedQty": 75,
+        "event": {
+          "cumulativeQty": 40,
+          "eventId": "dhan:TRADE-991",
+          "source": "order_update"
+        },
+        "deliveries": 3
+      },
+      "expected": {
+        "applied": [
+          {
+            "outcome": "applied",
+            "delta": 40,
+            "cumulative": 40
+          },
+          {
+            "outcome": "duplicate_event",
+            "delta": 0,
+            "cumulative": 40
+          },
+          {
+            "outcome": "duplicate_event",
+            "delta": 0,
+            "cumulative": 40
+          }
+        ],
+        "snapshot": {
+          "clientOrderId": "BOX:t:ENTRY:k2_ce:attempt-1",
+          "requestedQty": 75,
+          "cumulative": 40,
+          "remaining": 35,
+          "averagePrice": null,
+          "overfill": 0,
+          "appliedEvents": 1,
+          "duplicateEvents": 2,
+          "staleEvents": 0,
+          "sequenceRegressions": 0,
+          "lastSource": "order_update",
+          "firstFillAtMono": null,
+          "lastFillAtMono": null,
+          "firstFillAtWall": null,
+          "lastFillAtWall": null
+        }
+      }
+    },
+    {
+      "name": "an out-of-order event cannot reduce cumulative quantity",
+      "input": {
+        "requestedQty": 75,
+        "steps": [
+          {
+            "cumulativeQty": 52,
+            "eventId": "e9",
+            "sequence": 9,
+            "source": "order_update"
+          },
+          {
+            "cumulativeQty": 40,
+            "eventId": "e7",
+            "sequence": 7,
+            "source": "order_update"
+          }
+        ]
+      },
+      "expected": {
+        "applied": [
+          {
+            "outcome": "applied",
+            "delta": 52,
+            "cumulative": 52,
+            "sequenceRegression": false
+          },
+          {
+            "outcome": "stale_cumulative",
+            "delta": 0,
+            "cumulative": 52,
+            "sequenceRegression": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "an overfill is applied as broker truth and flagged, never clamped",
+      "input": {
+        "requestedQty": 75,
+        "cumulativeQty": 80
+      },
+      "expected": {
+        "outcome": "applied_overfill",
+        "cumulative": 80,
+        "overfill": 5,
+        "remaining": 0
+      }
+    },
+    {
+      "name": "outstanding quantity and stage from cumulative quantity",
+      "input": [
+        {
+          "requestedQty": 75,
+          "cumulativeQty": 52
+        },
+        {
+          "requestedQty": 75,
+          "cumulativeQty": 75
+        },
+        {
+          "requestedQty": 75,
+          "cumulativeQty": 80
+        },
+        {
+          "requestedQty": 75,
+          "cumulativeQty": 0
+        }
+      ],
+      "expected": [
+        {
+          "outstanding": 23,
+          "stage": "PARTIALLY_FILLED"
+        },
+        {
+          "outstanding": 0,
+          "stage": "FILLED"
+        },
+        {
+          "outstanding": 0,
+          "stage": "FILLED"
+        },
+        {
+          "outstanding": 75,
+          "stage": "CANCELLED"
+        }
+      ]
+    }
+  ]
+}

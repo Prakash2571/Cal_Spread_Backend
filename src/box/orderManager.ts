@@ -7,7 +7,12 @@ import {
   type BrokerOrderRequest,
   type BrokerOrderState,
 } from "./brokerAdapter.js";
+import { BoundedTtlCache } from "../boundedCache.js";
 import type { BoxConfig } from "./config.js";
+import { CumulativeFillLedger } from "./orderLifecycle.js";
+import type { ExecutionTimingRecorder } from "./executionTiming.js";
+import { kindForPurpose } from "./executionTiming.js";
+import type { BrokerId } from "./latencyModel.js";
 import { BOX_ORDER_PRIORITY } from "./executionSchedulingPolicy.js";
 import type {
   BoxOrderIntentAudit,
@@ -181,7 +186,20 @@ export class BoxOrderManager {
     circuit: "closed",
   };
   private readonly queue: QueueAction[] = [];
-  private readonly fillIdentities = new Set<string>();
+  /**
+   * Per-order cumulative-fill ledgers (audit divergence D5).
+   *
+   * REPLACES a dead `fillIdentities` set whose `continue` skipped nothing and which nothing ever
+   * read. Every observed broker snapshot for an order is now routed through a ledger that
+   * enforces the invariants the brief requires: a duplicate broker event contributes no
+   * quantity, an out-of-order snapshot cannot rewind the cumulative total, and an overfill is
+   * surfaced rather than silently clamped.
+   *
+   * The authoritative position arithmetic remains the Mongo-guarded path below; this ledger is
+   * the verification layer that turns a violated invariant into a tripped breaker instead of a
+   * quiet accounting error. Bounded by TTL and count, so a long session cannot leak.
+   */
+  private readonly fillLedgers: BoundedTtlCache<CumulativeFillLedger>;
   private readonly activeClientIds = new Set<string>();
   private readonly knownIntents = new Map<string, IBoxOrderIntent>();
   private orphanOrders: BrokerOrder[] = [];
@@ -225,9 +243,37 @@ export class BoxOrderManager {
       onReconciliationIssue?: (report: OrderManagerReconcileReport) => void | Promise<void>;
       loadDailyRiskSeed?: (tradingDay: string) => Promise<{ realisedPnl: number; rejects: number; consecutiveFailures: number }>;
       onCircuitTrip?: (reason: string) => void;
+      /**
+       * LIVE TIMING INSTRUMENTATION (Phase 2). Optional and FAIL-OPEN: when absent the manager
+       * behaves exactly as before, and when present no failure inside it can affect an order.
+       * The manager owns the SCHEDULER stages (enqueue/dequeue) because it is the only layer
+       * that witnesses them; the adapter marks the transport, ACK, fill and cancel stages on
+       * the same trace, keyed by client order id.
+       */
+      timing?: ExecutionTimingRecorder;
+      /**
+       * Called for every REAL broker rejection, so reject-family statistics are measured rather
+       * than modelled (Phase 19). Fail-open: a diagnostics failure here must not change how a
+       * rejection is handled.
+       */
+      onBrokerReject?: (order: BrokerOrder | null, reason: string) => void;
+      /**
+       * Which broker these samples belong to. Required for timing to be recorded at all,
+       * because a sample that cannot be attributed to a broker must never be filed — pooling
+       * Zerodha and Dhan latency would describe neither.
+       */
+      broker?: () => BrokerId;
     },
   ) {
     this.tradingDay = this.dayKey();
+    // Bounded: one ledger per in-flight order, expiring well after any order's lifetime. Sized
+    // generously relative to the concurrency cap so nothing in a normal session is evicted while
+    // still live, and hard-capped so nothing can leak.
+    this.fillLedgers = new BoundedTtlCache<CumulativeFillLedger>({
+      maxEntries: 512,
+      ttlMs: 60 * 60_000,
+      now: () => this.now(),
+    });
     this.controls = {
       entryEnabled: deps.controls?.entryEnabled ?? false,
       liveOrderEnabled: deps.controls?.liveOrderEnabled ?? false,
@@ -401,11 +447,121 @@ export class BoxOrderManager {
       this.reservedReductionsBySymbol.set(symbol, (this.reservedReductionsBySymbol.get(symbol) ?? 0) + request.quantity);
       this.reservedReductionQuantity += request.quantity;
     }
+    // SCHEDULER ENQUEUE. Recorded here, before the queue push, so `scheduler_wait_ms` measures
+    // the real wait rather than starting from whenever the pump happened to look. Fail-open by
+    // construction: `beginTrace` swallows everything.
+    this.beginTrace(request);
     return new Promise<BrokerOrder>((resolve, reject) => {
       this.queue.push({ kind: "submit", request, resolve, reject, sequence: this.sequence++ });
       this.sortQueue();
       this.pump();
     });
+  }
+
+  /**
+   * Open a timing trace for a request and mark the enqueue instant.
+   *
+   * NEVER THROWS and never affects the return path. Telemetry is not permitted to change whether
+   * an order is submitted.
+   */
+  private beginTrace(request: BrokerOrderRequest): void {
+    try {
+      const timing = this.deps.timing;
+      const broker = this.deps.broker?.();
+      // No broker attribution ⇒ no sample. Better to lose a measurement than to file it under
+      // the wrong broker and corrupt both distributions.
+      if (!timing || !broker) return;
+      const trace = timing.trace(request.client_order_id, {
+        broker,
+        purpose: request.purpose,
+        role: request.role,
+        tradeId: request.trade_id,
+        attemptId: request.attempt_id,
+        requestedQty: request.quantity,
+      });
+      trace?.setKind(kindForPurpose(request.purpose));
+      trace?.mark("scheduler_enqueued");
+    } catch {
+      /* telemetry must never affect execution */
+    }
+  }
+
+  /**
+   * Route an observed broker snapshot through this order's cumulative-fill ledger.
+   *
+   * THE INVARIANTS THIS ENFORCES (Phase 6 / Phase 29):
+   *
+   *  - a duplicate broker event contributes zero quantity (identity dedupe);
+   *  - an out-of-order or re-polled snapshot cannot reduce the cumulative total;
+   *  - an overfill — the broker reporting more filled than we asked for — TRIPS THE BREAKER
+   *    rather than being clamped away, because it means our own quantity model is wrong and
+   *    every downstream exposure number is suspect.
+   *
+   * Fail-open with respect to the ledger itself: a bookkeeping failure must not block
+   * persistence of a real fill. It is emphatically NOT fail-open with respect to the overfill
+   * finding, which is a safety signal.
+   */
+  private rememberFillIdentities(order: BrokerOrder): void {
+    let overfill: { cumulative: number; requested: number } | null = null;
+    try {
+      let ledger = this.fillLedgers.get(order.client_order_id);
+      if (!ledger) {
+        ledger = new CumulativeFillLedger(order.client_order_id, order.quantity);
+        this.fillLedgers.set(order.client_order_id, ledger);
+      }
+      const result = ledger.apply({
+        cumulativeQty: order.filled_quantity,
+        averagePrice: order.average_price,
+        // The newest fill identity the adapter surfaced. Kite synthesises one per distinct
+        // cumulative quantity and Dhan supplies the exchange trade id; either way a repeated
+        // poll of an unchanged order yields the same identity and is correctly ignored.
+        eventId: order.fills.at(-1)?.fill_id ?? null,
+        observedAtWall: order.updated_at,
+        source: "rest_poll",
+      });
+      if (result.outcome === "applied_overfill") {
+        overfill = { cumulative: result.cumulative, requested: ledger.requestedQty };
+      }
+    } catch {
+      /* bookkeeping must not block persistence of a confirmed fill */
+    }
+    if (overfill) {
+      this.trip(
+        `broker reported ${overfill.cumulative} filled for ${order.client_order_id}, exceeding the ${overfill.requested} requested`,
+      );
+    }
+  }
+
+  /** Report a real broker rejection for statistics. Fail-open. */
+  private noteBrokerReject(order: BrokerOrder | null, reason: string): void {
+    try {
+      this.deps.onBrokerReject?.(order, reason);
+    } catch {
+      /* diagnostics must never change rejection handling */
+    }
+  }
+
+  /** Mark a stage on a request's trace. Fail-open; a no-op when instrumentation is off. */
+  private markTiming(clientOrderId: string, stage: Parameters<ExecutionTimingRecorder["mark"]>[1]): void {
+    try {
+      this.deps.timing?.mark(clientOrderId, stage);
+    } catch {
+      /* telemetry must never affect execution */
+    }
+  }
+
+  /**
+   * Publish an order's timing once it is terminal.
+   *
+   * Called from the terminal paths only. Idempotent in the recorder, so an order whose terminal
+   * state is witnessed by both the adapter and the reconciler contributes exactly one sample.
+   */
+  private publishTiming(clientOrderId: string): void {
+    try {
+      this.deps.timing?.publish(clientOrderId);
+    } catch {
+      /* telemetry must never affect execution */
+    }
   }
 
   async cancelWorkingBoxOrders(): Promise<BrokerOrder[]> {
@@ -502,6 +658,12 @@ export class BoxOrderManager {
         action.reject(new Error(blocked));
         continue;
       }
+      // SCHEDULER DEQUEUE. A concurrency slot has been acquired and the operation is about to
+      // reach the broker, so this closes `scheduler_wait_ms` and opens `transport_wait_ms`.
+      this.markTiming(
+        action.kind === "submit" ? action.request.client_order_id : action.intent.client_order_id,
+        "scheduler_dequeued",
+      );
       this.inFlight++;
       const execution = action.kind === "submit"
         ? this.execute(action)
@@ -582,6 +744,7 @@ export class BoxOrderManager {
         if (error instanceof BrokerOrderRejectedError) {
           await this.persistOrder(intent, error.order, "broker rejected order");
           this.rejects++;
+          this.noteBrokerReject(error.order, errorMessage(error));
           this.noteFailure("broker rejected order");
           this.evaluateLimits();
           action.reject(error);
@@ -606,6 +769,7 @@ export class BoxOrderManager {
         const rejected = await this.transition(intent, "REJECTED", null, errorMessage(error));
         this.knownIntents.set(rejected.client_order_id, rejected);
         this.rejects++;
+        this.noteBrokerReject(null, errorMessage(error));
         this.noteFailure("broker rejected order");
         this.evaluateLimits();
         action.reject(error);
@@ -619,6 +783,7 @@ export class BoxOrderManager {
         await this.persistOrder(intent, order, "adapter order snapshot");
         if (order.state === "REJECTED") {
           this.rejects++;
+          this.noteBrokerReject(order, order.reject_reason ?? "broker rejected order");
           this.noteFailure("broker rejected order");
         } else if (order.state === "COMPLETE") {
           this.consecutiveFailures = 0;
@@ -871,10 +1036,18 @@ export class BoxOrderManager {
     order: BrokerOrder,
     message: string,
   ): Promise<IBoxOrderIntent> {
-    for (const fill of order.fills) {
-      if (this.fillIdentities.has(fill.fill_id)) continue;
-      this.fillIdentities.add(fill.fill_id);
+    // TIMING: record the broker's CUMULATIVE quantity for this snapshot, and — if the order has
+    // reached a terminal state — close and publish the trace. Both are fail-open no-ops when
+    // instrumentation is off, and neither can throw into the persistence path below.
+    try {
+      this.deps.timing?.markFill(order.client_order_id, order.filled_quantity);
+      if (isBrokerOrderTerminal(order.state)) {
+        this.markTiming(order.client_order_id, "terminal");
+      }
+    } catch {
+      /* telemetry must never affect execution */
     }
+    this.rememberFillIdentities(order);
     try {
       const result = await this.deps.persistence.update(
         intent.client_order_id,
@@ -901,7 +1074,14 @@ export class BoxOrderManager {
         this.recalculateGrossAttributedQuantity();
       }
       this.knownIntents.set(updated.client_order_id, updated);
-      if (isBrokerOrderTerminal(order.state)) this.releaseReservation(updated.client_order_id);
+      if (isBrokerOrderTerminal(order.state)) {
+        this.releaseReservation(updated.client_order_id);
+        // TIMING: publish only once the terminal snapshot is DURABLY recorded, so a sample can
+        // never describe an outcome the system does not actually believe in. A trace whose
+        // persistence failed is left to expire and is reported as lost measurement rather than
+        // being published against an uncertain outcome.
+        this.publishTiming(updated.client_order_id);
+      }
       this.health.persistence = "healthy";
       return updated;
     } catch (error) {
