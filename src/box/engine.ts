@@ -40,6 +40,11 @@ import {
 import { BoxChargeEstimator, buildEntryChargeLegs, type BoxChargeLeg, type PriceChargeGroupsFn } from "./charges.js";
 import { BoxChargeReconciler } from "./chargeReconciler.js";
 import { BoxExecutionSimulator } from "./executionSimulator.js";
+import { createExecutionClock, type ExecutionClock } from "./executionClock.js";
+import { ExecutionEnvironmentMonitor } from "./executionEnvironment.js";
+import { ExecutionCalibrationStore } from "./executionCalibration.js";
+import { ExecutionTimingRecorder } from "./executionTiming.js";
+import { BrokerTimingStore } from "./brokerTimingStore.js";
 import { CentralBoxExecutionGateway, type BoxExecutionGateway } from "./executionGateway.js";
 import { BoxOrderManager, orderManagerLimitsFromConfig, type OrderManagerReconcileReport } from "./orderManager.js";
 import { BoxMetrics } from "./metrics.js";
@@ -201,6 +206,20 @@ export class BoxEngine {
   private executionSim: BoxExecutionSimulator;
   private execution: BoxExecutionGateway;
   private orderManager: BoxOrderManager | null = null;
+  /**
+   * LIVE-CALIBRATION INFRASTRUCTURE (Phases 2, 7, 8, 13, 24).
+   *
+   * All four are additive and fail-open. The clock separates monotonic measurement from
+   * wall-clock audit; the environment monitor explains latency outliers; the calibration store
+   * accumulates dimensioned measured distributions that paper consumes; the timing recorder is
+   * the bridge that finally connects the live order path to both stores. None of them can affect
+   * whether or how an order is placed.
+   */
+  private readonly executionClock: ExecutionClock;
+  private readonly environmentMonitor: ExecutionEnvironmentMonitor;
+  private readonly calibration: ExecutionCalibrationStore;
+  private readonly brokerTiming: BrokerTimingStore;
+  private readonly timingRecorder: ExecutionTimingRecorder;
   private reconciler: BoxChargeReconciler;
   private metrics: BoxMetrics;
   private scanner: BoxScanner;
@@ -351,12 +370,47 @@ export class BoxEngine {
     this.strikeLevel = this.cfg.defaultStrikeLevel;
     this.baseMinGrossEdge = this.cfg.minGrossEdge;
 
+    // ── Calibration infrastructure, built before the simulator so it can consume it ──
+    this.executionClock = createExecutionClock();
+    this.environmentMonitor = new ExecutionEnvironmentMonitor({
+      enabled: this.cfg.executionEventLoopMetricsEnabled,
+      clock: this.executionClock,
+    });
+    this.calibration = new ExecutionCalibrationStore({
+      window: this.cfg.executionTimingWindow,
+      // The region is a LABEL, never auto-detected, and a store never merges another region's
+      // samples: two deployments have different physical RTTs to the broker.
+      region: this.cfg.deploymentRegion,
+      minSamples: this.cfg.paperCalibrationMinSamples,
+      bucketMinSamples: this.cfg.paperCalibrationBucketMinSamples,
+      maxAgeMs: this.cfg.paperCalibrationMaxAgeMs,
+      nowWall: () => this.executionClock.wall(),
+    });
+    this.brokerTiming = new BrokerTimingStore({
+      window: this.cfg.executionTimingWindow,
+      region: this.cfg.deploymentRegion,
+      now: () => this.executionClock.wall(),
+    });
+    this.timingRecorder = new ExecutionTimingRecorder({
+      enabled: this.cfg.executionTimingMetricsEnabled,
+      clock: this.executionClock,
+      timingStore: this.brokerTiming,
+      calibration: this.calibration,
+      environment: this.environmentMonitor,
+    });
+
     this.executionSim = new BoxExecutionSimulator({
       cfg: this.cfg,
       quotes: this.quotes,
       metrics: this.metrics,
       isMarketOpen: () => this.marketOpen,
       isFeedHealthy: () => this.isFeedHealthy(),
+      // Paper consumes the SAME store the live path writes to. That single shared store is what
+      // makes the simulator progressively more accurate as real executions are observed — and it
+      // is scoped by broker so paper only ever draws the latency of the broker it is shadowing.
+      calibration: this.calibration,
+      broker: () => this.deps.activeBroker(),
+      istMinutesOfDay: () => istMinutesOfDay(),
       // The local charge calculator prices paper_legging partial-entry and unwind
       // charges synchronously — never a network call inside the fill.
       chargeTotal: (orders) => this.localCharges.legs(orders).total,
@@ -373,7 +427,11 @@ export class BoxEngine {
           "[Box] live execution blocked: no live execution adapter was injected for the active broker.",
         );
       }
-      const adapter = createAdapter({ broker: this.deps.activeBroker(), cfg: this.cfg });
+      const adapter = createAdapter({
+        broker: this.deps.activeBroker(),
+        cfg: this.cfg,
+        timing: this.timingRecorder,
+      });
       this.orderManager = new BoxOrderManager({
         adapter,
         persistence: boxOrderIntentPersistence,
@@ -390,6 +448,10 @@ export class BoxEngine {
         },
         onReconciliationIssue: (report) => this.markReconciliationRecovery(report),
         loadDailyRiskSeed: (day) => loadBoxLiveRiskSeed(istDayStartMs(day)),
+        // Live timing instrumentation. The manager owns the scheduler stages and the terminal
+        // publish; the adapter marks the transport/ACK/fill/cancel stages on the same trace.
+        timing: this.timingRecorder,
+        broker: () => this.deps.activeBroker(),
       });
     }
     this.execution = new CentralBoxExecutionGateway({
@@ -878,6 +940,9 @@ export class BoxEngine {
     this.running = true;
     this.startedAt = Date.now();
     this.lastError = null;
+    // Event-loop / process diagnostics. Idempotent and fail-open: if it cannot attach it reports
+    // `enabled: false` and the engine carries on regardless.
+    this.environmentMonitor.start();
     this.scanner.setDiscovering(true);
     this.ensureFeed();
     this.startMarketWatch();
@@ -1040,6 +1105,7 @@ export class BoxEngine {
     this.orderManager?.setControls({ entryEnabled: false });
     this.stop();
     this.monitor.stop();
+    this.environmentMonitor.stop();
     this.metrics.stopSampling();
     this.pnlArchiver.stop();
     for (const t of [

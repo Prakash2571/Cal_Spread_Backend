@@ -1313,7 +1313,7 @@ export interface BoxScannerConfigSnapshot {
   simulated_decision_ms?: number;
   simulated_latency_ms?: number;
   /** Paper execution profile ("standard" | "live_parity"); absent on legacy documents. */
-  paper_execution_profile?: "standard" | "live_parity";
+  paper_execution_profile?: "standard" | "live_parity" | "stress";
   /** Live safety envelope captured for audit; absent on legacy paper documents. */
   live_trading_enabled?: boolean;
   live_reconcile_interval_ms?: number;

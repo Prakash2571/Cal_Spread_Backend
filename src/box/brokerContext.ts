@@ -23,6 +23,7 @@
 import type { BrokerId } from "../brokers/types.js";
 import type { BrokerAdapter } from "./brokerAdapter.js";
 import type { BoxConfig } from "./config.js";
+import type { ExecutionTimingRecorder } from "./executionTiming.js";
 import type { BoxCharges, BoxChargesWithOrigin, OrderSide } from "./types.js";
 
 /**
@@ -135,6 +136,15 @@ export interface BoxMarginProvider {
 export type BoxLiveAdapterFactory = (ctx: {
   broker: BrokerId;
   cfg: BoxConfig;
+  /**
+   * LIVE TIMING INSTRUMENTATION (Phase 2). Optional and FAIL-OPEN.
+   *
+   * Threaded through so the adapter can mark the stages only it witnesses — transport, HTTP,
+   * broker ACK, each cumulative fill, and the cancel request/acknowledgement — onto the same
+   * per-order trace the OrderManager opened. Without it the adapter records nothing and behaves
+   * exactly as before; with it, nothing it does can throw into or delay an order.
+   */
+  timing?: ExecutionTimingRecorder;
 }) => BrokerAdapter;
 
 
