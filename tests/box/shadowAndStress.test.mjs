@@ -476,3 +476,44 @@ test("the shipped .env.example still describes a SAFE, non-live configuration", 
     assert.doesNotMatch(env, /^BOX_PAPER_EXECUTION_PROFILE=stress$/m);
   });
 });
+
+
+test("REQUIRED 20: the pre-existing suite is still present and still exercised", async () => {
+  // Case 20 is "existing tests continue passing", which the suite itself proves by running. What
+  // this test adds is a guard against the OTHER way that requirement can be met dishonestly:
+  // deleting or emptying the tests that used to cover the behaviour being changed.
+  const { readdirSync, readFileSync } = await import("node:fs");
+  // "./" is this file's own directory (tests/box/); "../" would be tests/.
+  const dir = new URL("./", import.meta.url);
+  const files = readdirSync(dir).filter((f) => f.endsWith(".test.mjs"));
+
+  // The suites most exposed to this work must all still exist and still contain assertions.
+  for (const required of [
+    "execution.test.mjs",
+    "legParity.test.mjs",
+    "legParityScheduler.test.mjs",
+    "legExecutor.test.mjs",
+    "legFills.test.mjs",
+    "orderManager.test.mjs",
+    "kiteBrokerAdapter.test.mjs",
+    "dhanAdapter.test.mjs",
+    "brokerAdapter.test.mjs",
+    "orderPricing.test.mjs",
+    "liquidityLedger.test.mjs",
+    "paperScheduler.test.mjs",
+    "latencyModel.test.mjs",
+    "brokerTimingStore.test.mjs",
+    "parityReport.test.mjs",
+    "paperNeverReachesBroker.test.mjs",
+    "migrationFixtures.test.mjs",
+    "migrationFixturesParity.test.mjs",
+    "config.test.mjs",
+    "math.test.mjs",
+  ]) {
+    assert.ok(files.includes(required), `${required} must not be removed`);
+    const source = readFileSync(new URL(required, dir), "utf8");
+    assert.ok(source.includes("assert"), `${required} must still assert something`);
+    assert.ok(/\btest\(/.test(source), `${required} must still declare tests`);
+  }
+  assert.ok(files.length >= 55, `expected the full suite, found only ${files.length} files`);
+});
