@@ -98,8 +98,12 @@ export class CalibrationPersistenceBuffer {
 
   constructor(private readonly opts: CalibrationPersistenceOptions) {
     this.enabled = opts.enabled === true;
-    this.batchSize = Math.max(1, Math.floor(opts.batchSize));
-    this.maxBuffered = Math.max(this.batchSize, Math.floor(opts.maxBuffered ?? Math.max(1_000, this.batchSize * 20)));
+    // THE CAP IS AUTHORITATIVE. `maxBuffered` is a memory-safety bound; `batchSize` is a
+    // throughput preference. If a configuration asks for a batch larger than the cap, the cap
+    // wins and the batch shrinks — the opposite would let a throughput knob quietly raise a
+    // memory ceiling, which is how a diagnostics buffer becomes an outage.
+    this.maxBuffered = Math.max(1, Math.floor(opts.maxBuffered ?? Math.max(1_000, Math.floor(opts.batchSize) * 20)));
+    this.batchSize = Math.max(1, Math.min(Math.floor(opts.batchSize), this.maxBuffered));
     this.now = opts.now ?? (() => Date.now());
     this.schedule = opts.setInterval ?? ((fn, ms) => setInterval(fn, ms));
     this.cancel = opts.clearInterval ?? ((handle) => clearInterval(handle));

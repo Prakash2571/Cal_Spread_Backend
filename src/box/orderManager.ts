@@ -252,6 +252,12 @@ export class BoxOrderManager {
        */
       timing?: ExecutionTimingRecorder;
       /**
+       * Called for every REAL broker rejection, so reject-family statistics are measured rather
+       * than modelled (Phase 19). Fail-open: a diagnostics failure here must not change how a
+       * rejection is handled.
+       */
+      onBrokerReject?: (order: BrokerOrder | null, reason: string) => void;
+      /**
        * Which broker these samples belong to. Required for timing to be recorded at all,
        * because a sample that cannot be attributed to a broker must never be filed — pooling
        * Zerodha and Dhan latency would describe neither.
@@ -526,6 +532,15 @@ export class BoxOrderManager {
     }
   }
 
+  /** Report a real broker rejection for statistics. Fail-open. */
+  private noteBrokerReject(order: BrokerOrder | null, reason: string): void {
+    try {
+      this.deps.onBrokerReject?.(order, reason);
+    } catch {
+      /* diagnostics must never change rejection handling */
+    }
+  }
+
   /** Mark a stage on a request's trace. Fail-open; a no-op when instrumentation is off. */
   private markTiming(clientOrderId: string, stage: Parameters<ExecutionTimingRecorder["mark"]>[1]): void {
     try {
@@ -729,6 +744,7 @@ export class BoxOrderManager {
         if (error instanceof BrokerOrderRejectedError) {
           await this.persistOrder(intent, error.order, "broker rejected order");
           this.rejects++;
+          this.noteBrokerReject(error.order, errorMessage(error));
           this.noteFailure("broker rejected order");
           this.evaluateLimits();
           action.reject(error);
@@ -753,6 +769,7 @@ export class BoxOrderManager {
         const rejected = await this.transition(intent, "REJECTED", null, errorMessage(error));
         this.knownIntents.set(rejected.client_order_id, rejected);
         this.rejects++;
+        this.noteBrokerReject(null, errorMessage(error));
         this.noteFailure("broker rejected order");
         this.evaluateLimits();
         action.reject(error);
@@ -766,6 +783,7 @@ export class BoxOrderManager {
         await this.persistOrder(intent, order, "adapter order snapshot");
         if (order.state === "REJECTED") {
           this.rejects++;
+          this.noteBrokerReject(order, order.reject_reason ?? "broker rejected order");
           this.noteFailure("broker rejected order");
         } else if (order.state === "COMPLETE") {
           this.consecutiveFailures = 0;

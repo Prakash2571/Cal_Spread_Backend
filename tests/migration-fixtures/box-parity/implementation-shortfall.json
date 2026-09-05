@@ -1,0 +1,129 @@
+{
+  "category": "execution-parity",
+  "operation": "computeExecutionShortfall",
+  "description": "The subtraction chain from detected edge to realised net, attributed per leg, with the unexplained residual surfaced. Positive always means COST, whichever side the leg was.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "a complete 4/4 box",
+      "input": {
+        "theoreticalDetectedEdge": 1875,
+        "executedGrossEdge": 1700,
+        "brokerage": 80,
+        "taxesAndFees": 70,
+        "unwindCost": 0,
+        "realisedNetResult": 1425,
+        "outcome": "filled_4_of_4",
+        "legs": [
+          {
+            "role": "k1_ce",
+            "side": "BUY",
+            "detectedPrice": 100,
+            "submitPrice": 100.05,
+            "filledPrice": 100.1,
+            "requestedQty": 75,
+            "filledQty": 75
+          },
+          {
+            "role": "k2_ce",
+            "side": "SELL",
+            "detectedPrice": 50,
+            "submitPrice": 49.95,
+            "filledPrice": 49.9,
+            "requestedQty": 75,
+            "filledQty": 75
+          }
+        ]
+      },
+      "expected": {
+        "theoreticalDetectedEdge": 1875,
+        "executedGrossEdge": 1700,
+        "edgeDecay": 7.5,
+        "slippage": 7.5,
+        "brokerage": 80,
+        "taxesAndFees": 70,
+        "unwindCost": 0,
+        "realisedNetResult": 1425,
+        "legs": [
+          {
+            "role": "k1_ce",
+            "side": "BUY",
+            "detectedPrice": 100,
+            "submitPrice": 100.05,
+            "filledPrice": 100.1,
+            "requestedQty": 75,
+            "filledQty": 75,
+            "edgeDecay": 3.75,
+            "slippage": 3.75,
+            "totalShortfall": 7.5
+          },
+          {
+            "role": "k2_ce",
+            "side": "SELL",
+            "detectedPrice": 50,
+            "submitPrice": 49.95,
+            "filledPrice": 49.9,
+            "requestedQty": 75,
+            "filledQty": 75,
+            "edgeDecay": 3.75,
+            "slippage": 3.75,
+            "totalShortfall": 7.5
+          }
+        ],
+        "incomplete": false,
+        "outcome": "filled_4_of_4",
+        "unexplained": 285
+      }
+    },
+    {
+      "name": "an incomplete box that had to be unwound",
+      "input": {
+        "theoreticalDetectedEdge": 1000,
+        "executedGrossEdge": 0,
+        "brokerage": 0,
+        "taxesAndFees": 0,
+        "unwindCost": 250,
+        "realisedNetResult": -250,
+        "outcome": "partial_unwound",
+        "legs": [
+          {
+            "role": "k1_ce",
+            "side": "BUY",
+            "detectedPrice": 100,
+            "submitPrice": 101,
+            "filledPrice": null,
+            "requestedQty": 75,
+            "filledQty": 0
+          }
+        ]
+      },
+      "expected": {
+        "theoreticalDetectedEdge": 1000,
+        "executedGrossEdge": 0,
+        "edgeDecay": 0,
+        "slippage": 0,
+        "brokerage": 0,
+        "taxesAndFees": 0,
+        "unwindCost": 250,
+        "realisedNetResult": -250,
+        "legs": [
+          {
+            "role": "k1_ce",
+            "side": "BUY",
+            "detectedPrice": 100,
+            "submitPrice": 101,
+            "filledPrice": null,
+            "requestedQty": 75,
+            "filledQty": 0,
+            "edgeDecay": 0,
+            "slippage": null,
+            "totalShortfall": null
+          }
+        ],
+        "incomplete": true,
+        "outcome": "partial_unwound",
+        "unexplained": 1000
+      }
+    }
+  ]
+}
