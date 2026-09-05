@@ -162,6 +162,17 @@ export interface ResolvedCalibration {
   readonly newestSession: string | null;
   readonly percentiles: CalibrationPercentiles;
   /**
+   * The raw backing samples, in ring order.
+   *
+   * Exposed because a simulator that wants to reproduce a measured distribution should
+   * consume the ACTUAL observations — that is the only way to inherit the real right-hand
+   * tail, which is precisely the part a percentile summary flattens and a constant erases.
+   *
+   * Empty when `measured` is false. Bounded by the ring capacity times the pooled dimensions.
+   * COLD PATH: admin surfaces should omit this field; it is for consumption, not display.
+   */
+  readonly values: readonly number[];
+  /**
    * TRUE only when the percentiles come from measured live observations.
    *
    * When false the percentiles are all null and the caller MUST fall back to its own
@@ -408,6 +419,7 @@ export class ExecutionCalibrationStore {
       freshnessMs: pooledKinds.newestAtWall === null ? null : Math.max(0, now - pooledKinds.newestAtWall),
       newestSession: pooledKinds.newestSession,
       percentiles: { p50: null, p75: null, p90: null, p95: null, p99: null },
+      values: [],
       measured: false,
       note:
         total > 0
@@ -644,6 +656,7 @@ export class ExecutionCalibrationStore {
       freshnessMs: age,
       newestSession: pooled.newestSession,
       percentiles: percentilesOf(pooled.values),
+      values: pooled.values,
       measured: true,
       note: notes.join(" "),
     };

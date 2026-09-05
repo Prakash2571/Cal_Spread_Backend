@@ -15,6 +15,7 @@ import {
   type BrokerRejectFamily,
 } from "./brokerAdapter.js";
 import type { BoxConfig } from "./config.js";
+import type { ExecutionTimingRecorder } from "./executionTiming.js";
 import type { ExecutionMode, IBoxOrderIntent, OrderSide } from "./types.js";
 
 export interface KiteTransportOrder {
@@ -229,6 +230,18 @@ export class KiteHttpTransport implements KiteBrokerTransport {
 export interface KiteBrokerAdapterConfig {
   executionMode: ExecutionMode;
   enabled: boolean;
+  /**
+   * LIVE TIMING INSTRUMENTATION (Phase 2). Optional and FAIL-OPEN.
+   *
+   * The adapter marks the stages only IT can witness: transport start, the HTTP request leaving
+   * the wire, the response, the broker order id, the ACK, each cumulative fill, and the cancel
+   * request/acknowledgement. The OrderManager owns the queue stages and the terminal publish, and
+   * both write to the same trace, keyed by client order id.
+   *
+   * The adapter never CREATES a trace: without the strategy identity a sample cannot be filed
+   * under the right dimensions, so a mark for an unknown order is dropped rather than guessed at.
+   */
+  timing?: ExecutionTimingRecorder;
   ackTimeoutMs: number;
   workingTimeoutMs: number;
   partialTimeoutMs: number;
@@ -298,20 +311,32 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     order.tag = stableKiteTag(req.client_order_id, req.tag);
     this.orders.set(req.client_order_id, order);
 
+    // TRANSPORT START: before `call()`, so the pacing wait is attributed to transport_wait_ms
+    // rather than being hidden inside the POST duration.
+    this.mark(req.client_order_id, "transport_started");
     let placed: { order_id: string };
     try {
-      placed = await this.call(() => this.transport.placeOrder({
-        exchange: req.exchange,
-        tradingsymbol: req.tradingsymbol,
-        transaction_type: req.side,
-        quantity: req.quantity,
-        order_type: "LIMIT",
-        product: "NRML",
-        validity: "DAY",
-        price: req.pricing.limit_price,
-        tag: order.tag as string,
-      }));
+      placed = await this.call(() => {
+        // HTTP REQUEST START: inside the paced callback, so post_to_http_response_ms measures
+        // the network and the broker, NOT our own rate limiter.
+        this.mark(req.client_order_id, "http_request_started");
+        return this.transport.placeOrder({
+          exchange: req.exchange,
+          tradingsymbol: req.tradingsymbol,
+          transaction_type: req.side,
+          quantity: req.quantity,
+          order_type: "LIMIT",
+          product: "NRML",
+          validity: "DAY",
+          price: req.pricing.limit_price,
+          tag: order.tag as string,
+        });
+      });
+      this.mark(req.client_order_id, "http_response");
     } catch (error) {
+      // The response is an observable event whether it succeeded or failed. Recording it on the
+      // failure path is what makes a timeout's duration measurable instead of invisible.
+      this.mark(req.client_order_id, "http_response");
       if (error instanceof BrokerAmbiguousSubmitError || !isDefinitivePlacementRejection(error)) {
         order.state = "RECONCILIATION_REQUIRED";
         order.updated_at = this.clock.now();
@@ -332,6 +357,11 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     order.broker_order_id = placed.order_id;
     order.state = "ACKNOWLEDGED";
     order.updated_at = this.clock.now();
+    // BROKER ORDER ID + ACK. Two marks because they are two different facts: the id proves an
+    // order EXISTS, and the ACK proves the broker ACCEPTED it. Neither proves any quantity
+    // executed — see orderLifecycle.stageProvesExecution.
+    this.mark(req.client_order_id, "broker_order_id");
+    this.mark(req.client_order_id, "acknowledged");
     this.clientByBroker.set(placed.order_id, req.client_order_id);
     try {
       return await this.waitForResolution(order);
@@ -358,6 +388,10 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     }
     order.state = "CANCEL_REQUESTED";
     order.updated_at = this.clock.now();
+    // CANCEL REQUESTED. This opens cancel_request_to_terminal_ms — the measured span that sizes
+    // paper's cancel-vs-fill race window. It is deliberately marked BEFORE the DELETE is sent,
+    // because the race starts the moment we commit to cancelling.
+    this.mark(clientOrderId, "cancel_requested");
     await withDeadline(
       this.call(() => this.transport.cancelOrder(order.broker_order_id as string)),
       this.config.cancelTimeoutMs,
@@ -366,6 +400,9 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       order.state = "RECONCILIATION_REQUIRED";
       throw error;
     });
+    // The broker accepted the cancel REQUEST. It is not yet a cancellation: the order may still
+    // be filling right now, which is why confirmTerminalAfterCancel re-reads until terminal.
+    this.mark(clientOrderId, "cancel_acknowledged");
     return clone(await this.confirmTerminalAfterCancel(order));
   }
 
@@ -537,12 +574,14 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     if (!order.broker_order_id || isBrokerOrderTerminal(order.state)) return order;
     order.state = "CANCEL_REQUESTED";
     order.updated_at = this.clock.now();
+    this.mark(order.client_order_id, "cancel_requested");
     try {
       await withDeadline(
         this.call(() => this.transport.cancelOrder(order.broker_order_id as string)),
         this.config.cancelTimeoutMs,
         "Protective cancellation timed out.",
       );
+      this.mark(order.client_order_id, "cancel_acknowledged");
       return await this.confirmTerminalAfterCancel(order);
     } catch (error) {
       order.state = "RECONCILIATION_REQUIRED";
@@ -582,8 +621,33 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       return order;
     }
     const normalized = normalizeKiteOrder(raw, order, this.clock.now());
+    // TIMING: the broker's CUMULATIVE quantity. The recorder ignores anything that is not an
+    // increase, so re-polling an unchanged order does not manufacture extra "fill" events.
+    this.markFill(order.client_order_id, normalized.filled_quantity);
     this.orders.set(order.client_order_id, normalized);
     return normalized;
+  }
+
+  /**
+   * Mark a timing stage. FAIL-OPEN and silent when instrumentation is off or the order has no
+   * trace — a metrics failure must never be able to interfere with an order, least of all a
+   * cancel.
+   */
+  private mark(clientOrderId: string, stage: Parameters<ExecutionTimingRecorder["mark"]>[1]): void {
+    try {
+      this.config.timing?.mark(clientOrderId, stage);
+    } catch {
+      /* telemetry must never affect execution */
+    }
+  }
+
+  /** Record an observed cumulative filled quantity. Fail-open. */
+  private markFill(clientOrderId: string, cumulativeQty: number): void {
+    try {
+      this.config.timing?.markFill(clientOrderId, cumulativeQty);
+    } catch {
+      /* telemetry must never affect execution */
+    }
   }
 
   private isEnabled(): boolean {

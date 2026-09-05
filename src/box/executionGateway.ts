@@ -485,8 +485,16 @@ function paperLeg(order: BrokerOrder): PaperLegExecution {
     detected_qty: order.quantity,
     submit_at: order.created_at,
     arrival_at: order.created_at,
+    // This projection describes a LIVE order rendered in the paper shape for reporting. The
+    // live path records its own stage timings through the timing recorder, so these
+    // paper-only race fields stay null rather than being back-filled with a guess.
+    ack_at: null,
     pending_since: null,
     timeout_at: null,
+    cancel_requested_at: null,
+    cancel_confirmed_at: null,
+    fill_qty_at_cancel_request: null,
+    raced_fill_qty: 0,
     fill_at: filled > 0 ? order.updated_at : null,
     resolved_at: order.updated_at,
     fill_price: order.average_price,

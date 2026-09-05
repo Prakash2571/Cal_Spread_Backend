@@ -705,13 +705,26 @@ export type BoxLegExecutionMode = "parallel" | "sequential";
  *   UNWIND_FAILED    filled, and the reversal found no executable opposite price —
  *                    so simulated exposure is STILL OUTSTANDING and must stay visible
  */
+/**
+ * Two further states exist under the live_parity profile only, because they model something
+ * standard paper does not attempt:
+ *
+ *   ACKNOWLEDGED      the broker has accepted the order but it is not yet confirmed working at
+ *                     the exchange. Held explicitly so that an ACK can never be mistaken for a
+ *                     fill — see orderLifecycle.stageProvesExecution.
+ *   CANCEL_REQUESTED  a cancel is in flight and HAS NOT been confirmed. The order is STILL
+ *                     eligible to fill: this is the state in which the real cancel-vs-fill
+ *                     race happens, and modelling it is the whole point.
+ */
 export type PaperLegStatus =
   | "CREATED"
   | "SUBMITTED"
   | "IN_FLIGHT"
+  | "ACKNOWLEDGED"
   | "PENDING"
   | "PARTIALLY_FILLED"
   | "FILLED"
+  | "CANCEL_REQUESTED"
   | "TIMED_OUT"
   | "CANCELLED"
   | "FAILED"
@@ -719,8 +732,21 @@ export type PaperLegStatus =
   | "UNWOUND"
   | "UNWIND_FAILED";
 
-/** The kind of order the simulator submits. Only a marketable limit is modelled. */
-export type PaperOrderType = "MARKETABLE_LIMIT";
+/**
+ * How the order interacts with the book.
+ *
+ *   MARKETABLE_LIMIT — priced to cross immediately (a bounded limit at or through the touch).
+ *                      Its fill behaviour depends on visible depth within the limit, which we
+ *                      CAN observe. This is what the Box strategy submits.
+ *   PASSIVE_LIMIT    — priced away from the touch, resting behind unknown queue depth. Whether
+ *                      it fills depends overwhelmingly on true NSE queue position, which a
+ *                      retail feed does not expose.
+ *
+ * Recorded per order so realism scoring and parity reports can keep the two populations
+ * apart. They must never be pooled: passive fill statistics would flatter marketable orders
+ * and vice versa, and a blended figure describes neither.
+ */
+export type PaperOrderType = "MARKETABLE_LIMIT" | "PASSIVE_LIMIT";
 
 /**
  * The executable price envelope of one simulated order.
@@ -784,10 +810,37 @@ export interface PaperLegExecution {
   submit_at: number;
   /** submit + per-leg network/broker latency. */
   arrival_at: number;
+  /**
+   * When the broker ACKNOWLEDGED the order (live_parity only; null in standard paper).
+   *
+   * Recorded separately from `arrival_at` so the ACK is a first-class, measurable event rather
+   * than an implicit side effect of arrival. AN ACK IS NOT A FILL: this timestamp says the
+   * order exists at the broker, and nothing whatsoever about executed quantity.
+   */
+  ack_at: number | null;
   /** When the order arrived and began RESTING unfilled (null if it never did). */
   pending_since: number | null;
   /** arrival_at + BOX_LEG_TIMEOUT_MS — the instant this order gives up. */
   timeout_at: number | null;
+  /**
+   * When a cancel was REQUESTED (live_parity only; null in standard paper).
+   *
+   * Between this instant and `cancel_confirmed_at` the order is still working at the exchange
+   * and may still fill — a cancel request is a request, not an outcome.
+   */
+  cancel_requested_at: number | null;
+  /** When the cancel was CONFIRMED terminal by the broker. */
+  cancel_confirmed_at: number | null;
+  /**
+   * Cumulative filled quantity at the instant the cancel was requested.
+   *
+   * Retained purely so the race is visible: the difference between this and the final
+   * `fill_qty` is quantity that filled while the cancellation was in flight. The final
+   * quantity, never this one, is authoritative.
+   */
+  fill_qty_at_cancel_request: number | null;
+  /** Quantity that filled AFTER the cancel was requested. The race, quantified. */
+  raced_fill_qty: number;
   /** When the order became FULLY filled (null if it never did). */
   fill_at: number | null;
   /** When the fill (or failure) resolved. */
