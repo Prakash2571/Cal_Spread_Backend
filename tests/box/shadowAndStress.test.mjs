@@ -405,3 +405,74 @@ test("REQUIRED 19: there is still no Math.random anywhere in src/box", async () 
   }
   assert.deepEqual(offenders, [], "the execution model must remain fully deterministic");
 });
+
+
+/* ─────────────────── configuration documentation completeness ─────────────────── */
+
+test("every new configuration variable is documented in all four required places", async () => {
+  // Phase 31 requires each variable to appear in .env.example, README.md,
+  // docs/CONFIGURATION.md and src/box/LIVE_EXECUTION.md. Asserting it keeps code and docs from
+  // drifting apart, which is the usual fate of a configuration table.
+  const { readFileSync } = await import("node:fs");
+  const files = [".env.example", "README.md", "docs/CONFIGURATION.md", "src/box/LIVE_EXECUTION.md"];
+  const contents = new Map(
+    files.map((f) => [f, readFileSync(new URL(`../../${f}`, import.meta.url), "utf8")]),
+  );
+
+  const introduced = [
+    "BOX_PAPER_CALIBRATION_MIN_SAMPLES",
+    "BOX_PAPER_CALIBRATION_BUCKET_MIN_SAMPLES",
+    "BOX_PAPER_CALIBRATION_MAX_AGE_MS",
+    "BOX_PAPER_CALIBRATION_TIME_BUCKETS",
+    "BOX_PAPER_CANCEL_LATENCY_MS",
+    "BOX_LIVE_TIMING_PERSIST_ENABLED",
+    "BOX_LIVE_TIMING_BATCH_SIZE",
+    "BOX_LIVE_TIMING_FLUSH_MS",
+    "BOX_EXECUTION_EVENT_LOOP_METRICS_ENABLED",
+    "BOX_SHADOW_MODE_ENABLED",
+  ];
+
+  const missing = [];
+  for (const variable of introduced) {
+    for (const [file, text] of contents) {
+      if (!text.includes(variable)) missing.push(`${variable} missing from ${file}`);
+    }
+  }
+  assert.deepEqual(missing, []);
+});
+
+test("every new configuration variable is actually read by the loader", async () => {
+  // The mirror of the test above: documentation must not describe a variable that does nothing.
+  const { readFileSync } = await import("node:fs");
+  const configSource = readFileSync(new URL("../../src/box/config.ts", import.meta.url), "utf8");
+  for (const variable of [
+    "BOX_PAPER_CALIBRATION_MIN_SAMPLES",
+    "BOX_PAPER_CALIBRATION_BUCKET_MIN_SAMPLES",
+    "BOX_PAPER_CALIBRATION_MAX_AGE_MS",
+    "BOX_PAPER_CALIBRATION_TIME_BUCKETS",
+    "BOX_PAPER_CANCEL_LATENCY_MS",
+    "BOX_LIVE_TIMING_PERSIST_ENABLED",
+    "BOX_LIVE_TIMING_BATCH_SIZE",
+    "BOX_LIVE_TIMING_FLUSH_MS",
+    "BOX_EXECUTION_EVENT_LOOP_METRICS_ENABLED",
+    "BOX_SHADOW_MODE_ENABLED",
+  ]) {
+    assert.ok(configSource.includes(variable), `${variable} is documented but never read`);
+  }
+});
+
+test("the shipped .env.example still describes a SAFE, non-live configuration", () => {
+  // A copy-paste of the example file must never produce a live-trading process.
+  const profileLine = /^BOX_PAPER_EXECUTION_PROFILE=standard$/m;
+  const shadowLine = /^BOX_SHADOW_MODE_ENABLED=false$/m;
+  const persistLine = /^BOX_LIVE_TIMING_PERSIST_ENABLED=false$/m;
+  return import("node:fs").then(({ readFileSync }) => {
+    const env = readFileSync(new URL("../../.env.example", import.meta.url), "utf8");
+    assert.match(env, profileLine, "the example must not ship a non-default profile");
+    assert.match(env, shadowLine);
+    assert.match(env, persistLine);
+    assert.doesNotMatch(env, /^BOX_EXECUTION_MODE=live$/m, "the example must never default to live");
+    assert.doesNotMatch(env, /^BOX_LIVE_TRADING_ENABLED=true$/m);
+    assert.doesNotMatch(env, /^BOX_PAPER_EXECUTION_PROFILE=stress$/m);
+  });
+});

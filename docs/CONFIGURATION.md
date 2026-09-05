@@ -137,19 +137,50 @@ Mode: `BOX_EXECUTION_MODE` (`paper_touch`/`paper_latency`/`paper_legging`/`live`
 `BOX_SIMULATED_DECISION_MS`, `BOX_LEG_TIMEOUT_MS`, `BOX_LEG_MAX_CHASE_TICKS`,
 `BOX_LEG_UNWIND_LATENCY_MS`, `BOX_UNWIND_MAX_CHASE_TICKS`, `BOX_MAX_CONCURRENT_EXECUTIONS`.
 
-Paper live-parity profile (default OFF; layered on `paper_legging`, never changes
-`standard`): `BOX_PAPER_EXECUTION_PROFILE` (`standard`|`live_parity`),
+Paper execution profile (default OFF; layered on `paper_legging`, never changes
+`standard`): `BOX_PAPER_EXECUTION_PROFILE` (`standard`|`live_parity`|`stress`),
 `BOX_PAPER_MAX_CONCURRENT_EXECUTIONS` (default = `BOX_LIVE_MAX_CONCURRENT_EXECUTIONS`),
 `BOX_PAPER_LATENCY_MODE` (`constant`|`recorded_samples`), `BOX_PAPER_LATENCY_SAMPLES`
 (observed POST→ACK ms), `BOX_PAPER_LATENCY_ACK_TERMINAL_SAMPLES` (observed ACK→terminal
 ms), `BOX_PAPER_LATENCY_SEED`. Under `live_parity` the four legs are scheduled through the
 same priority queue + concurrency cap + `BOX_LIVE_BROKER_MIN_INTERVAL_MS` pacing as live.
 
+`stress` is a SEPARATE profile for resilience testing that deliberately injects faults. It is
+never a fallback (an unrecognised value becomes `standard`), and startup **refuses** if it is
+combined with `BOX_EXECUTION_MODE=live`. Its output is never live parity.
+
+Live-calibration consumption — how much measured evidence paper needs before it trusts a
+distribution: `BOX_PAPER_CALIBRATION_MIN_SAMPLES` (default `30`),
+`BOX_PAPER_CALIBRATION_BUCKET_MIN_SAMPLES` (default `60`; deliberately higher so a narrow
+time-of-day bucket cannot overfit a handful of observations),
+`BOX_PAPER_CALIBRATION_MAX_AGE_MS` (default 3 days; older samples are excluded from ACTIVE
+calibration but retained for analytics), `BOX_PAPER_CALIBRATION_TIME_BUCKETS` (default `true`),
+`BOX_PAPER_CANCEL_LATENCY_MS` (default `150` — the fallback cancel-vs-fill race window; non-zero
+on purpose, because zero would mean cancels are instantaneous).
+
 Execution timing observability / latency calibration (fail-open, off the trading hot path):
 `BOX_EXECUTION_TIMING_METRICS_ENABLED` (default `true`), `BOX_EXECUTION_TIMING_WINDOW`
-(default `500`), `BOX_DEPLOYMENT_REGION` / `BOX_EXECUTION_CALIBRATION_REGION` (region label
-stamped on calibration datasets; never auto-detected). See `src/box/LIVE_EXECUTION.md` for
-the recommended validation profile and calibration status.
+(default `500`), `BOX_EXECUTION_EVENT_LOOP_METRICS_ENABLED` (default `true`; measures
+event-loop delay so a Node stall is never recorded as broker latency),
+`BOX_DEPLOYMENT_REGION` / `BOX_EXECUTION_CALIBRATION_REGION` (region label stamped on
+calibration datasets; never auto-detected, and a store refuses to import another region's
+samples).
+
+Calibration persistence (bounded, asynchronous, never a synchronous hot-path write):
+`BOX_LIVE_TIMING_PERSIST_ENABLED` (default `false`), `BOX_LIVE_TIMING_BATCH_SIZE`
+(default `50`), `BOX_LIVE_TIMING_FLUSH_MS` (default `15000`). A full buffer drops the oldest
+observations and reports the loss; a failed flush discards the batch and reports it. No
+substitute samples are ever generated.
+
+Shadow validation: `BOX_SHADOW_MODE_ENABLED` (default `false`). The real feed and the real
+strategy run, paper produces the orders it would have produced, and **no broker order is ever
+submitted** — enforced by a startup refusal alongside live mode, by no live adapter existing,
+and by a guard that turns any attempted mutation into a throw.
+
+Read-only diagnostics live at `GET /api/box/execution-diagnostics`. See
+`src/box/LIVE_EXECUTION.md` for the recommended validation profile, the calibration honesty
+contract, and the "Observable parity" section describing exactly what the simulator can and
+cannot claim.
 
 Live-only limits (all under the `BOX_LIVE_*` prefix — order pacing, timeouts, and the
 risk caps below).
