@@ -42,8 +42,10 @@ import { BoxChargeReconciler } from "./chargeReconciler.js";
 import { BoxExecutionSimulator } from "./executionSimulator.js";
 import { createExecutionClock, type ExecutionClock } from "./executionClock.js";
 import { ExecutionEnvironmentMonitor } from "./executionEnvironment.js";
-import { ExecutionCalibrationStore } from "./executionCalibration.js";
+import { ExecutionCalibrationStore, type CalibrationStage } from "./executionCalibration.js";
+import { classifyTimeOfDayBucket, istMinutesOfDayFor } from "./latencyModel.js";
 import { ExecutionTimingRecorder } from "./executionTiming.js";
+import { CalibrationPersistenceBuffer } from "./calibrationPersistence.js";
 import { BrokerTimingStore } from "./brokerTimingStore.js";
 import { ExecutionOutcomeStore } from "./executionOutcomes.js";
 import { QueueCalibrationEstimator } from "./queueCalibration.js";
@@ -89,6 +91,8 @@ import {
   loadOpenBoxTrades,
   loadUnresolvedBoxExecutionAttempts,
   markBoxTradeRecovery,
+  loadBoxCalibrationSamples,
+  persistBoxCalibrationSamples,
   resolveBoxExecutionAttempt,
   updateBoxExecutionAttemptResidual,
   saveBoxSettings,
@@ -225,6 +229,14 @@ export class BoxEngine {
   private readonly calibration: ExecutionCalibrationStore;
   private readonly brokerTiming: BrokerTimingStore;
   private readonly timingRecorder: ExecutionTimingRecorder;
+  /**
+   * Bounded async buffer that persists measured calibration observations (Phase 25).
+   *
+   * Without it, calibration dies with the process — a restart at 09:30 discards the morning's
+   * evidence exactly when it is most valuable. Recording is one in-memory append with no await and
+   * no I/O; flushing is batched and off the order path entirely.
+   */
+  private readonly calibrationPersistence: CalibrationPersistenceBuffer;
   /** Measured outcome and reject-family rates (Phases 9, 19). */
   private readonly outcomeStore = new ExecutionOutcomeStore();
   /** Advisory queue/haircut recommender fed by live limit-order evidence (Phases 10, 26). */
@@ -404,12 +416,35 @@ export class BoxEngine {
       currentHaircutPct: this.cfg.queueLiquidityHaircutPct,
       minSamples: this.cfg.paperCalibrationMinSamples,
     });
+    this.calibrationPersistence = new CalibrationPersistenceBuffer({
+      enabled: this.cfg.liveTimingPersistEnabled,
+      sink: (batch) => persistBoxCalibrationSamples(batch, this.cfg.deploymentRegion),
+      batchSize: this.cfg.liveTimingBatchSize,
+      flushMs: this.cfg.liveTimingFlushMs,
+      now: () => this.executionClock.wall(),
+    });
     this.timingRecorder = new ExecutionTimingRecorder({
       enabled: this.cfg.executionTimingMetricsEnabled,
       clock: this.executionClock,
       timingStore: this.brokerTiming,
       calibration: this.calibration,
       environment: this.environmentMonitor,
+      // Mirror every measured span into the durable buffer so it survives a restart. Fail-open and
+      // allocation-light: the recorder already swallows anything this throws.
+      onPublish: (timing) => {
+        const bucket = classifyTimeOfDayBucket(istMinutesOfDayFor(timing.atWall));
+        for (const [stage, valueMs] of Object.entries(timing.spans)) {
+          this.calibrationPersistence.record({
+            broker: timing.identity.broker,
+            kind: stage === "cancel_request_to_terminal_ms" ? "CANCEL" : timing.kind,
+            profile: timing.profile,
+            bucket,
+            stage: stage as CalibrationStage,
+            valueMs: valueMs as number,
+            atWall: timing.atWall,
+          });
+        }
+      },
     });
 
     this.executionSim = new BoxExecutionSimulator({
@@ -476,6 +511,8 @@ export class BoxEngine {
       quotes: this.quotes,
       ...(this.orderManager ? { manager: this.orderManager, allocateTradeId: allocateBoxTradeId } : {}),
       isTokenWarm: (token) => this.tokenFeedGeneration.get(token) === this.feedGeneration,
+      // So LIVE residual flattening bills its own fees, exactly as the paper path already did.
+      chargeTotal: (orders) => this.localCharges.legs(orders).total,
     });
 
     this.reconciler = new BoxChargeReconciler({
@@ -959,6 +996,11 @@ export class BoxEngine {
     // Event-loop / process diagnostics. Idempotent and fail-open: if it cannot attach it reports
     // `enabled: false` and the engine carries on regardless.
     this.environmentMonitor.start();
+    // Persist measured calibration observations, and REHYDRATE what a previous process measured, so
+    // a restart does not throw the session's evidence away. Fail-open: a failure here degrades
+    // calibration to UNCALIBRATED (which reports itself honestly) and never blocks starting.
+    this.calibrationPersistence.start();
+    void this.rehydrateCalibration();
     this.scanner.setDiscovering(true);
     this.ensureFeed();
     this.startMarketWatch();
@@ -1101,10 +1143,12 @@ export class BoxEngine {
       (residual) => !projectedSymbols.has(`${residual.exchange ?? "NFO"}:${residual.tradingsymbol}`),
     );
     if (crashOnly.length > 0) {
-      results.push(await this.execution.flattenResidual({
+      const bootFlatten = await this.execution.flattenResidual({
         residual: crashOnly,
         keyPrefix: `boot-recovery:${this.deps.istDayKey()}`,
-      }));
+      });
+      this.noteFlattenCharges(bootFlatten.flatten_charges);
+      results.push(bootFlatten);
     }
     return { attempted: positions.length + crashOnly.length, results };
   }
@@ -1122,6 +1166,8 @@ export class BoxEngine {
     this.stop();
     this.monitor.stop();
     this.environmentMonitor.stop();
+    // Final flush, so a clean shutdown keeps the session's tail of observations.
+    void this.calibrationPersistence.dispose().catch(() => undefined);
     this.metrics.stopSampling();
     this.pnlArchiver.stop();
     for (const t of [
@@ -2977,6 +3023,63 @@ export class BoxEngine {
    * immediately, and resolves the attempt when it reaches zero. When nothing is
    * outstanding the timer stops and degraded clears.
    */
+  /**
+   * Reload previously-measured calibration observations into the in-memory store.
+   *
+   * THIS is what persistence is for: without it, calibration status resets to UNCALIBRATED on every
+   * restart and paper silently drops back to its constants. Region-scoped, because two deployments
+   * have different physical round-trip times to the broker.
+   *
+   * Bounded and fail-open: it loads at most a capped number of rows no older than the active
+   * calibration window, and any failure simply leaves the store empty — which reports itself as
+   * UNCALIBRATED rather than pretending.
+   */
+  private async rehydrateCalibration(): Promise<void> {
+    if (!this.cfg.liveTimingPersistEnabled) return;
+    try {
+      const rows = await loadBoxCalibrationSamples({
+        region: this.cfg.deploymentRegion,
+        maxAgeMs: this.cfg.paperCalibrationMaxAgeMs,
+      });
+      let restored = 0;
+      for (const row of rows) {
+        // Anything whose dimensions we no longer recognise is skipped, never coerced.
+        this.calibration.record({
+          broker: row.broker as BrokerId,
+          kind: row.kind as never,
+          profile: row.profile as never,
+          bucket: row.bucket as never,
+          stage: row.stage as CalibrationStage,
+          valueMs: row.valueMs,
+          atWall: row.atWall,
+          session: row.session,
+        });
+        restored++;
+      }
+      if (restored > 0) {
+        console.log(
+          `[Box] restored ${restored} persisted calibration observations` +
+            `${this.cfg.deploymentRegion ? ` for region ${this.cfg.deploymentRegion}` : ""}.`,
+        );
+      }
+    } catch (err) {
+      console.warn("[Box] calibration rehydration failed; starting UNCALIBRATED:", err);
+    }
+  }
+
+  /**
+   * Count residual-flatten charges against the live daily risk limit.
+   *
+   * Only the increment for THIS pass, so multi-pass flattening cannot double-count. Deliberately
+   * does NOT rewrite the attempt's historical `net_abort_pnl`: execution economics that were
+   * already recorded are never mutated after the fact — the cost is recorded as its own field and
+   * as realised P&L, which is the honest way to show a later cost against an earlier trade.
+   */
+  private noteFlattenCharges(charges: number): void {
+    if (!Number.isFinite(charges) || charges <= 0) return;
+    this.orderManager?.recordRealisedPnl(-charges);
+  }
+
   private async flattenResiduals(): Promise<void> {
     if (this.residualByAttempt.size === 0) {
       if (this.residualFlattenTimer) {
@@ -3007,8 +3110,13 @@ export class BoxEngine {
       this.metrics.recordResidualFlattenAttempt();
       try {
         const res = await this.execution.flattenResidual({ residual, keyPrefix: attemptId });
+        // THE FLATTEN IS NOT FREE. Its brokerage/taxes are a real cost of clearing residual
+        // exposure, and until now they were computed and discarded (paper) or never computed at
+        // all (live). Recorded atomically with the residual projection below, and counted against
+        // the live daily risk limit, so "residual flatten -> all actual charges" is true.
+        this.noteFlattenCharges(res.flatten_charges);
         if (res.remaining.length === 0) {
-          const acknowledged = await resolveBoxExecutionAttempt(attemptId).catch(() => false);
+          const acknowledged = await resolveBoxExecutionAttempt(attemptId, res.flatten_charges).catch(() => false);
           if (!acknowledged) {
             this.pendingResidualPersists.set(attemptId, []);
             this.execution.invariantViolation(`residual ${attemptId} flattened but durable resolution is unacknowledged`);
@@ -3023,7 +3131,11 @@ export class BoxEngine {
           // work set, so a lost acknowledgement can never replay a stale quantity.
           const sumQty = (legs: ResidualLegExposure[]): number => legs.reduce((s, r) => s + r.quantity, 0);
           const flattenedAny = sumQty(res.remaining) < sumQty(residual);
-          const acknowledged = await updateBoxExecutionAttemptResidual(attemptId, res.remaining).catch(() => false);
+          const acknowledged = await updateBoxExecutionAttemptResidual(
+            attemptId,
+            res.remaining,
+            res.flatten_charges,
+          ).catch(() => false);
           if (!acknowledged) {
             this.pendingResidualPersists.set(attemptId, res.remaining);
             this.execution.invariantViolation(`residual ${attemptId} partial flatten awaits durable projection`);
@@ -3224,6 +3336,9 @@ export class BoxEngine {
       // Recent raw timelines — the outliers an operator wants to inspect.
       recent_latency_outliers: this.brokerTiming.recentTimeline().slice(-20),
       timing_recorder: this.timingRecorder.diagnostics(),
+      // Persistence health. `lost_total` is surfaced deliberately: silent sample loss is
+      // indistinguishable from a broker that got faster.
+      calibration_persistence: this.calibrationPersistence.diagnostics(),
       // Node scheduling health, so a stall is never mistaken for broker latency.
       execution_environment: this.environmentMonitor.snapshot(),
       event_loop_attach_failure: this.environmentMonitor.attachFailure,

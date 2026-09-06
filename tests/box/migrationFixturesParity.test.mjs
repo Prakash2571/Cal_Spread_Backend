@@ -401,3 +401,32 @@ test("queue-calibration.json: reproduces the recorded realisation ratios and rec
     }
   }
 });
+
+
+test("paper-scheduler-persistence.json: durable persistence sits inside the held slot, before the POST", () => {
+  const { cases } = load("paper-scheduler-persistence.json");
+  const pick = (s) => ({
+    id: s.id,
+    dequeued_at: s.dequeued_at,
+    persisted_at: s.persisted_at,
+    post_started_at: s.post_started_at,
+    ack_at: s.ack_at,
+    persistence_wait_ms: s.persistence_wait_ms,
+    transport_wait_ms: s.transport_wait_ms,
+  });
+  for (const c of cases) {
+    const policy = createSchedulingPolicy(c.input.policy);
+    const scheduled = planPaperSchedule(c.input.operations, policy);
+    assert.deepEqual({ schedule: scheduled.map(pick) }, c.expected, c.name);
+    // Invariants asserted against the fixture data itself, so a regeneration cannot hide a break.
+    for (const s of c.expected.schedule) {
+      assert.ok(s.persistence_wait_ms >= 0, `${c.name}: persistence wait must never be negative`);
+      assert.ok(s.persisted_at >= s.dequeued_at, `${c.name}: an order cannot be sent before it is durable`);
+      assert.equal(
+        s.post_started_at - s.dequeued_at,
+        s.persistence_wait_ms + s.transport_wait_ms,
+        `${c.name}: persistence and pacing must exactly account for the gap — no overlap, no gap`,
+      );
+    }
+  }
+});

@@ -84,6 +84,17 @@ export const TIMING_STAGES = [
   "scheduler_enqueued",
   /** A concurrency slot was acquired and the operation left the queue. */
   "scheduler_dequeued",
+  /**
+   * The durable intent is safely persisted and the order may now be transmitted.
+   *
+   * This is real, unavoidable latency on the live critical path: the OrderManager writes the
+   * intent to Mongo and transitions it to SUBMITTING **before** any transport call, and both
+   * writes happen while the concurrency slot is already held. Measuring it separately matters
+   * because it was previously folded into `transport_wait_ms`, a span documented as being
+   * "purely transport pacing" — so a genuine database round trip was being reported as rate
+   * limiting.
+   */
+  "intent_persisted",
   /** The adapter began the transport call, including its pacing wait. */
   "transport_started",
   /** The HTTP request actually left the wire (after pacing). */
@@ -283,6 +294,7 @@ export class OrderTimingTrace {
 
       const enqueued = mono("scheduler_enqueued");
       const dequeued = mono("scheduler_dequeued");
+      const persisted = mono("intent_persisted");
       const transport = mono("transport_started");
       const httpStart = mono("http_request_started");
       const httpEnd = mono("http_response");
@@ -292,7 +304,12 @@ export class OrderTimingTrace {
       const cancelRequested = mono("cancel_requested");
 
       put("scheduler_wait_ms", monoSpan(enqueued, dequeued));
-      put("transport_wait_ms", monoSpan(dequeued, transport ?? httpStart));
+      // Durable persistence, measured on its own rather than hidden inside pacing.
+      put("persistence_wait_ms", monoSpan(dequeued, persisted));
+      // Pacing now genuinely means pacing: it starts from the moment the order was ALLOWED to be
+      // transmitted (i.e. after persistence), not from the moment it left the queue. Falls back to
+      // the dequeue instant when persistence was not marked, so the span is never lost.
+      put("transport_wait_ms", monoSpan(persisted ?? dequeued, transport ?? httpStart));
       put("post_to_http_response_ms", monoSpan(httpStart, httpEnd));
       put("post_to_ack_ms", monoSpan(httpStart, ack));
       put("ack_to_first_fill_ms", monoSpan(ack, firstFill));

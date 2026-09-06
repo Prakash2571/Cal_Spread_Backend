@@ -631,6 +631,15 @@ const boxExecutionAttemptSchema = new mongoose.Schema(
     legging: { type: mongoose.Schema.Types.Mixed, default: null },
     partial_entry_charges: { type: Number, default: null },
     unwind_charges: { type: Number, default: null },
+    /**
+     * Cumulative charges of RESIDUAL FLATTENING, accumulated with $inc across passes.
+     *
+     * Separate from `unwind_charges` on purpose: the unwind is the immediate reversal at abort
+     * time, whereas flattening is the later, possibly multi-pass work of clearing what the unwind
+     * could not. Overloading one field would have clobbered the abort-time figure. Previously
+     * these charges were computed and discarded (paper) or never computed at all (live).
+     */
+    flatten_charges: { type: Number, default: 0 },
     gross_abort_pnl: { type: Number, default: null },
     net_abort_pnl: { type: Number, default: null },
     // Outstanding simulated exposure this attempt could not flatten. `resolved` is
@@ -755,3 +764,59 @@ const boxSettingSchema = new mongoose.Schema<IBoxSetting>(
 
 /** Admin-controlled box thresholds (collection: "box_settings"). */
 export const BoxSetting = boxModel<IBoxSetting>("BoxSetting", boxSettingSchema);
+
+/**
+ * ONE MEASURED EXECUTION-LATENCY OBSERVATION.
+ *
+ * Exists so calibration survives a restart: without it, a restart at 09:30 throws away the
+ * morning's evidence and drops paper back to its constants, precisely when calibration is most
+ * valuable.
+ *
+ * Contains ONLY anonymised latency numbers and dimension labels — no credentials, no tokens, no
+ * instrument or position data. Rows expire automatically via a TTL index, so the collection is
+ * self-bounding and stale sessions cannot accumulate indefinitely.
+ */
+const boxCalibrationSampleSchema = new mongoose.Schema(
+  {
+    broker: { type: String, required: true },
+    kind: { type: String, required: true },
+    profile: { type: String, required: true },
+    bucket: { type: String, required: true },
+    stage: { type: String, required: true },
+    value_ms: { type: Number, required: true },
+    /** IST session key (YYYY-MM-DD), so freshness can be reasoned about per trading day. */
+    session: { type: String, required: true },
+    /** Explicitly-configured deployment region label; never auto-detected. */
+    region: { type: String, default: null },
+    observed_at: { type: Date, required: true },
+  },
+  { collection: "box_calibration_samples" },
+);
+
+// Read path: "recent samples for this region", which is exactly how the store rehydrates.
+boxCalibrationSampleSchema.index({ region: 1, observed_at: -1 }, { name: "box_calibration_region_recent" });
+// Self-bounding: 14 days is comfortably longer than the active-calibration window
+// (BOX_PAPER_CALIBRATION_MAX_AGE_MS, 3 days) so analytics keep a useful tail, while the
+// collection can never grow without limit.
+boxCalibrationSampleSchema.index(
+  { observed_at: 1 },
+  { expireAfterSeconds: 14 * 24 * 60 * 60, name: "box_calibration_ttl" },
+);
+
+export interface IBoxCalibrationSample {
+  broker: string;
+  kind: string;
+  profile: string;
+  bucket: string;
+  stage: string;
+  value_ms: number;
+  session: string;
+  region: string | null;
+  observed_at: Date;
+}
+
+/** Persisted execution-latency observations (collection: "box_calibration_samples"). */
+export const BoxCalibrationSample = boxModel<IBoxCalibrationSample>(
+  "BoxCalibrationSample",
+  boxCalibrationSampleSchema as unknown as mongoose.Schema<IBoxCalibrationSample>,
+);

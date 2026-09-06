@@ -474,6 +474,7 @@ changes the default execution mode.
 | `BOX_PAPER_CALIBRATION_MAX_AGE_MS` | `259200000` (3 days) | samples older than this are excluded from ACTIVE calibration, but retained for analytics |
 | `BOX_PAPER_CALIBRATION_TIME_BUCKETS` | `true` | enable coarse OPEN / NORMAL / CLOSE bucketing |
 | `BOX_PAPER_CANCEL_LATENCY_MS` | `150` | fallback cancel-race window when no measured CANCEL latency exists. Non-zero on purpose: zero means "cancels are instantaneous" |
+| `BOX_PAPER_PERSISTENCE_MS` | `0` | fallback durable-write delay before transmitting. Zero on purpose: unmeasured database latency is unknown, and guessing would be fabrication. The measured p50 is used once calibrated |
 | `BOX_EXECUTION_TIMING_METRICS_ENABLED` | `true` | collect live timing for calibration (fail-open) |
 | `BOX_EXECUTION_TIMING_WINDOW` | `500` | bounded ring size per timing distribution |
 | `BOX_EXECUTION_EVENT_LOOP_METRICS_ENABLED` | `true` | monitor event-loop delay and process pressure (cheap, fail-open) |
@@ -488,18 +489,36 @@ Scheduler pacing and the concurrency cap are sourced from the existing
 from `BOX_LEG_TIMEOUT_MS` (and the `BOX_LIVE_*_TIMEOUT_MS` family for the live path). The profile
 invents no separate paper timeout numbers.
 
-### Recommended validation profile
+### Recommended paper-validation configuration
+
+Places **no real orders**: the execution mode stays paper and the live double gate is left exactly
+as it is.
 
 ```
 BOX_EXECUTION_MODE=paper_legging
 BOX_PAPER_EXECUTION_PROFILE=live_parity
-BOX_PAPER_MAX_CONCURRENT_EXECUTIONS=1
 BOX_QUEUE_MODEL=haircut
 BOX_QUEUE_LIQUIDITY_HAIRCUT_PCT=30
+
+# Scheduler parity — paper must use the SAME cap and pacing as live, otherwise its
+# queueing model describes a deployment you are not running.
+BOX_PAPER_MAX_CONCURRENT_EXECUTIONS=1      # = BOX_LIVE_MAX_CONCURRENT_EXECUTIONS
+BOX_LIVE_BROKER_MIN_INTERVAL_MS=250        # shared by both schedulers
+
+# Measure, and keep what was measured across restarts.
 BOX_EXECUTION_TIMING_METRICS_ENABLED=true
 BOX_EXECUTION_EVENT_LOOP_METRICS_ENABLED=true
-BOX_DEPLOYMENT_REGION=ap-south-1
+BOX_LIVE_TIMING_PERSIST_ENABLED=true
+BOX_DEPLOYMENT_REGION=ap-south-1           # a LABEL; samples never cross regions
 ```
+
+`BOX_LIVE_TIMING_PERSIST_ENABLED=true` is what makes calibration survive a restart: observations
+are batched into `box_calibration_samples` (TTL-bounded, region-scoped, latency numbers only) and
+rehydrated on start.
+
+**Do NOT set `BOX_EXECUTION_MODE=live` or `BOX_LIVE_TRADING_ENABLED=true` as part of validation.**
+Enabling live trading is a separate, deliberate decision, and nothing in this work changes either
+flag or weakens the double gate.
 
 With no measured samples yet the calibration status is `UNCALIBRATED`, paper uses the documented
 constants, and every report says `measured: no` and `confidence: LOW`. It never pretends a
@@ -540,21 +559,38 @@ claim, and a claim needs evidence.
   is the optimistic assumption.
 - **Uncalibrated ACK→terminal** → 40 % of the single constant, so an uncalibrated run still
   separates "reaching the exchange" from "working at the exchange" instead of collapsing both.
+- **Durable-persistence delay** → the measured `persistence_wait_ms` p50 when calibrated, else
+  `BOX_PAPER_PERSISTENCE_MS` (default **0**). Zero is deliberate and it makes paper *optimistic*
+  on this stage: the live path really does pay two Mongo round trips inside the held concurrency
+  slot before it may transmit, but until that has been observed we do not know its size, and a
+  guessed database latency would be a fabrication. `calibrationStatus()` reports
+  `persistence_window_measured` so the difference is visible rather than assumed.
 
 ### What is NOT simulated, and will not be
 
-Absolute physical exchange parity is impossible, and pretending otherwise would be the most
-damaging thing this code could do. None of the following is available from a retail broker API
-plus level-2 depth, so none of it is fabricated:
+**THIS IS NOT AN EXACT EXCHANGE SIMULATOR, and it must never be described as one.** It is a
+deterministic digital twin of the *observable* execution path. Absolute physical exchange parity
+is impossible, and pretending otherwise would be the most damaging thing this code could do.
 
-- true NSE order-level queue position, or our place in it;
-- hidden, iceberg or reserve quantity;
-- the matching engine's exact sequence, or microsecond-level ordering;
-- other participants' orders, intentions, or the reason a level disappeared;
+`live_parity` explicitly **cannot reconstruct**:
+
+- **true NSE queue position** of our order — level-2 depth aggregates quantity per price and
+  reveals nothing about our place in the queue at that price;
+- **hidden or iceberg liquidity** — by definition not displayed;
+- **matching-engine ordering** — the exact sequence in which the exchange matches;
+- **another participant's future order** — including the one that is about to take the liquidity
+  we were relying on;
+- **exact market impact** of our own order.
+
+Nor does it fabricate:
+
 - price movement that never appeared on the feed;
-- market impact of our own order as a price model;
+- broker OMS/RMS acceptance quirks;
 - random slippage, random rejects, or random latency jitter — anywhere, under any profile called
   parity.
+
+Where a stage has not been measured, paper uses a documented constant and says
+`measured: false` / `confidence: LOW`. It never presents a constant as an observation.
 
 ### How to read a parity report
 

@@ -655,6 +655,54 @@ fixture(
   })(),
 );
 
+/* 10 ─ durable-persistence delay in the scheduler --------------------------- */
+
+fixture(
+  "paper-scheduler-persistence.json",
+  "planPaperSchedule (persistenceMs)",
+  "Durable persistence happens INSIDE the held concurrency slot, before the POST — mirroring the live manager, which writes the intent and transitions it to SUBMITTING before calling the adapter. Omitted/invalid values contribute 0 rather than being invented or poisoning the timeline.",
+  (() => {
+    const policy = createSchedulingPolicy({ maxConcurrentOperations: 1, minBrokerIntervalMs: 0 });
+    const paced = createSchedulingPolicy({ maxConcurrentOperations: 2, minBrokerIntervalMs: 200 });
+    const op = (over = {}) => ({
+      id: "0",
+      purpose: "ENTRY",
+      sequence: 0,
+      readyAt: 1000,
+      postToAckMs: 100,
+      ackToTerminalMs: 50,
+      ...over,
+    });
+    const pick = (s) => ({
+      id: s.id,
+      dequeued_at: s.dequeued_at,
+      persisted_at: s.persisted_at,
+      post_started_at: s.post_started_at,
+      ack_at: s.ack_at,
+      persistence_wait_ms: s.persistence_wait_ms,
+      transport_wait_ms: s.transport_wait_ms,
+    });
+    const cases = [];
+    for (const [name, ops, pol] of [
+      ["no persistence supplied models zero", [op()], policy],
+      ["a measured persistence delays the POST", [op({ persistenceMs: 35 })], policy],
+      ["invalid persistence contributes zero", [op({ persistenceMs: -100 })], policy],
+      [
+        "persistence and pacing are sequential, never overlapping",
+        [op({ id: "a", sequence: 0, persistenceMs: 35 }), op({ id: "b", sequence: 1, persistenceMs: 35 })],
+        paced,
+      ],
+    ]) {
+      cases.push({
+        name,
+        input: { operations: ops, policy: { maxConcurrentOperations: pol.maxConcurrentOperations, minBrokerIntervalMs: pol.minBrokerIntervalMs } },
+        expected: { schedule: planPaperSchedule(ops, pol).map(pick) },
+      });
+    }
+    return cases;
+  })(),
+);
+
 mkdirSync(OUT_DIR, { recursive: true });
 let total = 0;
 for (const { file, body } of files) {

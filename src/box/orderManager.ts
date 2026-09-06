@@ -736,6 +736,11 @@ export class BoxOrderManager {
         return;
       }
       intent = await this.transition(intent, "SUBMITTING", null, "transport submission starting");
+      // DURABLE PERSISTENCE COMPLETE. Both Mongo writes are done and the order may now be
+      // transmitted, so this closes `persistence_wait_ms` and opens `transport_wait_ms`. Recorded
+      // here rather than being left inside the pacing span, because a database round trip reported
+      // as rate limiting is exactly the kind of mislabelled measurement that corrupts calibration.
+      this.markTiming(intent.client_order_id, "intent_persisted");
 
       let order: BrokerOrder;
       try {

@@ -58,6 +58,14 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     allocateTradeId?: () => string;
     isTokenWarm?: (token: number) => boolean;
     now?: () => number;
+    /**
+     * Total charges (₹) for a set of orders, from the LOCAL fee calculator.
+     *
+     * Needed so LIVE residual flattening bills its own brokerage/taxes. Previously the live branch
+     * returned a hard `flatten_charges: 0`, which meant the fees on real EMERGENCY_RESIDUAL orders
+     * were never even estimated — a genuine cost silently absent from the trade's accounting.
+     */
+    chargeTotal?: (orders: { side: OrderSide; tradingsymbol: string; quantity: number; price: number }[]) => number;
   }) {
     this.mode = deps.cfg.executionMode;
   }
@@ -245,9 +253,22 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       flattened[residual.role] = quantity;
       if (quantity < residual.quantity) remaining.push({ ...residual, quantity: residual.quantity - quantity });
     }
+    // Bill the flatten. Only FILLED quantity is chargeable, and only at the price the broker
+    // actually reported — an unfilled residual order costs nothing, and an order with no average
+    // price gives us nothing to charge against, so it is excluded rather than guessed at.
+    const chargeable = orders
+      .filter((order) => order.filled_quantity > 0 && order.average_price !== null)
+      .map((order) => ({
+        side: order.side,
+        tradingsymbol: order.tradingsymbol,
+        quantity: order.filled_quantity,
+        price: order.average_price as number,
+      }));
+    const flattenCharges = chargeable.length > 0 ? round2(this.deps.chargeTotal?.(chargeable) ?? 0) : 0;
+
     return {
       flattened_by_role: flattened,
-      flatten_charges: 0,
+      flatten_charges: flattenCharges,
       remaining,
       legs: orders.map((order) => paperLeg(order)),
     };

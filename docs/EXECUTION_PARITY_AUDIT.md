@@ -212,3 +212,282 @@ Because the data to support them does not exist:
 - A market-impact price model. Size-vs-depth ratios are *exposed*; impact is not invented.
 - Random broker rejects or random slippage in `live_parity`. Recorded rejects can be
   replayed; a stress profile may inject them, and that profile is never called live parity.
+
+
+---
+---
+
+# PART 2 — Post-implementation audit
+
+Everything above was written *before* any code changed. This part is the audit performed *after*,
+answering each required question from the code as it now stands. Where the honest answer is "no",
+it says no.
+
+## 1. Files changed
+
+**New modules (16)**
+
+| File | Purpose |
+| --- | --- |
+| `src/box/executionClock.ts` | monotonic clock for durations, wall clock for audit |
+| `src/box/orderLifecycle.ts` | 15-stage observable vocabulary + `CumulativeFillLedger` |
+| `src/box/executionEnvironment.ts` | event-loop delay + process pressure |
+| `src/box/executionCalibration.ts` | dimensioned rolling distributions + fallback ladder |
+| `src/box/calibratedLatencySource.ts` | paper's measured-latency source + honesty contract |
+| `src/box/executionTiming.ts` | per-order stage recorder, fail-open |
+| `src/box/queueCalibration.ts` | realisation-ratio measurement + advisory haircut |
+| `src/box/executionShortfall.ts` | shortfall attribution + adverse selection |
+| `src/box/pairedComparison.ts` | paired live-vs-paper error distributions |
+| `src/box/executionOutcomes.ts` | measured outcome + reject-family rates |
+| `src/box/calibrationPersistence.ts` | bounded async persistence buffer |
+| `src/box/shadowMode.ts` | shadow guard |
+| `src/box/stressProfile.ts` | fault-injection profile, structurally isolated |
+| `docs/EXECUTION_PARITY_AUDIT.md` | this document |
+| 9 new test suites | see §13 |
+| 8 new golden-fixture files | see §13 |
+
+**Modified (19):** `types.ts`, `legExecutor.ts`, `executionSimulator.ts`, `paperScheduler.ts`,
+`orderPricing.ts`, `latencyModel.ts`, `brokerAdapter.ts`, `executionGateway.ts`, `orderManager.ts`,
+`kiteBrokerAdapter.ts`, `dhanBrokerAdapter.ts`, `brokerContext.ts`, `engine.ts`, `config.ts`,
+`model.ts`, `repository.ts`, `routes.ts`, `boundedCache.ts`, `brokers/registry.ts`,
+`brokers/zerodha/liveAdapter.ts`.
+
+**Untouched, deliberately:** `math.ts`, `scanner.ts`, `charges.ts`, `localCharges.ts`,
+`positions.ts`, `positionMonitor.ts`, and every frontend file. Strategy mathematics, thresholds,
+direction logic, option selection, expiry logic and fee semantics are unchanged, proven by the
+pre-existing golden fixtures still passing byte-for-byte.
+
+## 2. Execution lifecycle, before vs after
+
+| Stage | Before | After |
+| --- | --- | --- |
+| detection → decision | unmeasured | `detected` / `qualified` marks available |
+| durable persistence | happened, unmeasured, modelled as 0 in paper | **`intent_persisted` measured**; paper models the measured p50, else 0 and says so |
+| scheduler wait | live only | measured `scheduler_wait_ms`; paper reproduces from the shared policy |
+| transport pacing | conflated with persistence | `transport_wait_ms` now genuinely pacing |
+| HTTP submission | Kite quarantined all ambiguity | Kite adopts by tag when uniquely identified; still never re-POSTs |
+| broker ACK | set, never timestamped | `broker_order_id` + `acknowledged` marks; `ack_at` in paper |
+| exchange-working | live only | see §7 — **partially** distinct |
+| partial fills | live cumulative; paper book-walk | unchanged, now both funnelled through an idempotent ledger |
+| cancel/fill race | live respected; **paper not modelled** | **paper models it**; 52/23 pinned by test + fixture |
+| four-leg completion / unwind | unchanged | unchanged |
+| residual flatten | charges discarded (paper) / never computed (live) | **billed, persisted via `$inc`, counted against daily risk** |
+| all actual charges | flatten missing | flatten included as its own `flatten_charges` field |
+| final P&L | flatten cost absent | flatten cost recorded; historical `net_abort_pnl` deliberately not rewritten |
+
+## 3. What new measurements are REAL
+
+Genuinely measured from live operations, monotonic, per broker / kind / profile / time bucket:
+`scheduler_wait_ms`, `persistence_wait_ms`, `transport_wait_ms`, `post_to_http_response_ms`,
+`post_to_ack_ms`, `ack_to_first_fill_ms`, `ack_to_terminal_ms`, `partial_to_terminal_ms`,
+`cancel_request_to_terminal_ms`; event-loop p50/p95/p99 and stall events; CPU/memory; reject
+families from real refusals; outcome rates; queue realisation ratio; size vs visible depth.
+
+## 4. What still uses a fallback
+
+| Stage | Fallback | Reported as |
+| --- | --- | --- |
+| POST→ACK | `BOX_SIMULATED_LATENCY_MS` (250) | `measured: false`, `confidence: LOW` |
+| ACK→terminal | 40 % of that constant | `measured: false` |
+| cancel window | `BOX_PAPER_CANCEL_LATENCY_MS` (150) | `cancel_window_measured: false` |
+| **durable persistence** | `BOX_PAPER_PERSISTENCE_MS` (**0**) | `persistence_window_measured: false` |
+| queue share | 30 % haircut | advisory recommendation only |
+
+The persistence fallback of 0 makes paper **optimistic** on that stage. That is a deliberate
+choice over guessing, and it is surfaced rather than hidden.
+
+## 5. What remains fundamentally unknowable
+
+`live_parity` cannot reconstruct, and never fabricates:
+
+- **true NSE queue position** of our order;
+- **hidden or iceberg liquidity**;
+- **matching-engine ordering**;
+- **another participant's future order**;
+- **exact market impact** of our own order.
+
+**This is not an exact exchange simulator.** It is a deterministic digital twin of the observable
+execution path.
+
+## 6. Do live and paper share the same scheduler semantics?
+
+**Largely yes — one shared policy module, with four documented divergences.**
+
+Shared: `executionSchedulingPolicy.ts` defines `BOX_ORDER_PRIORITY`, `compareScheduling`, the cap
+and `minBrokerIntervalMs`. Live's `sortQueue` and paper's `planPaperSchedule` both consume it. Both
+hold a concurrency slot for the **whole order lifecycle**.
+
+Divergences:
+
+1. **Poll traffic is not modelled.** Live pays the shared throttle for every status poll of every
+   working order; paper debits the wire once, for the POST. With a cap above 1, paper
+   under-estimates POST delay. Dhan is worse: it polls the order *and* the trade book, so two paced
+   calls per poll versus Kite's one.
+2. **Paper plans per run, live queues globally.** All four legs share one purpose and one
+   `readyAt`, so priority never actually reorders anything intra-run; real cross-pipeline
+   pre-emption (an EXIT jumping a queued ENTRY from another candidate) is live-only.
+3. **Live re-validates at dequeue** (`queuedActionBlockReason`) and can reject an already-queued
+   order; paper has no such outcome.
+4. **Different cap knobs** (`liveMaxConcurrentExecutions` vs `paperMaxConcurrentExecutions`); they
+   match only if configured to, which is why the recommended configuration sets both.
+
+## 7. Are broker ACK and exchange-working now distinct?
+
+**Live: yes. Paper: only partially — and this is the largest remaining honest gap.**
+
+- Kite distinguishes `ACKNOWLEDGED` from `OPEN` and applies **three** deadlines: `ackTimeoutMs`,
+  `workingTimeoutMs`, `partialTimeoutMs`. Dhan does the same, plus a `maxPolls` budget.
+- Paper records `ack_at` as its own timestamp, and `BROKER_ACCEPTED` / `WORKING` exist in the
+  observable vocabulary — but the leg executor still treats ACK and working as **the same instant**
+  and has **one** deadline (`legTimeoutMs`). `PaperLegStatus.ACKNOWLEDGED` is declared and never
+  assigned by the executor.
+
+Paper therefore cannot express "acknowledged but never reached the exchange", and gives a partial
+fill no separate, shorter clock. The ACK≠fill *rule* is fully enforced (no stage proves execution;
+quantity is the only evidence); the ACK-vs-working *two-state model* is not.
+
+## 8. Is persistence latency represented?
+
+**Now yes, on both sides — where before it was neither measured nor modelled.** Measured as
+`persistence_wait_ms` (`intent_persisted` mark), removed from `transport_wait_ms` so pacing means
+pacing, and modelled by paper via `persistenceMs` — the measured p50 when available, else 0.
+
+## 9. Are ZERODHA live order updates consumed?
+
+**No.** Kite's WebSocket text frames — which carry order postbacks — are explicitly discarded in
+`src/ticker.ts` ("Text frames are postbacks (order updates / error messages) — ignore"), and
+`ConnectOptions` has no order callback. There is no Kite HTTP postback route. Fills are discovered
+**exclusively by REST polling** (`waitForResolution` → `refresh`, paced at
+`BOX_LIVE_BROKER_MIN_INTERVAL_MS`, default 250 ms) with the 60-second reconciler as the safety net.
+
+## 10. Are DHAN live order updates consumed?
+
+**No.** `POST /api/dhan/postback` exists but is **deliberately inert**: it validates shape, logs,
+returns 200, and mutates nothing — trusting an unauthenticated webhook to move a live order's state
+would be a second state machine and a security hole. Dhan's order-update socket is not implemented;
+`feed.ts` drops non-binary frames. Fills come from REST polling plus trade-book reads.
+
+**Consequence, stated plainly:** the idempotent ingestion primitive (`CumulativeFillLedger`, with
+`order_update` and `postback` as declared sources) is built, wired and tested, but **only
+`rest_poll` is ever emitted**. The fast path is prepared, not connected. Worst-case fill-discovery
+latency remains ~one poll interval.
+
+## 11. Do recovery charges include residual flattening?
+
+**Now yes — before, no.** Paper computed `flatten_charges` and every caller discarded it; live
+returned a hard `0`, so fees on real `EMERGENCY_RESIDUAL` orders were never even estimated; no Mongo
+field existed and nothing reached P&L.
+
+Now: live bills the flatten from orders that actually filled at the price the broker reported;
+charges accumulate onto a new `flatten_charges` attempt field with `$inc`, applied in the *same*
+update as the residual projection (atomic, retry-safe); and they count against the live daily risk
+limit. The attempt's historical `net_abort_pnl` is **not** retroactively rewritten — already-recorded
+execution economics are not mutated after the fact.
+
+## 12. Remaining differences: paper `live_parity` vs live
+
+### vs live ZERODHA
+
+1. No durable-intent layer in paper: no `CREATED`/`SUBMITTING`, no audit journal, no restart
+   adoption, no "existing intent" branch.
+2. Submission cannot fail: no 4xx/5xx/429, no timeout, no ambiguity, no `RECONCILIATION_REQUIRED`,
+   no `UNKNOWN`, no kill-switch refusal.
+3. One deadline vs three (§7).
+4. No poll model, so no poll pacing and no poll-driven state discovery.
+5. No `modifyOrder` / price chase; `liveMaxModifications` has no paper counterpart. (Note: no
+   production code calls `modifyOrder` on either adapter, so this is an unexercised live capability,
+   not an active divergence.)
+6. No broker reject families; paper's `reject` is snapshot tradability, not a broker verdict.
+7. Paper's cancel always confirms; Kite's can fail, time out, and end in a thrown ambiguous error.
+8. No overfill possibility in paper — its `fill_qty` is its own construction and nothing can
+   contradict it. Live has a ledger that trips the breaker on overfill.
+9. Paper has no reconciliation, orphan detection, or foreign-order concept.
+10. Paper-only, with no live counterpart: depth walking with per-level slice provenance, the shared
+    liquidity ledger, quote-staleness gating, sequential leg mode, mid-flight abort predicates, and
+    `raced_fill_qty` quantification.
+
+### vs live DHAN
+
+All of the above, plus Dhan-specific behaviour paper's single code path cannot represent:
+
+11. **Static-IP gate** — a per-mutation, fail-closed refusal with no Kite equivalent.
+12. Instrument identity resolution (`token → {segment, securityId}`) that can fail pre-transport.
+13. Correlation-id reconciliation via a **direct lookup**, versus Kite's order-book walk with a
+    uniqueness-and-attributes check.
+14. **Trade-book fills** with real per-trade exchange ids, versus Kite's single synthetic aggregate
+    whose `fill_id` mutates — which changes ledger dedupe granularity per broker.
+15. Two paced calls per poll (order + trades) versus Kite's one.
+16. `maxPolls` / `maxConfirmPolls` iteration budgets as a second, non-wall-clock exit.
+17. An unconfirmed cancel **returns** a quarantined order (no `unknownOrders++`) where Kite
+    **throws** — the same physical situation, different live accounting.
+18. Read-failure conservatism: keep the last known projection versus Kite's `UNKNOWN`.
+19. Reject classification from a stable `omsErrorCode` versus Kite's free-text matching.
+20. `Date.now()` + module `sleep` (not clock-injectable) and IST-naive timestamp parsing.
+21. `MARGIN` product versus Kite's `NRML`.
+
+## 13. Test results
+
+- **839 tests, 836 passing, 3 failing.** The 3 failures are **environment-only**: they import
+  `src/db.js`, which requires the real `mongoose`, unavailable in this offline sandbox. CI, with real
+  dependencies, passes all of them. Baseline before this work: 652 passing.
+- All 20 required cases are individually labelled and greppable (`grep -rn "REQUIRED " tests/`).
+- Golden fixtures: **71 cases across 14 files**, all generated from the implementation.
+- No test was deleted, skipped or weakened. A guard test asserts the twenty most-exposed
+  pre-existing suites still exist and still assert.
+
+## 14. TypeScript build
+
+`npm run typecheck`, `npm run build` and the build step inside `npm test` all pass with **zero
+errors**. CI (`Typecheck + Box tests`) is green with the real dependency tree, which also confirms
+no error was masked by the offline type stubs used locally.
+
+## 15. Migration impact
+
+- **Mongo:** one new collection `box_calibration_samples` (TTL-bounded, 14 days) and one new
+  optional field `flatten_charges` on execution attempts (defaults to 0). **No migration required**
+  — both are additive, and no existing field's meaning or type changed.
+- **Durable state machine:** `BoxOrderIntentState` and `INTENT_STATE_PREDECESSORS` are
+  **unchanged**. The richer 15-stage vocabulary is a separate observational layer mapped onto them,
+  chosen specifically to avoid a migration.
+- **Config:** 11 new variables, all defaulting to current behaviour. No existing default changed.
+- **Public API / frontend:** unchanged, plus one additive read-only endpoint
+  (`GET /api/box/execution-diagnostics`).
+- **Go/Rust port:** 8 new fixture files pin the new semantics; `ScheduledOperation` gains
+  `persisted_at` and `persistence_wait_ms`.
+
+## 16. Latency / performance regressions discovered
+
+None. Measured on the hot path:
+
+| Operation | Cost |
+| --- | --- |
+| `calibration.record()` | 0.56 µs/op |
+| `timing.mark()` enabled | 0.18 µs/op |
+| `timing.mark()` disabled | 0.017 µs/op |
+
+No new module performs I/O, awaits, or touches Mongo/Redis/the network on the order path
+(`calibrationPersistence` is the sole `await`, by design, off the hot path). Every structure is
+bounded: ring buffers, TTL caches, fixed-key maps. Persistence is batched and `unref()`ed; a full
+buffer drops oldest and counts the loss rather than growing.
+
+One **pre-existing** risk was found and is documented rather than silently absorbed: the two
+pre-submit Mongo writes sit inside the held concurrency slot, so with `maxConcurrentExecutions = 1`
+database latency directly delays the next leg. It is now measured, so it can be seen.
+
+## 17. Honest summary
+
+The core goal was the closest defensible deterministic digital twin buildable from observable
+retail-API data. Against that:
+
+- **Achieved:** ACK is never mistaken for a fill; the cancel/fill race is modelled with measured
+  windows and pinned by the brief's own 52/23 arithmetic; latency is measured per broker and fed
+  back so the twin improves by itself; the scheduler is one shared policy; residual flattening is
+  finally billed; every figure carries its evidence and refuses to overstate it.
+- **Partial:** ACK-vs-exchange-working is two states live but one instant in paper; poll traffic is
+  unmodelled; paper's scheduler plans per run rather than globally.
+- **Not done, and prepared rather than pretended:** broker order-update ingestion for either broker.
+  The idempotent primitive exists and is tested; nothing emits into it. Fills are still discovered
+  by REST polling.
+
+Nothing in this work enables live trading, changes the default execution mode, or weakens the
+double gate.
