@@ -127,6 +127,19 @@ export interface SwitchHooks {
   /** Re-publish state to every SSE client. */
   publish: () => void;
   /**
+   * Drop this process's contract reservations.
+   *
+   * Reservation keys are broker-namespaced (`ZERODHA:NFO:...` vs `DHAN:...`), so a
+   * surviving reservation from the outgoing broker is meaningless under the new one and
+   * would only block a legitimate execution until its TTL expired. Awaited, because the
+   * durable tier is a database write, and it must complete before the new broker's feed
+   * starts producing candidates.
+   *
+   * It clears only what THIS process owns. A sibling worker's live reservations are
+   * authoritative and must survive.
+   */
+  clearInstrumentReservations?: () => Promise<void>;
+  /**
    * Invalidate every stored browser market-data subscription session.
    *
    * A session holds a token list in the PREVIOUS broker's namespace. Left in place, a
@@ -493,8 +506,18 @@ export class ActiveBrokerManager {
    */
   async restore(): Promise<void> {
     const saved = await loadActiveBroker().catch(() => null);
-    if (saved && (BROKER_IDS as readonly string[]).includes(saved)) {
-      this.active = saved as BrokerId;
+    if (saved && (BROKER_IDS as readonly string[]).includes(saved.broker)) {
+      this.active = saved.broker as BrokerId;
+    }
+    // ADOPT THE PERSISTED GENERATION, do not restart the count.
+    //
+    // Durable instrument reservations are stamped with the generation and refuse to
+    // execute when it no longer matches. If this counter went back to 1 on every boot,
+    // a reservation left behind by the previous process would be indistinguishable from
+    // one taken under the current world — the exact stale-worker confusion the stamp is
+    // there to prevent.
+    if (saved && saved.generation > this.gen) {
+      this.gen = saved.generation;
     }
     // Rehydrate a still-valid Dhan session so a restart does not force a re-login.
     const session = await loadDhanSession().catch(() => null);
@@ -1554,17 +1577,39 @@ export class ActiveBrokerManager {
       this.instrumentProvider.invalidate();
       this.lastTickAt = null;
       hooks?.invalidateBooks();
+      // Contract reservations are broker-namespaced, so they die here too — alongside
+      // the books, and for the same reason. Awaited: the durable tier is a database
+      // write and must land before the new broker's feed can produce a candidate.
+      // A failure is logged and tolerated; the reservations then lapse by TTL instead.
+      if (hooks?.clearInstrumentReservations) {
+        try {
+          await hooks.clearInstrumentReservations();
+          console.log("[Broker] contract reservations cleared");
+        } catch (err) {
+          console.warn("[Broker] failed to clear contract reservations (they will expire by TTL):", err);
+        }
+      }
       console.log(`[Broker] quote generation ${this.gen} invalidated`);
 
       // 6. THE SWITCH. Nothing before this could touch the new broker, and nothing
       //    after it can touch the old one. The generation bump makes every surviving
       //    reference to an old book identifiable as stale.
+      //
+      //    Advance the DURABLE generation FIRST, then adopt broker and generation
+      //    TOGETHER. Assigning `this.active` before awaiting the persist would leave a
+      //    window in which a durable reservation could be stamped with the new broker and
+      //    the OLD generation — a pair that never legitimately existed, and therefore one
+      //    that no later verification could interpret correctly.
+      const persisted = await saveActiveBroker(target, actor).catch((err) => {
+        console.warn("[Broker] failed to persist the active broker:", err);
+        return null;
+      });
+      // If persistence is unavailable the counter must still move, or a reservation taken
+      // before the switch would verify as current.
+      const nextGen = persisted !== null ? Math.max(this.gen + 1, persisted.generation) : this.gen + 1;
       this.active = target;
-      this.gen += 1;
+      this.gen = nextGen;
       console.log(`[Broker] active=${target} generation=${this.gen}`);
-      await saveActiveBroker(target, actor).catch((err) =>
-        console.warn("[Broker] failed to persist the active broker:", err),
-      );
 
       // 7. load the NEW broker's universe BEFORE anything can ask for a token in it
       try {

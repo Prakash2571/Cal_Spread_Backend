@@ -252,6 +252,57 @@ export interface BoxConfig {
    */
   reservationRequireDurable: boolean;
   /**
+   * Build the DURABLE cross-process reservation tier at all.
+   *
+   * On by default. The in-process store is only authoritative for a single process,
+   * and the moment there are two — PM2 cluster mode, a second worker, another EC2
+   * instance, a Kubernetes replica — both see the same contract as free and both
+   * submit. Mongo is already mandatory for the Box module, so this adds no new
+   * operational dependency; it puts the exclusion where every worker can see it.
+   *
+   * Turning it off restores single-process-only protection.
+   */
+  durableReservationsEnabled: boolean;
+  /**
+   * How often a held reservation is renewed, in ms.
+   *
+   * A bounded timer derived from the TTL, NOT one renewal per market tick — that would
+   * put thousands of writes a minute on the authority to achieve nothing. Defaults to
+   * a third of `instrumentLockTtlMs`, so two consecutive renewals may fail before the
+   * lease is genuinely at risk.
+   */
+  reservationRenewIntervalMs: number;
+  /**
+   * Clock-skew grace for durable expiry decisions, in ms.
+   *
+   * Creates a deliberately ASYMMETRIC dead band: the holder stops claiming ownership
+   * `grace` BEFORE its lease expires, and a challenger may only reclaim a lease
+   * `grace` AFTER it expired. Handing a contract to nobody for 2×grace is a missed
+   * opportunity; handing it to two workers is a naked position.
+   */
+  reservationClockSkewGraceMs: number;
+  /**
+   * How long a reservation held over an UNRESOLVED broker state keeps being renewed.
+   *
+   * Unbounded renewal would lock a contract forever on one ambiguous outcome; no
+   * renewal would drop protection while real exposure may still exist. So protection
+   * is maintained for this long and then left to lapse by TTL — never actively
+   * released, because releasing is the "assume there is no exposure" mistake. Residual
+   * flattening is not gated by any of this and remains available throughout.
+   */
+  reservationUncertainHoldMaxMs: number;
+  /**
+   * How far AHEAD of its lease expiry an execution stops opening further legs, in ms.
+   *
+   * Deliberately separate from `reservationClockSkewGraceMs`, which is sized for clock
+   * measurement error and says nothing about broker latency. A leg permitted 300 ms
+   * before expiry, whose order takes a second to reach the exchange, can still be working
+   * when another worker legitimately owns the contract — and no broker accepts a fencing
+   * token that would let it reject the stale order. So this must exceed worst-case submit
+   * latency, not clock error.
+   */
+  reservationOwnershipMarginMs: number;
+  /**
    * Net two boxes that want opposite sides of the same contract against each other.
    *
    * MUST stay false until the ledger can represent virtual ownership of both boxes
@@ -818,7 +869,38 @@ export function loadBoxConfig(): BoxConfig {
     instrumentLockTtlMs: clampInt("BOX_INSTRUMENT_LOCK_TTL_MS", 5_000, 250, 60_000),
     maxConcurrentPerUnderlying: clampInt("BOX_MAX_CONCURRENT_PER_UNDERLYING", 2, 0, 16),
     conflictRevalidateMinEdgeRatio: num("BOX_CONFLICT_REVALIDATE_MIN_EDGE_RATIO", 0.8),
+    // Default FALSE, preserving today's single-process semantics exactly. Multi-worker
+    // deployments (PM2 cluster mode, several replicas) must set it true so live
+    // execution fails CLOSED rather than silently losing conflict protection.
     reservationRequireDurable: bool("BOX_RESERVATION_REQUIRE_DURABLE", false),
+    // Default TRUE: the durable tier is additive protection over a database that is
+    // already mandatory here, and running without it is only correct for exactly one
+    // process. When it cannot be reached, live ENTRY fails closed and paper degrades to
+    // an explicitly-labelled local_only mode.
+    durableReservationsEnabled: bool("BOX_DURABLE_RESERVATIONS_ENABLED", true),
+    // A third of the lock TTL, clamped. Two renewals may fail before the lease is
+    // genuinely at risk, and it is nowhere near per-tick.
+    reservationRenewIntervalMs: clampInt(
+      "BOX_RESERVATION_RENEW_INTERVAL_MS",
+      Math.max(250, Math.floor(clampInt("BOX_INSTRUMENT_LOCK_TTL_MS", 5_000, 250, 60_000) / 3)),
+      100,
+      30_000,
+    ),
+    // 250ms covers a healthy NTP-synced fleet plus a Mongo round trip several times
+    // over, while costing at most half a second of contract idleness on a handover.
+    reservationClockSkewGraceMs: clampInt("BOX_RESERVATION_CLOCK_SKEW_GRACE_MS", 250, 0, 5_000),
+    // 60s — twelve default TTLs. Long enough for reconciliation to resolve an ambiguous
+    // terminal state, short enough that one bad outcome cannot lock a strike all day.
+    reservationUncertainHoldMaxMs: clampInt("BOX_RESERVATION_UNCERTAIN_HOLD_MAX_MS", 60_000, 1_000, 600_000),
+    // Defaults to the order-wait budget (BOX_EXECUTION_MAX_WAIT_MS, 1500ms): if an order
+    // can legitimately be working that long, ownership must be certain for at least that
+    // long before another leg is permitted.
+    reservationOwnershipMarginMs: clampInt(
+      "BOX_RESERVATION_OWNERSHIP_MARGIN_MS",
+      Math.max(250, Math.round(num("BOX_EXECUTION_MAX_WAIT_MS", 1500))),
+      0,
+      30_000,
+    ),
     internalNettingEnabled: bool("BOX_INTERNAL_NETTING_ENABLED", false),
 
     // Paper live-parity profile. All default to preserving today's behaviour: the

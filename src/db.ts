@@ -680,6 +680,19 @@ export interface IActiveBroker {
   broker: string; // BrokerId; validated on read, never trusted blindly
   selected_at: Date;
   selected_by: string;
+  /**
+   * MONOTONIC broker generation. Incremented on every switch, never reset.
+   *
+   * WHY IT HAD TO BECOME DURABLE. The generation used to live only in
+   * `ActiveBrokerManager`, initialised to 1 at construction. That is fine as a cache
+   * key, and wrong as an identity: after a restart the counter goes back to 1, so
+   * generation 1 could mean "Zerodha before the first switch today" or "Dhan after two
+   * restarts". Durable instrument reservations are STAMPED with the generation and
+   * refuse to execute when it no longer matches, and that check is only meaningful if
+   * the number never repeats for a different state of the world. `$inc` on this field
+   * is what guarantees that across restarts and across workers.
+   */
+  generation: number;
 }
 
 const activeBrokerSchema = new mongoose.Schema<IActiveBroker>(
@@ -688,25 +701,56 @@ const activeBrokerSchema = new mongoose.Schema<IActiveBroker>(
     broker: { type: String, required: true },
     selected_at: { type: Date, default: () => new Date() },
     selected_by: { type: String, default: "admin" },
+    /**
+     * NO SCHEMA DEFAULT, deliberately.
+     *
+     * `saveActiveBroker` advances this with `$inc` on an upsert. Mongoose applies schema
+     * defaults on insert via `$setOnInsert`, and `$setOnInsert` plus `$inc` on the SAME
+     * path is a conflicting update that MongoDB rejects outright — which would break
+     * broker switching entirely. `$inc` on a missing field sets it to the increment, so a
+     * fresh document gets `1` anyway, and `loadActiveBroker` treats a missing or
+     * non-finite value as `1` for documents written before this field existed.
+     */
+    generation: { type: Number },
   },
   { collection: "active_broker" },
 );
 
 export const ActiveBrokerDoc = mongoose.model<IActiveBroker>("ActiveBroker", activeBrokerSchema);
 
-export async function saveActiveBroker(broker: string, selectedBy: string): Promise<void> {
-  if (!isDbEnabled()) return;
-  await ActiveBrokerDoc.updateOne(
+/**
+ * Persist a broker selection AND advance the generation, atomically.
+ *
+ * Returns the NEW generation so the caller adopts exactly the number that was stored
+ * rather than its own guess. `$inc` and `$set` in one update means two workers
+ * switching concurrently cannot land on the same generation.
+ */
+export async function saveActiveBroker(
+  broker: string,
+  selectedBy: string,
+): Promise<{ generation: number } | null> {
+  if (!isDbEnabled()) return null;
+  const doc = await ActiveBrokerDoc.findOneAndUpdate(
     { _id: "current" },
-    { $set: { _id: "current", broker, selected_by: selectedBy, selected_at: new Date() } },
-    { upsert: true },
-  );
+    {
+      // `_id` is NOT in `$set`: it is immutable, and on an upsert MongoDB takes it from
+      // the filter. Setting it explicitly only invites an immutable-field error.
+      $set: { broker, selected_by: selectedBy, selected_at: new Date() },
+      $inc: { generation: 1 },
+    },
+    { upsert: true, returnDocument: "after" },
+  ).lean<IActiveBroker>();
+  const generation = doc?.generation;
+  return typeof generation === "number" && Number.isFinite(generation) ? { generation } : null;
 }
 
-export async function loadActiveBroker(): Promise<string | null> {
+/** The persisted broker selection and its generation, or null when unavailable. */
+export async function loadActiveBroker(): Promise<{ broker: string; generation: number } | null> {
   if (!isDbEnabled()) return null;
   const doc = await ActiveBrokerDoc.findById("current").lean<IActiveBroker>();
-  return doc?.broker ?? null;
+  if (!doc?.broker) return null;
+  const generation = typeof doc.generation === "number" && Number.isFinite(doc.generation) ? doc.generation : 1;
+  return { broker: doc.broker, generation };
 }
 
 // ============================================================================

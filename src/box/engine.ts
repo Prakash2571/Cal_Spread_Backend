@@ -58,7 +58,13 @@ import { profileReportBanner } from "./stressProfile.js";
 import { formatCalibrationBlock } from "./calibratedLatencySource.js";
 import { CentralBoxExecutionGateway, type BoxExecutionGateway } from "./executionGateway.js";
 import { CoordinatedBoxExecutionGateway } from "./executionCoordinator.js";
-import { InProcessInstrumentReservations } from "./instrumentReservations.js";
+// The BARREL, not the `instrumentReservations.js` shim: this is the one module that
+// needs the Mongo-bound factory, and the engine is already database-bound.
+import {
+  createReservationStack,
+  isDeploymentIdExplicit,
+  type ReservationStack,
+} from "./reservations/index.js";
 import { BoxOrderManager, orderManagerLimitsFromConfig, type OrderManagerReconcileReport } from "./orderManager.js";
 import { BoxMetrics } from "./metrics.js";
 import {
@@ -166,6 +172,15 @@ export interface BoxEngineDeps {
    */
   activeBroker: () => BrokerId;
   /**
+   * The broker GENERATION, bumped on every switch.
+   *
+   * Stamped onto every durable reservation and re-checked before execution, so a
+   * worker cannot keep trading a lease taken under a broker that is no longer active.
+   * Optional, defaulting to 0, so existing wiring and every existing test behave
+   * exactly as before.
+   */
+  brokerGeneration?: () => number;
+  /**
    * The ACTIVE broker's live feed. Not a TickerHub: the engine must not be able to
    * reach a specific broker's socket (see brokerContext.ts).
    */
@@ -220,8 +235,12 @@ export class BoxEngine {
   private localCharges: BoxChargeCalculatorLike;
   private executionSim: BoxExecutionSimulator;
   private execution: BoxExecutionGateway;
-  /** Contract-level reservations. Held here so a broker switch can clear them. */
-  private readonly reservations: InProcessInstrumentReservations;
+  /**
+   * Contract-level reservations: the fast in-process tier plus, when configured, the
+   * durable cross-process authority. Held here so a broker switch can clear them and
+   * so boot() can bring the durable tier up.
+   */
+  private readonly reservations: ReservationStack;
   /** The coordinator, kept typed so its metrics reach diagnostics. */
   private readonly coordinator: CoordinatedBoxExecutionGateway;
   private orderManager: BoxOrderManager | null = null;
@@ -543,14 +562,32 @@ export class BoxEngine {
     // sits ABOVE the paper/live branch: paper gets no shortcut around coordination,
     // which is the only way paper can stop showing two boxes consuming one lot. The
     // scanner and monitor are unchanged — they still see a plain BoxExecutionGateway.
-    this.reservations = new InProcessInstrumentReservations();
+    // The chain is [in-process, durable]. That order is the ACQUIRE order: the free
+    // process-local filter rejects the common same-tick overlap without a network
+    // call, and only then is the cross-process authority asked. Release runs in the
+    // reverse order, so the authority lets go first. See reservations/chained.ts.
+    this.reservations = createReservationStack({
+      durableEnabled: this.cfg.durableReservationsEnabled,
+      context: () => ({
+        deployment: this.reservations.identity.deployment,
+        broker: this.deps.activeBroker(),
+        generation: this.deps.brokerGeneration?.() ?? 0,
+        mode: this.cfg.executionMode,
+      }),
+      skewGraceMs: this.cfg.reservationClockSkewGraceMs,
+    });
     this.coordinator = new CoordinatedBoxExecutionGateway({
       inner: centralGateway,
-      reservations: this.reservations,
-      waitable: this.reservations,
+      reservations: this.reservations.store,
+      // The in-process tier on its own: it is the only tier that can offer
+      // event-driven wakeups, and the only one paper may fall back to.
+      local: this.reservations.local,
+      waitable: this.reservations.local,
       cfg: this.cfg,
       quotes: this.quotes,
       broker: () => this.deps.activeBroker(),
+      generation: () => this.deps.brokerGeneration?.() ?? 0,
+      identity: this.reservations.identity,
     });
     this.execution = this.coordinator;
 
@@ -711,9 +748,52 @@ export class BoxEngine {
     // Open the box database first (BOX_MONGODB_URI when set, otherwise the main
     // one) so the positions below are read from the right place.
     await initBoxConnection();
+    // Bring the durable reservation tier up: create and VERIFY its indexes, measure the
+    // authority's clock, and reclaim reservations that have already lost their lease.
+    // It never throws — an unreachable authority is an operating state the coordinator
+    // reports and fails closed on, not a reason to stop the engine from booting and
+    // managing exposure that already exists.
+    const durableReady = await this.reservations.initialise();
+    if (this.cfg.durableReservationsEnabled) {
+      console.log(
+        `[Box] durable instrument reservations ${durableReady ? "READY" : "UNAVAILABLE"} ` +
+          `(deployment=${this.reservations.identity.deployment} store=${this.reservations.store.name})`,
+      );
+      // An INFERRED lock namespace is a footgun in live trading: two environments sharing
+      // one means a laptop can take a contract the real trading process needs, or believe
+      // it holds one production is actively trading. Say so loudly rather than silently.
+      if (this.cfg.executionMode === "live" && !isDeploymentIdExplicit()) {
+        console.warn(
+          `[Box] CALSPREAD_DEPLOYMENT_ID is not set — the durable reservation lock namespace ` +
+            `was INFERRED as "${this.reservations.identity.deployment}". Set it explicitly so this ` +
+            `deployment cannot share a lock namespace with another environment.`,
+        );
+      }
+      if (!durableReady && this.cfg.executionMode === "live") {
+        console.warn(
+          "[Box] LIVE Box ENTRY is disabled until the durable reservation authority is reachable. " +
+            "Exits, residual flattening and reconciliation remain available.",
+        );
+      }
+    }
     if (this.cfg.executionMode === "live") {
       if (!isBoxDbEnabled()) {
         throw new Error("[Box] live execution blocked: Box database is not ready.");
+      }
+      if (this.cfg.reservationRequireDurable && !durableReady) {
+        // Deliberately a WARNING, not a throw.
+        //
+        // Refusing to boot would also refuse to adopt open positions, run the position
+        // monitor, reconcile, and flatten residual exposure — so a missing lock would
+        // strand real money in the market. ENTRY safety and EXIT safety are different
+        // problems: new Box entries are already failed closed by the coordinator (it
+        // reports `durable_reservation_unavailable` and refuses), while everything that
+        // REDUCES exposure keeps working.
+        console.error(
+          "[Box] BOX_RESERVATION_REQUIRE_DURABLE is set but the durable instrument-reservation " +
+            "authority could not be initialised. LIVE Box ENTRY is DISABLED. Exits, residual " +
+            "flattening, reconciliation and position monitoring continue.",
+        );
       }
       if (!this.deps.marketData.isAuthenticated()) {
         throw new Error(
@@ -1226,6 +1306,10 @@ export class BoxEngine {
     this.ownedRetryTimer = null;
     this.residualFlattenTimer = null;
     this.orderManager?.dispose();
+    // The reservation heartbeat. It only exists while a lease is held, and it is
+    // unref'd, but stopping it explicitly keeps the "every timer the engine owns is
+    // cleared" property this method exists to guarantee.
+    this.coordinator.dispose();
     if (this.removeConnectionListener) {
       this.removeConnectionListener();
       this.removeConnectionListener = null;
@@ -3585,6 +3669,11 @@ export class BoxEngine {
       // Contract-level coordination. No high-cardinality labels: counts, percentiles
       // and statuses only — never an order id, execution id or symbol.
       coordinator: this.coordinator.metrics(),
+      // Multi-process reservation health. `liveEntryBlocked` is the field that matters
+      // operationally: when true the system is deliberately refusing to open NEW Box
+      // exposure because cross-process exclusion cannot be guaranteed. Exits, residual
+      // flattening and reconciliation are unaffected.
+      executionCoordination: this.coordinator.coordinationHealth(),
       shadow_mode: shadowModeStatus({
         shadowEnabled: this.cfg.shadowModeEnabled,
         executionMode: this.cfg.executionMode,
@@ -3731,7 +3820,14 @@ export class BoxEngine {
       workingOrders: live ? live.inFlight + live.queued : 0,
       // A simulated pipeline counts too: deleting the feed under an in-flight paper
       // entry would leave the attempt unable to resolve.
-      executionInFlight: this.executionSim.activeCount > 0,
+      //
+      // The COORDINATOR is consulted as well, and that is a real widening. A pipeline
+      // is only "active" once the simulator owns it, so an execution parked in the
+      // conflict wait — and a reservation still held because a terminal broker state
+      // was ambiguous — used to be invisible to the broker-switch guard. Both hold
+      // contracts in the OUTGOING broker's namespace, so switching under them is
+      // exactly what creates a stale-generation worker.
+      executionInFlight: this.executionSim.activeCount > 0 || this.coordinator.holdsReservations,
       reconciliationComplete: live?.health.reconciliation_complete ?? true,
       residualLegs: this.residualLegCount(),
       unknownOrders: live?.unknownOrders ?? 0,
@@ -3753,8 +3849,8 @@ export class BoxEngine {
    * Zerodha reservation is meaningless to Dhan and would only be able to block a
    * legitimate execution until its TTL expired.
    */
-  clearInstrumentReservations(): void {
-    this.coordinator.resetForBrokerSwitch();
+  async clearInstrumentReservations(): Promise<void> {
+    await this.coordinator.resetForBrokerSwitch();
   }
 
   /**
