@@ -189,6 +189,66 @@ export interface BoxConfig {
   /** Cap on simultaneous simulated execution pipelines. */
   maxConcurrentExecutions: number;
 
+  // ---- Box execution coordination (shared-contract exclusion) ----
+  /**
+   * Master switch for the execution coordinator.
+   *
+   * On by default because without it two boxes sharing an option strike can be
+   * submitted in the same instant, each assuming the whole displayed size at that
+   * strike. Exposed so it can be turned off in an emergency without a redeploy — but
+   * turning it off restores that behaviour.
+   */
+  executionCoordinatorEnabled: boolean;
+  /**
+   * How long a box may wait for a contract another execution is holding.
+   *
+   * Deliberately short: the loser is woken by the holder's release (typically within
+   * a millisecond) and then RE-PRICED, so this is the give-up bound, not the normal
+   * path. Large values keep stale opportunities alive to no purpose.
+   */
+  conflictWaitMaxMs: number;
+  /**
+   * TTL on a contract reservation.
+   *
+   * This is the crash-recovery mechanism: a wedged or dead execution cannot hold a
+   * contract beyond it. It is also how long a reservation is HELD when a terminal
+   * broker state was ambiguous, so it must comfortably exceed a normal round trip.
+   */
+  instrumentLockTtlMs: number;
+  /**
+   * Optional per-underlying execution budget. 0 disables it.
+   *
+   * A risk cap layered ON TOP of exact-contract exclusion — never a replacement for
+   * it. RELIANCE 2500CE and RELIANCE 2800CE share no contract and must still be able
+   * to execute concurrently.
+   */
+  maxConcurrentPerUnderlying: number;
+  /**
+   * Minimum fraction of the originally detected gross edge that must survive for a
+   * box that waited on a conflict to be allowed to execute.
+   *
+   * Arriving at the front of the queue is not a reason to trade.
+   */
+  conflictRevalidateMinEdgeRatio: number;
+  /**
+   * Require a DURABLE reservation tier before live execution is permitted.
+   *
+   * Off by default because the deployment is a single PM2 fork process, where the
+   * in-process store is authoritative and strictly stronger than a network lock. Turn
+   * it on when running multiple workers: live execution then fails CLOSED unless a
+   * durable tier is configured, rather than silently losing conflict protection.
+   */
+  reservationRequireDurable: boolean;
+  /**
+   * Net two boxes that want opposite sides of the same contract against each other.
+   *
+   * MUST stay false until the ledger can represent virtual ownership of both boxes
+   * while broker net exposure is zero. Until then opposite-side overlaps take the
+   * same safe path as same-side ones: serialise, confirm, re-evaluate. Correctness
+   * before cleverness.
+   */
+  internalNettingEnabled: boolean;
+
   // ---- Paper live-parity profile (default OFF; layered on paper_legging) ----
   /**
    * `standard` keeps today's paper behaviour byte-for-byte. `live_parity` layers a
@@ -735,6 +795,18 @@ export function loadBoxConfig(): BoxConfig {
     executionMaxWaitMs: num("BOX_EXECUTION_MAX_WAIT_MS", 1500),
     executionPollMs: num("BOX_EXECUTION_POLL_MS", 20),
     maxConcurrentExecutions: num("BOX_MAX_CONCURRENT_EXECUTIONS", 8),
+
+    executionCoordinatorEnabled: bool("BOX_EXECUTION_COORDINATOR_ENABLED", true),
+    // 250ms: long enough for a broker ACK to land and the holder to release, short
+    // enough that a dead opportunity is abandoned rather than chased.
+    conflictWaitMaxMs: clampInt("BOX_CONFLICT_WAIT_MAX_MS", 250, 0, 5_000),
+    // 5s: comfortably longer than a round trip, so an ambiguous terminal state stays
+    // protected, but short enough that a crashed process frees contracts quickly.
+    instrumentLockTtlMs: clampInt("BOX_INSTRUMENT_LOCK_TTL_MS", 5_000, 250, 60_000),
+    maxConcurrentPerUnderlying: clampInt("BOX_MAX_CONCURRENT_PER_UNDERLYING", 2, 0, 16),
+    conflictRevalidateMinEdgeRatio: num("BOX_CONFLICT_REVALIDATE_MIN_EDGE_RATIO", 0.8),
+    reservationRequireDurable: bool("BOX_RESERVATION_REQUIRE_DURABLE", false),
+    internalNettingEnabled: bool("BOX_INTERNAL_NETTING_ENABLED", false),
 
     // Paper live-parity profile. All default to preserving today's behaviour: the
     // profile is `standard`, and the ledger/latency-source are only ever consulted when

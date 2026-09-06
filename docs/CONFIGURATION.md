@@ -137,6 +137,42 @@ Mode: `BOX_EXECUTION_MODE` (`paper_touch`/`paper_latency`/`paper_legging`/`live`
 `BOX_SIMULATED_DECISION_MS`, `BOX_LEG_TIMEOUT_MS`, `BOX_LEG_MAX_CHASE_TICKS`,
 `BOX_LEG_UNWIND_LATENCY_MS`, `BOX_UNWIND_MAX_CHASE_TICKS`, `BOX_MAX_CONCURRENT_EXECUTIONS`.
 
+### Shared-contract execution coordination
+
+Two Box opportunities can need the SAME option contract. A 1300/1320 box and a 1320/1340 box
+have different candidate keys — `underlying|expiry|K1|K2|DIRECTION` — and both trade the 1320
+strike. Every duplicate guard in the engine is keyed on that candidate key, so before this layer
+existed the two looked unrelated and could be submitted in the same instant, each assuming the
+whole displayed size resting at 1320.
+
+The coordinator wraps the execution gateway, which puts it ABOVE the paper/live branch: paper is
+coordinated by exactly the same code as live, because a simulator that lets two boxes consume one
+lot is not modelling anything real.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `BOX_EXECUTION_COORDINATOR_ENABLED` | `true` | Master switch. Turning it off restores the un-coordinated behaviour, in which overlapping boxes can submit the same contract simultaneously. An emergency escape hatch, not a tuning knob. |
+| `BOX_CONFLICT_WAIT_MAX_MS` | `250` | How long a box may wait for a contract another execution holds, before giving up and recording `expired_while_waiting`. This is the GIVE-UP bound, not the normal path: the loser is woken by the holder's release, usually within a millisecond. Raising it only keeps stale opportunities alive. |
+| `BOX_INSTRUMENT_LOCK_TTL_MS` | `5000` | Reservation TTL. This is the crash-recovery mechanism — a dead or wedged execution cannot hold a contract past it — and also how long a reservation is HELD when a terminal broker state was ambiguous, so it must comfortably exceed a normal round trip. |
+| `BOX_MAX_CONCURRENT_PER_UNDERLYING` | `2` | Optional per-underlying execution budget; `0` disables it. A risk cap layered ON TOP of exact-contract exclusion, never a replacement: RELIANCE 2500CE and RELIANCE 2800CE share no contract and must still run concurrently. |
+| `BOX_CONFLICT_REVALIDATE_MIN_EDGE_RATIO` | `0.8` | Fraction of the originally detected gross edge that must survive for a box that waited to be allowed to execute. Arriving at the front of the queue is not a reason to trade. |
+| `BOX_RESERVATION_REQUIRE_DURABLE` | `false` | Require a durable (cross-process) reservation tier before LIVE execution is permitted. Off by default because the deployment is a single PM2 fork process, where the in-process store is authoritative and strictly stronger than a network lock — it cannot time out or be delayed. Turn it on when running multiple workers: live then fails CLOSED rather than silently losing conflict protection. Paper continues on the in-process store so development and tests still work, and the diagnostics say which store is active. |
+| `BOX_INTERNAL_NETTING_ENABLED` | `false` | Net two boxes wanting OPPOSITE sides of one contract against each other. **Must stay false** until the ledger can represent virtual ownership of both boxes while broker net exposure is zero. Until then opposite-side overlaps take the same safe path as same-side ones: serialise, confirm, re-evaluate. |
+
+Behaviour by conflict type:
+
+- **Unrelated boxes** (no shared contract) — execute concurrently. There is no global execution
+  mutex and no whole-underlying lock.
+- **Same contract, same side** — serialise, then re-price the loser. Never combined into one
+  order: aggregation would need the accounting layer to attribute fills, prices, quantity and P&L
+  back to both boxes, which is not proven.
+- **Same contract, opposite side** — identical safe handling. The distinction is *recorded* in
+  conflict metrics so netting can be justified against real observations later.
+- **Residual flattening** — never gated. It reduces exposure that already exists; queueing it
+  behind a speculative entry would leave a naked leg open.
+- **Ambiguous/unknown terminal state, or residual exposure** — the reservation is HELD until its
+  TTL, so a second box cannot assume there is no exposure on that contract.
+
 ### The four execution settings, and how they differ
 
 Two independent axes. `BOX_EXECUTION_MODE` decides whether real orders can exist at all;
