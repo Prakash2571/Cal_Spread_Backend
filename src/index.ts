@@ -5238,6 +5238,9 @@ const boxModule: BoxModule = registerBoxModule(app, {
   getAdminRole,
   // ---- broker-neutral wiring: every one of these routes to the ACTIVE broker ----
   activeBroker: () => brokerManager.activeBroker,
+  // Stamped onto every durable instrument reservation and re-checked before execution,
+  // so a lease taken under a superseded broker cannot authorise a trade.
+  brokerGeneration: () => brokerManager.generation,
   marketData: brokerManager.marketData(),
   margins: brokerManager.margins(),
   // Subscriptions go to whichever feed is active; the hub is still the publish path
@@ -5297,6 +5300,10 @@ brokerManager.attach(
   {
     stopScanner: () => boxModule.engine.stop(),
     invalidateBooks: () => boxModule.engine.invalidateBooks(),
+    // Contract reservations are broker-namespaced, so a switch must drop the ones this
+    // process owns. Previously defined on the engine but never wired to anything, which
+    // meant they survived a switch until their TTL.
+    clearInstrumentReservations: () => boxModule.engine.clearInstrumentReservations(),
     reloadUniverse: () => boxModule.engine.reloadUniverse(),
     publish: () => boxModule.engine.publishNow(),
     dropMarketDataSessions: () => marketDataSessions.dropAll(),

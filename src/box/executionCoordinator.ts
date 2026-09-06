@@ -1,5 +1,5 @@
 /**
- * BOX EXECUTION COORDINATION — one contract, one execution at a time.
+ * BOX EXECUTION COORDINATION — one contract, one execution at a time, ACROSS WORKERS.
  *
  * THE PROBLEM, CONCRETELY
  * Every duplicate guard in this engine is keyed on the strike pair
@@ -9,6 +9,14 @@
  * resting at 1320. Real closed-trade history shows exactly that: overlapping-strike
  * pairs opened in the same second. In paper it overstates achievable fills, because
  * the same resting lot is spent twice.
+ *
+ * That guard used to be process-local. Under PM2 cluster mode, several workers, two
+ * EC2 instances or Kubernetes replicas, each process owned a separate in-memory Map:
+ * both saw RELIANCE 2550CE as free, both reserved it, both sent an order. The
+ * reservation store is now CHAINED — a free in-process filter in front of a durable
+ * MongoDB authority — so exclusion holds deployment-wide. See
+ * `reservations/durable.ts` for why a single-document insert against a unique
+ * multikey index makes a four-leg claim atomic.
  *
  * WHERE THIS SITS, AND WHY THERE
  * It decorates `BoxExecutionGateway` — the interface where, and only where, the
@@ -26,17 +34,39 @@
  * slow: wrong because it does not actually establish exclusion, and slow because the
  * dislocation is usually gone. The loser of a conflict instead registers for the
  * winner's release and is woken by it — typically within a millisecond — then
- * REPRICES against the current book before it is allowed to proceed. A poll interval
- * exists only as a backstop for a release that somehow never fires.
+ * REPRICES against the current book before it is allowed to proceed.
+ *
+ * WAITING IS NOW HYBRID, BECAUSE IT HAS TO BE
+ * `onRelease` is an in-memory emitter: it can only ever observe a release by THIS
+ * process. A contract held by a sibling worker will never fire it. So the wait races
+ * the release event against a short jittered timer and retries the acquisition —
+ * event-driven where that works, bounded polling where it cannot. The jitter matters:
+ * without it several workers freed by the same release would retry in lockstep and
+ * hammer the authority in a thundering herd. Every path stays bounded by
+ * `BOX_CONFLICT_WAIT_MAX_MS`; there are no unbounded waits.
+ *
+ * TTL IS NOT EXECUTION PERMISSION
+ * The dangerous sequence is: this worker stalls on GC, its lease expires, another
+ * worker legitimately takes the contracts, this worker wakes up and submits another
+ * leg. Local state saying "running" is not good enough. So ownership is re-checked
+ * at every point where it can be:
+ *
+ *   • a heartbeat RENEWS the lease and, on failure, records a safety event and trips
+ *     `invariantViolation` rather than carrying on;
+ *   • `stillWanted` — which the simulator already consults before each leg — is
+ *     COMPOSED with a synchronous ownership predicate, so ownership loss aborts the
+ *     remaining legs of a paper legging run through the existing abort path;
+ *   • immediately before delegating, the broker generation is re-checked, and the
+ *     durable lease is re-verified whenever the execution waited.
  *
  * WHAT IT DELIBERATELY DOES NOT DO
  * It does not serialise unrelated boxes. Two boxes sharing no contract never wait on
- * each other; there is no global execution mutex here. It does not lock a whole
- * underlying either — RELIANCE 2500CE and RELIANCE 2800CE are independent. And it
- * does not net opposite sides internally: that needs the ledger to represent virtual
- * ownership of both boxes while broker net exposure is zero, which has not been
- * proven, so the safe path (serialise, confirm, re-evaluate) is taken for both
- * same-side and opposite-side overlaps.
+ * each other; there is no global execution mutex and no per-underlying lock —
+ * RELIANCE 2500CE and RELIANCE 2800CE are independent. And it does not net opposite
+ * sides internally: that needs the ledger to represent virtual ownership of both
+ * boxes while broker net exposure is zero, which has not been proven, so the safe
+ * path (serialise, confirm, re-evaluate) is taken for both same-side and
+ * opposite-side overlaps.
  */
 
 import { entrySideFor, evaluateCandidate } from "./math.js";
@@ -47,7 +77,21 @@ import {
   type InstrumentConflict,
   type InstrumentLegRef,
 } from "./instrumentKey.js";
-import type { InProcessInstrumentReservations, InstrumentReservationStore } from "./instrumentReservations.js";
+// Imported from the LEAF modules rather than the `instrumentReservations.js` barrel on
+// purpose: the barrel re-exports the Mongo adapter, and the coordinator has no business
+// pulling mongoose into its module graph just to name a type.
+import { BoundedSamples } from "./reservations/types.js";
+import { createProcessIdentity, mintOwnerId } from "./reservations/identity.js";
+import type { ProcessIdentity } from "./reservations/identity.js";
+import type {
+  InstrumentReservationStore,
+  RenewOutcome,
+  ReservationContext,
+  ReservationDurability,
+  ReservationLease,
+  ReservationStoreDiagnostics,
+  ReservationWaitable,
+} from "./reservations/types.js";
 import type { BoxExecutionGateway } from "./executionGateway.js";
 import type { BoxConfig } from "./config.js";
 import type { BoxQuoteStore } from "./quotes.js";
@@ -77,7 +121,20 @@ export type CoordinationState =
   | "ABORTED_DETERIORATED"
   | "EXPIRED_WHILE_WAITING"
   | "SUPPRESSED_DUPLICATE"
-  | "REFUSED_NO_COORDINATION";
+  | "REFUSED_NO_COORDINATION"
+  /** The durable authority could not be reached, so a live entry was refused. */
+  | "REFUSED_DURABLE_UNAVAILABLE"
+  /** The lease was lost mid-execution. An invariant violation, not a retry. */
+  | "OWNERSHIP_LOST"
+  /** The broker or its generation moved on while this execution was coordinating. */
+  | "ABORTED_STALE_GENERATION";
+
+/**
+ * A machine-greppable token that leads the detail of a fail-closed refusal, so an
+ * operator (and the execution-attempts ledger) can find these without parsing prose.
+ */
+export const DURABLE_UNAVAILABLE_REASON = "durable_reservation_unavailable";
+export const STALE_GENERATION_REASON = "stale_broker_generation";
 
 export interface CoordinatorMetricsSnapshot {
   activeExecutions: number;
@@ -91,8 +148,60 @@ export interface CoordinatorMetricsSnapshot {
   reservationsHeldOnUncertainty: number;
   failedClosed: number;
   waitMs: { p50: number | null; p95: number | null; samples: number };
+  /** Retained names, so existing consumers and the frontend keep working. */
   store: string;
   durable: boolean;
+
+  /* ---- durable-tier health. Counts, statuses and percentiles only: never an
+   * execution id, instrument token, symbol or order id. ---- */
+  reservationStore: string;
+  reservationDurability: ReservationDurability;
+  durableReservationsEnabled: boolean;
+  durableReady: boolean;
+  requireDurable: boolean;
+  durableAcquireAttempts: number;
+  durableAcquireSuccess: number;
+  durableConflicts: number;
+  durableErrors: number;
+  durableAcquireLatencyP50: number | null;
+  durableAcquireLatencyP95: number | null;
+  durableAcquireLatencyP99: number | null;
+  reservationRenewSuccess: number;
+  reservationRenewFailure: number;
+  reservationOwnershipLost: number;
+  expiredReservationsObserved: number;
+  /** Live entries refused because the authority was unreachable. */
+  durableUnavailableRefusals: number;
+  /** Paper executions that proceeded on the local tier alone, and said so. */
+  localOnlyFallbacks: number;
+  staleGenerationAborts: number;
+  /** Reservations still held because a terminal broker state was unresolved. */
+  uncertainHoldsActive: number;
+  /** Uncertain holds that hit their bound and were left to expire. */
+  uncertainHoldsAbandoned: number;
+  clockOffsetMs: number | null;
+}
+
+/** The richer, operator-facing view. May contain a (scrubbed) error message. */
+export interface CoordinationHealthSnapshot {
+  enabled: boolean;
+  localStore: string;
+  durableStore: string | null;
+  durableReady: boolean;
+  requireDurable: boolean;
+  /** True when LIVE Box ENTRY is currently refused for safety. */
+  liveEntryBlocked: boolean;
+  liveEntryBlockedReason: string | null;
+  deployment: string;
+  broker: string;
+  generation: number;
+  activeReservations: number;
+  ownershipLosses: number;
+  acquireP50Ms: number | null;
+  acquireP95Ms: number | null;
+  acquireP99Ms: number | null;
+  durableLastError: string | null;
+  tiers: ReservationStoreDiagnostics[];
 }
 
 export interface CoordinatorLogFields {
@@ -103,51 +212,83 @@ export interface CoordinatorLogFields {
   [extra: string]: string | number | boolean | null;
 }
 
-/** Percentiles over a bounded sample window — no unbounded arrays on a hot path. */
-class BoundedSamples {
-  private buf: number[] = [];
-  constructor(private readonly max = 256) {}
-  add(v: number): void {
-    if (!Number.isFinite(v)) return;
-    if (this.buf.length >= this.max) this.buf.shift();
-    this.buf.push(v);
-  }
-  percentile(p: number): number | null {
-    if (this.buf.length === 0) return null;
-    const sorted = [...this.buf].sort((a, b) => a - b);
-    const idx = Math.min(sorted.length - 1, Math.floor(p * sorted.length));
-    return sorted[idx] ?? null;
-  }
-  get samples(): number {
-    return this.buf.length;
-  }
-}
-
 export interface CoordinatorDeps {
   /** The real gateway. Every call is delegated once coordination succeeds. */
   inner: BoxExecutionGateway;
+  /** The chain: in-process filter plus (when configured) the durable authority. */
   reservations: InstrumentReservationStore;
-  /** Present only when the store supports event-driven wakeups. */
-  waitable?: Pick<InProcessInstrumentReservations, "onRelease">;
+  /**
+   * The in-process tier on its own.
+   *
+   * Needed for the explicitly-marked paper fallback: when the durable authority is
+   * unreachable, paper may still coordinate locally, and doing so requires bypassing
+   * the chain that (correctly) refuses.
+   */
+  local?: InstrumentReservationStore;
+  /** Present only when a tier supports event-driven wakeups. */
+  waitable?: ReservationWaitable;
   cfg: BoxConfig;
   quotes: BoxQuoteStore;
   broker: () => string;
+  /** Broker generation. Bumped on every switch; stamped on every durable lease. */
+  generation?: () => number;
+  /** Process/deployment identity. Generated once at startup. */
+  identity?: ProcessIdentity;
   now?: () => number;
   /** Injected so tests can drive waiting deterministically. */
   sleep?: (ms: number) => Promise<void>;
+  /** Injected so tests never create a real heartbeat timer. */
+  setTimer?: (fn: () => void, ms: number) => unknown;
+  clearTimer?: (handle: unknown) => void;
   log?: (fields: CoordinatorLogFields) => void;
 }
 
 const DEFAULT_POLL_MS = 100;
 
+type AcquireResult =
+  | { kind: "acquired"; lease: ReservationLease }
+  | { kind: "conflict"; conflicts: InstrumentConflict[] }
+  | { kind: "unavailable"; tier: string; detail: string };
+
+interface ActiveExecution {
+  keys: string[];
+  underlying: string;
+  /** Null until the reservation is granted — an execution is CLAIMED before it is leased. */
+  lease: ReservationLease | null;
+  context: ReservationContext;
+  ownershipLost: boolean;
+  ownershipLossReason: string | null;
+  opportunityId: string | null;
+}
+
+interface UncertainHold {
+  lease: ReservationLease;
+  context: ReservationContext;
+  keys: string[];
+  heldSince: number;
+  reason: string;
+}
+
 export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
   readonly mode: BoxConfig["executionMode"];
 
   private seq = 0;
-  private active = new Map<string, { keys: string[]; underlying: string }>();
+  private readonly identity: ProcessIdentity;
+  private active = new Map<string, ActiveExecution>();
+  /**
+   * Leases retained because a terminal broker state was ambiguous.
+   *
+   * Kept SEPARATE from `active` so the heartbeat keeps renewing them — a healthy
+   * process with unresolved broker state must not let protection lapse just because
+   * its execution call returned — while they no longer count as executions in flight.
+   */
+  private holds = new Map<string, UncertainHold>();
   /** Canonical opportunity identity -> execution id, for duplicate suppression. */
   private activeOpportunities = new Map<string, string>();
   private waiting = 0;
+  private heartbeat: unknown = null;
+  private heartbeatRunning = false;
+  private disposed = false;
   private stats = {
     reservationConflicts: 0,
     duplicateSuppressed: 0,
@@ -156,15 +297,44 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     revalidationPassed: 0,
     reservationsHeldOnUncertainty: 0,
     failedClosed: 0,
+    durableUnavailableRefusals: 0,
+    localOnlyFallbacks: 0,
+    staleGenerationAborts: 0,
+    ownershipLost: 0,
+    renewSuccess: 0,
+    renewFailure: 0,
+    uncertainHoldsAbandoned: 0,
   };
   private waitSamples = new BoundedSamples();
+  /** Deterministic retry jitter. See `pollDelay()`. */
+  private jitterSeq = 0;
+  private readonly jitterSeed: number;
 
   constructor(private readonly deps: CoordinatorDeps) {
     this.mode = deps.inner.mode;
+    this.identity = deps.identity ?? createProcessIdentity();
+    // Seeded from the per-process identity, so two workers de-synchronise while each
+    // stays reproducible. A plain string hash is ample: this picks a retry delay.
+    let seed = 0;
+    for (const ch of this.identity.processTag) seed = (Math.imul(seed, 31) + ch.charCodeAt(0)) >>> 0;
+    this.jitterSeed = seed;
   }
 
   private now(): number {
     return this.deps.now?.() ?? Date.now();
+  }
+
+  private generation(): number {
+    return this.deps.generation?.() ?? 0;
+  }
+
+  private context(): ReservationContext {
+    return {
+      deployment: this.identity.deployment,
+      broker: this.deps.broker(),
+      generation: this.generation(),
+      mode: this.mode,
+    };
   }
 
   private log(fields: CoordinatorLogFields): void {
@@ -200,12 +370,15 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
   }
 
   /**
-   * Residual flattening is NOT gated.
+   * Residual flattening is NOT gated. Not by a reservation, and NOT by the durable
+   * authority's health either.
    *
    * It reduces exposure that already exists, and it runs on the highest scheduling
    * priority for exactly that reason. Making it wait behind an entry's reservation
    * would let a naked leg sit open while a speculative box held the contract — the
-   * precise inversion of the safety this class is for.
+   * precise inversion of the safety this class is for. "Cannot flatten a naked leg
+   * because a database lock is unavailable" must never be reachable: ENTRY safety and
+   * EXIT safety are different problems, and reducing exposure always wins.
    */
   flattenResidual(...args: Parameters<BoxExecutionGateway["flattenResidual"]>) {
     return this.deps.inner.flattenResidual(...args);
@@ -231,13 +404,16 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       };
     }
     try {
-      const result = await this.deps.inner.simulateLeggingEntry(args);
-      this.settle(gate.executionId, gate.keys, gate.opportunityId, uncertaintyOf(result));
+      const result = await this.deps.inner.simulateLeggingEntry({
+        ...args,
+        stillWanted: this.ownershipGuard(gate.executionId, args.stillWanted),
+      });
+      await this.settle(gate.executionId, gate.opportunityId, uncertaintyOf(result));
       return result;
     } catch (error) {
-      // An exception leaves broker state genuinely unknown. Hold the reservation for
-      // its TTL rather than releasing: the alternative is a second box firing into a
-      // contract whose first order may well have been accepted.
+      // An exception leaves broker state genuinely unknown. Hold the reservation
+      // rather than releasing: the alternative is a second box firing into a contract
+      // whose first order may well have been accepted.
       this.holdOnUncertainty(gate.executionId, gate.opportunityId, "entry threw");
       throw error;
     }
@@ -256,9 +432,12 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       >;
     }
     try {
-      const result = await this.deps.inner.simulateEntry(args);
+      const result = await this.deps.inner.simulateEntry({
+        ...args,
+        stillWanted: this.ownershipGuard(gate.executionId, args.stillWanted),
+      });
       // The atomic entry path reports no residual, so a plain failure is clean.
-      this.settle(gate.executionId, gate.keys, gate.opportunityId, result.ok ? "clean" : "clean");
+      await this.settle(gate.executionId, gate.opportunityId, "clean");
       return result;
     } catch (error) {
       this.holdOnUncertainty(gate.executionId, gate.opportunityId, "entry threw");
@@ -276,6 +455,10 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
    * the monitor already handles by holding the position and retrying next cycle.
    * Waiting would be worse than retrying — the monitor owns exit urgency (including
    * the expiry-safety window) and must not be blocked behind a speculative entry.
+   *
+   * A DURABLE OUTAGE DOES NOT BLOCK AN EXIT. An exit reduces exposure, so when the
+   * authority is unreachable it proceeds on the local tier and says so, rather than
+   * leaving a position open because a database was down.
    */
   async simulateLeggingExit(
     args: Parameters<BoxExecutionSimulator["simulateLeggingExit"]>[0],
@@ -285,17 +468,21 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     }
     const refs = this.refsForExit(args.position);
     const executionId = this.mintId("exit");
-    const acquired = this.acquire(executionId, refs);
-    if (!acquired.ok) {
+    const acquired = await this.acquireForExit(executionId, refs);
+    if (acquired.kind !== "acquired") {
       this.stats.reservationConflicts++;
+      const count = acquired.kind === "conflict" ? acquired.conflicts.length : 0;
       this.log({
         execution: executionId,
         broker: this.deps.broker(),
         underlying: args.position.underlying,
         status: "exit_conflict",
-        conflicts: acquired.conflicts.length,
+        conflicts: count,
       });
-      const detail = `exit deferred: ${acquired.conflicts.length} leg(s) reserved by another execution`;
+      const detail =
+        acquired.kind === "conflict"
+          ? `exit deferred: ${count} leg(s) reserved by another execution`
+          : `exit deferred: ${acquired.detail}`;
       return {
         ok: false,
         reason: "insufficient_quantity",
@@ -303,10 +490,17 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
         record: emptyLeggingRecord(this.mode, args.detectedAt ?? this.now(), this.now(), "insufficient_quantity", detail),
       };
     }
-    this.active.set(executionId, { keys: keysOf(refs), underlying: args.position.underlying });
+    this.registerActive(executionId, keysOf(refs), args.position.underlying, acquired.lease);
     try {
+      // NOTE the ownership guard is deliberately NOT composed in here.
+      //
+      // An exit REDUCES exposure. If a lost or unverifiable lease aborted the remaining
+      // legs of an exit, a half-closed box would be left with naked legs — the precise
+      // inversion of the safety this class exists for, and the same reason
+      // `flattenResidual` is ungated. Ownership matters for OPENING exposure; it must
+      // never be a reason to stop closing it.
       const result = await this.deps.inner.simulateLeggingExit(args);
-      this.settle(executionId, keysOf(refs), null, uncertaintyOf(result));
+      await this.settle(executionId, null, uncertaintyOf(result));
       return result;
     } catch (error) {
       this.holdOnUncertainty(executionId, null, "exit threw");
@@ -322,24 +516,51 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     }
     const refs = this.refsForExit(args.position);
     const executionId = this.mintId("exit");
-    const acquired = this.acquire(executionId, refs);
-    if (!acquired.ok) {
+    const acquired = await this.acquireForExit(executionId, refs);
+    if (acquired.kind !== "acquired") {
       this.stats.reservationConflicts++;
       return {
         ok: false,
         reason: "insufficient_quantity",
-        detail: "exit deferred: leg reserved by another execution",
+        detail:
+          acquired.kind === "conflict"
+            ? "exit deferred: leg reserved by another execution"
+            : `exit deferred: ${acquired.detail}`,
       } as Awaited<ReturnType<BoxExecutionSimulator["simulateExit"]>>;
     }
-    this.active.set(executionId, { keys: keysOf(refs), underlying: args.position.underlying });
+    this.registerActive(executionId, keysOf(refs), args.position.underlying, acquired.lease);
     try {
       const result = await this.deps.inner.simulateExit(args);
-      this.settle(executionId, keysOf(refs), null, "clean");
+      await this.settle(executionId, null, "clean");
       return result;
     } catch (error) {
       this.holdOnUncertainty(executionId, null, "exit threw");
       throw error;
     }
+  }
+
+  /**
+   * An exit's acquisition, which degrades to the local tier on a durable outage.
+   *
+   * Reducing existing exposure outranks cross-process exclusion: the worst case of
+   * proceeding is that two workers work the same contract, the worst case of refusing
+   * is an open position nobody closes. Entry takes the opposite trade-off, on purpose.
+   */
+  private async acquireForExit(executionId: string, refs: InstrumentLegRef[]): Promise<AcquireResult> {
+    const attempt = await this.acquire(executionId, refs, this.context());
+    if (attempt.kind !== "unavailable") return attempt;
+    const local = this.deps.local;
+    if (local === undefined) return attempt;
+    this.stats.localOnlyFallbacks++;
+    this.log({
+      execution: executionId,
+      broker: this.deps.broker(),
+      underlying: "-",
+      status: "exit_local_only",
+      reason: DURABLE_UNAVAILABLE_REASON,
+      detail: "exit proceeds on the local tier; reducing exposure outranks cross-process exclusion",
+    });
+    return this.acquireWith(local, executionId, refs, this.context());
   }
 
   /* ------------------------------------------------------------------ *
@@ -351,16 +572,17 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     detection: BoxEvaluation,
   ): Promise<
     | { ok: true; executionId: string; keys: string[]; opportunityId: string }
-    | { ok: false; reason: "duplicate" | "price_moved" | "edge_disappeared" | "feed_unhealthy"; detail: string }
+    | { ok: false; reason: BoxExecutionFailureReason; detail: string }
   > {
     const broker = this.deps.broker();
     const executionId = this.mintId("entry");
     const opportunityId = `${broker.toUpperCase()}:${candidate.key}`;
+    const context = this.context();
 
-    // FAIL CLOSED. If a durable tier is required (multi-worker deployments) and the
-    // configured store cannot provide one, live execution must not proceed
-    // uncoordinated. Paper is allowed to continue on the in-process store so
-    // development and tests still work, and it says so.
+    // FAIL CLOSED (1). A durable tier is REQUIRED but none is configured. Live
+    // execution must not proceed with only process-local exclusion. Paper is allowed
+    // to continue on the in-process store so development and tests still work, and it
+    // says so.
     if (this.deps.cfg.reservationRequireDurable && !this.deps.reservations.durable) {
       if (this.mode === "live") {
         this.stats.failedClosed++;
@@ -381,6 +603,20 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
         };
       }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // EVERYTHING FROM HERE TO `claim()` RUNS SYNCHRONOUSLY, AND MUST.
+    //
+    // The duplicate guard and the per-underlying budget are check-then-act on process
+    // state. When the reservation store was synchronous, this whole prologue ran to
+    // completion in one turn of the event loop, so two candidates arriving on the same
+    // tick could not both pass. Making the store asynchronous introduced an `await`
+    // between the check and the registration — a textbook TOCTOU, and it really did let
+    // two identical opportunities through, and two boxes past a budget of one.
+    //
+    // The fix is to CLAIM the slot before yielding. No `await` may be added between the
+    // guards below and `this.claim(...)`.
+    // ─────────────────────────────────────────────────────────────────────────
 
     // DUPLICATE GUARD — a different problem from instrument reservation. This one
     // catches the SAME strategy fired twice; the reservation catches DIFFERENT
@@ -416,10 +652,33 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       }
     }
 
-    const waitStarted = this.now();
-    let attempt = this.acquire(executionId, refs);
+    // THE CLAIM. Still synchronous, still the same event-loop turn as the guards above,
+    // so a sibling candidate on this tick now sees this execution and is suppressed.
+    this.claim(executionId, opportunityId, candidate.underlying, keys, context);
 
-    if (!attempt.ok) {
+    const waitStarted = this.now();
+    let attempt: AcquireResult;
+    let waited = false;
+    try {
+      attempt = await this.acquire(executionId, refs, context);
+    } catch (error) {
+      // A store that throws must not leave the claim behind, or this opportunity would
+      // be suppressed as a duplicate of itself forever.
+      this.abandon(executionId);
+      throw error;
+    }
+
+    if (attempt.kind === "unavailable") {
+      const fallback = await this.handleUnavailable(executionId, refs, candidate, context, attempt);
+      if (!fallback.ok) {
+        this.abandon(executionId);
+        return fallback;
+      }
+      attempt = fallback.attempt;
+    }
+
+    if (attempt.kind === "conflict") {
+      waited = true;
       this.stats.reservationConflicts++;
       const described = attempt.conflicts.map((c) => c.kind).join(",");
       this.log({
@@ -432,11 +691,22 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       });
       this.waiting++;
       try {
-        attempt = await this.waitForKeys(executionId, refs, waitStarted);
+        attempt = await this.waitForKeys(executionId, refs, waitStarted, context);
       } finally {
         this.waiting--;
       }
-      if (!attempt.ok) {
+
+      if (attempt.kind === "unavailable") {
+        const fallback = await this.handleUnavailable(executionId, refs, candidate, context, attempt);
+        if (!fallback.ok) {
+          this.abandon(executionId);
+          return fallback;
+        }
+        attempt = fallback.attempt;
+      }
+
+      if (attempt.kind !== "acquired") {
+        this.abandon(executionId);
         this.stats.expiredWhileWaiting++;
         this.waitSamples.add(this.now() - waitStarted);
         this.log({
@@ -455,13 +725,15 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
 
       // REVALIDATE. Arriving at the front of the queue is not a reason to trade. The
       // book has moved while waiting, so the opportunity is re-measured and only
-      // executed if it still qualifies on CURRENT prices.
+      // executed if it still qualifies on CURRENT prices. Distributed waiting makes
+      // this MORE important, not less: the wait may have been on another worker.
       const waitMs = this.now() - waitStarted;
       this.waitSamples.add(waitMs);
       const verdict = this.revalidate(candidate, detection);
       if (!verdict.ok) {
         this.stats.revalidationRejected++;
-        this.release(executionId, keys);
+        this.abandon(executionId);
+        await this.releaseLease(executionId, attempt.lease);
         this.log({
           execution: executionId,
           broker,
@@ -487,25 +759,225 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       });
     }
 
-    this.active.set(executionId, { keys, underlying: candidate.underlying });
-    this.activeOpportunities.set(opportunityId, executionId);
+    // PRE-SUBMIT OWNERSHIP CHECK. The last thing before the order path.
+    const permitted = await this.confirmBeforeSubmit(executionId, keys, context, attempt.lease, waited);
+    if (!permitted.ok) {
+      this.abandon(executionId);
+      await this.releaseLease(executionId, attempt.lease);
+      this.log({
+        execution: executionId,
+        broker,
+        underlying: candidate.underlying,
+        status: "abort",
+        reason: permitted.token,
+        detail: permitted.detail,
+      });
+      return { ok: false, reason: "feed_unhealthy", detail: `${permitted.token}: ${permitted.detail}` };
+    }
+
+    // The claim becomes a LEASED execution. Nothing was registered twice: `claim()`
+    // already created the record; this only attaches the granted reservation.
+    this.grant(executionId, keys, attempt.lease);
     return { ok: true, executionId, keys, opportunityId };
   }
 
+  /* ------------------------------------------------------------------ *
+   * Claim lifecycle: claimed (synchronously) -> leased -> settled.
+   * ------------------------------------------------------------------ */
+
   /**
-   * Wait for every required contract to become free, event-driven.
+   * Reserve this execution's PROCESS-LOCAL identity, synchronously.
    *
-   * Woken by the holder's release. The poll interval is a backstop only — if it were
-   * the primary mechanism this would just be a sleep with extra steps.
+   * Separate from the contract reservation, and earlier than it, because the duplicate
+   * guard and the per-underlying budget are decisions about this process's own state and
+   * must not straddle an `await`. Called with no `await` between it and those guards.
+   */
+  private claim(
+    executionId: string,
+    opportunityId: string | null,
+    underlying: string,
+    keys: string[],
+    context: ReservationContext,
+  ): void {
+    this.active.set(executionId, {
+      keys,
+      underlying,
+      lease: null,
+      context,
+      ownershipLost: false,
+      ownershipLossReason: null,
+      opportunityId,
+    });
+    if (opportunityId !== null) this.activeOpportunities.set(opportunityId, executionId);
+  }
+
+  /** Attach the granted reservation to an already-claimed execution. */
+  private grant(executionId: string, keys: string[], lease: ReservationLease | null): void {
+    const exec = this.active.get(executionId);
+    if (exec === undefined) return;
+    exec.keys = keys;
+    exec.lease = lease;
+    exec.context = this.context();
+    this.ensureHeartbeat();
+  }
+
+  /**
+   * Drop a claim that never became an execution.
+   *
+   * Every failure path after `claim()` must call this, or the opportunity would be
+   * suppressed as a duplicate of itself and the underlying's budget slot would leak.
+   */
+  private abandon(executionId: string): void {
+    const exec = this.active.get(executionId);
+    if (exec === undefined) return;
+    this.active.delete(executionId);
+    if (exec.opportunityId !== null && this.activeOpportunities.get(exec.opportunityId) === executionId) {
+      this.activeOpportunities.delete(exec.opportunityId);
+    }
+    // An abandoned claim can be the last thing keeping the heartbeat alive.
+    this.stopHeartbeatIfIdle();
+  }
+
+  /**
+   * The durable authority is unreachable. Decide, by mode, what that means.
+   *
+   * LIVE fails closed, unconditionally. A live entry opens NEW exposure on a shared
+   * contract, and without the authority there is no way to know another worker is not
+   * doing the same thing. Note this is not a new restriction in practice: live
+   * execution already requires the Box database for durable order intents, so a Mongo
+   * outage stops live entry regardless — this just makes the refusal explicit and
+   * attributable instead of surfacing later as a persistence failure.
+   *
+   * PAPER may continue on the local tier, because paper cannot reach a broker and
+   * because a development machine with no database must still be able to run. It is
+   * counted and labelled `local_only` so nobody can mistake a degraded paper run for a
+   * cross-process-safe one.
+   */
+  private async handleUnavailable(
+    executionId: string,
+    refs: InstrumentLegRef[],
+    candidate: BoxCandidate,
+    context: ReservationContext,
+    attempt: Extract<AcquireResult, { kind: "unavailable" }>,
+  ): Promise<
+    | { ok: true; attempt: AcquireResult }
+    | { ok: false; reason: BoxExecutionFailureReason; detail: string }
+  > {
+    if (this.mode === "live") {
+      this.stats.failedClosed++;
+      this.stats.durableUnavailableRefusals++;
+      this.log({
+        execution: executionId,
+        broker: context.broker,
+        underlying: candidate.underlying,
+        status: "failed_closed",
+        reason: DURABLE_UNAVAILABLE_REASON,
+        tier: attempt.tier,
+      });
+      return {
+        ok: false,
+        reason: "feed_unhealthy",
+        detail:
+          `${DURABLE_UNAVAILABLE_REASON}: live entry refused because the durable reservation ` +
+          `authority "${attempt.tier}" is unavailable (${attempt.detail})`,
+      };
+    }
+    const local = this.deps.local;
+    if (local === undefined) {
+      return {
+        ok: false,
+        reason: "feed_unhealthy",
+        detail: `${DURABLE_UNAVAILABLE_REASON}: ${attempt.detail}`,
+      };
+    }
+    this.stats.localOnlyFallbacks++;
+    this.log({
+      execution: executionId,
+      broker: context.broker,
+      underlying: candidate.underlying,
+      status: "local_only",
+      reason: DURABLE_UNAVAILABLE_REASON,
+      reservationDurability: "local_only",
+    });
+    return { ok: true, attempt: await this.acquireWith(local, executionId, refs, context) };
+  }
+
+  /**
+   * The final gate before anything reaches the order path.
+   *
+   * TWO checks, with deliberately different costs.
+   *
+   * The broker/generation comparison is free and ALWAYS runs, because a broker switch
+   * can land during the conflict wait: the lease would still be valid while naming a
+   * broker whose token namespace no longer applies.
+   *
+   * The durable re-verification costs a round trip, so it runs only when the execution
+   * actually WAITED. With no wait, the lease was granted microseconds earlier in this
+   * same call and there is no window to close; after a wait of up to
+   * `BOX_CONFLICT_WAIT_MAX_MS` there genuinely is one.
+   */
+  private async confirmBeforeSubmit(
+    executionId: string,
+    keys: readonly string[],
+    context: ReservationContext,
+    lease: ReservationLease,
+    waited: boolean,
+  ): Promise<{ ok: true } | { ok: false; token: string; detail: string }> {
+    const current = this.context();
+    if (current.broker !== context.broker || current.generation !== context.generation) {
+      this.stats.staleGenerationAborts++;
+      return {
+        ok: false,
+        token: STALE_GENERATION_REASON,
+        detail:
+          `reservation was taken under ${context.broker} generation ${context.generation}, ` +
+          `active is ${current.broker} generation ${current.generation}`,
+      };
+    }
+    if (!waited || lease.durability !== "durable") return { ok: true };
+    const verdict = await this.deps.reservations.verify({
+      owner: executionId,
+      keys,
+      now: this.now(),
+      fence: lease.fence,
+      context: current,
+    });
+    if (verdict.owned) return { ok: true };
+    if (verdict.reason === "superseded") this.stats.staleGenerationAborts++;
+    else this.stats.ownershipLost++;
+    return {
+      ok: false,
+      token: verdict.reason === "superseded" ? STALE_GENERATION_REASON : "reservation_ownership_lost",
+      detail: verdict.detail,
+    };
+  }
+
+  /**
+   * Wait for every required contract to become free.
+   *
+   * HYBRID, because it must be. Within this process the holder's release wakes the
+   * waiter almost immediately. Across processes nothing can: `onRelease` is an
+   * in-memory emitter, so a sibling worker's release is invisible and the only way to
+   * learn about it is to ask again. So each round races the release event against a
+   * short JITTERED timer and retries.
+   *
+   * The jitter is not decoration. Several workers woken by the same expiry would
+   * otherwise retry in lockstep, converge on the authority together, and all but one
+   * would pay a round trip to be told no.
+   *
+   * An `unavailable` result ends the wait immediately rather than spinning: retrying
+   * against a database that is down just burns the opportunity window.
    */
   private async waitForKeys(
     executionId: string,
     refs: InstrumentLegRef[],
     startedAt: number,
-  ): Promise<ReturnType<CoordinatedBoxExecutionGateway["acquire"]>> {
+    context: ReservationContext,
+  ): Promise<AcquireResult> {
     const deadline = startedAt + this.deps.cfg.conflictWaitMaxMs;
     const keys = keysOf(refs);
     const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    let last: AcquireResult = { kind: "conflict", conflicts: [] };
 
     while (this.now() < deadline) {
       let wake: (() => void) | null = null;
@@ -515,14 +987,40 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       const off = this.deps.waitable?.onRelease(keys, () => wake?.());
       const remaining = Math.max(1, deadline - this.now());
       try {
-        await Promise.race([woken, sleep(Math.min(DEFAULT_POLL_MS, remaining))]);
+        await Promise.race([woken, sleep(Math.min(this.pollDelay(), remaining))]);
       } finally {
         off?.();
       }
-      const retry = this.acquire(executionId, refs);
-      if (retry.ok) return retry;
+      const retry = await this.acquire(executionId, refs, context);
+      if (retry.kind === "acquired") return retry;
+      if (retry.kind === "unavailable") return retry;
+      last = retry;
     }
-    return { ok: false, conflicts: [] };
+    return last;
+  }
+
+  /**
+   * The retry delay, jittered ±20% — DETERMINISTICALLY.
+   *
+   * Jitter is needed because several workers freed by the same release or the same lease
+   * expiry would otherwise retry in lockstep, converge on the authority together, and
+   * all but one would pay a round trip to be told no.
+   *
+   * It is NOT `Math.random()`. The execution model is required to stay fully
+   * deterministic — a recorded scenario has to reproduce exactly, and there is a test
+   * asserting `Math.random` appears nowhere in `src/box` — so the sequence is a counter
+   * stepped through a cheap integer hash, seeded from THIS PROCESS's boot token. Each
+   * worker therefore walks a different sequence (which is what de-synchronises them)
+   * while remaining perfectly reproducible within a process.
+   */
+  private pollDelay(): number {
+    this.jitterSeq = (this.jitterSeq + 1) >>> 0;
+    // Knuth multiplicative hash: one multiply, well-spread low bits.
+    const mixed = Math.imul(this.jitterSeed ^ this.jitterSeq, 2654435761) >>> 0;
+    const frac = (mixed % 1024) / 1024;
+    // Rounded: sub-millisecond precision is meaningless to a timer, and an integer keeps
+    // the delay readable in a log.
+    return Math.round(DEFAULT_POLL_MS * (0.8 + 0.4 * frac));
   }
 
   /**
@@ -590,35 +1088,319 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
   private acquire(
     executionId: string,
     refs: InstrumentLegRef[],
-  ): { ok: true } | { ok: false; conflicts: InstrumentConflict[] } {
+    context: ReservationContext,
+  ): Promise<AcquireResult> {
+    return this.acquireWith(this.deps.reservations, executionId, refs, context);
+  }
+
+  private async acquireWith(
+    store: InstrumentReservationStore,
+    executionId: string,
+    refs: InstrumentLegRef[],
+    context: ReservationContext,
+  ): Promise<AcquireResult> {
     const now = this.now();
     const keys = keysOf(refs);
     const sideByKey = new Map<string, string>();
     for (const ref of refs) sideByKey.set(ref.key, ref.side);
 
-    const outcome = this.deps.reservations.tryAcquireAll({
+    const outcome = await store.tryAcquireAll({
       owner: executionId,
       keys,
       ttlMs: this.deps.cfg.instrumentLockTtlMs,
       now,
       sideByKey,
+      context,
     });
-    if (outcome.ok) return { ok: true };
-
-    const byKey = new Map(refs.map((r) => [r.key, r.side] as const));
+    if (outcome.ok) {
+      return {
+        kind: "acquired",
+        lease: {
+          owner: outcome.owner,
+          keys: outcome.keys,
+          expiresAt: outcome.expiresAt,
+          fence: outcome.fence,
+          durability: outcome.durability,
+        },
+      };
+    }
+    if (outcome.reason === "unavailable") {
+      return { kind: "unavailable", tier: outcome.tier, detail: outcome.detail };
+    }
+    const wanted = new Map(refs.map((r) => [r.key, r.side] as const));
+    // The incumbent's side arrives ON the conflict, so no second lookup is needed —
+    // a follow-up read could describe a holder that has since gone away.
     const conflicts = outcome.conflicts.map((c) =>
       classifyConflict(
         c.key,
         c.heldBy,
-        this.deps.reservations.sideOf(c.key, now) as OrderSide | null,
-        byKey.get(c.key) ?? "BUY",
+        (c.heldSide as OrderSide | null) ?? null,
+        wanted.get(c.key) ?? "BUY",
       ),
     );
-    return { ok: false, conflicts };
+    return { kind: "conflict", conflicts };
   }
 
-  private release(executionId: string, keys: readonly string[]): void {
-    this.deps.reservations.release({ owner: executionId, keys, now: this.now() });
+  private async releaseLease(executionId: string, lease: ReservationLease | null): Promise<void> {
+    await this.deps.reservations.release({
+      owner: executionId,
+      ...(lease === null ? {} : { keys: lease.keys, fence: lease.fence }),
+      now: this.now(),
+    });
+    // The paper fallback may have written to the local tier directly, so release it
+    // there too. Releasing a lease you do not hold is a no-op by contract.
+    const local = this.deps.local;
+    if (local !== undefined && local !== this.deps.reservations) {
+      await local.release({ owner: executionId, now: this.now() });
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Ownership: the heartbeat and the synchronous guard.
+   * ------------------------------------------------------------------ */
+
+  /**
+   * Register an EXIT's execution.
+   *
+   * Exits take the same contract reservation but participate in neither the duplicate
+   * guard nor the per-underlying budget — the monitor owns exit urgency, and an exit is
+   * never a speculative duplicate — so they have no opportunity identity to claim and can
+   * register once the reservation is granted.
+   */
+  private registerActive(
+    executionId: string,
+    keys: string[],
+    underlying: string,
+    lease: ReservationLease | null,
+  ): void {
+    this.active.set(executionId, {
+      keys,
+      underlying,
+      lease,
+      context: this.context(),
+      ownershipLost: false,
+      ownershipLossReason: null,
+      opportunityId: null,
+    });
+    this.ensureHeartbeat();
+  }
+
+  /**
+   * The synchronous ownership predicate, composed with the caller's own `stillWanted`.
+   *
+   * This is the hook that makes "TTL is not execution permission" real rather than
+   * aspirational: the simulator already consults `stillWanted` before each leg and
+   * inside its abort predicate, so a lost lease aborts the remaining legs through the
+   * existing, tested path instead of a new one.
+   *
+   * It is PESSIMISTIC about time, and the margin is NOT the clock-skew grace.
+   *
+   * The clock grace (250 ms) is sized for measurement error between this process and the
+   * authority. It says nothing about how long a broker order takes. A leg permitted at
+   * `expiresAt - 300ms` is submitted, the HTTP round trip takes a second or more, and by
+   * the time it is acknowledged another worker may legitimately hold the contract — and
+   * as `durable.ts` notes honestly, neither Zerodha nor Dhan accepts a fencing token, so
+   * nothing downstream can reject the stale order.
+   *
+   * So the margin is `reservationOwnershipMarginMs`, which must exceed worst-case submit
+   * latency. Renewal normally keeps `expiresAt` far ahead, so this boundary is rarely
+   * reached; when it is, refusing to open another leg is the only safe answer.
+   *
+   * NOTE it is deliberately NOT applied to `flattenResidual` or to EXITS, both of which
+   * must reduce existing exposure regardless of lease state.
+   */
+  private ownershipGuard(executionId: string, inner?: () => boolean): () => boolean {
+    return () => {
+      if (inner !== undefined && !inner()) return false;
+      const exec = this.active.get(executionId);
+      // FAIL CLOSED on an untracked execution. The only ways to get here are a settled
+      // execution (whose executor has already returned, so nothing consults this) or a
+      // broker switch that cleared the table mid-flight — in which case stopping is
+      // exactly right, because the contracts are in the outgoing broker's namespace.
+      if (exec === undefined) return false;
+      // Coordination granted no lease at all: there is nothing to assert.
+      if (exec.lease === null) return true;
+      if (exec.ownershipLost) return false;
+      return this.now() < exec.lease.expiresAt - this.deps.cfg.reservationOwnershipMarginMs;
+    };
+  }
+
+  private ensureHeartbeat(): void {
+    if (this.disposed) return;
+    if (this.heartbeat !== null) return;
+    if (this.active.size === 0 && this.holds.size === 0) return;
+    const interval = this.deps.cfg.reservationRenewIntervalMs;
+    const set =
+      this.deps.setTimer ??
+      ((fn: () => void, ms: number) => {
+        const handle = setInterval(fn, ms);
+        // Never hold the process open for a lock heartbeat.
+        if (typeof handle.unref === "function") handle.unref();
+        return handle;
+      });
+    this.heartbeat = set(() => {
+      // The tick is async; a rejection must never escape as an unhandled rejection.
+      void this.renewTick().catch(() => undefined);
+    }, interval);
+  }
+
+  private stopHeartbeatIfIdle(): void {
+    if (this.heartbeat === null) return;
+    if (this.active.size > 0 || this.holds.size > 0) return;
+    const clear = this.deps.clearTimer ?? ((h: unknown) => clearInterval(h as ReturnType<typeof setInterval>));
+    clear(this.heartbeat);
+    this.heartbeat = null;
+  }
+
+  /**
+   * Renew every lease this process still depends on.
+   *
+   * Bounded by a timer derived from the TTL, NOT driven by market ticks — renewing per
+   * tick would put thousands of writes a minute on the authority to achieve nothing.
+   *
+   * A failed renewal is a SAFETY EVENT. Ownership was lost, or is unknown, and either
+   * way this worker must stop treating the contracts as its own. `invariantViolation`
+   * is raised so the live path's existing quarantine logic engages, and the
+   * synchronous guard flips so the remaining legs abort.
+   */
+  async renewTick(): Promise<void> {
+    if (this.heartbeatRunning) return; // never overlap a tick with itself
+    this.heartbeatRunning = true;
+    try {
+      const now = this.now();
+      const ttl = this.deps.cfg.instrumentLockTtlMs;
+      // THE CURRENT context, deliberately — never the one the lease was taken under.
+      //
+      // Renewal asks "is this lease still valid in the world as it is NOW", and the
+      // durable tier answers by comparing the STORED broker/generation against what it is
+      // given. Handing it the lease's own recorded context would compare the lease to
+      // itself, which always matches, which silently disables the stale-generation check
+      // at exactly the moment it matters: a broker switch during a long execution.
+      const current = this.context();
+
+      // Renewed CONCURRENTLY, not one after another. A serial loop costs N round trips
+      // per tick, so a slow tier could push a tick past the renew interval and let
+      // leases lapse — and it would couple unrelated boxes, since one slow renewal would
+      // delay every other lease's. The fan-out is bounded by the execution concurrency
+      // cap, so this is a handful of requests.
+      // `allSettled`, not `all`: one renewal rejecting must not abandon the others, nor
+      // skip the uncertain-hold maintenance below.
+      await Promise.allSettled(
+        [...this.active].map(async ([executionId, exec]) => {
+          if (exec.lease === null || exec.ownershipLost) return;
+          const outcome = await this.renewLease(executionId, exec.lease, ttl, now, current);
+          if (outcome.ok) {
+            this.stats.renewSuccess++;
+            exec.lease = { ...exec.lease, expiresAt: outcome.expiresAt, fence: outcome.fence };
+            return;
+          }
+          this.stats.renewFailure++;
+          this.stats.ownershipLost++;
+          exec.ownershipLost = true;
+          exec.ownershipLossReason = outcome.reason;
+          this.log({
+            execution: executionId,
+            broker: exec.context.broker,
+            underlying: exec.underlying,
+            status: "ownership_lost",
+            reason: outcome.reason,
+            detail: outcome.detail,
+          });
+          // An invariant violation, not a retryable hiccup: another worker may already
+          // own these contracts.
+          this.deps.inner.invariantViolation(
+            `box reservation ownership ${outcome.reason} mid-execution (${outcome.detail})`,
+          );
+        }),
+      );
+
+      // Uncertain holds keep their protection alive while this process is healthy, and
+      // for a BOUNDED time only. Renewing forever would lock a contract permanently on
+      // one ambiguous outcome; not renewing at all would drop protection while real
+      // exposure may exist. So it is renewed up to `reservationUncertainHoldMaxMs` and
+      // then LEFT TO EXPIRE — never actively released, because releasing is the
+      // "assume there is no exposure" mistake this hold exists to avoid.
+      for (const [executionId, hold] of [...this.holds]) {
+        if (now - hold.heldSince >= this.deps.cfg.reservationUncertainHoldMaxMs) {
+          this.holds.delete(executionId);
+          this.stats.uncertainHoldsAbandoned++;
+          this.log({
+            execution: executionId,
+            broker: hold.context.broker,
+            underlying: "-",
+            status: "reservation_hold_expiring",
+            reason: hold.reason,
+            heldMs: now - hold.heldSince,
+          });
+          continue;
+        }
+        // Current context here too: a hold from a superseded broker generation must stop
+        // being renewed rather than being kept alive indefinitely.
+        const outcome = await this.renewLease(executionId, hold.lease, ttl, now, current);
+        if (outcome.ok) {
+          this.stats.renewSuccess++;
+          hold.lease = { ...hold.lease, expiresAt: outcome.expiresAt, fence: outcome.fence };
+          continue;
+        }
+        this.stats.renewFailure++;
+        // A TRANSIENT failure must not collapse the hold. `unavailable` means ownership is
+        // UNKNOWN, and dropping the hold on a brief Mongo blip would cut protection from
+        // `reservationUncertainHoldMaxMs` down to a single lock TTL at exactly the moment
+        // broker state is ambiguous. Only a confirmed loss ends the hold.
+        if (outcome.reason === "unavailable") {
+          this.log({
+            execution: executionId,
+            broker: hold.context.broker,
+            underlying: "-",
+            status: "reservation_hold_renew_unavailable",
+            reason: outcome.reason,
+          });
+          continue;
+        }
+        this.holds.delete(executionId);
+        this.log({
+          execution: executionId,
+          broker: hold.context.broker,
+          underlying: "-",
+          status: "reservation_hold_lost",
+          reason: outcome.reason,
+        });
+      }
+      this.stopHeartbeatIfIdle();
+    } finally {
+      this.heartbeatRunning = false;
+    }
+  }
+
+  /**
+   * Renew ONE lease against the tier that actually granted it.
+   *
+   * A `local_only` lease came from the in-process tier, because the durable authority was
+   * unreachable when it was taken. Renewing it against the CHAIN would ask that same
+   * unreachable authority to confirm a lease it never issued, get `unavailable`, and
+   * declare ownership lost on the very first heartbeat — destroying the documented
+   * degraded modes (paper continuing, and an exit proceeding) exactly one interval after
+   * they began.
+   */
+  private renewLease(
+    executionId: string,
+    lease: ReservationLease,
+    ttlMs: number,
+    now: number,
+    context: ReservationContext,
+  ): Promise<RenewOutcome> {
+    const store =
+      lease.durability === "local_only" && this.deps.local !== undefined
+        ? this.deps.local
+        : this.deps.reservations;
+    return store.renew({
+      owner: executionId,
+      keys: lease.keys,
+      ttlMs,
+      now,
+      fence: lease.fence,
+      context,
+    });
   }
 
   /**
@@ -627,61 +1409,112 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
    * `clean` means the broker's position is knowable and settled — released, so a
    * later box may legitimately work the same contract for its own lot. `uncertain`
    * means residual exposure exists or the terminal state is ambiguous, and the
-   * reservation is HELD until its TTL expires. Holding is the conservative choice:
+   * reservation is HELD and kept renewed. Holding is the conservative choice:
    * releasing would let a second box assume there is no exposure on a contract that
    * may still carry some.
    */
-  private settle(
+  private async settle(
     executionId: string,
-    keys: readonly string[],
     opportunityId: string | null,
     outcome: "clean" | "uncertain",
-  ): void {
-    this.active.delete(executionId);
+  ): Promise<void> {
+    const exec = this.active.get(executionId);
+    this.abandon(executionId);
     if (opportunityId !== null) this.activeOpportunities.delete(opportunityId);
     if (outcome === "clean") {
-      this.release(executionId, keys);
+      await this.releaseLease(executionId, exec?.lease ?? null);
+      this.stopHeartbeatIfIdle();
       return;
     }
-    this.stats.reservationsHeldOnUncertainty++;
-    this.log({
-      execution: executionId,
-      broker: this.deps.broker(),
-      underlying: "-",
-      status: "reservation_held",
-      reason: "uncertain_terminal_state",
-      ttlMs: this.deps.cfg.instrumentLockTtlMs,
-    });
+    this.retain(executionId, exec, "uncertain_terminal_state");
   }
 
   private holdOnUncertainty(executionId: string, opportunityId: string | null, why: string): void {
-    this.active.delete(executionId);
+    const exec = this.active.get(executionId);
+    this.abandon(executionId);
     if (opportunityId !== null) this.activeOpportunities.delete(opportunityId);
+    this.retain(executionId, exec, why);
+  }
+
+  private retain(executionId: string, exec: ActiveExecution | undefined, why: string): void {
     this.stats.reservationsHeldOnUncertainty++;
+    if (exec?.lease != null && !exec.ownershipLost) {
+      this.holds.set(executionId, {
+        lease: exec.lease,
+        context: exec.context,
+        keys: exec.keys,
+        heldSince: this.now(),
+        reason: why,
+      });
+      this.ensureHeartbeat();
+    }
     this.log({
       execution: executionId,
-      broker: this.deps.broker(),
+      broker: exec?.context.broker ?? this.deps.broker(),
       underlying: "-",
       status: "reservation_held",
       reason: why,
       ttlMs: this.deps.cfg.instrumentLockTtlMs,
+      renewedUntilMs: this.deps.cfg.reservationUncertainHoldMaxMs,
     });
+    this.stopHeartbeatIfIdle();
   }
 
   private mintId(kind: string): string {
     this.seq += 1;
-    return `${kind}-${this.seq.toString(36)}-${this.now().toString(36)}`;
+    // Globally unique. A bare per-process counter collides across workers — worker-1's
+    // `entry-7` and worker-2's `entry-7` are the same string — which would let one
+    // worker renew or release the other's lease.
+    return mintOwnerId(this.identity, kind, this.seq);
   }
 
-  /** Broker switch: keys change namespace wholesale, so nothing may survive. */
-  resetForBrokerSwitch(): void {
-    this.deps.reservations.clear();
+  /**
+   * Broker switch: keys change namespace wholesale, so nothing may survive.
+   *
+   * The durable tier clears only the reservations THIS PROCESS owns. A sibling
+   * worker's live reservations are authoritative and must not be deleted — doing so
+   * would be exactly the multi-process violation this subsystem exists to prevent.
+   */
+  async resetForBrokerSwitch(): Promise<void> {
+    await this.deps.reservations.clear();
+    const local = this.deps.local;
+    if (local !== undefined && local !== this.deps.reservations) await local.clear();
     this.active.clear();
+    this.holds.clear();
     this.activeOpportunities.clear();
+    this.stopHeartbeatIfIdle();
+  }
+
+  /** True while this process holds any reservation, including uncertain holds. */
+  get holdsReservations(): boolean {
+    return this.active.size > 0 || this.holds.size > 0;
+  }
+
+  /** Stop the heartbeat. Called from the engine's shutdown path. */
+  dispose(): void {
+    this.disposed = true;
+    if (this.heartbeat !== null) {
+      const clear = this.deps.clearTimer ?? ((h: unknown) => clearInterval(h as ReturnType<typeof setInterval>));
+      clear(this.heartbeat);
+      this.heartbeat = null;
+    }
+  }
+
+  /** Why LIVE Box entry is currently refused, or null when it is permitted. */
+  private liveEntryBlockedReason(): string | null {
+    if (this.mode !== "live") return null;
+    if (this.deps.cfg.reservationRequireDurable && !this.deps.reservations.durable) {
+      return `BOX_RESERVATION_REQUIRE_DURABLE is set but "${this.deps.reservations.name}" is not durable`;
+    }
+    if (this.deps.cfg.durableReservationsEnabled && !this.deps.reservations.ready) {
+      return `${DURABLE_UNAVAILABLE_REASON}: the durable reservation authority is not ready`;
+    }
+    return null;
   }
 
   metrics(): CoordinatorMetricsSnapshot {
     const now = this.now();
+    const tier = this.deps.reservations.diagnostics();
     return {
       activeExecutions: this.active.size,
       activeInstrumentReservations: this.deps.reservations.activeCount(now),
@@ -700,6 +1533,67 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       },
       store: this.deps.reservations.name,
       durable: this.deps.reservations.durable,
+
+      reservationStore: this.deps.reservations.name,
+      reservationDurability: this.deps.reservations.durable ? "durable" : "local_only",
+      durableReservationsEnabled: this.deps.cfg.durableReservationsEnabled,
+      durableReady: this.deps.reservations.ready,
+      requireDurable: this.deps.cfg.reservationRequireDurable,
+      durableAcquireAttempts: tier.acquireAttempts,
+      durableAcquireSuccess: tier.acquireSuccess,
+      durableConflicts: tier.conflicts,
+      durableErrors: tier.errors,
+      durableAcquireLatencyP50: tier.acquireLatencyP50Ms,
+      durableAcquireLatencyP95: tier.acquireLatencyP95Ms,
+      durableAcquireLatencyP99: tier.acquireLatencyP99Ms,
+      reservationRenewSuccess: this.stats.renewSuccess,
+      reservationRenewFailure: this.stats.renewFailure,
+      reservationOwnershipLost: this.stats.ownershipLost,
+      expiredReservationsObserved: tier.expiredReservationsObserved,
+      durableUnavailableRefusals: this.stats.durableUnavailableRefusals,
+      localOnlyFallbacks: this.stats.localOnlyFallbacks,
+      staleGenerationAborts: this.stats.staleGenerationAborts,
+      uncertainHoldsActive: this.holds.size,
+      uncertainHoldsAbandoned: this.stats.uncertainHoldsAbandoned,
+      clockOffsetMs: tier.clockOffsetMs,
+    };
+  }
+
+  /**
+   * The operator-facing health view.
+   *
+   * Separate from `metrics()` because it may carry a (scrubbed) error message, and
+   * `metrics()` is contractually counts-and-statuses only. `liveEntryBlocked` is the
+   * field a UI should surface loudly: it means the system is deliberately refusing to
+   * open new Box exposure.
+   */
+  coordinationHealth(): CoordinationHealthSnapshot {
+    const now = this.now();
+    const tiers =
+      typeof (this.deps.reservations as { tierDiagnostics?: () => ReservationStoreDiagnostics[] })
+        .tierDiagnostics === "function"
+        ? (this.deps.reservations as { tierDiagnostics: () => ReservationStoreDiagnostics[] }).tierDiagnostics()
+        : [this.deps.reservations.diagnostics()];
+    const durableTier = tiers.find((t) => t.durable) ?? null;
+    const blocked = this.liveEntryBlockedReason();
+    return {
+      enabled: this.deps.cfg.executionCoordinatorEnabled,
+      localStore: this.deps.local?.name ?? tiers[0]?.name ?? this.deps.reservations.name,
+      durableStore: durableTier?.name ?? null,
+      durableReady: durableTier?.ready ?? false,
+      requireDurable: this.deps.cfg.reservationRequireDurable,
+      liveEntryBlocked: blocked !== null,
+      liveEntryBlockedReason: blocked,
+      deployment: this.identity.deployment,
+      broker: this.deps.broker(),
+      generation: this.generation(),
+      activeReservations: this.deps.reservations.activeCount(now),
+      ownershipLosses: this.stats.ownershipLost,
+      acquireP50Ms: durableTier?.acquireLatencyP50Ms ?? tiers[0]?.acquireLatencyP50Ms ?? null,
+      acquireP95Ms: durableTier?.acquireLatencyP95Ms ?? tiers[0]?.acquireLatencyP95Ms ?? null,
+      acquireP99Ms: durableTier?.acquireLatencyP99Ms ?? tiers[0]?.acquireLatencyP99Ms ?? null,
+      durableLastError: durableTier?.lastError ?? null,
+      tiers,
     };
   }
 }

@@ -79,6 +79,13 @@ export interface BoxModuleDeps {
    */
   activeBroker?: () => BrokerId;
   /**
+   * The broker GENERATION, bumped on every switch and persisted so it never repeats.
+   *
+   * Stamped onto every durable instrument reservation. Defaults to 0 when absent, which
+   * keeps existing wiring and every existing test behaving exactly as before.
+   */
+  brokerGeneration?: () => number;
+  /**
    * Overrides the market-data provider. When absent, one is adapted from `kite`,
    * preserving current Zerodha behaviour bit for bit.
    */
@@ -135,6 +142,7 @@ export function registerBoxModule(app: Express, deps: BoxModuleDeps): BoxModule 
   const engine = new BoxEngine({
     marketData: deps.marketData ?? kiteMarketData(deps.kite),
     activeBroker: deps.activeBroker ?? (() => "zerodha" as const),
+    ...(deps.brokerGeneration === undefined ? {} : { brokerGeneration: deps.brokerGeneration }),
     // The hub already satisfies BoxFeedProvider structurally, so a Zerodha-only
     // deployment needs no adapter at all.
     feed: deps.feed ?? deps.tickerHub,
