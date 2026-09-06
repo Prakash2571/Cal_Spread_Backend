@@ -137,6 +137,43 @@ Mode: `BOX_EXECUTION_MODE` (`paper_touch`/`paper_latency`/`paper_legging`/`live`
 `BOX_SIMULATED_DECISION_MS`, `BOX_LEG_TIMEOUT_MS`, `BOX_LEG_MAX_CHASE_TICKS`,
 `BOX_LEG_UNWIND_LATENCY_MS`, `BOX_UNWIND_MAX_CHASE_TICKS`, `BOX_MAX_CONCURRENT_EXECUTIONS`.
 
+### The four execution settings, and how they differ
+
+Two independent axes. `BOX_EXECUTION_MODE` decides whether real orders can exist at all;
+`BOX_PAPER_EXECUTION_PROFILE` decides how faithfully the simulator behaves.
+
+| Setting | Axis | Real broker orders? | What it is |
+|---|---|---|---|
+| `standard` | profile | no | Today's paper behaviour, byte-for-byte. Constant latency, no cancel race, no shared liquidity. The baseline. |
+| `live_parity` | profile | no | **Evidence-driven.** Shared liquidity ledger, the live scheduling policy, latency and cancel windows drawn from MEASURED live observations when calibration is valid, ACK recorded distinctly from fills. Every figure reports whether it is measured. |
+| `stress` | profile | no | **Fault injection for resilience testing.** Deliberately synthetic. A separate profile so an injected fault can never be mistaken for observed behaviour. Refuses to start with live execution. |
+| `live` | mode | **YES** | Real orders through the durable OrderManager and a real broker adapter. Requires `BOX_LIVE_TRADING_ENABLED=true` as a second gate, or startup fails. |
+
+`live_parity` and `stress` share the same realism *layering*; they differ entirely in what feeds
+it. Only `live_parity` is `evidence_driven`, and only `live_parity` may report confidence above
+`LOW`.
+
+#### What `live_parity` knows
+
+Measured from real executions, per broker, per operation kind, per marketable/passive profile and
+per time-of-day bucket: scheduler queue wait, durable-persistence latency, transport pacing,
+POST→HTTP response, POST→ACK, ACK→first fill, ACK→terminal, partial→terminal, and
+cancel-request→terminal. Fills, prices and partial fills come from real observed WebSocket depth
+walked within a bounded LIMIT. Shared displayed liquidity is finite across concurrent attempts.
+
+#### What `live_parity` still CANNOT know
+
+It cannot reconstruct the true NSE queue position of our order, hidden or iceberg liquidity, the
+matching engine's ordering, another participant's future order, and the exact market impact of
+our own order.
+
+None of those is available from a retail broker API plus level-2 depth, so none of them is
+fabricated. Where a stage has not been measured, paper uses a documented constant and reports
+`measured: false` with `confidence: LOW` — it never presents a constant as an observation.
+
+**This is not an exact exchange simulator, and must never be described as one.** It is a
+deterministic digital twin of the *observable* Zerodha/Dhan execution path.
+
 Paper execution profile (default OFF; layered on `paper_legging`, never changes
 `standard`): `BOX_PAPER_EXECUTION_PROFILE` (`standard`|`live_parity`|`stress`),
 `BOX_PAPER_MAX_CONCURRENT_EXECUTIONS` (default = `BOX_LIVE_MAX_CONCURRENT_EXECUTIONS`),
@@ -156,7 +193,10 @@ time-of-day bucket cannot overfit a handful of observations),
 `BOX_PAPER_CALIBRATION_MAX_AGE_MS` (default 3 days; older samples are excluded from ACTIVE
 calibration but retained for analytics), `BOX_PAPER_CALIBRATION_TIME_BUCKETS` (default `true`),
 `BOX_PAPER_CANCEL_LATENCY_MS` (default `150` — the fallback cancel-vs-fill race window; non-zero
-on purpose, because zero would mean cancels are instantaneous).
+on purpose, because zero would mean cancels are instantaneous), `BOX_PAPER_PERSISTENCE_MS`
+(default `0` — the fallback durable-write delay before transmitting; zero on purpose, because an
+unmeasured database latency is unknown and a guessed one would be a fabrication. Once
+`persistence_wait_ms` is calibrated, the measured p50 is used instead).
 
 Execution timing observability / latency calibration (fail-open, off the trading hot path):
 `BOX_EXECUTION_TIMING_METRICS_ENABLED` (default `true`), `BOX_EXECUTION_TIMING_WINDOW`

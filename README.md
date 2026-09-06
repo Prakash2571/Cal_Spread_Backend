@@ -290,12 +290,21 @@ operations.
 >
 > **Every figure states its own evidence.** A report says `measured: no` and `confidence: LOW`
 > whenever it is running on a configured constant rather than observations, and a stale sample set
-> is *not* quietly reused — yesterday's latency is not today's. **It remains a simulator**: it
-> cannot reproduce true NSE queue position, hidden liquidity, the matching-engine sequence, or
-> other participants' orders, and it does not fabricate any of them. Read-only diagnostics are at
-> `GET /api/box/execution-diagnostics`; see `src/box/LIVE_EXECUTION.md` for the calibration
-> honesty contract and the "Observable parity" section stating exactly what can and cannot be
-> claimed.
+> is *not* quietly reused — yesterday's latency is not today's.
+>
+> **It is NOT an exact exchange simulator and must never be described as one.** It is a
+> deterministic digital twin of the *observable* execution path. It explicitly cannot reconstruct
+> **true NSE queue position**, **hidden or iceberg liquidity**, **matching-engine ordering**,
+> **another participant's future order**, or the **exact market impact** of our own order — and it
+> fabricates none of them. Read-only diagnostics are at `GET /api/box/execution-diagnostics`; see
+> `src/box/LIVE_EXECUTION.md` for the calibration honesty contract and the "Observable parity"
+> section stating exactly what can and cannot be claimed.
+>
+> **The four settings, distinguished.** `standard` = today's paper, byte-for-byte. `live_parity` =
+> evidence-driven simulation, no broker orders. `stress` = deliberately synthetic fault injection
+> for resilience testing, no broker orders, and never called parity. `BOX_EXECUTION_MODE=live` =
+> real orders, and the only one of the four that can place them — behind a second gate
+> (`BOX_LIVE_TRADING_ENABLED=true`) without which startup fails.
 
 ### The box — LONG and SHORT
 
@@ -568,6 +577,7 @@ Every threshold is env-overridable; the defaults are the shipped specification.
 | `BOX_PAPER_CALIBRATION_MAX_AGE_MS` | `259200000` | Samples older than this are excluded from ACTIVE calibration; still retained for analytics |
 | `BOX_PAPER_CALIBRATION_TIME_BUCKETS` | `true` | Enable coarse OPEN / NORMAL / CLOSE calibration buckets |
 | `BOX_PAPER_CANCEL_LATENCY_MS` | `150` | Fallback cancel-vs-fill race window (ms) when no measured CANCEL latency exists. Non-zero on purpose |
+| `BOX_PAPER_PERSISTENCE_MS` | `0` | Fallback durable-write delay (ms) before transmitting. Zero on purpose: an unmeasured database latency is unknown, and a guess would be fabrication |
 | `BOX_EXECUTION_EVENT_LOOP_METRICS_ENABLED` | `true` | Measure event-loop delay and process pressure, so a Node stall is never recorded as broker latency |
 | `BOX_LIVE_TIMING_PERSIST_ENABLED` | `false` | Persist calibration observations so they survive a restart |
 | `BOX_LIVE_TIMING_BATCH_SIZE` | `50` | Calibration observations buffered before a flush (never a synchronous hot-path write) |
