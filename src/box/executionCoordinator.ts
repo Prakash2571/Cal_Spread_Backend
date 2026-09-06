@@ -759,6 +759,29 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       });
     }
 
+    // NOT merely a type narrowing — a genuine hole this closes.
+    //
+    // The paper/exit fallback re-acquires against the local tier, and that attempt can
+    // ITSELF come back `unavailable`. Without this guard that outcome fell straight
+    // through the conflict branch and reached the submit path with no lease at all. It
+    // fails closed like every other unresolved acquisition.
+    if (attempt.kind !== "acquired") {
+      this.abandon(executionId);
+      this.stats.failedClosed++;
+      const detail =
+        attempt.kind === "unavailable"
+          ? `${DURABLE_UNAVAILABLE_REASON}: ${attempt.detail}`
+          : "no reservation was granted";
+      this.log({
+        execution: executionId,
+        broker,
+        underlying: candidate.underlying,
+        status: "failed_closed",
+        reason: attempt.kind,
+      });
+      return { ok: false, reason: "feed_unhealthy", detail };
+    }
+
     // PRE-SUBMIT OWNERSHIP CHECK. The last thing before the order path.
     const permitted = await this.confirmBeforeSubmit(executionId, keys, context, attempt.lease, waited);
     if (!permitted.ok) {
@@ -1569,10 +1592,15 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
    */
   coordinationHealth(): CoordinationHealthSnapshot {
     const now = this.now();
+    // `tierDiagnostics` is a chain-only affordance, so it is probed structurally rather
+    // than added to the store interface every single-tier implementation would then have
+    // to satisfy for no benefit.
+    const maybeChain = this.deps.reservations as unknown as {
+      tierDiagnostics?: () => ReservationStoreDiagnostics[];
+    };
     const tiers =
-      typeof (this.deps.reservations as { tierDiagnostics?: () => ReservationStoreDiagnostics[] })
-        .tierDiagnostics === "function"
-        ? (this.deps.reservations as { tierDiagnostics: () => ReservationStoreDiagnostics[] }).tierDiagnostics()
+      typeof maybeChain.tierDiagnostics === "function"
+        ? maybeChain.tierDiagnostics()
         : [this.deps.reservations.diagnostics()];
     const durableTier = tiers.find((t) => t.durable) ?? null;
     const blocked = this.liveEntryBlockedReason();

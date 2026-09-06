@@ -144,6 +144,32 @@ const ReservationModel = boxModel<ReservationRow>("BoxInstrumentReservation", re
 const FenceModel = boxModel<FenceRow>("BoxReservationFence", fenceSchema);
 
 /**
+ * Exactly the NATIVE driver operations this adapter uses, and nothing else.
+ *
+ * The native collection is reached directly for three of them — `insertOne` (so the raw
+ * duplicate-key error shape survives to `duplicateTarget()`), the deletes (no casting
+ * needed, and a plain count back), and index creation. The driver types those against
+ * `Document`, whose `_id` is an `ObjectId`; this collection's `_id` is the owner STRING,
+ * and its delete filters use operators like `$regex` and `$lte` that a row-shaped filter
+ * type rejects.
+ *
+ * Writing the surface down and casting ONCE is better than sprinkling casts at each call:
+ * it says precisely which database capabilities are relied on, which is the same reason
+ * `port.ts` exists.
+ */
+interface RawReservationCollection {
+  insertOne(doc: ReservationRow): Promise<unknown>;
+  deleteOne(filter: Record<string, unknown>): Promise<{ deletedCount?: number }>;
+  deleteMany(filter: Record<string, unknown>): Promise<{ deletedCount?: number }>;
+  createIndexes(specs: Record<string, unknown>[]): Promise<unknown>;
+  indexes(): Promise<{ name?: string; unique?: boolean; key?: Record<string, unknown> }[]>;
+}
+
+function rawCollection(): RawReservationCollection {
+  return ReservationModel.collection as unknown as RawReservationCollection;
+}
+
+/**
  * Which unique index rejected an insert?
  *
  * The two causes need different handling — an `_id` collision is our own re-entrant
@@ -218,7 +244,7 @@ export class MongoReservationPort implements DurableReservationPort {
     if (!isBoxConnectionReady()) {
       throw new Error("box MongoDB connection is not ready");
     }
-    const collection = ReservationModel.collection;
+    const collection = rawCollection();
     try {
       await collection.createIndexes([
         // THE safety property. Unique + multikey over `keys`, namespaced by deployment.
@@ -239,11 +265,7 @@ export class MongoReservationPort implements DurableReservationPort {
 
     // VERIFY rather than assume. `createIndexes` succeeding is good evidence, reading
     // the index back is proof — and this is the one guarantee the whole design rests on.
-    const indexes = (await collection.indexes()) as {
-      name?: string;
-      unique?: boolean;
-      key?: Record<string, unknown>;
-    }[];
+    const indexes = await collection.indexes();
     const unique = indexes.find((index) => index.name === RESERVATION_UNIQUE_INDEX);
     if (unique === undefined) {
       throw new Error(`${COLLECTION} is missing the ${RESERVATION_UNIQUE_INDEX} index`);
@@ -335,7 +357,7 @@ export class MongoReservationPort implements DurableReservationPort {
       renewed_at: new Date(doc.renewedAt),
     };
     try {
-      await ReservationModel.collection.insertOne(row);
+      await rawCollection().insertOne(row);
       return "inserted";
     } catch (error) {
       const target = duplicateTarget(error);
@@ -357,7 +379,7 @@ export class MongoReservationPort implements DurableReservationPort {
       expires_at: { $lte: new Date(args.notAfter) },
     };
     if (args.keys !== undefined) filter.keys = { $in: [...args.keys] };
-    const result = await ReservationModel.collection.deleteMany(filter);
+    const result = await rawCollection().deleteMany(filter);
     return result.deletedCount ?? 0;
   }
 
@@ -383,7 +405,7 @@ export class MongoReservationPort implements DurableReservationPort {
   async deleteOwned(args: { readonly owner: string; readonly fence?: number }): Promise<number> {
     const filter: Record<string, unknown> = { _id: args.owner };
     if (args.fence !== undefined) filter.fence = args.fence;
-    const result = await ReservationModel.collection.deleteOne(filter);
+    const result = await rawCollection().deleteOne(filter);
     return result.deletedCount ?? 0;
   }
 
@@ -428,7 +450,7 @@ export class MongoReservationPort implements DurableReservationPort {
    */
   async deleteByOwnerPrefix(prefix: string): Promise<number> {
     const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const result = await ReservationModel.collection.deleteMany({
+    const result = await rawCollection().deleteMany({
       _id: { $regex: `^${escaped}` },
     });
     return result.deletedCount ?? 0;
