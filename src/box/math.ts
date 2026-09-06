@@ -780,16 +780,56 @@ export function evaluateCandidateIndicative(args: {
   // PLAUSIBILITY BOUND — the reason this function cannot simply do the arithmetic
   // and publish it.
   //
-  // A box's fair value is the width, undiscounted. For a LONG box the net debit
-  // (its cost) must sit strictly inside (0, width); for a SHORT box the mirror
-  // holds, so the DIRECTION-SIGNED cost must sit inside (0, width). Outside that
-  // band the inputs are not a coherent snapshot — the normal case for a
-  // last-traded price, because a strike that has not traded for days carries a
-  // price struck when the underlying was somewhere else entirely. Four legs each
-  // stale from a different session produce an enormous fictional edge; reporting
-  // no edge is the honest answer.
+  // A box's fair value is the width, undiscounted. `signedCost` is the implied
+  // VALUE of the box (what establishing the long side would cost): the entry sides
+  // mirror by direction, so `netDebit` flips sign with the direction and
+  // `directionSign × netDebit` recovers the same positive value either way.
+  //
+  // The band bounds how far that implied value may sit from the width before the
+  // four prices stop being a coherent snapshot. It has to be TWO-SIDED, because
+  // both sides of the width are real:
+  //
+  //   value < width  →  the LONG box is the arbitrage (pay less than it settles at)
+  //   value > width  →  the SHORT box is the arbitrage (take in more than it costs)
+  //
+  // This previously read `signedCost < box_width`, which is not a coherence test at
+  // all — it is a "the long box is profitable" test. Since the value is identical
+  // for both directions, it admitted every long-box edge and rejected EVERY
+  // profitable short box as implausible, so the market-closed view could only ever
+  // show short boxes as losers.
+  //
+  // What is genuinely implausible is an edge of the same order as the width itself:
+  // a strike that has not traded for days carries a price struck when the
+  // underlying was somewhere else entirely, and four legs each stale from a
+  // different session produce a fictional edge many times the width. Bounding the
+  // edge MAGNITUDE by the width keeps both real arbitrage directions and still
+  // rejects that garbage — with no invented tolerance constant, since the width is
+  // already the natural scale of the trade.
+  // Restated as a bound on this direction's SIGNED edge — `0 < edge < width` —
+  // which is what makes it direction-correct. The edge is
+  // `directionSign × width − netDebit`, so the single condition expands to each
+  // direction's own profitable region:
+  //
+  //   LONG:   0 < width − value < width   ⟺   0 < value < width
+  //   SHORT:  0 < value − width < width   ⟺   width < value < 2 × width
+  //
+  // The long-box case is byte-for-byte the old band, so nothing about long boxes
+  // changes — including the excluded boundaries (value = 0 is the free-money case,
+  // value = width has no edge) and the guarantee that a reported edge is positive
+  // and smaller than the box's maximum payoff. What it adds is the mirror region,
+  // where taking in more than the box can cost to settle makes the SHORT box the
+  // arbitrage. No tolerance constant is introduced: the width is the trade's own
+  // natural scale, and an "edge" as large as the width is stale-data garbage rather
+  // than a dislocation.
   const signedCost = netDebit === null ? null : directionSign(direction) * netDebit;
-  const plausible = signedCost !== null && signedCost > 0 && signedCost < candidate.box_width;
+  const impliedEdge =
+    netDebit === null ? null : directionSign(direction) * candidate.box_width - netDebit;
+  const plausible =
+    signedCost !== null &&
+    impliedEdge !== null &&
+    signedCost > 0 &&
+    impliedEdge > 0 &&
+    impliedEdge < candidate.box_width;
 
   const netDebitPerUnit = plausible ? netDebit : null;
   const grossPerUnit =

@@ -83,6 +83,12 @@ export interface BoxScannerDeps {
     legging: PaperLeggingExecutionRecord,
     reason: BoxExecutionFailureReason,
     detail: string,
+    /**
+     * The gross edge measured at DETECTION (₹), which the legging record does not carry.
+     * Cost attribution needs the edge the attempt set out to capture; without it there is
+     * nothing to attribute against, so it is passed explicitly rather than substituted.
+     */
+    detectedGrossEdge?: number | null,
   ) => void;
   /** Ledger hook for rejections and detections. */
   onEvent: (
@@ -436,7 +442,13 @@ export class BoxScanner {
           // Some legs may have filled and been unwound: persist the attempt so the
           // legging loss is not invisible, then release.
           if (legging.legging.filled_leg_count > 0 || legging.legging.emergency_unwind) {
-            this.deps.onExecutionAttempt?.(cand, legging.legging, legging.reason, legging.detail);
+            this.deps.onExecutionAttempt?.(
+              cand,
+              legging.legging,
+              legging.reason,
+              legging.detail,
+              detection.gross_edge,
+            );
           }
           this.recordExecutionFailure(cand, detection, legging.reason, legging.detail);
           finish(

@@ -870,8 +870,8 @@ export async function loadBoxLiveRiskSeed(sinceMs: number): Promise<{
       .select({ realised_net_pnl: 1, net_pnl: 1 })
       .lean<Array<{ realised_net_pnl?: number | null; net_pnl?: number | null }>>(),
     BoxExecutionAttempt.find({ resolved_at: { $gte: new Date(sinceMs) } })
-      .select({ net_abort_pnl: 1 })
-      .lean<Array<{ net_abort_pnl?: number | null }>>(),
+      .select({ net_abort_pnl: 1, flatten_charges: 1 })
+      .lean<Array<{ net_abort_pnl?: number | null; flatten_charges?: number | null }>>(),
     BoxOrderIntent.countDocuments({ state: "REJECTED", updated_at: { $gte: new Date(sinceMs) } }),
     BoxOrderIntent.find({ updated_at: { $gte: new Date(sinceMs) } })
       .select({ state: 1 })
@@ -879,7 +879,17 @@ export async function loadBoxLiveRiskSeed(sinceMs: number): Promise<{
       .lean<Array<{ state: BoxOrderIntentState }>>(),
   ]);
   const tradePnl = trades.reduce((sum, trade) => sum + (trade.realised_net_pnl ?? trade.net_pnl ?? 0), 0);
-  const abortPnl = attempts.reduce((sum, attempt) => sum + (attempt.net_abort_pnl ?? 0), 0);
+  // `net_abort_pnl` deliberately EXCLUDES the cost of flattening residual exposure, which is
+  // accumulated separately in `flatten_charges`. In-session the engine charges those against the
+  // daily loss limit as they are paid (`noteFlattenCharges` → `recordRealisedPnl(-charges)`), so
+  // omitting them here made the restart seed strictly more optimistic than the live counter it
+  // replaces: after a restart the day looked BETTER by the whole sum of flatten charges, and live
+  // entry could stay enabled with the true realised loss already past the limit. A risk seed that
+  // errs generous is the one direction it must never err in.
+  const abortPnl = attempts.reduce(
+    (sum, attempt) => sum + (attempt.net_abort_pnl ?? 0) - Math.max(0, attempt.flatten_charges ?? 0),
+    0,
+  );
   let consecutiveFailures = 0;
   for (const intent of recentIntents) {
     if (intent.state === "COMPLETE") break;

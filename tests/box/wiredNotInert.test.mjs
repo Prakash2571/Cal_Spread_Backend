@@ -41,8 +41,11 @@ test("recordOutcome is CALLED, so outcome rates have a numerator", () => {
   const engine = code("engine.ts");
   assert.ok(engine.includes("this.outcomeStore.recordOutcome("), "nothing recorded outcomes before");
   // Both a success and a failure path must feed it, or the rates are structurally skewed.
-  assert.ok(engine.includes("this.observeAttempt(legging, false)"), "abort path must be observed");
-  assert.ok(engine.includes("this.observeAttempt(args.legging, true)"), "success path must be observed");
+  // Matched on the call prefix, not the whole expression: these calls also carry the
+  // detected gross edge for cost attribution, and pinning the exact argument list
+  // made this assertion break on an unrelated (and correct) signature change.
+  assert.ok(engine.includes("this.observeAttempt(legging, false"), "abort path must be observed");
+  assert.ok(engine.includes("this.observeAttempt(args.legging, true"), "success path must be observed");
 });
 
 test("the queue estimator is FED, not only read", () => {

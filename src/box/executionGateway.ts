@@ -127,7 +127,14 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       return liveEntryFailure(args.candidate, args.detection.at, submittedAt, orders, "legging_incomplete", "broker terminal quantity is uncertain; entry quarantined", this.deps.cfg, tradeId);
     }
 
-    const fullyFilled = orders.length === requests.length && orders.every((order) => order.filled_quantity === order.quantity);
+    // `>=`, not `===`. A broker reporting MORE filled than requested is an anomaly, but it is an
+    // anomaly in which the four-leg box is unambiguously ON — the requested quantity is covered.
+    // Under `===` an overfill read as "not fully filled" and sent a complete, hedged box straight
+    // into a four-leg protective unwind, paying a full round trip plus charges to reverse a
+    // position that was actually correct. Overfill is detected and quarantined by the cumulative
+    // fill ledger, which is where that belongs; it must not also be mistaken for underfill here.
+    const fullyFilled =
+      orders.length === requests.length && orders.every((order) => order.filled_quantity >= order.quantity);
     if (!fullyFilled) {
       const unwindOrders = await this.unwindConfirmed(orders, args.candidate.legs, tradeId, `${attemptId}:unwind`);
       const residual = residualAfterUnwind(orders, unwindOrders);
@@ -190,7 +197,11 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     if (uncertain) manager.invariantViolation(`live exit ${attemptId} has uncertain broker terminal quantity`);
     const record = liveRecord(args.detectedAt, this.now(), orders, false, this.deps.cfg, requests.length, args.position.id);
     const legs = legsFromOrders(orders, args.position.legs, this.deps.quotes, this.now());
-    const clean = !uncertain && orders.length === requests.length && orders.every((order) => order.filled_quantity === order.quantity);
+    // `>=` for the same reason as the entry path: the requested exit quantity is covered, so the
+    // close is complete. Reading an overfilled exit as incomplete would leave the monitor believing
+    // roles are still outstanding and re-submitting closes against already-flat legs.
+    const clean =
+      !uncertain && orders.length === requests.length && orders.every((order) => order.filled_quantity >= order.quantity);
     if (clean) return { ok: true, legs, record, booksAtFill: new Map() };
     return {
       ok: false,
@@ -449,7 +460,7 @@ function liveEntryFailure(candidate: BoxCandidate, detectedAt: number, submitted
 
 function liveRecord(detectedAt: number, submittedAt: number, orders: BrokerOrder[], opened: boolean, cfg: BoxConfig, requestedCount = orders.length, tradeId: string | null = null): PaperLeggingExecutionRecord {
   const legs = orders.map(paperLeg);
-  const fully = orders.filter((order) => order.filled_quantity === order.quantity).length;
+  const fully = orders.filter((order) => order.filled_quantity >= order.quantity).length;
   const fills: Partial<Record<BoxLegRole, number>> = {};
   for (const order of orders) fills[order.role] = order.filled_quantity;
   const fillTimes = orders.filter((order) => order.filled_quantity > 0).map((order) => order.updated_at);
