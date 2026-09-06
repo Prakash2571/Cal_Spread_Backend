@@ -49,6 +49,10 @@ import { CalibrationPersistenceBuffer } from "./calibrationPersistence.js";
 import { BrokerTimingStore } from "./brokerTimingStore.js";
 import { ExecutionOutcomeStore } from "./executionOutcomes.js";
 import { QueueCalibrationEstimator } from "./queueCalibration.js";
+import { computeExecutionShortfall, type ExecutionShortfall } from "./executionShortfall.js";
+import { buildParityReports } from "./parityReport.js";
+import type { BoxExecutionOutcome } from "./brokerTimingStore.js";
+import type { LatencyProfile } from "./latencyModel.js";
 import { shadowModeStatus } from "./shadowMode.js";
 import { profileReportBanner } from "./stressProfile.js";
 import { formatCalibrationBlock } from "./calibratedLatencySource.js";
@@ -228,6 +232,14 @@ export class BoxEngine {
   private readonly environmentMonitor: ExecutionEnvironmentMonitor;
   private readonly calibration: ExecutionCalibrationStore;
   private readonly brokerTiming: BrokerTimingStore;
+  /**
+   * PAPER-side timing store, the counterpart of `brokerTiming`.
+   *
+   * `parityReport` compares a LIVE snapshot against a PAPER snapshot, and it previously had no
+   * production caller for exactly one reason: nothing produced the paper half. This store is fed
+   * from finished paper legs, which is what makes a live-vs-paper comparison possible at all.
+   */
+  private readonly paperTiming: BrokerTimingStore;
   private readonly timingRecorder: ExecutionTimingRecorder;
   /**
    * Bounded async buffer that persists measured calibration observations (Phase 25).
@@ -241,6 +253,8 @@ export class BoxEngine {
   private readonly outcomeStore = new ExecutionOutcomeStore();
   /** Advisory queue/haircut recommender fed by live limit-order evidence (Phases 10, 26). */
   private readonly queueEstimator: QueueCalibrationEstimator;
+  /** Most recent implementation-shortfall attribution, surfaced in diagnostics. */
+  private lastShortfall: ExecutionShortfall | null = null;
   private reconciler: BoxChargeReconciler;
   private metrics: BoxMetrics;
   private scanner: BoxScanner;
@@ -408,6 +422,11 @@ export class BoxEngine {
       nowWall: () => this.executionClock.wall(),
     });
     this.brokerTiming = new BrokerTimingStore({
+      window: this.cfg.executionTimingWindow,
+      region: this.cfg.deploymentRegion,
+      now: () => this.executionClock.wall(),
+    });
+    this.paperTiming = new BrokerTimingStore({
       window: this.cfg.executionTimingWindow,
       region: this.cfg.deploymentRegion,
       now: () => this.executionClock.wall(),
@@ -1888,6 +1907,9 @@ export class BoxEngine {
       residual_exposure: residual.length > 0 ? residual : [],
       resolved: residual.length === 0,
     };
+    // Feed the calibration surface BEFORE persistence, so an attempt is observed even if its
+    // durable projection fails (the failure is handled separately below).
+    this.observeAttempt(legging, false);
     const attemptId = await insertBoxExecutionAttempt(attempt);
     if (this.orderManager && this.cfg.executionMode === "live") {
       if (attemptId) this.orderManager.recordRealisedPnl(netAbort ?? 0);
@@ -2145,6 +2167,11 @@ export class BoxEngine {
     };
     this.positions.add(position);
     this.syncManagerExposure();
+
+    // A successfully opened box IS the 4/4 outcome. Observed here so measured outcome rates have a
+    // numerator as well as a denominator — previously nothing ever recorded a success, so every
+    // rate was permanently zero.
+    if (args.legging) this.observeAttempt(args.legging, true);
 
     // Margin is captured AFTER the fill is recorded, off the hot path.
     void this.captureMargin(id, candidate.legs, candidate.lot_size, candidate.key, direction);
@@ -3024,6 +3051,154 @@ export class BoxEngine {
    * outstanding the timer stops and degraded clears.
    */
   /**
+   * OBSERVE A COMPLETED FOUR-LEG ATTEMPT (Phases 9, 10, 18).
+   *
+   * One integration point, called from both the success and the abort path, that turns a finished
+   * attempt into the three kinds of evidence the calibration surface needs:
+   *
+   *   - the OUTCOME class, so measured outcome rates exist at all (they were previously always
+   *     zero because nothing ever recorded one);
+   *   - QUEUE EVIDENCE per leg, so the haircut recommender has a data source (it previously had
+   *     none and could only ever report "insufficient evidence");
+   *   - IMPLEMENTATION SHORTFALL, so where the detected edge went is attributed rather than
+   *     inferred.
+   *
+   * FAIL-OPEN. This is pure observability on a path that has already completed real or simulated
+   * execution; a failure here must never affect the attempt's recorded result.
+   */
+  private observeAttempt(legging: PaperLeggingExecutionRecord, filledAllFour: boolean): void {
+    try {
+      const broker = this.deps.activeBroker();
+      const legs = legging.legs ?? [];
+
+      // ── outcome class ──────────────────────────────────────────────────────────────
+      // Precedence is deliberate: the most SPECIFIC description of what went wrong wins, so a
+      // partial that was then unwound is reported as the unwind it became, not merely as "partial".
+      const raced = legs.some((leg) => (leg.raced_fill_qty ?? 0) > 0);
+      const residual = (legging.residual_exposure ?? []).length > 0;
+      const outcome: BoxExecutionOutcome = filledAllFour
+        ? "filled_4_of_4"
+        : legging.abort_after_fill
+          ? "abort_after_fill"
+          : legging.failure_reason === "unwind_failed"
+            ? "failed_unwind"
+            : residual
+              ? "residual"
+              : raced
+                ? "cancel_race"
+                : legs.some((leg) => leg.status === "UNWOUND")
+                  ? "clean_unwind"
+                  : legging.filled_leg_count > 0
+                    ? "partial"
+                    : legs.some((leg) => leg.status === "TIMED_OUT")
+                      ? "timeout"
+                      : "no_fill";
+
+      // Marketable and passive populations are never pooled, so the outcome is filed under the
+      // profile the legs were actually CLASSIFIED as (not an assumed one).
+      const profile: LatencyProfile =
+        legs.some((leg) => leg.pricing?.order_type === "PASSIVE_LIMIT") ? "PASSIVE_LIMIT" : "MARKETABLE_LIMIT";
+      this.outcomeStore.recordOutcome(broker, profile, outcome);
+
+      // ── queue evidence, per leg ────────────────────────────────────────────────────
+      for (const leg of legs) {
+        const visible = leg.executable_within_limit_at_arrival;
+        // No observed executable depth means no realisation ratio to compute. Skipped rather than
+        // recorded as a zero, which would drag the recommended haircut upward on no evidence.
+        if (visible === null || !(visible > 0)) continue;
+        this.queueEstimator.record({
+          broker,
+          profile: leg.pricing?.order_type === "PASSIVE_LIMIT" ? "PASSIVE_LIMIT" : "MARKETABLE_LIMIT",
+          side: leg.side,
+          tradingsymbol: leg.tradingsymbol,
+          displayedQtyAtSubmit: leg.displayed_qty_at_arrival ?? visible,
+          executableWithinLimitAtSubmit: visible,
+          requestedQty: leg.requested_qty,
+          limitOffsetTicks: leg.limit_offset_ticks,
+          immediatelyMarketable: leg.pricing?.order_type !== "PASSIVE_LIMIT",
+          filledQty: leg.fill_qty,
+          fillLatencyMs:
+            leg.fill_at !== null && leg.ack_at !== null ? Math.max(0, leg.fill_at - leg.ack_at) : null,
+          partial: leg.fill_qty > 0 && leg.fill_qty < leg.quantity,
+          bookUpdatesWhileWorking: null,
+          atWall: this.executionClock.wall(),
+        });
+      }
+
+      // ── paper-side timing, so a parity report has two sides to compare ────────────
+      // Only from PAPER legs: a live attempt's timing already goes to `brokerTiming` through the
+      // recorder, and mixing the two stores would compare a distribution against itself.
+      if (this.cfg.executionMode !== "live") {
+        for (const leg of legs) {
+          this.paperTiming.recordLegTiming({
+            broker,
+            trade_id: legging.trade_id ?? null,
+            attempt_id: "paper",
+            role: leg.role,
+            purpose: "ENTRY",
+            kind: "ENTRY",
+            detected_at: legging.detected_at,
+            queued_at: leg.submit_at,
+            dequeued_at: leg.submit_at,
+            post_started_at: leg.submit_at,
+            post_returned_at: leg.ack_at,
+            acknowledged_at: leg.ack_at,
+            first_fill_at: leg.fills[0]?.at ?? null,
+            last_fill_at: leg.fills.at(-1)?.at ?? null,
+            terminal_at: leg.resolved_at,
+            cancel_requested_at: leg.cancel_requested_at,
+            cancel_confirmed_at: leg.cancel_confirmed_at,
+          });
+        }
+        this.paperTiming.recordBoxOutcome({
+          broker,
+          outcome,
+          detection_to_first_fill_ms:
+            legging.decision_to_first_fill_ms ?? null,
+          detection_to_all_four_filled_ms: legging.decision_to_last_fill_ms ?? null,
+          first_fill_to_last_fill_ms: legging.first_to_last_fill_ms ?? null,
+          unhedged_exposure_duration_ms: legging.exposure_duration_ms ?? null,
+        });
+      }
+
+      // ── implementation shortfall ───────────────────────────────────────────────────
+      const shortfall = computeExecutionShortfall({
+        theoreticalDetectedEdge: legging.required_expected_net_profit ?? 0,
+        executedGrossEdge: legging.final_expected_net_profit ?? null,
+        brokerage: 0,
+        taxesAndFees: round2((legging.partial_entry_charges ?? 0) + (legging.unwind_charges ?? 0)),
+        unwindCost: Math.max(0, -(legging.legging_gross_loss ?? 0)),
+        realisedNetResult: legging.legging_net_loss ?? 0,
+        outcome:
+          outcome === "filled_4_of_4"
+            ? "filled_4_of_4"
+            : outcome === "abort_after_fill"
+              ? "aborted_after_fill"
+              : residual
+                ? "partial_residual"
+                : legging.filled_leg_count > 0
+                  ? "partial_unwound"
+                  : "no_fill",
+        legs: legs.map((leg) => ({
+          role: leg.role,
+          side: leg.side,
+          detectedPrice: leg.detected_price,
+          // The touch at submission is not separately captured, so the detection reference is used
+          // and edge decay collapses into slippage rather than being invented as a separate figure.
+          submitPrice: null,
+          filledPrice: leg.average_fill_price ?? leg.fill_price,
+          requestedQty: leg.requested_qty,
+          filledQty: leg.fill_qty,
+        })),
+      });
+      this.lastShortfall = shortfall;
+    } catch (err) {
+      // Observability only; never allow it to disturb a completed execution.
+      console.warn("[Box] attempt observation failed (diagnostics only):", err);
+    }
+  }
+
+  /**
    * Reload previously-measured calibration observations into the in-memory store.
    *
    * THIS is what persistence is for: without it, calibration status resets to UNCALIBRATED on every
@@ -3347,6 +3522,11 @@ export class BoxEngine {
       rejects: this.outcomeStore.rejectCounts(this.deps.activeBroker()),
       // Advisory only. Never applied automatically; never a claim about NSE queue position.
       queue_calibration: this.queueEstimator.recommendAll(),
+      last_implementation_shortfall: this.lastShortfall,
+      // LIVE vs PAPER parity, per broker. Both halves are now produced, so this is a real
+      // comparison rather than an unreachable pure function. Low-confidence metrics are flagged by
+      // the report itself rather than being presented as significant.
+      parity: buildParityReports(this.brokerTiming.snapshot(), this.paperTiming.snapshot()),
       shadow_mode: shadowModeStatus({
         shadowEnabled: this.cfg.shadowModeEnabled,
         executionMode: this.cfg.executionMode,

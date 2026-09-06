@@ -46,7 +46,7 @@
 
 import type { BoxExecutionPolicy, ExecutionPhase } from "./executionPolicy.js";
 import { round2, slippagePerUnit } from "./math.js";
-import { touchPrice, walkDepth } from "./orderPricing.js";
+import { classifyOrderProfile, touchPrice, walkDepth } from "./orderPricing.js";
 import type { BoxQuoteStore } from "./quotes.js";
 import type {
   BoxExecutionFailureReason,
@@ -644,6 +644,19 @@ export class LegExecutor {
         inst: req.inst,
         phase,
       });
+      // CLASSIFY, DO NOT ASSUME. The strategy prices bounded marketable limits, so
+      // MARKETABLE_LIMIT is the expected answer — but it is DECIDED here against the book we
+      // actually observed, so a limit that ended up resting behind the touch is labelled
+      // PASSIVE_LIMIT and its statistics never contaminate the marketable population.
+      const classified = classifyOrderProfile({
+        side: req.side,
+        limitPrice: leg.pricing.limit_price,
+        bids: quote.bids,
+        asks: quote.asks,
+        tickSize: this.deps.policy.tickSizeFor(req.inst),
+      });
+      leg.pricing = { ...leg.pricing, order_type: classified.profile };
+      leg.limit_offset_ticks = classified.offsetTicks;
     }
 
     const levels = req.side === "BUY" ? quote.asks : quote.bids;
@@ -666,6 +679,14 @@ export class LegExecutor {
       quoteVersion: quote.version,
       reserved: reservedLookup,
     });
+
+    // QUEUE EVIDENCE (Phase 10). Recorded once, on the first book this order was offered, before
+    // anything was consumed — the closest observable analogue of "displayed depth at submission".
+    // This is the denominator the realisation ratio is measured against.
+    if (leg.executable_within_limit_at_arrival === null) {
+      leg.executable_within_limit_at_arrival = walk.executable_within_limit;
+      leg.displayed_qty_at_arrival = levels.reduce((sum, level) => sum + Math.max(0, level.qty), 0);
+    }
 
     if (walk.filled_qty <= 0) {
       // Either nothing within the limit, or the queue haircut left nothing for us.
@@ -776,6 +797,9 @@ function blankLeg(req: LegOrderRequest, orderIdPrefix: string, phase: ExecutionP
     cancel_confirmed_at: null,
     fill_qty_at_cancel_request: null,
     raced_fill_qty: 0,
+    executable_within_limit_at_arrival: null,
+    displayed_qty_at_arrival: null,
+    limit_offset_ticks: null,
     fill_at: null,
     resolved_at: null,
     fill_price: null,

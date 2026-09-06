@@ -516,6 +516,11 @@ function paperLeg(order: BrokerOrder): PaperLegExecution {
     cancel_confirmed_at: null,
     fill_qty_at_cancel_request: null,
     raced_fill_qty: 0,
+    // A live order is filled by the exchange, not by walking a book, so there is no
+    // "executable within limit" observation to report. Left null rather than back-filled.
+    executable_within_limit_at_arrival: null,
+    displayed_qty_at_arrival: null,
+    limit_offset_ticks: null,
     fill_at: filled > 0 ? order.updated_at : null,
     resolved_at: order.updated_at,
     fill_price: order.average_price,
