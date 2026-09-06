@@ -332,11 +332,11 @@ measured: yes
 ### Marketable vs passive
 
 `PaperOrderType` is now `MARKETABLE_LIMIT | PASSIVE_LIMIT`, and
-`orderPricing.classifyOrderProfile()` decides which from an **observed book** rather than from an
-assumption, also reporting the signed distance from the touch in ticks (the most useful covariate
-for queue calibration). The Box strategy submits bounded marketable limits, so `MARKETABLE_LIMIT`
-is the normal answer — but the classification is made, not assumed, and `assumed: true` records
-the case where no opposite touch was observable.
+`orderPricing.classifyOrderProfile()` decides which from an **observed book**, also reporting the
+signed distance from the touch in ticks (the most useful covariate for queue calibration). The Box
+strategy submits bounded marketable limits, so `MARKETABLE_LIMIT` is the normal answer — but the
+classification is made against a real book, and `assumed: true` records the case where no opposite
+touch was observable.
 
 Statistics are keyed by profile everywhere. They are never pooled, because a blended fill rate
 flatters passive orders, slanders marketable ones, and describes neither.
@@ -346,8 +346,8 @@ flatters passive orders, slanders marketable ones, and describes neither.
 We cannot know NSE queue position. That is stated first and repeatedly in
 `src/box/queueCalibration.ts`, and nothing there attempts to reconstruct it.
 
-What it does measure is the **realisation ratio**: of the executable depth we could actually see
-within our limit, what fraction did we get? That is directly observable, and it is exactly what
+What it measures is the **realisation ratio**: of the executable depth we could actually see within
+our limit, what fraction did we get? That is directly observable, and it is exactly what
 the 30 % haircut is approximating. From it the estimator recommends a conservative haircut,
 derived from the **p25** rather than the median — the haircut exists to stop paper over-filling,
 so it should encode a bad-but-plausible realisation, and a median-derived haircut would let paper
@@ -406,11 +406,23 @@ merely checked before submitting gets bypassed by new code paths and error handl
    deliberately **not** forwarded, because adopting a live order means taking ownership of real
    exposure.
 
+   **This third layer is currently UNREACHABLE BY CONSTRUCTION, and that is the point.** Because
+   layers 1 and 2 mean no live adapter can exist in shadow mode, there is nothing for the wrapper to
+   wrap today — it has no production call site. It exists as insurance against a future refactor
+   that weakens layer 1 or 2, and is exercised only by its tests. Stated plainly so nobody reads
+   "three layers" as "three active layers".
+
 ### Stress profile — separate, and never called live parity
 
-`BOX_PAPER_EXECUTION_PROFILE=stress` is for resilience testing: broker slowdown, feed outage,
-WebSocket gap, HTTP timeout, delayed ACK, delayed cancel, partial fill, broker reject, Mongo
-failure, Redis failure, process restart, duplicate event, out-of-order event.
+`BOX_PAPER_EXECUTION_PROFILE=stress` is the profile reserved for resilience testing: broker
+slowdown, feed outage, WebSocket gap, HTTP timeout, delayed ACK, delayed cancel, partial fill,
+broker reject, Mongo failure, Redis failure, process restart, duplicate event, out-of-order event.
+
+**STATUS: the profile and its isolation are complete; the fault injection itself is NOT yet plumbed
+into the simulator's fill path.** `StressInjector` defines the fault schedule deterministically and
+`createStressInjector()` refuses to exist outside this profile, so the containment guarantees below
+hold today — but selecting `stress` currently produces the same behaviour as `live_parity` rather
+than injecting anything. The scaffolding is deliberate and the gap is stated rather than implied.
 
 The separation is structural, not conventional:
 
@@ -443,6 +455,14 @@ the SAME candidate, what did paper predict and what actually happened? It report
 p50/p95/p99 error plus signed bias**, because a mean absolute error hides the tail and the tail
 decides whether a four-leg entry completes. An unmatched prediction is excluded, never counted as
 a zero error.
+
+**STATUS: the comparison is a pure function with no production producer yet.** Pairing real
+micro-size live executions against paper predictions requires both sides to be captured for the same
+candidate id, which needs a live run to capture. `buildPairedComparison` and
+`formatPairedComparison` are ready and tested; nothing calls them in production. Likewise
+`computeAdverseSelection` (Phase 17) needs book-at-submit/ACK/post-fill snapshots that are not yet
+captured, and `RecordedRejectReplayer` has no replay harness wired. These are prepared primitives,
+not delivered reports.
 
 ### Admin diagnostics
 
