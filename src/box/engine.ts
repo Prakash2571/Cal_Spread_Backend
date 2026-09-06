@@ -57,6 +57,8 @@ import { shadowModeStatus } from "./shadowMode.js";
 import { profileReportBanner } from "./stressProfile.js";
 import { formatCalibrationBlock } from "./calibratedLatencySource.js";
 import { CentralBoxExecutionGateway, type BoxExecutionGateway } from "./executionGateway.js";
+import { CoordinatedBoxExecutionGateway } from "./executionCoordinator.js";
+import { InProcessInstrumentReservations } from "./instrumentReservations.js";
 import { BoxOrderManager, orderManagerLimitsFromConfig, type OrderManagerReconcileReport } from "./orderManager.js";
 import { BoxMetrics } from "./metrics.js";
 import {
@@ -218,6 +220,10 @@ export class BoxEngine {
   private localCharges: BoxChargeCalculatorLike;
   private executionSim: BoxExecutionSimulator;
   private execution: BoxExecutionGateway;
+  /** Contract-level reservations. Held here so a broker switch can clear them. */
+  private readonly reservations: InProcessInstrumentReservations;
+  /** The coordinator, kept typed so its metrics reach diagnostics. */
+  private readonly coordinator: CoordinatedBoxExecutionGateway;
   private orderManager: BoxOrderManager | null = null;
   /**
    * LIVE-CALIBRATION INFRASTRUCTURE (Phases 2, 7, 8, 13, 24).
@@ -524,7 +530,7 @@ export class BoxEngine {
         },
       });
     }
-    this.execution = new CentralBoxExecutionGateway({
+    const centralGateway = new CentralBoxExecutionGateway({
       cfg: this.cfg,
       simulator: this.executionSim,
       quotes: this.quotes,
@@ -533,6 +539,20 @@ export class BoxEngine {
       // So LIVE residual flattening bills its own fees, exactly as the paper path already did.
       chargeTotal: (orders) => this.localCharges.legs(orders).total,
     });
+    // Contract-level exclusion wraps the gateway rather than living inside it, so it
+    // sits ABOVE the paper/live branch: paper gets no shortcut around coordination,
+    // which is the only way paper can stop showing two boxes consuming one lot. The
+    // scanner and monitor are unchanged — they still see a plain BoxExecutionGateway.
+    this.reservations = new InProcessInstrumentReservations();
+    this.coordinator = new CoordinatedBoxExecutionGateway({
+      inner: centralGateway,
+      reservations: this.reservations,
+      waitable: this.reservations,
+      cfg: this.cfg,
+      quotes: this.quotes,
+      broker: () => this.deps.activeBroker(),
+    });
+    this.execution = this.coordinator;
 
     this.reconciler = new BoxChargeReconciler({
       cfg: this.cfg,
@@ -3551,6 +3571,9 @@ export class BoxEngine {
       // comparison rather than an unreachable pure function. Low-confidence metrics are flagged by
       // the report itself rather than being presented as significant.
       parity: buildParityReports(this.brokerTiming.snapshot(), this.paperTiming.snapshot()),
+      // Contract-level coordination. No high-cardinality labels: counts, percentiles
+      // and statuses only — never an order id, execution id or symbol.
+      coordinator: this.coordinator.metrics(),
       shadow_mode: shadowModeStatus({
         shadowEnabled: this.cfg.shadowModeEnabled,
         executionMode: this.cfg.executionMode,
@@ -3712,6 +3735,17 @@ export class BoxEngine {
    * warm-generation marker is invalidated, so nothing is treated as executable until
    * the NEW broker has published a fresh book for it.
    */
+  /**
+   * Drop every contract reservation.
+   *
+   * Called on a broker switch: the keys are namespaced by broker, so a surviving
+   * Zerodha reservation is meaningless to Dhan and would only be able to block a
+   * legitimate execution until its TTL expired.
+   */
+  clearInstrumentReservations(): void {
+    this.coordinator.resetForBrokerSwitch();
+  }
+
   invalidateBooks(): void {
     this.invalidateFeedGeneration();
     this.quotes.clear();
