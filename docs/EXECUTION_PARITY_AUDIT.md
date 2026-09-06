@@ -491,3 +491,61 @@ retail-API data. Against that:
 
 Nothing in this work enables live trading, changes the default execution mode, or weakens the
 double gate.
+
+
+---
+---
+
+# PART 3 — Wired-vs-inert follow-up
+
+Part 2 answered the required questions but did not ask a question it should have: *which of these
+modules is actually called in production?* Auditing that found **ten** modules built, unit-tested and
+never invoked. A module that is never called reports empty forever while looking finished — and two
+documentation statements had already been written as though they were live. Both are now fixed.
+
+## What was inert, and what changed
+
+| Module | Before | Now |
+| --- | --- | --- |
+| `classifyOrderProfile` | 0 call sites; the calibration profile was the hardcoded literal `"MARKETABLE_LIMIT"` | **Called in the fill path** against the observed book; result stored on the order, with the signed tick offset |
+| `ExecutionOutcomeStore.recordOutcome` | 0 call sites → every outcome rate permanently zero | **Called on both the success and the abort path** |
+| `QueueCalibrationEstimator.record` | 0 call sites → estimator had no data source and could only report "insufficient evidence" | **Fed per leg** from finished attempts |
+| `computeExecutionShortfall` | 0 call sites | **Computed at attempt completion**, surfaced in diagnostics |
+| `buildParityReports` | 0 call sites — the paper half was never produced | **Produced**: a paper-side `BrokerTimingStore` is fed from finished paper legs |
+| `buildPairedComparison` | 0 call sites | still a primitive — needs a live micro-size run to pair against |
+| `computeAdverseSelection` | 0 call sites | still a primitive — needs book-at-submit/ACK/post-fill snapshots |
+| `RecordedRejectReplayer` | 0 call sites | still a primitive — no replay harness |
+| `shadowGuardedAdapter` | 0 call sites | **unreachable by construction**, deliberately: layers 1–2 mean no live adapter exists in shadow mode. Documented, not forced |
+| `createStressInjector` | self-referential only | isolation complete; **fault injection not plumbed** into the fill path |
+
+## The overclaims that were corrected
+
+1. `LIVE_EXECUTION.md` said marketable/passive was *"decided from an observed book rather than from
+   an assumption"*. It was a hardcoded literal. Now genuinely decided — and the doc was corrected
+   **before** the wiring, so it was never left false on `main`.
+2. The stress profile was described by listing the fault classes it injects. It injects none yet; its
+   *isolation* is what is complete. Now stated explicitly.
+3. "Three layers" of shadow enforcement read as three active layers. Layer 3 has no call site by
+   design; now labelled.
+4. The queue estimator was described as measuring the realisation ratio while having no data source.
+
+## Why some things are still primitives
+
+Deliberate, not abandoned:
+
+- **Paired comparison** needs the *same candidate id* captured on both sides. Paper predictions and
+  live outcomes for one candidate only coexist during a live micro-size validation run, which has
+  not happened. Fabricating a pairing would be worse than having none.
+- **Adverse selection** needs book snapshots at submit, ACK and a post-fill horizon. Those are not
+  captured, and inventing them would defeat the purpose.
+- **Reject replay** needs recorded real rejects, which requires live rejections to have occurred.
+- **Shadow layer 3** is insurance against a future refactor. Wiring it artificially — by
+  constructing a live adapter in shadow mode purely so the guard has something to wrap — would
+  *create* the risk it exists to prevent.
+- **Stress injection** is a genuine feature, not a gap in this one: the containment guarantees are
+  what mattered, and they hold.
+
+A regression test (`tests/box/wiredNotInert.test.mjs`) now asserts that each wired module has a
+production call site and produces non-empty output when fed, and that anything still inert remains
+labelled as such in the documentation. The specific failure mode it guards against is a module
+quietly reverting to scaffolding while the docs still claim it works.

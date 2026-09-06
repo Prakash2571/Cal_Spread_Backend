@@ -332,11 +332,19 @@ measured: yes
 ### Marketable vs passive
 
 `PaperOrderType` is now `MARKETABLE_LIMIT | PASSIVE_LIMIT`, and
-`orderPricing.classifyOrderProfile()` decides which from an **observed book** rather than from an
-assumption, also reporting the signed distance from the touch in ticks (the most useful covariate
-for queue calibration). The Box strategy submits bounded marketable limits, so `MARKETABLE_LIMIT`
-is the normal answer — but the classification is made, not assumed, and `assumed: true` records
-the case where no opposite touch was observable.
+`orderPricing.classifyOrderProfile()` decides which from an **observed book**, also reporting the
+signed distance from the touch in ticks (the most useful covariate for queue calibration). The Box
+strategy submits bounded marketable limits, so `MARKETABLE_LIMIT` is the normal answer — but the
+classification is made against a real book, and `assumed: true` records the case where no opposite
+touch was observable.
+
+The classification is **performed in the fill path against the observed book**, not assumed at the
+edges. `legExecutor` calls `classifyOrderProfile()` with the same depth snapshot it is about to walk
+and stores the result on `leg.pricing.order_type`, together with `limit_offset_ticks`. Everything
+downstream — outcome rates, queue observations, latency selection — reads that recorded
+classification, so a leg that was genuinely behind the touch is filed as `PASSIVE_LIMIT` even though
+the strategy intended a marketable limit. This replaced a hardcoded `"MARKETABLE_LIMIT"` constant,
+which had made the profile split cosmetic: every sample landed in one bucket regardless of the book.
 
 Statistics are keyed by profile everywhere. They are never pooled, because a blended fill rate
 flatters passive orders, slanders marketable ones, and describes neither.
@@ -346,9 +354,20 @@ flatters passive orders, slanders marketable ones, and describes neither.
 We cannot know NSE queue position. That is stated first and repeatedly in
 `src/box/queueCalibration.ts`, and nothing there attempts to reconstruct it.
 
-What it does measure is the **realisation ratio**: of the executable depth we could actually see
-within our limit, what fraction did we get? That is directly observable, and it is exactly what
-the 30 % haircut is approximating. From it the estimator recommends a conservative haircut,
+What it measures is the **realisation ratio**: of the executable depth we could actually see within
+our limit, what fraction did we get? That is directly observable, and it is exactly what
+the 30 % haircut is approximating.
+
+The estimator is **fed per leg**, not left to be populated later. `legExecutor` captures
+`executable_within_limit_at_arrival` and `displayed_qty_at_arrival` from the book the leg actually
+arrived on — recorded *before* the `filled_qty <= 0` early return, so a leg that saw depth and got
+nothing still counts as evidence rather than vanishing from the denominator — and
+`BoxEngine.observeAttempt()` records one observation per leg, keyed by the profile that leg was
+classified as. A leg with no observable executable depth is **skipped, not recorded as a zero**:
+a zero there is absence of evidence, and treating it as a realisation of 0 % would drag the
+recommended haircut upward on no information.
+
+From these observations the estimator recommends a conservative haircut,
 derived from the **p25** rather than the median — the haircut exists to stop paper over-filling,
 so it should encode a bad-but-plausible realisation, and a median-derived haircut would let paper
 over-fill half the time.
@@ -406,11 +425,23 @@ merely checked before submitting gets bypassed by new code paths and error handl
    deliberately **not** forwarded, because adopting a live order means taking ownership of real
    exposure.
 
+   **This third layer is currently UNREACHABLE BY CONSTRUCTION, and that is the point.** Because
+   layers 1 and 2 mean no live adapter can exist in shadow mode, there is nothing for the wrapper to
+   wrap today — it has no production call site. It exists as insurance against a future refactor
+   that weakens layer 1 or 2, and is exercised only by its tests. Stated plainly so nobody reads
+   "three layers" as "three active layers".
+
 ### Stress profile — separate, and never called live parity
 
-`BOX_PAPER_EXECUTION_PROFILE=stress` is for resilience testing: broker slowdown, feed outage,
-WebSocket gap, HTTP timeout, delayed ACK, delayed cancel, partial fill, broker reject, Mongo
-failure, Redis failure, process restart, duplicate event, out-of-order event.
+`BOX_PAPER_EXECUTION_PROFILE=stress` is the profile reserved for resilience testing: broker
+slowdown, feed outage, WebSocket gap, HTTP timeout, delayed ACK, delayed cancel, partial fill,
+broker reject, Mongo failure, Redis failure, process restart, duplicate event, out-of-order event.
+
+**STATUS: the profile and its isolation are complete; the fault injection itself is NOT yet plumbed
+into the simulator's fill path.** `StressInjector` defines the fault schedule deterministically and
+`createStressInjector()` refuses to exist outside this profile, so the containment guarantees below
+hold today — but selecting `stress` currently produces the same behaviour as `live_parity` rather
+than injecting anything. The scaffolding is deliberate and the gap is stated rather than implied.
 
 The separation is structural, not conventional:
 
@@ -443,6 +474,26 @@ the SAME candidate, what did paper predict and what actually happened? It report
 p50/p95/p99 error plus signed bias**, because a mean absolute error hides the tail and the tail
 decides whether a four-leg entry completes. An unmatched prediction is excluded, never counted as
 a zero error.
+
+`computeExecutionShortfall` **is** called in production: `BoxEngine.observeAttempt()` runs it for
+every finished legging attempt — filled, partial, aborted and failed alike — and the most recent
+record is exposed on the diagnostics route as `last_implementation_shortfall`.
+
+The **latency parity report** (`src/box/parityReport.ts`) is also produced now. It needs two
+snapshots of the same shape, and previously only the live one existed; a separate paper-side
+`BrokerTimingStore` is now fed from finished PAPER legs in `observeAttempt()`, so
+`buildParityReports(liveSnapshot, paperSnapshot)` has two real sides to compare and appears on
+diagnostics as `parity`. The two stores are kept strictly apart — paper legs are recorded only when
+`executionMode !== "live"`, because feeding both halves from one population would compare a
+distribution against itself and report perfect parity by construction.
+
+**STATUS: the *paired candidate* comparison is a pure function with no production producer yet.**
+That is a different thing from the latency parity report above: pairing real micro-size live
+executions against paper predictions requires both sides to be captured for the same candidate id,
+which needs a live run to capture. `buildPairedComparison` and `formatPairedComparison` are ready
+and tested; nothing calls them in production. Likewise `computeAdverseSelection` (Phase 17) needs
+book-at-submit/ACK/post-fill snapshots that are not yet captured, and `RecordedRejectReplayer` has
+no replay harness wired. Those three are prepared primitives, not delivered reports.
 
 ### Admin diagnostics
 
@@ -546,6 +597,9 @@ claim, and a claim needs evidence.
 | Shared displayed liquidity across concurrent attempts | the reservation ledger; two attempts cannot double-spend one observed level |
 | Time-of-day variation | OPEN / NORMAL / CLOSE buckets, activated only with enough samples of their own |
 | Outcome and reject rates | counted from real observations, for comparison — paper is never steered to hit them |
+| Marketable vs passive classification | decided in the fill path from the observed book, never assumed |
+| Implementation shortfall | attributed per leg for every finished attempt, including aborted and failed ones |
+| Live-vs-paper latency parity | two independently-fed timing stores compared stage by stage; paper is never fed from live samples, so the comparison can actually fail |
 
 ### What is a documented approximation
 

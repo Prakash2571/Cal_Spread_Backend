@@ -841,6 +841,19 @@ export interface PaperLegExecution {
   fill_qty_at_cancel_request: number | null;
   /** Quantity that filled AFTER the cancel was requested. The race, quantified. */
   raced_fill_qty: number;
+  /**
+   * Executable quantity WITHIN THE LIMIT on the first book this order was offered, before any of it
+   * was consumed (queue haircut applied, concurrent reservations subtracted).
+   *
+   * The denominator of the realisation ratio: what we could actually SEE and were willing to pay
+   * for. Captured once, at the first fill attempt, because that is the closest observable analogue
+   * of "displayed depth at submission". Null when the order never saw a usable book.
+   */
+  executable_within_limit_at_arrival: number | null;
+  /** Total displayed quantity on our side of that first book, before the queue haircut. */
+  displayed_qty_at_arrival: number | null;
+  /** Signed ticks from the opposite touch when priced. Positive = through the touch. */
+  limit_offset_ticks: number | null;
   /** When the order became FULLY filled (null if it never did). */
   fill_at: number | null;
   /** When the fill (or failure) resolved. */
