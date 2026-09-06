@@ -189,6 +189,18 @@ export interface BoxConfig {
   /** Cap on simultaneous simulated execution pipelines. */
   maxConcurrentExecutions: number;
 
+  /**
+   * Route the Box scanner's option tokens onto a DEDICATED market-data lane.
+   *
+   * A second physical WebSocket on the same ACTIVE broker (never a second broker), with
+   * its own refcount table and its own token budget. On by default because the shared
+   * feed makes the option universe and the calendar-spread board compete for one budget:
+   * every strike the board displaces is an arbitrage the scanner cannot see.
+   *
+   * Turning it off falls back to the single shared feed, exactly as before.
+   */
+  boxDedicatedMarketFeed: boolean;
+
   // ---- Box execution coordination (shared-contract exclusion) ----
   /**
    * Master switch for the execution coordinator.
@@ -796,6 +808,7 @@ export function loadBoxConfig(): BoxConfig {
     executionPollMs: num("BOX_EXECUTION_POLL_MS", 20),
     maxConcurrentExecutions: num("BOX_MAX_CONCURRENT_EXECUTIONS", 8),
 
+    boxDedicatedMarketFeed: bool("BOX_DEDICATED_MARKET_FEED", true),
     executionCoordinatorEnabled: bool("BOX_EXECUTION_COORDINATOR_ENABLED", true),
     // 250ms: long enough for a broker ACK to land and the holder to release, short
     // enough that a dead opportunity is abandoned rather than chased.

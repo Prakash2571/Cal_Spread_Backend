@@ -28,6 +28,8 @@
  * whole table rather than trying to translate tokens that have no counterpart.
  */
 
+import type { MarketDataLane } from "./marketDataLane.js";
+
 /** Who wants a token. Kept coarse on purpose — one class per lifecycle. */
 export type SubscriptionOwner = "browser" | "scanner" | "strategy" | "analytics";
 
@@ -48,6 +50,22 @@ export interface SubscriptionTransport {
   unsubscribeTokens(tokens: number[]): void;
 }
 
+/**
+ * ONE coordinator per market-data lane.
+ *
+ * There are two instances — `futures` and `box` — and they share nothing. Each owns its
+ * own refcount table and its own upstream transport, so:
+ *
+ *   - a futures token can never be unsubscribed by the Box scanner's window moving,
+ *     and a Box strike can never be dropped because a browser closed a chart;
+ *   - the two token budgets are independent, which is the entire point of the split:
+ *     a wide option universe cannot displace the board's instruments;
+ *   - a diff computed for one lane is physically incapable of emitting a subscribe or
+ *     unsubscribe on the other lane's socket, because it holds no reference to it.
+ *
+ * The lane is carried for logging and diagnostics only — isolation comes from there
+ * being two objects, not from a conditional.
+ */
 export class SubscriptionCoordinator {
   private counts = new Map<number, TokenCounts>();
   /**
@@ -58,7 +76,11 @@ export class SubscriptionCoordinator {
   private leases = new Map<string, { owner: SubscriptionOwner; tokens: Set<number> }>();
   private leaseSeq = 0;
 
-  constructor(private transport: SubscriptionTransport) {}
+  constructor(
+    private transport: SubscriptionTransport,
+    /** Which lane this coordinator owns. Defaults to `futures` for legacy callers. */
+    readonly lane: MarketDataLane = "futures",
+  ) {}
 
   private empty(): TokenCounts {
     return { browser: 0, scanner: 0, strategy: 0, analytics: 0, total: 0 };
@@ -90,7 +112,7 @@ export class SubscriptionCoordinator {
     // token, so printing both is what proves refcounting is doing its job instead of
     // duplicating upstream subscriptions.
     console.log(
-      `[Subscriptions] owner=${owner} acquire=${unique.size} upstreamAdd=${toSubscribe.length} ` +
+      `[Subscriptions] lane=${this.lane} owner=${owner} acquire=${unique.size} upstreamAdd=${toSubscribe.length} ` +
         `totalTokens=${this.counts.size} leases=${this.leases.size}`,
     );
     if (toSubscribe.length > 0) this.transport.subscribeTokens(toSubscribe);
@@ -126,7 +148,7 @@ export class SubscriptionCoordinator {
       }
     }
     console.log(
-      `[Subscriptions] owner=${lease.owner} release=${lease.tokens.size} ` +
+      `[Subscriptions] lane=${this.lane} owner=${lease.owner} release=${lease.tokens.size} ` +
         `upstreamDrop=${toUnsubscribe.length} totalTokens=${this.counts.size} ` +
         `leases=${this.leases.size}`,
     );
@@ -224,8 +246,16 @@ export class SubscriptionCoordinator {
   }
 
   /** Per-owner totals, for the status endpoints. */
-  stats(): Record<SubscriptionOwner, number> & { tokens: number; leases: number } {
-    const out = { browser: 0, scanner: 0, strategy: 0, analytics: 0, tokens: 0, leases: 0 };
+  stats(): Record<SubscriptionOwner, number> & { tokens: number; leases: number; lane: MarketDataLane } {
+    const out = {
+      browser: 0,
+      scanner: 0,
+      strategy: 0,
+      analytics: 0,
+      tokens: 0,
+      leases: 0,
+      lane: this.lane,
+    };
     for (const entry of this.counts.values()) {
       for (const owner of OWNERS) if (entry[owner] > 0) out[owner] += 1;
     }

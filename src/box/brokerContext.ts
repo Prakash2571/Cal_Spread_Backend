@@ -179,6 +179,19 @@ export interface BoxFeedProvider {
    * correctly if the owner states its whole set rather than deltas.
    */
   setStrategyTokens?(tokens: number[]): void;
+  /**
+   * Declare the Box lane's ENTIRE token set in one diff.
+   *
+   * The DEDICATED Box market-data lane: a second physical socket on the same active
+   * broker, with its own refcount table and its own token budget. Preferred over
+   * `setStrategyTokens` when `BOX_DEDICATED_MARKET_FEED` is on, because sharing one
+   * connection makes the option universe and the calendar-spread board compete — every
+   * strike the board displaces is an arbitrage the scanner cannot see.
+   *
+   * Optional so a provider that predates the lane split still satisfies this contract,
+   * in which case the engine falls back to the shared feed.
+   */
+  setBoxTokens?(tokens: number[]): void;
   subscribedCount(): number;
   isConnected(): boolean;
 }

@@ -421,6 +421,17 @@ export function registerMarketDataRoutes(app: Express, deps: MarketDataDeps): vo
         detail: feed.detail,
       },
       upstream: brokerManager.upstreamFeedStats(),
+      // PER-LANE health. Two sockets on the ONE active broker, reported separately
+      // because "the box lane is stale" and "the board is stale" are different
+      // incidents with different consequences — the first stops Box execution, the
+      // second must not.
+      lanes: {
+        futures: brokerManager.laneStats("futures"),
+        box: {
+          ...brokerManager.laneStats("box"),
+          subscriptions: brokerManager.boxSubscriptions.stats(),
+        },
+      },
     };
   }
 

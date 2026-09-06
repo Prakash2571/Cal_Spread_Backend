@@ -48,6 +48,8 @@ import { QuoteProvider } from "./quoteProvider.js";
 import { computeFeedHealth, type FeedHealth } from "./feedHealth.js";
 import { DhanHttp, dhanHttpConfigFromEnv } from "./dhan/http.js";
 import { DhanFeed } from "./dhan/feed.js";
+import { ZerodhaFeed } from "./zerodha/feed.js";
+import { type LaneFeedStats, type MarketDataLane } from "./marketDataLane.js";
 import { DhanInstrumentStore, dhanInternalToken, getDhanParseReport, type DhanInstrument } from "./dhan/instruments.js";
 import { DhanChargeCalculator } from "./dhan/charges.js";
 import { DhanBrokerAdapter, dhanAdapterConfigFromBoxConfig } from "../box/dhanBrokerAdapter.js";
@@ -143,6 +145,32 @@ export interface ActiveBrokerManagerDeps {
   onDhanTicks: (ticks: Parameters<TickerHub["seed"]>[0]) => void;
   onDhanConnection?: (connected: boolean) => void;
   onSessionLost?: (broker: BrokerId, reason: string) => void;
+  /** Zerodha credentials, read fresh so a lane reconnect uses the CURRENT token. */
+  zerodhaCredentials: () => { apiKey: string; accessToken: string | null };
+  /**
+   * Ticks from the BOX lane.
+   *
+   * Delivered straight to the Box quote store and deliberately NOT through the hub:
+   * the hub owns the board's caches and its SSE fan-out, and pushing thousands of
+   * option strikes through it would both pollute those caches and put option volume on
+   * the browser broadcast path. Separate lane, separate destination.
+   */
+  onBoxLaneTicks?: (ticks: Parameters<TickerHub["seed"]>[0]) => void;
+  onBoxLaneConnection?: (connected: boolean) => void;
+}
+
+/** A lane with no socket yet: honest zeros rather than a pretence of health. */
+function emptyLaneStats(lane: MarketDataLane, wanted: number, generation: number): LaneFeedStats {
+  return {
+    lane,
+    connected: false,
+    subscribedTokens: 0,
+    wantedTokens: wanted,
+    ticksPerSecond: 0,
+    lastTickAgeMs: null,
+    reconnects: 0,
+    generation,
+  };
 }
 
 export class ActiveBrokerManager {
@@ -195,9 +223,22 @@ export class ActiveBrokerManager {
   /** Set while a switch is mid-flight, so nothing reports READY during a transition. */
   private transitioning = false;
 
+  /**
+   * The FUTURES lane: calendar-spread board, spot, futures analytics, browser SSE.
+   *
+   * Named `subscriptions` rather than `futuresSubscriptions` so every existing caller
+   * (browser leases, feed health, the status endpoints) keeps working unchanged. The
+   * accessor `futuresSubscriptions` below is the explicit name for new code.
+   */
   readonly subscriptions: SubscriptionCoordinator;
+  /** The BOX lane: option strikes for the Box scanner, on its own socket and budget. */
+  readonly boxSubscriptions: SubscriptionCoordinator;
   readonly instrumentProvider: InstrumentProvider;
   readonly quoteProvider: QuoteProvider;
+
+  /** Box-lane sockets, created lazily — only when the Box scanner actually wants data. */
+  private boxZerodhaFeed: ZerodhaFeed | null = null;
+  private boxDhanFeed: DhanFeed | null = null;
 
   constructor(private deps: ActiveBrokerManagerDeps) {
     this.dhanHttp = new DhanHttp(
@@ -213,10 +254,23 @@ export class ActiveBrokerManager {
     // EVERY market-data subscription goes through the coordinator, which diffs
     // refcounts and only then touches the ACTIVE broker's socket. This is what stops a
     // browser SSE client from opening a Zerodha WebSocket while Dhan is active.
-    this.subscriptions = new SubscriptionCoordinator({
-      subscribeTokens: (tokens) => this.subscribeUpstream(tokens),
-      unsubscribeTokens: (tokens) => this.unsubscribeUpstream(tokens),
-    });
+    this.subscriptions = new SubscriptionCoordinator(
+      {
+        subscribeTokens: (tokens) => this.subscribeUpstream("futures", tokens),
+        unsubscribeTokens: (tokens) => this.unsubscribeUpstream("futures", tokens),
+      },
+      "futures",
+    );
+    // A SECOND, fully independent coordinator for the Box lane. It holds no reference
+    // to the futures transport, so a Box strike-window diff is structurally incapable
+    // of emitting a subscribe or unsubscribe on the board's socket — and vice versa.
+    this.boxSubscriptions = new SubscriptionCoordinator(
+      {
+        subscribeTokens: (tokens) => this.subscribeUpstream("box", tokens),
+        unsubscribeTokens: (tokens) => this.unsubscribeUpstream("box", tokens),
+      },
+      "box",
+    );
 
     this.instrumentProvider = new InstrumentProvider({
       activeBroker: () => this.active,
@@ -266,9 +320,20 @@ export class ActiveBrokerManager {
     return true;
   }
 
-  /** Subscribe on the ACTIVE broker only. Called by the coordinator. */
-  private subscribeUpstream(tokens: number[]): void {
+  /**
+   * Subscribe on the ACTIVE broker's socket FOR THIS LANE only.
+   *
+   * The lane selects which of the two sockets is touched; the broker selects which
+   * implementation. Both dimensions are explicit, so no call site can accidentally
+   * cross either boundary.
+   */
+  private subscribeUpstream(lane: MarketDataLane, tokens: number[]): void {
     if (tokens.length === 0) return;
+    if (lane === "box") {
+      if (this.active === "zerodha") this.ensureBoxZerodhaFeed().subscribeTokens(tokens);
+      else this.ensureBoxDhanFeed().subscribeTokens(tokens);
+      return;
+    }
     if (this.active === "zerodha") {
       this.deps.tickerHub.subscribeTokens(tokens);
       return;
@@ -276,13 +341,135 @@ export class ActiveBrokerManager {
     this.ensureDhanFeed().subscribeTokens(tokens);
   }
 
-  private unsubscribeUpstream(tokens: number[]): void {
+  private unsubscribeUpstream(lane: MarketDataLane, tokens: number[]): void {
     if (tokens.length === 0) return;
+    if (lane === "box") {
+      if (this.active === "zerodha") this.boxZerodhaFeed?.unsubscribeTokens(tokens);
+      else this.boxDhanFeed?.unsubscribeTokens(tokens);
+      return;
+    }
     if (this.active === "zerodha") {
       this.deps.tickerHub.unsubscribeTokens(tokens);
       return;
     }
     this.dhanFeed?.unsubscribeTokens(tokens);
+  }
+
+  /**
+   * The Box lane's Zerodha socket.
+   *
+   * This is the SECOND of the three connections Zerodha permits per API key; the first
+   * is the futures lane's, and the third is deliberately left free. Created lazily, so
+   * a deployment that never runs the Box scanner opens exactly one socket.
+   */
+  private ensureBoxZerodhaFeed(): ZerodhaFeed {
+    if (!this.boxZerodhaFeed) {
+      this.boxZerodhaFeed = new ZerodhaFeed({
+        lane: "box",
+        credentials: () => this.deps.zerodhaCredentials(),
+        generation: () => this.gen,
+        onTicks: (ticks) => {
+          this.noteTick();
+          this.deps.onBoxLaneTicks?.(ticks);
+        },
+        onConnectionChange: (connected) => this.deps.onBoxLaneConnection?.(connected),
+        onDead: (message) => console.warn(`[Broker] box lane (zerodha) feed died: ${message}`),
+      });
+    }
+    return this.boxZerodhaFeed;
+  }
+
+  /** The Box lane's Dhan socket. Dhan permits 5 per user, so two lanes fit easily. */
+  private ensureBoxDhanFeed(): DhanFeed {
+    if (!this.boxDhanFeed) {
+      this.boxDhanFeed = new DhanFeed({
+        accessToken: () => this.usableDhanToken(),
+        clientId: () => this.dhanSessionMeta?.clientId ?? process.env.DHAN_CLIENT_ID?.trim() ?? "",
+        onTicks: (ticks) => {
+          this.noteTick();
+          this.deps.onBoxLaneTicks?.(ticks);
+        },
+        onConnection: (connected) => this.deps.onBoxLaneConnection?.(connected),
+        onSessionLost: (reason) => void this.onDhanSessionLost(reason),
+        resolve: (token) => this.dhanInstruments.identify(token),
+        depthLevel: 5,
+      });
+    }
+    return this.boxDhanFeed;
+  }
+
+  /** Replace the BOX lane's entire token set in one diff. */
+  setBoxTokens(tokens: number[]): void {
+    this.boxSubscriptions.setOwnerTokens("strategy", tokens);
+  }
+
+  /** Per-lane feed statistics for diagnostics. */
+  laneStats(lane: MarketDataLane): LaneFeedStats {
+    const wanted = lane === "box" ? this.boxSubscriptions.size : this.subscriptions.size;
+    if (lane === "box") {
+      if (this.active === "zerodha") {
+        const feed = this.boxZerodhaFeed;
+        if (feed) return feed.stats();
+        return emptyLaneStats("box", wanted, this.gen);
+      }
+      const feed = this.boxDhanFeed;
+      return feed
+        ? {
+            lane: "box",
+            connected: feed.isConnected(),
+            subscribedTokens: feed.subscribedCount(),
+            wantedTokens: feed.wantedCount(),
+            ticksPerSecond: 0,
+            lastTickAgeMs: feed.feedAgeMs(),
+            reconnects: 0,
+            generation: this.gen,
+          }
+        : emptyLaneStats("box", wanted, this.gen);
+    }
+    if (this.active === "dhan") {
+      const feed = this.dhanFeed;
+      return feed
+        ? {
+            lane: "futures",
+            connected: feed.isConnected(),
+            subscribedTokens: feed.subscribedCount(),
+            wantedTokens: feed.wantedCount(),
+            ticksPerSecond: 0,
+            lastTickAgeMs: feed.feedAgeMs(),
+            reconnects: 0,
+            generation: this.gen,
+          }
+        : emptyLaneStats("futures", wanted, this.gen);
+    }
+    return {
+      lane: "futures",
+      connected: this.deps.tickerHub.isConnected(),
+      subscribedTokens: this.deps.tickerHub.subscribedCount(),
+      wantedTokens: wanted,
+      ticksPerSecond: 0,
+      lastTickAgeMs: this.lastTickAt === null ? null : Math.max(0, Date.now() - this.lastTickAt),
+      reconnects: 0,
+      generation: this.gen,
+    };
+  }
+
+  /** Stop BOTH lanes of BOTH brokers, and forget their subscriptions. */
+  private stopAllLanes(): void {
+    const attempt = (what: string, fn: () => void) => {
+      try {
+        fn();
+      } catch (err) {
+        console.warn(`[Broker] ${what} failed:`, err);
+      }
+    };
+    attempt("tickerHub.stop()", () => this.deps.tickerHub.stop());
+    attempt("dhanFeed.stop()", () => this.dhanFeed?.stop());
+    attempt("boxZerodhaFeed.stop()", () => this.boxZerodhaFeed?.stop());
+    attempt("boxDhanFeed.stop()", () => this.boxDhanFeed?.stop());
+    // A stopped ZerodhaFeed is permanently disposed, so the next lane use must build a
+    // fresh one under the NEW generation rather than resurrect the old socket object.
+    this.boxZerodhaFeed = null;
+    this.boxDhanFeed = null;
   }
 
   /** Wire the exposure probe and switch hooks (done once, after the engine exists). */
@@ -436,10 +623,17 @@ export class ActiveBrokerManager {
       // Re-subscribe whatever consumers still want. Tokens are unchanged (same broker,
       // same namespace), so the coordinator's table is still valid — only the socket
       // was replaced.
+      // Replay EACH LANE's own table onto its own socket. Replaying the union would
+      // put option strikes on the board's connection and futures on the Box lane's.
       const wanted = this.subscriptions.activeTokens();
-      if (wanted.length > 0) {
-        console.log(`[Broker] restoring ${wanted.length} Dhan subscription(s) after reconnect`);
-        this.subscribeUpstream(wanted);
+      const wantedBox = this.boxSubscriptions.activeTokens();
+      if (wanted.length > 0 || wantedBox.length > 0) {
+        console.log(
+          `[Broker] restoring ${wanted.length} futures + ${wantedBox.length} box ` +
+            `Dhan subscription(s) after reconnect`,
+        );
+        this.subscribeUpstream("futures", wanted);
+        this.subscribeUpstream("box", wantedBox);
       }
       this.hooks?.publish();
     }
@@ -1112,6 +1306,7 @@ export class ActiveBrokerManager {
     // the existing BoxFeedProvider contract.
     if (tokens.length === 0) return;
     this.unsubscribeUpstream(
+      "futures",
       tokens.filter((t) => {
         const counts = this.subscriptions.countsFor(t);
         // Only reach upstream for tokens nothing else wants.
@@ -1211,16 +1406,10 @@ export class ActiveBrokerManager {
    * issue pointless unsubscribes against sockets that are already gone.
    */
   stopFeeds(): void {
-    try {
-      this.deps.tickerHub.stop();
-    } catch (err) {
-      console.warn("[Broker] tickerHub.stop() failed during shutdown:", err);
-    }
-    try {
-      this.dhanFeed?.stop();
-    } catch (err) {
-      console.warn("[Broker] dhanFeed.stop() failed during shutdown:", err);
-    }
+    // BOTH lanes of BOTH brokers. A switch earlier in the process's life can leave the
+    // previous broker's objects present, and at exit there is no reason to reason about
+    // which — every stop() is idempotent.
+    this.stopAllLanes();
   }
 
   /* ------------------------------ switching ------------------------------ */
@@ -1335,23 +1524,23 @@ export class ActiveBrokerManager {
       hooks?.stopScanner();
       console.log("[Broker] scanner stopped");
 
-      // 2 + 3. stop the outgoing feed and DROP its subscriptions and books
-      if (previous === "zerodha") {
-        // The Kite hub clears `subscribed` and `latest` on stop, so no Zerodha depth
-        // survives into the Dhan session.
-        this.deps.tickerHub.stop();
-      } else {
-        this.dhanFeed?.stop();
-      }
-      console.log(`[Broker] ${previous} feed stopped`);
+      // 2 + 3. stop BOTH LANES of the outgoing broker and DROP their subscriptions and
+      //    books. Both, unconditionally: leaving the Box lane's socket open would keep
+      //    streaming old-namespace option strikes into a session that no longer owns
+      //    them, which is precisely the leak this transition exists to prevent. The Kite
+      //    hub clears `subscribed` and `latest` on stop, and each lane feed forgets its
+      //    own token set.
+      this.stopAllLanes();
+      console.log(`[Broker] ${previous} feeds stopped (futures + box lanes)`);
 
-      // 4. drop every token registration. NOT translated: a Kite token has no Dhan
-      //    counterpart even when the integers coincide, so carrying the table across
-      //    would be the exact namespace leak this transition exists to prevent.
+      // 4. drop every token registration IN BOTH LANES. NOT translated: a Kite token has
+      //    no Dhan counterpart even when the integers coincide, so carrying either table
+      //    across would be the exact namespace leak this transition exists to prevent.
       const dropped = this.subscriptions.resetForBrokerSwitch();
+      const droppedBox = this.boxSubscriptions.resetForBrokerSwitch();
       console.log(
-        `[Broker] ${dropped.droppedTokens} old subscription(s) cleared ` +
-          `(${dropped.droppedLeases} lease(s))`,
+        `[Broker] ${dropped.droppedTokens} futures + ${droppedBox.droppedTokens} box ` +
+          `subscription(s) cleared (${dropped.droppedLeases + droppedBox.droppedLeases} lease(s))`,
       );
       // Browser stream sessions hold token lists in the OLD namespace, so they die here
       // too. Their owners get a 409 and refetch the board.
