@@ -570,8 +570,8 @@ export class BoxEngine {
       metrics: this.metrics,
       positions: this.positions,
       openPaperTrade: (args) => this.openPaperTrade(args),
-      onExecutionAttempt: (candidate, legging, reason, detail) =>
-        void this.persistExecutionAttempt(candidate, legging, reason, detail),
+      onExecutionAttempt: (candidate, legging, reason, detail, detectedGrossEdge) =>
+        void this.persistExecutionAttempt(candidate, legging, reason, detail, detectedGrossEdge),
       onEvent: (event, candidate, evaluation, detail) => {
         void appendBoxEvent({
           event,
@@ -1846,6 +1846,8 @@ export class BoxEngine {
     legging: PaperLeggingExecutionRecord,
     reason: BoxExecutionFailureReason,
     detail: string,
+    /** Gross edge at detection (₹), for cost attribution. Null when it is not known. */
+    detectedGrossEdge?: number | null,
   ): Promise<void> {
     const direction = candidate.direction ?? "LONG_BOX";
     let grossAbort = legging.legging_gross_loss ?? null;
@@ -1909,7 +1911,7 @@ export class BoxEngine {
     };
     // Feed the calibration surface BEFORE persistence, so an attempt is observed even if its
     // durable projection fails (the failure is handled separately below).
-    this.observeAttempt(legging, false);
+    this.observeAttempt(legging, false, detectedGrossEdge ?? null);
     const attemptId = await insertBoxExecutionAttempt(attempt);
     if (this.orderManager && this.cfg.executionMode === "live") {
       if (attemptId) this.orderManager.recordRealisedPnl(netAbort ?? 0);
@@ -2171,7 +2173,7 @@ export class BoxEngine {
     // A successfully opened box IS the 4/4 outcome. Observed here so measured outcome rates have a
     // numerator as well as a denominator — previously nothing ever recorded a success, so every
     // rate was permanently zero.
-    if (args.legging) this.observeAttempt(args.legging, true);
+    if (args.legging) this.observeAttempt(args.legging, true, evaluation.gross_edge);
 
     // Margin is captured AFTER the fill is recorded, off the hot path.
     void this.captureMargin(id, candidate.legs, candidate.lot_size, candidate.key, direction);
@@ -3066,7 +3068,15 @@ export class BoxEngine {
    * FAIL-OPEN. This is pure observability on a path that has already completed real or simulated
    * execution; a failure here must never affect the attempt's recorded result.
    */
-  private observeAttempt(legging: PaperLeggingExecutionRecord, filledAllFour: boolean): void {
+  private observeAttempt(
+    legging: PaperLeggingExecutionRecord,
+    filledAllFour: boolean,
+    /**
+     * Gross edge measured at DETECTION (₹), or null when the caller does not know it.
+     * Required for shortfall attribution and never substituted with another figure.
+     */
+    detectedGrossEdge: number | null = null,
+  ): void {
     try {
       const broker = this.deps.activeBroker();
       const legs = legging.legs ?? [];
@@ -3162,9 +3172,23 @@ export class BoxEngine {
       }
 
       // ── implementation shortfall ───────────────────────────────────────────────────
+      // Attribution is only meaningful against the edge the attempt SET OUT to capture. That
+      // figure is not on the legging record, and the two fields that look adjacent are neither of
+      // it: `required_expected_net_profit` is the GATE THRESHOLD the executed prices were tested
+      // against, and `final_expected_net_profit` is an expected NET, not a gross edge. Feeding the
+      // threshold in as the theoretical edge made every line of the subtraction chain — including
+      // `unexplained` — an attribution of nothing in particular. The detected edge is now passed
+      // in explicitly by the caller, and when the caller does not know it the shortfall is SKIPPED
+      // rather than computed from a stand-in.
+      if (detectedGrossEdge === null || !Number.isFinite(detectedGrossEdge)) {
+        this.lastShortfall = null;
+        return;
+      }
       const shortfall = computeExecutionShortfall({
-        theoreticalDetectedEdge: legging.required_expected_net_profit ?? 0,
-        executedGrossEdge: legging.final_expected_net_profit ?? null,
+        theoreticalDetectedEdge: detectedGrossEdge,
+        // The record carries no EXECUTED gross edge, and `final_expected_net_profit` is an expected
+        // net — a different quantity. Reported as unknown rather than filled with the wrong one.
+        executedGrossEdge: null,
         brokerage: 0,
         taxesAndFees: round2((legging.partial_entry_charges ?? 0) + (legging.unwind_charges ?? 0)),
         unwindCost: Math.max(0, -(legging.legging_gross_loss ?? 0)),

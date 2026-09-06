@@ -800,7 +800,18 @@ export class BoxPositionMonitor {
       const prev = pos.remaining_qty_by_role[role] ?? 0;
       const closed = record.fills_by_role[role] ?? 0;
       if (closed <= 0) continue;
-      const price = leg.price ?? 0;
+      // A confirmed fill with no price is a contradiction, and defaulting it to 0 would be the
+      // worst possible response: `per` below becomes ±entryPrice, fabricating tens of thousands of
+      // rupees of realised P&L out of a missing field, and the leg's charges would be priced on ₹0
+      // of turnover. Refuse the quantity instead and raise the invariant — the role stays
+      // outstanding, so the next cycle re-reads it rather than banking a fiction.
+      if (leg.price === null || !(leg.price > 0)) {
+        this.deps.executionSim.invariantViolation(
+          `${pos.id}: exit fill on ${role} reported ${closed} filled with no usable price; quantity retained`,
+        );
+        continue;
+      }
+      const price = leg.price;
       const remaining = Math.max(0, prev - closed);
       projected.remaining_qty_by_role[role] = remaining;
       fillsByRole[role] = closed;
@@ -932,7 +943,16 @@ export class BoxPositionMonitor {
       created_at: now,
     }));
     this.deps.metrics?.recordPartialExitRemainingRoles(residual.length);
-    const persisted = await this.deps.persistPartialExit({ position: projected, residual, legging: record });
+    // `.catch` is NOT optional here. The store REJECTS (rather than returning false) on a socket
+    // error, timeout or topology change. An escaping rejection would unwind past this function
+    // without running the quarantine below, leaving `pos.remaining_qty_by_role` still claiming the
+    // full quantity on roles the broker has already closed — and nothing queued for retry. The next
+    // monitor cycle would then size a fresh closing order from those stale figures and re-close an
+    // already-flat role, which is reverse exposure: precisely the outcome this class exists to make
+    // impossible. Every sibling persist on this path is guarded the same way.
+    const persisted = await this.deps
+      .persistPartialExit({ position: projected, residual, legging: record })
+      .catch(() => false);
     const detail =
       `partial exit: closed ${closedRoles.join(", ")}; still open ` +
       `${residual.map((r) => `${r.role}×${r.quantity}`).join(", ")}` +

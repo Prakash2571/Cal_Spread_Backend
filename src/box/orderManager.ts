@@ -568,11 +568,29 @@ export class BoxOrderManager {
     if (!this.canManageExposure()) return [];
     const intents = await this.deps.persistence.loadNonterminal();
     const cancelled: BrokerOrder[] = [];
+    const failures: string[] = [];
     for (const intent of intents) {
       // Only durable BOX intents are eligible. Never cancel arbitrary broker orders.
       if (!intent.client_order_id.startsWith("BOX:")) continue;
-      const order = await this.enqueueCancel(intent);
-      if (order) cancelled.push(order);
+      // One leg's cancel MUST NOT abandon the others. `enqueueCancel` rejects on any adapter
+      // error, and an ambiguous or slow cancel is exactly the situation in which this method is
+      // called — so letting the rejection escape the loop meant the first troublesome leg
+      // prevented legs 2-4 from ever being enqueued, leaving them working at the broker while the
+      // operator's panic button reported a flat failure. Every eligible intent now gets its own
+      // attempt, and the failures are surfaced after all of them have been tried.
+      try {
+        const order = await this.enqueueCancel(intent);
+        if (order) cancelled.push(order);
+      } catch (error) {
+        failures.push(`${intent.client_order_id}: ${errorMessage(error)}`);
+      }
+    }
+    if (failures.length > 0) {
+      // Loud, and not thrown: the caller needs the list of what WAS cancelled far more than it
+      // needs an exception, and a half-completed cancel sweep must never look like a clean one.
+      this.invariantViolation(
+        `cancel-working sweep left ${failures.length} order(s) uncancelled: ${failures.join("; ")}`,
+      );
     }
     return cancelled;
   }
