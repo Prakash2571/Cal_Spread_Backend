@@ -1809,8 +1809,19 @@ export class BoxEngine {
     this.subscribedOptionTokens = wantOption;
     this.subscribedSpotTokens = wantSpot;
 
-    // Prefer declaring the whole set: the coordinator can then refcount correctly and
-    // will not drop a token another consumer (a browser SSE client) still wants.
+    // PREFERRED: the dedicated Box lane. Its own socket and its own token budget, so a
+    // wide option universe cannot displace the calendar-spread board's instruments and
+    // a busy board cannot displace strikes. Both option AND spot tokens go here: the Box
+    // scanner's view of the underlying must not depend on the futures lane's health.
+    if (this.cfg.boxDedicatedMarketFeed && this.deps.feed.setBoxTokens) {
+      this.deps.feed.setBoxTokens([...wantOption, ...wantSpot]);
+      this.subscribedOptionTokens = new Set(wantOption);
+      this.subscribedSpotTokens = new Set(wantSpot);
+      if (toDrop.length > 0) this.quotes.forget(toDrop);
+      return;
+    }
+    // Fallback: the single shared feed, exactly as before. Kept so the dedicated lane
+    // can be switched off without a redeploy, and so a provider that predates it works.
     if (this.deps.feed.setStrategyTokens) {
       this.deps.feed.setStrategyTokens([...wantOption, ...wantSpot]);
       this.subscribedOptionTokens = new Set(wantOption);
@@ -3744,6 +3755,29 @@ export class BoxEngine {
    */
   clearInstrumentReservations(): void {
     this.coordinator.resetForBrokerSwitch();
+  }
+
+  /**
+   * Ticks from the DEDICATED BOX LANE.
+   *
+   * Deliberately the same code path as the shared-feed listener, so a Box quote is
+   * processed identically however it arrived and the two feed topologies cannot drift.
+   * What differs is only the source socket — and therefore the token budget the Box
+   * universe is competing for, which is the entire point of the split.
+   */
+  ingestBoxLaneTicks(ticks: Tick[]): void {
+    this.onTicks(ticks);
+  }
+
+  /**
+   * The Box lane's socket changed state.
+   *
+   * Bumps the feed generation exactly as a shared-feed reconnect does, so no book
+   * cached before the reconnect can be treated as warm and therefore executable.
+   */
+  onBoxLaneConnection(connected: boolean): void {
+    this.invalidateFeedGeneration();
+    if (!connected) this.lastError = "box market-data lane disconnected";
   }
 
   invalidateBooks(): void {

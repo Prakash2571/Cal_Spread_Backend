@@ -124,6 +124,18 @@ const brokerManager = new ActiveBrokerManager({
   tickerHub,
   boxConfig: () => boxModule.engine.getConfigRaw(),
   istDayKey,
+  // Read fresh on every connect: a lane reconnecting after a token refresh must use
+  // the CURRENT access token, not the one captured when the feed was constructed.
+  zerodhaCredentials: () => ({ apiKey: kite.getApiKey(), accessToken: kite.getAccessToken() }),
+  // BOX-LANE ticks go straight to the Box quote store, NOT through the hub. The hub
+  // owns the board's caches and its SSE fan-out; pushing thousands of option strikes
+  // through it would pollute those caches and put option volume on the browser
+  // broadcast path. Separate lane, separate destination.
+  onBoxLaneTicks: (ticks) => {
+    brokerManager.noteTick();
+    boxModule.engine.ingestBoxLaneTicks(ticks);
+  },
+  onBoxLaneConnection: (connected) => boxModule.engine.onBoxLaneConnection(connected),
   // Dhan ticks are pushed into the shared hub's caches so EVERY existing consumer
   // (the Box quote store, SSE clients, analytics) sees them through the same path it
   // already uses. No consumer needs to know which broker produced a tick.
@@ -5246,6 +5258,9 @@ const boxModule: BoxModule = registerBoxModule(app, {
     // Declaring the whole set is what makes a moving strike window safe: the
     // coordinator diffs it, so a token also wanted by a browser survives.
     setStrategyTokens: (tokens) => brokerManager.setStrategyTokens(tokens),
+    // The DEDICATED Box lane — a second socket on the same active broker, with its own
+    // refcount table and token budget.
+    setBoxTokens: (tokens) => brokerManager.setBoxTokens(tokens),
     subscribedCount: () => brokerManager.subscribedCount(),
     isConnected: () => brokerManager.feedConnected(),
   },
