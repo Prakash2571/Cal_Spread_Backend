@@ -87,7 +87,15 @@ import {
 export const CALIBRATION_STAGES = [
   /** Enqueued in our scheduler → a concurrency slot was acquired. Our own queueing. */
   "scheduler_wait_ms",
-  /** Slot acquired → transport pacing permitted the call. Our own rate limiting. */
+  /**
+   * Slot acquired → the durable intent is persisted and the order may be transmitted.
+   *
+   * A real Mongo round trip on the live critical path, inside the held concurrency slot. Measured
+   * separately because it is neither our queueing nor our rate limiting, and because it is the one
+   * live-only stage paper models as zero until it has been observed.
+   */
+  "persistence_wait_ms",
+  /** Persistence done → transport pacing permitted the call. Our own rate limiting. */
   "transport_wait_ms",
   /** POST left the wire → HTTP response returned. Pure transport + broker front end. */
   "post_to_http_response_ms",

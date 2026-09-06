@@ -34,7 +34,12 @@
  *  - It does not model each individual poll GET's pacing during the rest window. The POST
  *    is the pacing-relevant transport event that gates other operations; polls happen
  *    inside an operation's own already-held slot. This is a documented simplification, not
- *    an invented behaviour.
+ *    an invented behaviour — but note it is an OPTIMISTIC one: live pays the shared throttle
+ *    for every status poll of every working order, so with a concurrency cap above 1 paper
+ *    will under-estimate how long a POST waits for the wire.
+ *  - It does not INVENT a durable-persistence delay. `persistenceMs` defaults to 0, so a run
+ *    that has never measured the live Mongo round trip is knowingly optimistic on that stage
+ *    rather than guessing at it. Once measured, the caller supplies the real value.
  */
 
 import type { BoxOrderPurpose } from "./types.js";
@@ -59,6 +64,17 @@ export interface SchedulableOperation {
    * ready when its trigger fires.
    */
   readonly readyAt: number;
+  /**
+   * Slot acquired → the durable intent is persisted (ms), i.e. the Mongo round trip the live
+   * OrderManager pays before it may transmit, inside the already-held concurrency slot.
+   *
+   * OPTIONAL, and 0 when omitted — which is deliberate. Until this stage has actually been
+   * measured we do not know it, and inventing a plausible-looking database latency would be
+   * exactly the kind of fabrication this model exists to avoid. A caller supplies the MEASURED
+   * value once calibration has one; a run without it is knowingly optimistic on this stage, and
+   * says so in the calibration status rather than pretending otherwise.
+   */
+  readonly persistenceMs?: number;
   /** POST leaves the wire → broker ACK (ms). The order is "live at the exchange" at ACK. */
   readonly postToAckMs: number;
   /**
@@ -81,7 +97,9 @@ export interface ScheduledOperation {
   readonly queued_at: number;
   /** A concurrency slot was acquired (inFlight++). */
   readonly dequeued_at: number;
-  /** The shared transport throttle permitted the POST (>= dequeued_at). */
+  /** The durable intent was persisted; the order may now be transmitted (>= dequeued_at). */
+  readonly persisted_at: number;
+  /** The shared transport throttle permitted the POST (>= persisted_at). */
   readonly transport_allowed_at: number;
   /** POST left the wire (== transport_allowed_at). */
   readonly post_started_at: number;
@@ -92,7 +110,9 @@ export interface ScheduledOperation {
 
   /** dequeued_at − queued_at: time spent waiting for a free, higher-priority-clear slot. */
   readonly queue_wait_ms: number;
-  /** post_started_at − dequeued_at: extra wait imposed purely by transport pacing. */
+  /** persisted_at − dequeued_at: durable-write latency before the order may be transmitted. */
+  readonly persistence_wait_ms: number;
+  /** post_started_at − persisted_at: extra wait imposed purely by transport pacing. */
   readonly transport_wait_ms: number;
 }
 
@@ -172,7 +192,15 @@ export function planPaperSchedule(
     const { op, priority } = pending[chosen]!;
     const queued_at = op.readyAt;
     const dequeued_at = Math.max(slotAvailableAt, op.readyAt);
-    const transport_allowed_at = Math.max(dequeued_at, transportFreeAt);
+    // Durable persistence happens INSIDE the held slot, before the order may be transmitted —
+    // mirroring the live manager, which writes the intent and transitions it to SUBMITTING before
+    // calling the adapter. Zero unless the caller supplied a measured value.
+    // Sanitised: a non-finite or negative value contributes nothing rather than poisoning the whole
+    // timeline. `dequeued_at + NaN` would make every downstream instant NaN and silently destroy the
+    // schedule, so the guard is on finiteness, not just on sign.
+    const persistenceMs = Number.isFinite(op.persistenceMs) ? Math.max(0, op.persistenceMs as number) : 0;
+    const persisted_at = dequeued_at + persistenceMs;
+    const transport_allowed_at = Math.max(persisted_at, transportFreeAt);
     const post_started_at = transport_allowed_at;
     const ack_at = post_started_at + Math.max(0, op.postToAckMs);
     const terminal_at = ack_at + Math.max(0, op.ackToTerminalMs);
@@ -190,12 +218,14 @@ export function planPaperSchedule(
       slot,
       queued_at,
       dequeued_at,
+      persisted_at,
       transport_allowed_at,
       post_started_at,
       ack_at,
       terminal_at,
       queue_wait_ms: dequeued_at - queued_at,
-      transport_wait_ms: post_started_at - dequeued_at,
+      persistence_wait_ms: persisted_at - dequeued_at,
+      transport_wait_ms: post_started_at - persisted_at,
     };
     scheduled[chosen] = true;
     dequeuedCount++;

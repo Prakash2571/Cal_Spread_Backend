@@ -11,6 +11,7 @@ import mongoose from "mongoose";
 import { isBoxConnectionReady } from "../db.js";
 import { LEGACY_BROKER, type BrokerId } from "../brokers/types.js";
 import {
+  BoxCalibrationSample,
   BoxDailyPnl,
   BoxExecutionAttempt,
   BoxOrderIntent,
@@ -807,12 +808,17 @@ export async function loadUnresolvedBoxExecutionAttempts(
 }
 
 /** Mark an execution attempt's residual exposure as flattened (best-effort). */
-export async function resolveBoxExecutionAttempt(id: string): Promise<boolean> {
+export async function resolveBoxExecutionAttempt(
+  id: string,
+  /** Charges incurred by the final flatten pass (a delta). Applied atomically with resolution. */
+  flattenChargeDelta?: number,
+): Promise<boolean> {
   if (!isBoxDbEnabled() || !isValidBoxId(id)) return false;
-  const result = await BoxExecutionAttempt.updateOne(
-    { _id: id },
-    { $set: { resolved: true, residual_exposure: [] } },
-  );
+  const update: Record<string, unknown> = { $set: { resolved: true, residual_exposure: [] } };
+  if (flattenChargeDelta !== undefined && flattenChargeDelta > 0) {
+    update.$inc = { flatten_charges: round2Repo(flattenChargeDelta) };
+  }
+  const result = await BoxExecutionAttempt.updateOne({ _id: id }, update);
   return (result.matchedCount ?? 0) > 0;
 }
 
@@ -826,16 +832,24 @@ export async function resolveBoxExecutionAttempt(id: string): Promise<boolean> {
 export async function updateBoxExecutionAttemptResidual(
   id: string,
   residual: unknown[],
-  cumulativeUnwindCharges?: number,
+  /**
+   * Charges incurred by THIS flatten pass (a delta, not a running total).
+   *
+   * Applied with `$inc` in the SAME update as the residual projection, so the cost and the quantity
+   * it paid for are recorded atomically: a pass can never leave one written without the other, and
+   * retrying an unacknowledged update cannot double-charge because it applied wholly or not at all.
+   */
+  flattenChargeDelta?: number,
 ): Promise<boolean> {
   if (!isBoxDbEnabled() || !isValidBoxId(id)) return false;
   const resolved = residual.length === 0;
-  const set: Record<string, unknown> = {
-    residual_exposure: resolved ? [] : residual,
-    resolved,
+  const update: Record<string, unknown> = {
+    $set: { residual_exposure: resolved ? [] : residual, resolved },
   };
-  if (cumulativeUnwindCharges !== undefined) set.unwind_charges = round2Repo(cumulativeUnwindCharges);
-  const result = await BoxExecutionAttempt.updateOne({ _id: id }, { $set: set });
+  if (flattenChargeDelta !== undefined && flattenChargeDelta > 0) {
+    update.$inc = { flatten_charges: round2Repo(flattenChargeDelta) };
+  }
+  const result = await BoxExecutionAttempt.updateOne({ _id: id }, update);
   return (result.matchedCount ?? 0) > 0;
 }
 
@@ -1000,4 +1014,87 @@ export async function saveBoxSettings(entries: Map<string, number>): Promise<voi
     })),
     { ordered: false },
   );
+}
+
+/* ------------------- execution-latency calibration samples ------------------- */
+
+/**
+ * Persist a BATCH of measured execution-latency observations.
+ *
+ * Called only from the bounded async buffer ({@link ./calibrationPersistence}), never from the
+ * order path — the whole point of that buffer is that no order ever waits on this write.
+ *
+ * `insertMany` with `ordered: false` so one malformed row cannot discard the rest of the batch.
+ * Contains only latency numbers and dimension labels; no credentials or position data.
+ */
+export async function persistBoxCalibrationSamples(
+  batch: readonly {
+    broker: string;
+    kind: string;
+    profile: string;
+    bucket: string;
+    stage: string;
+    valueMs: number;
+    session?: string | undefined;
+    atWall: number;
+  }[],
+  region: string | null,
+): Promise<void> {
+  if (!isBoxDbEnabled() || batch.length === 0) return;
+  await BoxCalibrationSample.insertMany(
+    batch.map((sample) => ({
+      broker: sample.broker,
+      kind: sample.kind,
+      profile: sample.profile,
+      bucket: sample.bucket,
+      stage: sample.stage,
+      value_ms: round2Repo(sample.valueMs),
+      session: sample.session ?? "",
+      region,
+      observed_at: new Date(sample.atWall),
+    })),
+    { ordered: false },
+  );
+}
+
+/**
+ * Load recent persisted observations so calibration survives a restart.
+ *
+ * Region-scoped, because two deployments have different physical round-trip times to the broker and
+ * a merged distribution would describe neither. Bounded by both age and a hard row cap, so startup
+ * cost stays predictable however long the collection has been accumulating.
+ */
+export async function loadBoxCalibrationSamples(args: {
+  region: string | null;
+  maxAgeMs: number;
+  limit?: number;
+}): Promise<Array<{
+  broker: string;
+  kind: string;
+  profile: string;
+  bucket: string;
+  stage: string;
+  valueMs: number;
+  session: string;
+  atWall: number;
+}>> {
+  if (!isBoxDbEnabled()) return [];
+  const cutoff = new Date(Date.now() - Math.max(0, args.maxAgeMs));
+  const rows = await BoxCalibrationSample.find({
+    region: args.region,
+    observed_at: { $gte: cutoff },
+  })
+    .sort({ observed_at: 1 })
+    .limit(Math.max(1, Math.floor(args.limit ?? 50_000)))
+    .lean<Array<Record<string, unknown>>>();
+  return rows.map((row) => ({
+    broker: String(row.broker),
+    kind: String(row.kind),
+    profile: String(row.profile),
+    bucket: String(row.bucket),
+    stage: String(row.stage),
+    valueMs: Number(row.value_ms),
+    session: String(row.session ?? ""),
+    atWall: row.observed_at instanceof Date ? row.observed_at.getTime() : Number(row.observed_at),
+  }));
 }

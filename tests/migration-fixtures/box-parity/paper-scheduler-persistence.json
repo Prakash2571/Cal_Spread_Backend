@@ -1,0 +1,157 @@
+{
+  "category": "execution-parity",
+  "operation": "planPaperSchedule (persistenceMs)",
+  "description": "Durable persistence happens INSIDE the held concurrency slot, before the POST — mirroring the live manager, which writes the intent and transitions it to SUBMITTING before calling the adapter. Omitted/invalid values contribute 0 rather than being invented or poisoning the timeline.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "no persistence supplied models zero",
+      "input": {
+        "operations": [
+          {
+            "id": "0",
+            "purpose": "ENTRY",
+            "sequence": 0,
+            "readyAt": 1000,
+            "postToAckMs": 100,
+            "ackToTerminalMs": 50
+          }
+        ],
+        "policy": {
+          "maxConcurrentOperations": 1,
+          "minBrokerIntervalMs": 0
+        }
+      },
+      "expected": {
+        "schedule": [
+          {
+            "id": "0",
+            "dequeued_at": 1000,
+            "persisted_at": 1000,
+            "post_started_at": 1000,
+            "ack_at": 1100,
+            "persistence_wait_ms": 0,
+            "transport_wait_ms": 0
+          }
+        ]
+      }
+    },
+    {
+      "name": "a measured persistence delays the POST",
+      "input": {
+        "operations": [
+          {
+            "id": "0",
+            "purpose": "ENTRY",
+            "sequence": 0,
+            "readyAt": 1000,
+            "postToAckMs": 100,
+            "ackToTerminalMs": 50,
+            "persistenceMs": 35
+          }
+        ],
+        "policy": {
+          "maxConcurrentOperations": 1,
+          "minBrokerIntervalMs": 0
+        }
+      },
+      "expected": {
+        "schedule": [
+          {
+            "id": "0",
+            "dequeued_at": 1000,
+            "persisted_at": 1035,
+            "post_started_at": 1035,
+            "ack_at": 1135,
+            "persistence_wait_ms": 35,
+            "transport_wait_ms": 0
+          }
+        ]
+      }
+    },
+    {
+      "name": "invalid persistence contributes zero",
+      "input": {
+        "operations": [
+          {
+            "id": "0",
+            "purpose": "ENTRY",
+            "sequence": 0,
+            "readyAt": 1000,
+            "postToAckMs": 100,
+            "ackToTerminalMs": 50,
+            "persistenceMs": -100
+          }
+        ],
+        "policy": {
+          "maxConcurrentOperations": 1,
+          "minBrokerIntervalMs": 0
+        }
+      },
+      "expected": {
+        "schedule": [
+          {
+            "id": "0",
+            "dequeued_at": 1000,
+            "persisted_at": 1000,
+            "post_started_at": 1000,
+            "ack_at": 1100,
+            "persistence_wait_ms": 0,
+            "transport_wait_ms": 0
+          }
+        ]
+      }
+    },
+    {
+      "name": "persistence and pacing are sequential, never overlapping",
+      "input": {
+        "operations": [
+          {
+            "id": "a",
+            "purpose": "ENTRY",
+            "sequence": 0,
+            "readyAt": 1000,
+            "postToAckMs": 100,
+            "ackToTerminalMs": 50,
+            "persistenceMs": 35
+          },
+          {
+            "id": "b",
+            "purpose": "ENTRY",
+            "sequence": 1,
+            "readyAt": 1000,
+            "postToAckMs": 100,
+            "ackToTerminalMs": 50,
+            "persistenceMs": 35
+          }
+        ],
+        "policy": {
+          "maxConcurrentOperations": 2,
+          "minBrokerIntervalMs": 200
+        }
+      },
+      "expected": {
+        "schedule": [
+          {
+            "id": "a",
+            "dequeued_at": 1000,
+            "persisted_at": 1035,
+            "post_started_at": 1035,
+            "ack_at": 1135,
+            "persistence_wait_ms": 35,
+            "transport_wait_ms": 0
+          },
+          {
+            "id": "b",
+            "dequeued_at": 1000,
+            "persisted_at": 1035,
+            "post_started_at": 1235,
+            "ack_at": 1335,
+            "persistence_wait_ms": 35,
+            "transport_wait_ms": 200
+          }
+        ]
+      }
+    }
+  ]
+}

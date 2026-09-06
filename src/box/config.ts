@@ -249,6 +249,17 @@ export interface BoxConfig {
    * observed latency.
    */
   paperCancelLatencyMs: number;
+  /**
+   * Fallback durable-persistence delay (ms) paper applies between acquiring a concurrency slot
+   * and transmitting, used only when `persistence_wait_ms` has not been measured.
+   *
+   * Defaults to 0 — deliberately. The live path really does pay a Mongo round trip there, but we
+   * do not know its size until it has been observed, and a guessed database latency would be a
+   * fabrication. 0 means "knowingly optimistic on this stage, and it says so"; once calibration
+   * has samples paper uses the measured p50 instead. Set this only if you have measured your own
+   * deployment's write latency.
+   */
+  paperPersistenceMs: number;
 
   // ---- Live timing persistence (Phase 25) ----
   /**
@@ -759,6 +770,7 @@ export function loadBoxConfig(): BoxConfig {
     // 150ms is a conservative stand-in for a real cancel round trip. NOT zero: an instantaneous
     // cancel is the optimistic assumption the race model exists to remove.
     paperCancelLatencyMs: clampInt("BOX_PAPER_CANCEL_LATENCY_MS", 150, 0, 60_000),
+    paperPersistenceMs: clampInt("BOX_PAPER_PERSISTENCE_MS", 0, 0, 60_000),
 
     liveTimingPersistEnabled: bool("BOX_LIVE_TIMING_PERSIST_ENABLED", false),
     liveTimingBatchSize: clampInt("BOX_LIVE_TIMING_BATCH_SIZE", 50, 1, 10_000),

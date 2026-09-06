@@ -54,6 +54,7 @@ import {
 import type { CalibrationDimensions, ExecutionCalibrationStore } from "./executionCalibration.js";
 import { CalibratedStructuredLatencySource, type CalibratedLatencyStatus } from "./calibratedLatencySource.js";
 import type { LegCancelRaceModel } from "./legExecutor.js";
+import { kindForPurpose } from "./executionTiming.js";
 import { createSchedulingPolicy, type ExecutionSchedulingPolicy } from "./executionSchedulingPolicy.js";
 import { planPaperSchedule, type SchedulableOperation } from "./paperScheduler.js";
 import type { ExecutionPhase } from "./executionPolicy.js";
@@ -311,6 +312,23 @@ export class BoxExecutionSimulator {
   }
 
   /**
+   * Durable-persistence delay to apply before transmitting, in ms.
+   *
+   * Measured `persistence_wait_ms` p50 when calibration supports it, else the configured
+   * fallback (0 by default). Returning 0 is the honest answer to "we have never measured our own
+   * database": it makes paper optimistic on this stage rather than confidently wrong about it,
+   * and {@link calibrationStatus} reports which of the two is in force.
+   */
+  private persistenceWindowMs(kind: CalibrationDimensions["kind"]): number {
+    const fallback = Math.max(0, this.deps.cfg.paperPersistenceMs);
+    const store = this.deps.calibration;
+    if (!store) return fallback;
+    const resolved = store.resolve(this.calibrationDimensions(kind), "persistence_wait_ms");
+    if (!resolved.measured || resolved.percentiles.p50 === null) return fallback;
+    return Math.max(0, Math.round(resolved.percentiles.p50));
+  }
+
+  /**
    * How long a cancel takes to reach a confirmed terminal state, in ms.
    *
    * Measured CANCEL latency when calibration supports it (p50, because the window's typical
@@ -339,6 +357,8 @@ export class BoxExecutionSimulator {
     latency: CalibratedLatencyStatus | null;
     cancel_window_ms: number;
     cancel_window_measured: boolean;
+    persistence_window_ms: number;
+    persistence_window_measured: boolean;
     confidence: CalibrationConfidence;
   } {
     const latency = this.calibratedLatency?.status() ?? null;
@@ -346,12 +366,20 @@ export class BoxExecutionSimulator {
     const cancelResolved = store
       ? store.resolve(this.calibrationDimensions("CANCEL"), "cancel_request_to_terminal_ms")
       : null;
+    const persistenceResolved = store
+      ? store.resolve(this.calibrationDimensions("ENTRY"), "persistence_wait_ms")
+      : null;
     return {
       profile: this.deps.cfg.paperExecutionProfile,
       evidence_driven: this.evidenceDriven,
       latency,
       cancel_window_ms: this.cancelWindowMs(),
       cancel_window_measured: cancelResolved?.measured === true && cancelResolved.percentiles.p50 !== null,
+      persistence_window_ms: this.persistenceWindowMs("ENTRY"),
+      // False means paper is applying its configured fallback (0 by default) rather than a measured
+      // durable-write latency — i.e. optimistic on this stage, and saying so.
+      persistence_window_measured:
+        persistenceResolved?.measured === true && persistenceResolved.percentiles.p50 !== null,
       // The stress profile is never allowed to claim confidence: its numbers come from injected
       // faults, not observations.
       confidence: this.evidenceDriven ? (latency?.confidence ?? "LOW") : "LOW",
@@ -374,6 +402,7 @@ export class BoxExecutionSimulator {
     // diagnostics/fixtures; intra-run ordering is FIFO by leg. Unwinds carry the
     // emergency-residual band, everything else the entry band.
     const purpose: BoxOrderPurpose = args.phase === "unwind" ? "EMERGENCY_RESIDUAL" : "ENTRY";
+    const persistence = this.persistenceWindowMs(kindForPurpose(purpose));
     const ops: SchedulableOperation[] = Array.from({ length: args.count }, (_, i) => {
       const draw = source.next();
       return {
@@ -381,6 +410,8 @@ export class BoxExecutionSimulator {
         purpose,
         sequence: i,
         readyAt: args.submitAt,
+        // Durable-persistence latency, from measurement when it exists and 0 otherwise.
+        persistenceMs: persistence,
         postToAckMs: draw.postToAckMs,
         ackToTerminalMs: draw.ackToTerminalMs,
       };

@@ -1160,6 +1160,13 @@ export interface IBoxExecutionAttempt {
   /** ABORT accounting, hoisted for easy querying. */
   partial_entry_charges: number | null;
   unwind_charges: number | null;
+  /**
+   * Cumulative charges of RESIDUAL FLATTENING, accumulated across flatten passes.
+   *
+   * Kept separate from `unwind_charges`: the unwind is the immediate reversal at abort time,
+   * flattening is the later (possibly multi-pass) work of clearing what the unwind could not.
+   */
+  flatten_charges?: number | null;
   gross_abort_pnl: number | null;
   net_abort_pnl: number | null;
   /**
