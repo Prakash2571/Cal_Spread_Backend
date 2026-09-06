@@ -1,0 +1,107 @@
+{
+  "category": "execution-parity",
+  "operation": "classifyTimeOfDayBucket",
+  "description": "Coarse OPEN / NORMAL / CLOSE bucketing of the NSE session, and the IST session key used for freshness. Outside the session is NORMAL, never a fourth bucket.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "minute 555",
+      "input": {
+        "istMinutesOfDay": 555
+      },
+      "expected": {
+        "bucket": "OPEN"
+      }
+    },
+    {
+      "name": "minute 560",
+      "input": {
+        "istMinutesOfDay": 560
+      },
+      "expected": {
+        "bucket": "OPEN"
+      }
+    },
+    {
+      "name": "minute 569",
+      "input": {
+        "istMinutesOfDay": 569
+      },
+      "expected": {
+        "bucket": "OPEN"
+      }
+    },
+    {
+      "name": "minute 570",
+      "input": {
+        "istMinutesOfDay": 570
+      },
+      "expected": {
+        "bucket": "NORMAL"
+      }
+    },
+    {
+      "name": "minute 720",
+      "input": {
+        "istMinutesOfDay": 720
+      },
+      "expected": {
+        "bucket": "NORMAL"
+      }
+    },
+    {
+      "name": "minute 915",
+      "input": {
+        "istMinutesOfDay": 915
+      },
+      "expected": {
+        "bucket": "NORMAL"
+      }
+    },
+    {
+      "name": "minute 916",
+      "input": {
+        "istMinutesOfDay": 916
+      },
+      "expected": {
+        "bucket": "CLOSE"
+      }
+    },
+    {
+      "name": "minute 930",
+      "input": {
+        "istMinutesOfDay": 930
+      },
+      "expected": {
+        "bucket": "CLOSE"
+      }
+    },
+    {
+      "name": "minute 360",
+      "input": {
+        "istMinutesOfDay": 360
+      },
+      "expected": {
+        "bucket": "NORMAL"
+      }
+    },
+    {
+      "name": "minute 1320",
+      "input": {
+        "istMinutesOfDay": 1320
+      },
+      "expected": {
+        "bucket": "NORMAL"
+      }
+    },
+    {
+      "name": "IST session key straddles the UTC day boundary correctly",
+      "input": {
+        "atWall": 1772478000000
+      },
+      "expected": {
+        "session": "2026-03-03"
+      }
+    }
+  ]
+}

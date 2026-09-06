@@ -1,0 +1,76 @@
+{
+  "category": "execution-parity",
+  "operation": "classifyConfidence",
+  "description": "Confidence is LOW for anything unmeasured or stale, capped at MEDIUM for a fallback, and HIGH only for a large fresh non-fallback set.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "CALIBRATED n=100000 measured=false fellBack=false",
+      "input": {
+        "status": "CALIBRATED",
+        "sampleCount": 100000,
+        "measured": false
+      },
+      "expected": {
+        "confidence": "LOW"
+      }
+    },
+    {
+      "name": "STALE n=100000 measured=true fellBack=false",
+      "input": {
+        "status": "STALE",
+        "sampleCount": 100000,
+        "measured": true
+      },
+      "expected": {
+        "confidence": "LOW"
+      }
+    },
+    {
+      "name": "UNCALIBRATED n=0 measured=true fellBack=false",
+      "input": {
+        "status": "UNCALIBRATED",
+        "sampleCount": 0,
+        "measured": true
+      },
+      "expected": {
+        "confidence": "LOW"
+      }
+    },
+    {
+      "name": "PARTIALLY_CALIBRATED n=5 measured=true fellBack=false",
+      "input": {
+        "status": "PARTIALLY_CALIBRATED",
+        "sampleCount": 5,
+        "measured": true
+      },
+      "expected": {
+        "confidence": "LOW"
+      }
+    },
+    {
+      "name": "CALIBRATED n=500 measured=true fellBack=true",
+      "input": {
+        "status": "CALIBRATED",
+        "sampleCount": 500,
+        "measured": true,
+        "fellBack": true
+      },
+      "expected": {
+        "confidence": "MEDIUM"
+      }
+    },
+    {
+      "name": "CALIBRATED n=500 measured=true fellBack=false",
+      "input": {
+        "status": "CALIBRATED",
+        "sampleCount": 500,
+        "measured": true,
+        "fellBack": false
+      },
+      "expected": {
+        "confidence": "HIGH"
+      }
+    }
+  ]
+}

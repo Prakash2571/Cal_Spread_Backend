@@ -243,9 +243,14 @@ function paperState(status: PaperLegExecution["status"]): BrokerOrderState {
   switch (status) {
     case "CREATED": return "CREATED";
     case "SUBMITTED":
-    case "IN_FLIGHT": return "ACKNOWLEDGED";
+    case "IN_FLIGHT":
+    // The broker has the order; nothing has executed. ACK IS NOT FILL.
+    case "ACKNOWLEDGED": return "ACKNOWLEDGED";
     case "PENDING": return "OPEN";
     case "PARTIALLY_FILLED": return "PARTIALLY_FILLED";
+    // A cancel is in flight but unconfirmed, so the order may still fill. The durable
+    // vocabulary already permits CANCEL_REQUESTED -> COMPLETE for exactly this reason.
+    case "CANCEL_REQUESTED": return "CANCEL_REQUESTED";
     case "FILLED":
     case "UNWOUND": return "COMPLETE";
     case "CANCELLED": return "CANCELLED";

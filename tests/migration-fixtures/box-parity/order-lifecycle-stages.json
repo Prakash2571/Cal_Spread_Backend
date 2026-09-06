@@ -1,0 +1,173 @@
+{
+  "category": "execution-parity",
+  "operation": "BoxOrderStage",
+  "description": "The observable stage vocabulary, its mapping onto durable state, terminality, and which stages still accept fills. A cancel in flight MUST still accept fills.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "CREATED",
+      "input": {
+        "stage": "CREATED"
+      },
+      "expected": {
+        "durable_state": "CREATED",
+        "terminal": false,
+        "accepts_further_fills": true
+      }
+    },
+    {
+      "name": "QUEUED",
+      "input": {
+        "stage": "QUEUED"
+      },
+      "expected": {
+        "durable_state": "CREATED",
+        "terminal": false,
+        "accepts_further_fills": true
+      }
+    },
+    {
+      "name": "POSTING",
+      "input": {
+        "stage": "POSTING"
+      },
+      "expected": {
+        "durable_state": "SUBMITTING",
+        "terminal": false,
+        "accepts_further_fills": true
+      }
+    },
+    {
+      "name": "BROKER_ACCEPTED",
+      "input": {
+        "stage": "BROKER_ACCEPTED"
+      },
+      "expected": {
+        "durable_state": "ACKNOWLEDGED",
+        "terminal": false,
+        "accepts_further_fills": true
+      }
+    },
+    {
+      "name": "ACKNOWLEDGED",
+      "input": {
+        "stage": "ACKNOWLEDGED"
+      },
+      "expected": {
+        "durable_state": "ACKNOWLEDGED",
+        "terminal": false,
+        "accepts_further_fills": true
+      }
+    },
+    {
+      "name": "WORKING",
+      "input": {
+        "stage": "WORKING"
+      },
+      "expected": {
+        "durable_state": "OPEN",
+        "terminal": false,
+        "accepts_further_fills": true
+      }
+    },
+    {
+      "name": "PARTIALLY_FILLED",
+      "input": {
+        "stage": "PARTIALLY_FILLED"
+      },
+      "expected": {
+        "durable_state": "PARTIALLY_FILLED",
+        "terminal": false,
+        "accepts_further_fills": true
+      }
+    },
+    {
+      "name": "FILLED",
+      "input": {
+        "stage": "FILLED"
+      },
+      "expected": {
+        "durable_state": "COMPLETE",
+        "terminal": true,
+        "accepts_further_fills": false
+      }
+    },
+    {
+      "name": "CANCEL_REQUESTED",
+      "input": {
+        "stage": "CANCEL_REQUESTED"
+      },
+      "expected": {
+        "durable_state": "CANCEL_REQUESTED",
+        "terminal": false,
+        "accepts_further_fills": true
+      }
+    },
+    {
+      "name": "CANCEL_PENDING",
+      "input": {
+        "stage": "CANCEL_PENDING"
+      },
+      "expected": {
+        "durable_state": "CANCEL_REQUESTED",
+        "terminal": false,
+        "accepts_further_fills": true
+      }
+    },
+    {
+      "name": "CANCELLED",
+      "input": {
+        "stage": "CANCELLED"
+      },
+      "expected": {
+        "durable_state": "CANCELLED",
+        "terminal": true,
+        "accepts_further_fills": false
+      }
+    },
+    {
+      "name": "REJECTED",
+      "input": {
+        "stage": "REJECTED"
+      },
+      "expected": {
+        "durable_state": "REJECTED",
+        "terminal": true,
+        "accepts_further_fills": false
+      }
+    },
+    {
+      "name": "EXPIRED",
+      "input": {
+        "stage": "EXPIRED"
+      },
+      "expected": {
+        "durable_state": "CANCELLED",
+        "terminal": true,
+        "accepts_further_fills": false
+      }
+    },
+    {
+      "name": "UNKNOWN",
+      "input": {
+        "stage": "UNKNOWN"
+      },
+      "expected": {
+        "durable_state": "UNKNOWN",
+        "terminal": false,
+        "accepts_further_fills": true
+      }
+    },
+    {
+      "name": "RECONCILIATION_REQUIRED",
+      "input": {
+        "stage": "RECONCILIATION_REQUIRED"
+      },
+      "expected": {
+        "durable_state": "RECONCILIATION_REQUIRED",
+        "terminal": false,
+        "accepts_further_fills": true
+      }
+    }
+  ]
+}

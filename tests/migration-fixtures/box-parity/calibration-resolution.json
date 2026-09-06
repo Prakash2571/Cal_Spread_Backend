@@ -1,0 +1,162 @@
+{
+  "category": "execution-parity",
+  "operation": "ExecutionCalibrationStore.resolve",
+  "description": "The fallback ladder (exact bucket -> pooled buckets -> pooled kinds -> unavailable), session freshness, and the honesty contract that an unmeasured resolution reports measured:false with null percentiles.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "an adequately-sampled bucket is used directly",
+      "input": {
+        "bucketSamples": 25,
+        "bucketMinSamples": 20
+      },
+      "expected": {
+        "fallback": "none",
+        "status": "PARTIALLY_CALIBRATED",
+        "confidence": "MEDIUM",
+        "samples": 25,
+        "measured": true,
+        "percentiles": {
+          "p50": 120,
+          "p75": 120,
+          "p90": 120,
+          "p95": 120,
+          "p99": 120
+        },
+        "newestSession": "2026-03-02"
+      }
+    },
+    {
+      "name": "a thin bucket pools across buckets rather than overfitting",
+      "input": {
+        "openSamples": 5,
+        "normalSamples": 30
+      },
+      "expected": {
+        "fallback": "bucket_pooled",
+        "status": "PARTIALLY_CALIBRATED",
+        "confidence": "MEDIUM",
+        "samples": 35,
+        "measured": true,
+        "percentiles": {
+          "p50": 400,
+          "p75": 400,
+          "p90": 400,
+          "p95": 400,
+          "p99": 400
+        },
+        "newestSession": "2026-03-02"
+      }
+    },
+    {
+      "name": "a thin kind pools across kinds, still within one broker and profile",
+      "input": {
+        "cancelSamples": 4,
+        "entrySamples": 30
+      },
+      "expected": {
+        "fallback": "kind_pooled",
+        "status": "PARTIALLY_CALIBRATED",
+        "confidence": "MEDIUM",
+        "samples": 34,
+        "measured": true,
+        "percentiles": {
+          "p50": 120,
+          "p75": 120,
+          "p90": 120,
+          "p95": 120,
+          "p99": 120
+        },
+        "newestSession": "2026-03-02"
+      }
+    },
+    {
+      "name": "pooling NEVER crosses a broker",
+      "input": {
+        "zerodhaSamples": 500,
+        "dhanSamples": 0
+      },
+      "expected": {
+        "fallback": "unavailable",
+        "status": "UNCALIBRATED",
+        "confidence": "LOW",
+        "samples": 0,
+        "measured": false,
+        "percentiles": {
+          "p50": null,
+          "p75": null,
+          "p90": null,
+          "p95": null,
+          "p99": null
+        },
+        "newestSession": null
+      }
+    },
+    {
+      "name": "pooling NEVER crosses the marketable/passive boundary",
+      "input": {
+        "marketableSamples": 500,
+        "passiveSamples": 0
+      },
+      "expected": {
+        "fallback": "unavailable",
+        "status": "UNCALIBRATED",
+        "confidence": "LOW",
+        "samples": 0,
+        "measured": false,
+        "percentiles": {
+          "p50": null,
+          "p75": null,
+          "p90": null,
+          "p95": null,
+          "p99": null
+        },
+        "newestSession": null
+      }
+    },
+    {
+      "name": "a calibrated set past the staleness window is STALE and LOW confidence",
+      "input": {
+        "samples": 60,
+        "ageMs": 129600000
+      },
+      "expected": {
+        "fallback": "none",
+        "status": "STALE",
+        "confidence": "LOW",
+        "samples": 60,
+        "measured": true,
+        "percentiles": {
+          "p50": 100,
+          "p75": 100,
+          "p90": 100,
+          "p95": 100,
+          "p99": 100
+        },
+        "newestSession": "2026-03-02"
+      }
+    },
+    {
+      "name": "a set beyond the retention window cannot calibrate today",
+      "input": {
+        "samples": 60,
+        "ageMs": 259200000
+      },
+      "expected": {
+        "fallback": "unavailable",
+        "status": "UNCALIBRATED",
+        "confidence": "LOW",
+        "samples": 0,
+        "measured": false,
+        "percentiles": {
+          "p50": null,
+          "p75": null,
+          "p90": null,
+          "p95": null,
+          "p99": null
+        },
+        "newestSession": null
+      }
+    }
+  ]
+}

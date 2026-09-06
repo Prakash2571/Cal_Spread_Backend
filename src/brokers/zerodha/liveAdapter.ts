@@ -20,6 +20,7 @@ import {
   kiteAdapterConfigFromBoxConfig,
 } from "../../box/kiteBrokerAdapter.js";
 import type { BoxConfig } from "../../box/config.js";
+import type { ExecutionTimingRecorder } from "../../box/executionTiming.js";
 
 /**
  * Build the Zerodha live adapter.
@@ -28,7 +29,11 @@ import type { BoxConfig } from "../../box/config.js";
  * startup, because the alternative — degrading to simulated fills while the
  * operator believes real orders are going out — is the worst possible outcome.
  */
-export function createZerodhaLiveAdapter(kite: KiteClient, cfg: BoxConfig): BrokerAdapter {
+export function createZerodhaLiveAdapter(
+  kite: KiteClient,
+  cfg: BoxConfig,
+  timing?: ExecutionTimingRecorder,
+): BrokerAdapter {
   const apiKey = process.env.KITE_API_KEY?.trim() ?? "";
   if (!apiKey) {
     throw new Error("[Box] live execution blocked: KITE_API_KEY is missing.");
@@ -44,7 +49,10 @@ export function createZerodhaLiveAdapter(kite: KiteClient, cfg: BoxConfig): Brok
     },
     timeoutMs: cfg.liveHttpTimeoutMs,
   });
-  return new KiteBrokerAdapter(transport, kiteAdapterConfigFromBoxConfig(cfg));
+  return new KiteBrokerAdapter(transport, {
+    ...kiteAdapterConfigFromBoxConfig(cfg),
+    ...(timing ? { timing } : {}),
+  });
 }
 
 /**
@@ -56,13 +64,13 @@ export function createZerodhaLiveAdapter(kite: KiteClient, cfg: BoxConfig): Brok
  * so it is an explicit throw.
  */
 export function zerodhaOnlyLiveAdapterFactory(kite: KiteClient): BoxLiveAdapterFactory {
-  return ({ broker, cfg }) => {
+  return ({ broker, cfg, timing }) => {
     if (broker !== "zerodha") {
       throw new Error(
         `[Box] live execution blocked: no live execution adapter is wired for broker "${broker}". ` +
           `Refusing to fall back to Zerodha.`,
       );
     }
-    return createZerodhaLiveAdapter(kite, cfg);
+    return createZerodhaLiveAdapter(kite, cfg, timing);
   };
 }

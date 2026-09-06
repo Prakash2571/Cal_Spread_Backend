@@ -31,7 +31,14 @@
  *    conservative liquidity. Randomness is never used.
  */
 
-import type { BoxDepthLevel, BoxQueueModel, OrderSide, PaperFillSlice, PaperOrderPricing } from "./types.js";
+import type {
+  BoxDepthLevel,
+  BoxQueueModel,
+  OrderSide,
+  PaperFillSlice,
+  PaperOrderPricing,
+  PaperOrderType,
+} from "./types.js";
 
 /** Float comparisons on prices tolerate a sub-paise epsilon. */
 const EPS = 1e-9;
@@ -65,17 +72,26 @@ export function computeLimitPrice(args: {
   return roundToTick(raw, tickSize);
 }
 
-/** Build the full pricing envelope for one order. */
+/**
+ * Build the full pricing envelope for one order.
+ *
+ * `orderType` defaults to `MARKETABLE_LIMIT` because that is what the Box strategy submits: a
+ * bounded limit priced from the opposite touch with a non-negative chase band is marketable by
+ * construction. The parameter exists so a caller that deliberately prices passively can label
+ * it truthfully rather than mislabelling it — see {@link classifyOrderProfile}, which
+ * determines the label from an observed book rather than from an assumption.
+ */
 export function buildOrderPricing(args: {
   side: OrderSide;
   quantity: number;
   referencePrice: number;
   tickSize: number;
   maxChaseTicks: number;
+  orderType?: PaperOrderType;
 }): PaperOrderPricing {
   const tick = args.tickSize > 0 ? args.tickSize : 0.05;
   return {
-    order_type: "MARKETABLE_LIMIT",
+    order_type: args.orderType ?? "MARKETABLE_LIMIT",
     side: args.side,
     quantity: args.quantity,
     reference_price: round2(args.referencePrice),
@@ -193,6 +209,75 @@ export function walkDepth(args: {
     average_price: filled > 0 ? round2(valueSum / filled) : null,
     slices,
     executable_within_limit: executableWithinLimit,
+  };
+}
+
+/**
+ * MARKETABLE vs PASSIVE classification, decided from an OBSERVED book rather than from an
+ * assumption about how the order was priced.
+ *
+ * WHY THE DISTINCTION IS LOAD-BEARING (audit divergence D20)
+ *
+ * A marketable limit crosses the spread: it executes against liquidity that is visible to us
+ * right now, so its fill behaviour is largely a function of things we CAN measure — displayed
+ * depth within the limit, and how fast we arrive. A passive limit rests behind other orders at
+ * its price, so whether and when it fills is dominated by true NSE queue position and by other
+ * participants' flow, NEITHER of which a retail level-2 feed reveals.
+ *
+ * That means the two have fundamentally different epistemic status. Statistics about marketable
+ * fills are evidence; statistics about passive fills are largely a statement about an unobserved
+ * queue. Pooling them produces a "fill rate" that flatters passive orders, slanders marketable
+ * ones, and describes neither — which is why every distribution and every parity comparison in
+ * this system is keyed by the profile this function returns.
+ *
+ * Pure: no clock, no randomness.
+ */
+export interface OrderProfileClassification {
+  readonly profile: PaperOrderType;
+  /** True when the limit is at or through the opposite touch. */
+  readonly marketable: boolean;
+  /** The opposite touch the classification was made against, or null when unobservable. */
+  readonly touch: number | null;
+  /**
+   * Signed distance from the touch, in ticks. POSITIVE means through the touch (more
+   * aggressive); negative means resting behind it. Null when the touch is unknown.
+   *
+   * Recorded because it is the single most useful covariate for queue-model calibration: how
+   * far past the touch an order reached predicts how much of the displayed depth it realised.
+   */
+  readonly offsetTicks: number | null;
+  /** Set when the book gave no opposite touch, so the profile is a documented assumption. */
+  readonly assumed: boolean;
+}
+
+export function classifyOrderProfile(args: {
+  side: OrderSide;
+  limitPrice: number;
+  bids: BoxDepthLevel[];
+  asks: BoxDepthLevel[];
+  tickSize: number;
+}): OrderProfileClassification {
+  const { side, limitPrice } = args;
+  const touch = touchPrice(side, args.bids, args.asks);
+  const tick = args.tickSize > 0 ? args.tickSize : 0.05;
+
+  if (touch === null || !(limitPrice > 0)) {
+    // No observable opposite touch. We do NOT guess a passive classification: the strategy
+    // prices from the touch with a non-negative chase, so marketable is the correct structural
+    // answer — but `assumed` records that this came from construction, not observation.
+    return { profile: "MARKETABLE_LIMIT", marketable: true, touch: null, offsetTicks: null, assumed: true };
+  }
+
+  // A BUY is marketable when it is willing to pay at least the best ask; a SELL when it is
+  // willing to accept at most the best bid.
+  const marketable = side === "BUY" ? limitPrice >= touch - EPS : limitPrice <= touch + EPS;
+  const rawOffset = side === "BUY" ? limitPrice - touch : touch - limitPrice;
+  return {
+    profile: marketable ? "MARKETABLE_LIMIT" : "PASSIVE_LIMIT",
+    marketable,
+    touch: round2(touch),
+    offsetTicks: Math.round((rawOffset / tick) * 100) / 100,
+    assumed: false,
   };
 }
 

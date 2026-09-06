@@ -73,6 +73,93 @@ export const LATENCY_COMPONENTS = [
 ] as const;
 export type LatencyComponent = (typeof LATENCY_COMPONENTS)[number];
 
+/* ------------------------- calibration dimensions ------------------------- */
+
+/**
+ * How the order interacts with the book — the single most important calibration dimension
+ * after the broker itself, and one that must NEVER be pooled.
+ *
+ *   MARKETABLE_LIMIT — priced to cross immediately: a bounded limit at or through the touch.
+ *                      Its fill behaviour depends mostly on visible depth within the limit,
+ *                      which we CAN observe. This is what the Box strategy submits.
+ *   PASSIVE_LIMIT    — priced away from the touch, resting behind other orders. Whether and
+ *                      when it fills depends overwhelmingly on true NSE queue position and on
+ *                      other participants' flow — neither of which a retail feed reveals.
+ *
+ * Pooling the two would be actively misleading: passive fill rates are far lower and far more
+ * variable, so a blended "fill rate" flatters passive orders and slanders marketable ones,
+ * and a blended latency distribution describes neither. Every distribution, every parity
+ * comparison and every realism score in this system is therefore keyed by profile.
+ */
+export type LatencyProfile = "MARKETABLE_LIMIT" | "PASSIVE_LIMIT";
+export const LATENCY_PROFILES: readonly LatencyProfile[] = ["MARKETABLE_LIMIT", "PASSIVE_LIMIT"] as const;
+
+/**
+ * Coarse time-of-day bucket. Execution latency and liquidity genuinely differ across the
+ * session — the open is thin and fast-moving, the close carries square-off flow — so a
+ * single all-day distribution smears three different regimes together.
+ *
+ * DELIBERATELY COARSE. Three buckets, not twelve. A bucket is only used when it has enough
+ * observations of its own (see `ResolvedCalibration.fallback`); otherwise the broker-wide set
+ * is used instead. Overfitting a tiny sample to a narrow time window would produce
+ * confident-looking numbers with no statistical basis, which is worse than a coarse average.
+ */
+export type TimeOfDayBucket = "OPEN" | "NORMAL" | "CLOSE";
+export const TIME_OF_DAY_BUCKETS: readonly TimeOfDayBucket[] = ["OPEN", "NORMAL", "CLOSE"] as const;
+
+/** NSE equity-derivatives session, in minutes past IST midnight. */
+export const IST_MARKET_OPEN_MINUTES = 9 * 60 + 15;
+export const IST_MARKET_CLOSE_MINUTES = 15 * 60 + 30;
+
+export interface TimeBucketBoundaries {
+  /** Minutes from the open that count as OPEN. Default 15 (09:15–09:30). */
+  openWindowMinutes: number;
+  /** Minutes before the close that count as CLOSE. Default 15 (15:15–15:30). */
+  closeWindowMinutes: number;
+}
+
+export const DEFAULT_TIME_BUCKET_BOUNDARIES: TimeBucketBoundaries = {
+  openWindowMinutes: 15,
+  closeWindowMinutes: 15,
+};
+
+/**
+ * Classify minutes-past-IST-midnight into a bucket. Pure.
+ *
+ * Anything outside the session maps to NORMAL: an operation observed outside market hours is
+ * not evidence about the open or the close, and inventing a fourth bucket for it would split
+ * samples for no benefit.
+ */
+export function classifyTimeOfDayBucket(
+  istMinutesOfDay: number,
+  boundaries: TimeBucketBoundaries = DEFAULT_TIME_BUCKET_BOUNDARIES,
+): TimeOfDayBucket {
+  if (!Number.isFinite(istMinutesOfDay)) return "NORMAL";
+  const openWindow = Math.max(0, boundaries.openWindowMinutes);
+  const closeWindow = Math.max(0, boundaries.closeWindowMinutes);
+  if (istMinutesOfDay < IST_MARKET_OPEN_MINUTES || istMinutesOfDay > IST_MARKET_CLOSE_MINUTES) {
+    return "NORMAL";
+  }
+  if (istMinutesOfDay < IST_MARKET_OPEN_MINUTES + openWindow) return "OPEN";
+  if (istMinutesOfDay > IST_MARKET_CLOSE_MINUTES - closeWindow) return "CLOSE";
+  return "NORMAL";
+}
+
+/** Minutes past IST midnight for a wall-clock instant. */
+export function istMinutesOfDayFor(atWall: number): number {
+  const ist = new Date(atWall + 5.5 * 60 * 60 * 1000);
+  return ist.getUTCHours() * 60 + ist.getUTCMinutes();
+}
+
+/** IST calendar day key (`YYYY-MM-DD`) — the session identity used for freshness. */
+export function istSessionKey(atWall: number): string {
+  const ist = new Date(atWall + 5.5 * 60 * 60 * 1000);
+  const y = ist.getUTCFullYear();
+  const m = String(ist.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(ist.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
 /* --------------------------- calibration status --------------------------- */
 
 /**
@@ -117,6 +204,60 @@ export function classifyCalibration(
   const stale = lastSampleAgeMs > thresholds.staleAfterMs;
   if (sampleCount >= thresholds.calibratedMinSamples) return stale ? "STALE" : "CALIBRATED";
   return "PARTIALLY_CALIBRATED";
+}
+
+/**
+ * How much a reported figure should be trusted — the number that goes on every parity report.
+ *
+ * This exists because "the simulator is 95 % realistic" is a claim, and a claim needs
+ * evidence. There is no arithmetic that turns 12 observations into a confident statement about
+ * a latency tail, so the report says LOW and the reader knows to keep validating.
+ *
+ *   HIGH   — a calibrated, fresh set with a large sample count. Percentile tails are meaningful.
+ *   MEDIUM — genuinely measured, but either the sample count only just clears the bar or the
+ *            set is a fallback from a narrower dimension. Central tendency is usable; tails
+ *            are not.
+ *   LOW    — too few samples, stale, or not measured at all. Diagnostic only. Nothing here
+ *            justifies a realism claim.
+ */
+export type CalibrationConfidence = "LOW" | "MEDIUM" | "HIGH";
+
+export interface ConfidenceThresholds {
+  /** At/above this many fresh samples a calibrated set is HIGH confidence. Default 200. */
+  highMinSamples: number;
+  /** At/above this many fresh samples a set is at least MEDIUM. Default 30. */
+  mediumMinSamples: number;
+}
+
+export const DEFAULT_CONFIDENCE_THRESHOLDS: ConfidenceThresholds = {
+  highMinSamples: 200,
+  mediumMinSamples: 30,
+};
+
+/**
+ * Classify confidence. Pure and deliberately pessimistic:
+ *
+ *  - anything not backed by measured samples is LOW, whatever the sample count says;
+ *  - a STALE or UNCALIBRATED set is LOW, however large — yesterday's tail is not today's;
+ *  - a set reached only by falling back from a narrower dimension is capped at MEDIUM, because
+ *    it is evidence about a broader population than the one being asked about.
+ */
+export function classifyConfidence(args: {
+  status: CalibrationStatus;
+  sampleCount: number;
+  /** False when the figures are a configured constant rather than live observations. */
+  measured: boolean;
+  /** True when a broader dimension supplied the samples (e.g. broker-wide instead of a bucket). */
+  fellBack?: boolean;
+  thresholds?: ConfidenceThresholds;
+}): CalibrationConfidence {
+  if (!args.measured) return "LOW";
+  if (args.status === "UNCALIBRATED" || args.status === "STALE") return "LOW";
+  const t = args.thresholds ?? DEFAULT_CONFIDENCE_THRESHOLDS;
+  if (args.sampleCount < t.mediumMinSamples) return "LOW";
+  if (args.fellBack) return "MEDIUM";
+  if (args.status === "CALIBRATED" && args.sampleCount >= t.highMinSamples) return "HIGH";
+  return "MEDIUM";
 }
 
 /* ----------------------- structured latency source ------------------------ */

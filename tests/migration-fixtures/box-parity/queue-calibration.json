@@ -1,0 +1,68 @@
+{
+  "category": "execution-parity",
+  "operation": "QueueCalibrationEstimator",
+  "description": "Realisation ratio measured against VISIBLE executable depth, and the conservative haircut recommended from its p25. NOT a reconstruction of NSE queue position, and never applied automatically.",
+  "generated_from": "TypeScript reference implementation (src/box)",
+  "cases": [
+    {
+      "name": "below the sample floor no recommendation is made",
+      "input": {
+        "observations": 10,
+        "minSamples": 30
+      },
+      "expected": {
+        "samples": 10,
+        "realisationRatioP50": null,
+        "realisationRatioP25": null,
+        "realisationRatioP10": null,
+        "recommendedHaircutPct": null,
+        "currentHaircutPct": 30,
+        "confidence": "LOW",
+        "partialFillRate": null,
+        "sizeExceededVisibleDepthRate": null
+      }
+    },
+    {
+      "name": "40 full realisations and 10 half realisations",
+      "input": {
+        "fullOrders": 40,
+        "halfOrders": 10,
+        "visible": 150,
+        "requested": 75
+      },
+      "expected": {
+        "samples": 50,
+        "realisationRatioP50": 1,
+        "realisationRatioP25": 1,
+        "realisationRatioP10": 0.493,
+        "recommendedHaircutPct": 0,
+        "currentHaircutPct": 30,
+        "confidence": "MEDIUM",
+        "partialFillRate": 0.2,
+        "sizeExceededVisibleDepthRate": 0
+      }
+    },
+    {
+      "name": "liquidity classification from visible depth vs requested",
+      "input": [
+        {
+          "visible": 50,
+          "requested": 75
+        },
+        {
+          "visible": 150,
+          "requested": 75
+        },
+        {
+          "visible": 400,
+          "requested": 75
+        }
+      ],
+      "expected": [
+        "THIN",
+        "NORMAL",
+        "DEEP"
+      ]
+    }
+  ]
+}

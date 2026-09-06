@@ -15,6 +15,7 @@ import {
   type BrokerRejectFamily,
 } from "./brokerAdapter.js";
 import type { BoxConfig } from "./config.js";
+import type { ExecutionTimingRecorder } from "./executionTiming.js";
 import type { ExecutionMode, IBoxOrderIntent, OrderSide } from "./types.js";
 
 export interface KiteTransportOrder {
@@ -229,6 +230,18 @@ export class KiteHttpTransport implements KiteBrokerTransport {
 export interface KiteBrokerAdapterConfig {
   executionMode: ExecutionMode;
   enabled: boolean;
+  /**
+   * LIVE TIMING INSTRUMENTATION (Phase 2). Optional and FAIL-OPEN.
+   *
+   * The adapter marks the stages only IT can witness: transport start, the HTTP request leaving
+   * the wire, the response, the broker order id, the ACK, each cumulative fill, and the cancel
+   * request/acknowledgement. The OrderManager owns the queue stages and the terminal publish, and
+   * both write to the same trace, keyed by client order id.
+   *
+   * The adapter never CREATES a trace: without the strategy identity a sample cannot be filed
+   * under the right dimensions, so a mark for an unknown order is dropped rather than guessed at.
+   */
+  timing?: ExecutionTimingRecorder;
   ackTimeoutMs: number;
   workingTimeoutMs: number;
   partialTimeoutMs: number;
@@ -298,26 +311,52 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     order.tag = stableKiteTag(req.client_order_id, req.tag);
     this.orders.set(req.client_order_id, order);
 
+    // TRANSPORT START: before `call()`, so the pacing wait is attributed to transport_wait_ms
+    // rather than being hidden inside the POST duration.
+    this.mark(req.client_order_id, "transport_started");
     let placed: { order_id: string };
     try {
-      placed = await this.call(() => this.transport.placeOrder({
-        exchange: req.exchange,
-        tradingsymbol: req.tradingsymbol,
-        transaction_type: req.side,
-        quantity: req.quantity,
-        order_type: "LIMIT",
-        product: "NRML",
-        validity: "DAY",
-        price: req.pricing.limit_price,
-        tag: order.tag as string,
-      }));
+      placed = await this.call(() => {
+        // HTTP REQUEST START: inside the paced callback, so post_to_http_response_ms measures
+        // the network and the broker, NOT our own rate limiter.
+        this.mark(req.client_order_id, "http_request_started");
+        return this.transport.placeOrder({
+          exchange: req.exchange,
+          tradingsymbol: req.tradingsymbol,
+          transaction_type: req.side,
+          quantity: req.quantity,
+          order_type: "LIMIT",
+          product: "NRML",
+          validity: "DAY",
+          price: req.pricing.limit_price,
+          tag: order.tag as string,
+        });
+      });
+      this.mark(req.client_order_id, "http_response");
     } catch (error) {
+      // The response is an observable event whether it succeeded or failed. Recording it on the
+      // failure path is what makes a timeout's duration measurable instead of invisible.
+      this.mark(req.client_order_id, "http_response");
       if (error instanceof BrokerAmbiguousSubmitError || !isDefinitivePlacementRejection(error)) {
+        // AMBIGUOUS TRANSPORT OUTCOME (audit divergence D6).
+        //
+        // The POST may have been accepted despite the failure: a timeout, a 5xx or a 429 tells
+        // us nothing about whether the exchange received the order. Dhan already handled this
+        // by looking the order up by correlation id; Kite did not, and instead quarantined
+        // every ambiguous submit for the periodic reconciler — even though the stable tag makes
+        // an immediate lookup possible.
+        //
+        // So: ASK THE BROKER. Never re-POST.
+        const adopted = await this.reconcileByTag(req, order).catch(() => null);
+        if (adopted) {
+          // The order DOES exist. Carry on with its real state, exactly as Dhan does.
+          return await this.resolveAdopted(req, adopted);
+        }
         order.state = "RECONCILIATION_REQUIRED";
         order.updated_at = this.clock.now();
         throw new BrokerAmbiguousSubmitError(
           req.client_order_id,
-          errorMessage(error),
+          `${errorMessage(error)} (${describeAmbiguity(error)}; tag lookup did not uniquely identify an order, so reconciliation is required and NO retry was attempted)`,
           error,
           clone(order),
         );
@@ -332,6 +371,11 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     order.broker_order_id = placed.order_id;
     order.state = "ACKNOWLEDGED";
     order.updated_at = this.clock.now();
+    // BROKER ORDER ID + ACK. Two marks because they are two different facts: the id proves an
+    // order EXISTS, and the ACK proves the broker ACCEPTED it. Neither proves any quantity
+    // executed — see orderLifecycle.stageProvesExecution.
+    this.mark(req.client_order_id, "broker_order_id");
+    this.mark(req.client_order_id, "acknowledged");
     this.clientByBroker.set(placed.order_id, req.client_order_id);
     try {
       return await this.waitForResolution(order);
@@ -358,6 +402,10 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     }
     order.state = "CANCEL_REQUESTED";
     order.updated_at = this.clock.now();
+    // CANCEL REQUESTED. This opens cancel_request_to_terminal_ms — the measured span that sizes
+    // paper's cancel-vs-fill race window. It is deliberately marked BEFORE the DELETE is sent,
+    // because the race starts the moment we commit to cancelling.
+    this.mark(clientOrderId, "cancel_requested");
     await withDeadline(
       this.call(() => this.transport.cancelOrder(order.broker_order_id as string)),
       this.config.cancelTimeoutMs,
@@ -366,6 +414,9 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       order.state = "RECONCILIATION_REQUIRED";
       throw error;
     });
+    // The broker accepted the cancel REQUEST. It is not yet a cancellation: the order may still
+    // be filling right now, which is why confirmTerminalAfterCancel re-reads until terminal.
+    this.mark(clientOrderId, "cancel_acknowledged");
     return clone(await this.confirmTerminalAfterCancel(order));
   }
 
@@ -515,6 +566,96 @@ export class KiteBrokerAdapter implements BrokerAdapter {
         };
   }
 
+  /**
+   * Ask Kite whether our stable tag already exists — the anti-duplicate primitive, and the
+   * counterpart to Dhan's `reconcileByCorrelation`.
+   *
+   * ADOPTION IS ONLY SAFE WHEN THE ORDER IS UNIQUELY IDENTIFIED. Three outcomes:
+   *
+   *   exactly one match, immutable attributes agree → ADOPT it. The order exists; we now own it.
+   *   no match                                      → return null. We do NOT conclude "no order
+   *                                                    was created": one order-book read that
+   *                                                    does not yet show a just-placed order is
+   *                                                    weak evidence, and acting on it is how
+   *                                                    duplicate orders happen. The caller
+   *                                                    quarantines instead, and NEVER retries.
+   *   several matches, or attributes disagree        → return null and quarantine. Adopting the
+   *                                                    wrong order would attribute someone
+   *                                                    else's exposure to this Box.
+   *
+   * The tag is derived deterministically from the client order id (see {@link stableKiteTag}),
+   * which itself carries the attempt number — so two attempts at the same leg have different
+   * tags and cannot be confused with one another.
+   */
+  private async reconcileByTag(req: BrokerOrderRequest, pending: BrokerOrder): Promise<BrokerOrder | null> {
+    const tag = pending.tag;
+    if (!tag) return null;
+    const raw = await this.call(() => this.transport.listOrders());
+    const matches = raw.filter((item) => item.tag === tag);
+    if (matches.length !== 1) {
+      if (matches.length > 1) {
+        console.warn(
+          `[Kite] ${matches.length} broker orders carry tag ${tag}; refusing to adopt any of them for ${req.client_order_id}.`,
+        );
+      }
+      return null;
+    }
+    const candidate = matches[0]!;
+
+    // The tag is a hash, so a collision is conceivable and a mismatch would be catastrophic.
+    // Verify the attributes that CANNOT legitimately differ before taking ownership.
+    const attributesAgree =
+      candidate.exchange === req.exchange &&
+      candidate.tradingsymbol === req.tradingsymbol &&
+      candidate.transaction_type === req.side &&
+      candidate.quantity === req.quantity;
+    if (!attributesAgree) {
+      console.warn(
+        `[Kite] broker order ${candidate.order_id} matched tag ${tag} but its immutable attributes disagree with ${req.client_order_id}; refusing to adopt.`,
+      );
+      return null;
+    }
+
+    const alreadyOwned = this.clientByBroker.get(candidate.order_id);
+    if (alreadyOwned && alreadyOwned !== req.client_order_id) {
+      console.warn(
+        `[Kite] broker order ${candidate.order_id} is already attributed to ${alreadyOwned}; refusing to adopt it for ${req.client_order_id}.`,
+      );
+      return null;
+    }
+
+    const adopted = normalizeKiteOrder(candidate, pending, this.clock.now());
+    this.orders.set(req.client_order_id, adopted);
+    this.clientByBroker.set(candidate.order_id, req.client_order_id);
+    // The order exists at the broker, so these facts are now established — even though our POST
+    // appeared to fail. Recording them keeps the latency sample honest rather than losing the
+    // whole operation from calibration.
+    this.mark(req.client_order_id, "broker_order_id");
+    this.mark(req.client_order_id, "acknowledged");
+    this.markFill(req.client_order_id, adopted.filled_quantity);
+    console.warn(
+      `[Kite] adopted existing broker order ${candidate.order_id} for ${req.client_order_id} after an ambiguous submission; no retry was attempted.`,
+    );
+    return adopted;
+  }
+
+  /** Continue an adopted order's lifecycle, quarantining it if it becomes uncertain. */
+  private async resolveAdopted(req: BrokerOrderRequest, adopted: BrokerOrder): Promise<BrokerOrder> {
+    if (isBrokerOrderTerminal(adopted.state)) return clone(adopted);
+    try {
+      return await this.waitForResolution(adopted);
+    } catch (error) {
+      adopted.state = "RECONCILIATION_REQUIRED";
+      adopted.updated_at = this.clock.now();
+      throw new BrokerAmbiguousSubmitError(
+        req.client_order_id,
+        `Kite order ${adopted.broker_order_id} was adopted after an ambiguous submission but its terminal state remains uncertain.`,
+        error,
+        clone(adopted),
+      );
+    }
+  }
+
   private async waitForResolution(order: BrokerOrder): Promise<BrokerOrder> {
     const started = this.clock.now();
     let partialAt: number | null = null;
@@ -537,12 +678,14 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     if (!order.broker_order_id || isBrokerOrderTerminal(order.state)) return order;
     order.state = "CANCEL_REQUESTED";
     order.updated_at = this.clock.now();
+    this.mark(order.client_order_id, "cancel_requested");
     try {
       await withDeadline(
         this.call(() => this.transport.cancelOrder(order.broker_order_id as string)),
         this.config.cancelTimeoutMs,
         "Protective cancellation timed out.",
       );
+      this.mark(order.client_order_id, "cancel_acknowledged");
       return await this.confirmTerminalAfterCancel(order);
     } catch (error) {
       order.state = "RECONCILIATION_REQUIRED";
@@ -582,8 +725,33 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       return order;
     }
     const normalized = normalizeKiteOrder(raw, order, this.clock.now());
+    // TIMING: the broker's CUMULATIVE quantity. The recorder ignores anything that is not an
+    // increase, so re-polling an unchanged order does not manufacture extra "fill" events.
+    this.markFill(order.client_order_id, normalized.filled_quantity);
     this.orders.set(order.client_order_id, normalized);
     return normalized;
+  }
+
+  /**
+   * Mark a timing stage. FAIL-OPEN and silent when instrumentation is off or the order has no
+   * trace — a metrics failure must never be able to interfere with an order, least of all a
+   * cancel.
+   */
+  private mark(clientOrderId: string, stage: Parameters<ExecutionTimingRecorder["mark"]>[1]): void {
+    try {
+      this.config.timing?.mark(clientOrderId, stage);
+    } catch {
+      /* telemetry must never affect execution */
+    }
+  }
+
+  /** Record an observed cumulative filled quantity. Fail-open. */
+  private markFill(clientOrderId: string, cumulativeQty: number): void {
+    try {
+      this.config.timing?.markFill(clientOrderId, cumulativeQty);
+    } catch {
+      /* telemetry must never affect execution */
+    }
   }
 
   private isEnabled(): boolean {
@@ -777,4 +945,26 @@ function isDefinitivePlacementRejection(error: unknown): boolean {
 
 function isTimeoutLike(error: unknown): boolean {
   return error instanceof Error && (error.name === "AbortError" || /timeout|timed out/i.test(error.message));
+}
+
+/**
+ * Classify WHY a submission outcome is unknown, for the quarantine message.
+ *
+ * Purely diagnostic, and deliberately so: every branch below is handled identically (adopt if
+ * uniquely identified, otherwise quarantine and never retry). The classification exists because
+ * an operator triaging a quarantined order needs to know whether the request probably reached
+ * the exchange — a timeout means very likely yes, a 429 means probably not, and a 5xx could be
+ * either. Guessing differently per branch is exactly the reasoning that produces duplicate
+ * orders, so the behaviour stays uniform and only the explanation varies.
+ */
+function describeAmbiguity(error: unknown): string {
+  if (isTimeoutLike(error)) {
+    return "the request timed out, so the order may well have reached the exchange";
+  }
+  if (error instanceof KiteHttpError) {
+    if (error.status === 429) return "the broker rate-limited us, so the order was probably not accepted";
+    if (error.status >= 500) return `the broker returned ${error.status}, so acceptance is unknown`;
+    return `the broker returned ${error.status} without a definitive rejection`;
+  }
+  return "the transport failed without a definitive broker verdict";
 }

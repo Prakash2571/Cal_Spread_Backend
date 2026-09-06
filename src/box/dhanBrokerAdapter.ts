@@ -43,6 +43,7 @@ import {
   type BrokerRejectFamily,
 } from "./brokerAdapter.js";
 import type { BoxConfig } from "./config.js";
+import type { ExecutionTimingRecorder } from "./executionTiming.js";
 import type { IBoxOrderIntent } from "./types.js";
 import {
   DhanAuthError,
@@ -85,6 +86,17 @@ export interface DhanAdapterConfig {
   dhanClientId: () => string;
   /** Internal token → Dhan (segment, securityId). */
   identify: (token: number) => { segment: DhanExchangeSegment; securityId: number } | null;
+  /**
+   * LIVE TIMING INSTRUMENTATION (Phase 2). Optional and FAIL-OPEN.
+   *
+   * Marks the stages only this adapter can witness: transport start, the HTTP request leaving the
+   * wire, the response, the broker order id, the ACK, each cumulative fill, and the cancel
+   * request/acknowledgement. The OrderManager owns the queue stages and the terminal publish.
+   *
+   * Dhan samples are filed under broker `dhan` and can never mix with Zerodha's — the two have
+   * different networks and different gateways, so a pooled distribution would describe neither.
+   */
+  timing?: ExecutionTimingRecorder;
 }
 
 export function dhanAdapterConfigFromBoxConfig(
@@ -284,9 +296,15 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     this.clientByCorrelation.set(correlationId, req.client_order_id);
 
     let placed: { orderId: string; orderStatus: DhanOrderStatus } | null = null;
+    // TRANSPORT START: before `call()`, so the pacing wait is attributed to transport_wait_ms
+    // rather than being hidden inside the POST duration.
+    this.mark(req.client_order_id, "transport_started");
     try {
-      placed = await this.call(() =>
-        this.client.placeOrder({
+      placed = await this.call(() => {
+        // HTTP REQUEST START: inside the paced callback, so post_to_http_response_ms measures the
+        // network and Dhan, NOT our own rate limiter.
+        this.mark(req.client_order_id, "http_request_started");
+        return this.client.placeOrder({
           dhanClientId: this.cfg.dhanClientId(),
           correlationId,
           transactionType: req.side,
@@ -298,9 +316,13 @@ export class DhanBrokerAdapter implements BrokerAdapter {
           securityId: String(identity.securityId),
           quantity: req.quantity,
           price: req.pricing.limit_price,
-        }),
-      );
+        });
+      });
+      this.mark(req.client_order_id, "http_response");
     } catch (err) {
+      // Recorded on the failure path too: a timeout's duration is only measurable if the
+      // response event is marked whether or not it succeeded.
+      this.mark(req.client_order_id, "http_response");
       // A DEFINITIVE 4xx (not 429) means Dhan understood and refused.
       if (err instanceof DhanError && err.isDefinitive && !(err instanceof DhanRateLimitError)) {
         order.state = "REJECTED";
@@ -351,6 +373,10 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     order.broker_order_id = placed.orderId;
     order.state = dhanOrderState(placed.orderStatus, 0, req.quantity);
     order.updated_at = Date.now();
+    // Two distinct facts: an order id proves the order EXISTS; the ACK proves Dhan ACCEPTED it.
+    // Neither proves any quantity executed.
+    this.mark(req.client_order_id, "broker_order_id");
+    this.mark(req.client_order_id, "acknowledged");
     this.clientByBroker.set(placed.orderId, req.client_order_id);
     this.orders.set(req.client_order_id, order);
 
@@ -432,8 +458,15 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       order.state = "CANCEL_REQUESTED";
       order.updated_at = Date.now();
       this.orders.set(clientOrderId, order);
+      // CANCEL REQUESTED. Opens cancel_request_to_terminal_ms — the measured span that sizes
+      // paper's cancel-vs-fill race window. Marked before the DELETE, because the race begins the
+      // moment we commit to cancelling.
+      this.mark(clientOrderId, "cancel_requested");
       try {
         await this.call(() => this.client.cancelOrder(order.broker_order_id!));
+        // Dhan accepted the cancel REQUEST. Not a cancellation: the loop below keeps confirming
+        // precisely because the order may be filling right now.
+        this.mark(clientOrderId, "cancel_acknowledged");
       } catch (err) {
         // A cancel that fails does not make the order gone; keep confirming.
         console.warn(`[Dhan] protective cancel failed for ${clientOrderId}:`, err);
@@ -460,6 +493,27 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     return cloneOrder(quarantined);
   }
 
+  /**
+   * Mark a timing stage. FAIL-OPEN and silent when instrumentation is off or the order has no
+   * trace — a metrics failure must never interfere with an order, least of all a cancel.
+   */
+  private mark(clientOrderId: string, stage: Parameters<ExecutionTimingRecorder["mark"]>[1]): void {
+    try {
+      this.cfg.timing?.mark(clientOrderId, stage);
+    } catch {
+      /* telemetry must never affect execution */
+    }
+  }
+
+  /** Record an observed CUMULATIVE filled quantity. Fail-open; increases only. */
+  private markFill(clientOrderId: string, cumulativeQty: number): void {
+    try {
+      this.cfg.timing?.markFill(clientOrderId, cumulativeQty);
+    } catch {
+      /* telemetry must never affect execution */
+    }
+  }
+
   /** Re-read one order and update the session projection. */
   private async refresh(clientOrderId: string): Promise<BrokerOrder | undefined> {
     const known = this.orders.get(clientOrderId);
@@ -471,6 +525,9 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       if (!remote) return known;
       const fills = await this.fetchFills(remote.orderId);
       const projected = this.project(known, remote, known.tag ?? this.correlationFor(clientOrderId), fills);
+      // TIMING: the broker's CUMULATIVE quantity. The recorder ignores anything that is not an
+      // increase, so re-polling an unchanged order manufactures no extra "fill" events.
+      this.markFill(clientOrderId, projected.filled_quantity);
       this.orders.set(clientOrderId, projected);
       if (projected.broker_order_id) this.clientByBroker.set(projected.broker_order_id, clientOrderId);
       return projected;

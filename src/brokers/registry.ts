@@ -67,6 +67,7 @@ import {
   saveDhanSession,
 } from "../db.js";
 import type { BoxConfig } from "../box/config.js";
+import type { ExecutionTimingRecorder } from "../box/executionTiming.js";
 import { DhanError } from "./dhan/errors.js";
 
 /** Why a broker switch was refused. Each maps to something the operator can fix. */
@@ -1028,14 +1029,14 @@ export class ActiveBrokerManager {
    * structural half of the single-broker rule. It would otherwise be possible to
    * hold a Dhan adapter during a Zerodha session and place orders at the wrong venue.
    */
-  createLiveAdapter(ctx: { broker: BrokerId; cfg: BoxConfig }): BrokerAdapter {
+  createLiveAdapter(ctx: { broker: BrokerId; cfg: BoxConfig; timing?: ExecutionTimingRecorder }): BrokerAdapter {
     if (ctx.broker !== this.active) {
       throw new Error(
         `[Box] refusing to build a ${ctx.broker} execution adapter while ${this.active} is the active broker.`,
       );
     }
     if (ctx.broker === "zerodha") {
-      return createZerodhaLiveAdapter(this.deps.kite, ctx.cfg);
+      return createZerodhaLiveAdapter(this.deps.kite, ctx.cfg, ctx.timing);
     }
     if (!this.dhanLiveTradingEnabled()) {
       throw new Error(
@@ -1048,6 +1049,7 @@ export class ActiveBrokerManager {
         staticIpReady: () => this.dhanStaticIpReady(),
         dhanClientId: () => this.dhanSessionMeta?.clientId ?? process.env.DHAN_CLIENT_ID?.trim() ?? "",
         identify: (token) => this.dhanInstruments.identify(token),
+        ...(ctx.timing ? { timing: ctx.timing } : {}),
       }),
     );
   }
