@@ -23,6 +23,14 @@ import {
 } from "./charges.js";
 import type { BoxExecutionGateway } from "./executionGateway.js";
 import type { BoxChargeCalculatorLike } from "./brokerContext.js";
+import {
+  classifyExecutionFault,
+  faultErrorType,
+  faultMessage,
+  type BoxParentAttemptReason,
+  type ExecutionFaultLog,
+  type ExecutionStage,
+} from "./executionFaults.js";
 import type { BoxMetrics } from "./metrics.js";
 import {
   evaluateCandidate,
@@ -46,6 +54,9 @@ import {
   type PaperLeggingExecutionRecord,
 } from "./types.js";
 
+/** At most one hot-path evaluation-fault log line per this interval. */
+const EVALUATION_FAULT_LOG_INTERVAL_MS = 5_000;
+
 /** What the scanner needs from the outside world. */
 export interface BoxScannerDeps {
   cfg: BoxConfig;
@@ -59,6 +70,19 @@ export interface BoxScannerDeps {
   executionSim: BoxExecutionGateway;
   positions: BoxPositionBook;
   metrics?: BoxMetrics;
+  /**
+   * Bounded store for TECHNICAL entry failures.
+   *
+   * The metric label is only ever the fixed fault class; the detail an operator actually needs
+   * (stage, sanitized message, stack, whether a reservation was held, whether exposure existed)
+   * lands here instead of being crammed into a label. Optional so tests and the pure paths need
+   * not supply it.
+   */
+  faults?: ExecutionFaultLog;
+  /** Live only: has execution reached the broker for this attempt? Null/absent in paper. */
+  reachedBroker?: () => boolean;
+  /** Which broker the fault is attributable to. Diagnostics only. */
+  activeBroker?: () => string;
   /** Opens the paper trade. Returns the trade id, or null when it did not open. */
   openPaperTrade: (args: {
     candidate: BoxCandidate;
@@ -119,6 +143,13 @@ export interface BoxScannerStats {
   rejectedNetProfit: number;
   rejectedExecution: number;
   rejectedDuplicate: number;
+  /**
+   * Candidate evaluations that threw on the hot path.
+   *
+   * A technical fault, not a market rejection, so it has its own counter rather than being pooled
+   * into `rejectedExecution`. Always 0 in a healthy session.
+   */
+  evaluationFaults: number;
   lastEvaluationAt: number | null;
 }
 
@@ -154,8 +185,11 @@ export class BoxScanner {
     rejectedNetProfit: 0,
     rejectedExecution: 0,
     rejectedDuplicate: 0,
+    evaluationFaults: 0,
     lastEvaluationAt: null,
   };
+  /** Throttle for hot-path fault logging; the fault log itself keeps every occurrence. */
+  private lastEvaluationFaultLogAt = 0;
 
   constructor(private deps: BoxScannerDeps) {}
 
@@ -262,14 +296,61 @@ export class BoxScanner {
     for (const key of affected) {
       const cand = this.candidates.get(key);
       if (!cand) continue;
-      this.evaluateAndMaybeEnter(cand, now, receivedAt);
+      this.safeEvaluate(cand, now, receivedAt);
     }
   }
 
   refreshAll(): void {
     const now = Date.now();
     for (const cand of this.candidates.values()) {
-      this.evaluateAndMaybeEnter(cand, now);
+      this.safeEvaluate(cand, now);
+    }
+  }
+
+  /**
+   * ONE CANDIDATE'S FAULT MUST NOT ABORT THE TICK.
+   *
+   * `evaluateAndMaybeEnter` is fully synchronous and runs in a loop over every candidate the tick
+   * touched, and it calls the charge calculator (`localDecisionFor`) twice. An escaping error
+   * therefore skipped every remaining candidate in the batch AND propagated out of
+   * `onTokensUpdated` into the WebSocket tick handler — so one unpriceable candidate could stop
+   * discovery for the whole universe. The position monitor has always had this guard for its
+   * cycle; the scanner did not.
+   *
+   * Classified and recorded like any other technical fault, never silently swallowed.
+   */
+  private safeEvaluate(cand: BoxCandidate, now: number, receivedAt?: number): void {
+    try {
+      this.evaluateAndMaybeEnter(cand, now, receivedAt);
+    } catch (err) {
+      // The only thing that can throw out here is the pre-entry evaluation/projection: the entry
+      // pipeline past this point has its own classified catch.
+      const faultClass = classifyExecutionFault({ stage: "pre_decision", error: err });
+      this.stats.evaluationFaults++;
+      this.deps.faults?.record({
+        at: now,
+        fault_class: faultClass,
+        stage: "pre_decision",
+        execution_mode: this.deps.cfg.executionMode,
+        paper_profile: this.deps.cfg.paperExecutionProfile,
+        broker: this.deps.activeBroker?.() ?? null,
+        error_type: faultErrorType(err),
+        message: faultMessage(err),
+        stack: err instanceof Error ? err.stack ?? null : null,
+        candidate_key: cand.key,
+        reservation_held: this.deps.positions.isTaken(cand.key),
+        exposure_existed: this.deps.positions.getByKey(cand.key) !== undefined,
+        reached_broker: null,
+      });
+      // Bounded logging: this runs at tick rate, so a persistent fault must not become a log flood.
+      if (now - this.lastEvaluationFaultLogAt >= EVALUATION_FAULT_LOG_INTERVAL_MS) {
+        this.lastEvaluationFaultLogAt = now;
+        console.warn(
+          `[Box] candidate evaluation ${faultClass} for ${cand.key} ` +
+            `(${this.stats.evaluationFaults} total this session):`,
+          err,
+        );
+      }
     }
   }
 
@@ -399,13 +480,21 @@ export class BoxScanner {
     // work and retries remain child events and cannot change this denominator.
     const attemptId = `entry:${cand.key}:${detection.at}`;
     this.deps.metrics?.beginLogicalAttempt(attemptId);
-    const detectionDecision = this.localDecisionFor(
-      detection,
-      this.deps.cfg.expectedEntrySlippage,
-    );
+    /**
+     * WHERE WE ARE. Advanced as the pipeline progresses so the catch can classify a fault by the
+     * subsystem that was actually running, rather than guessing from an exception string.
+     */
+    let stage: ExecutionStage = "pre_decision";
+    /**
+     * Assigned inside the try. It used to be computed BEFORE the try even though it calls the
+     * charge calculator — so a throw there escaped `attemptEntry` entirely, leaving the candidate
+     * permanently in `entryInFlight` and its strike pair permanently reserved, with the parent
+     * attempt counted and never terminated.
+     */
+    let detectionDecision: BoxEntryDecision | null = null;
     const finish = (
       outcome: "SUCCESS" | "FAILED" | "PARTIAL_RECOVERED" | "PARTIAL_UNRESOLVED" | "ABORTED",
-      reason: string | null,
+      reason: BoxParentAttemptReason | null,
       realisedExpectedNet: number | null,
       decisionToFillMs: number | null,
       arrivalExecutionSlippage: number | null,
@@ -429,14 +518,31 @@ export class BoxScanner {
       this.feedHealthy &&
       this.deps.positions.getByKey(cand.key) === undefined;
 
+    /**
+     * Run the final qualification with the stage temporarily set, because the gateway invokes it
+     * as a callback from deep inside execution. Without this a charge-calculator fault would be
+     * attributed to the broker.
+     */
+    const qualifyStaged = (execution: BoxEvaluation, measuredSlippage: number): BoxEntryDecision => {
+      const outer = stage;
+      stage = "final_qualification";
+      try {
+        return this.finalQualify(execution, measuredSlippage);
+      } finally {
+        stage = outer;
+      }
+    };
+
     try {
+      detectionDecision = this.localDecisionFor(detection, this.deps.cfg.expectedEntrySlippage);
+      stage = "execution";
       // Independent role orders in paper_legging and live modes.
       if (this.deps.cfg.executionMode === "paper_legging" || this.deps.cfg.executionMode === "live") {
         const legging = await this.deps.executionSim.simulateLeggingEntry({
           candidate: cand,
           detection,
           stillWanted,
-          qualify: (execution, measuredSlippage) => this.finalQualify(execution, measuredSlippage),
+          qualify: qualifyStaged,
         });
         if (!legging.ok) {
           // Some legs may have filled and been unwound: persist the attempt so the
@@ -490,6 +596,7 @@ export class BoxScanner {
          * is persisted and handed to the monitor — which runs regardless of RUN/STOP,
          * market hours or feed health, and will exit it when it can.
          */
+        stage = "trade_persistence";
         const opened = await this.finalizeOpen(cand, legging.evaluation, legging.decision, null, legging.legging);
         finish(
           opened ? "SUCCESS" : "PARTIAL_UNRESOLVED",
@@ -507,7 +614,7 @@ export class BoxScanner {
         stillWanted,
         // The final gate: expected NET profit on the EXECUTED snapshot, with the
         // measured entry slippage RECORDED but never deducted again.
-        qualify: (execution, measuredSlippage) => this.finalQualify(execution, measuredSlippage),
+        qualify: qualifyStaged,
       });
 
       if (!result.ok) {
@@ -535,6 +642,7 @@ export class BoxScanner {
        * The simulator's own pre-fill checks are what cancel an entry safely; once
        * filled, the position is persisted and the (always-on) monitor owns it.
        */
+      stage = "trade_persistence";
       const opened = await this.finalizeOpen(cand, result.evaluation, result.decision, result.record, null);
       finish(
         opened ? "SUCCESS" : "PARTIAL_UNRESOLVED",
@@ -545,8 +653,41 @@ export class BoxScanner {
         0,
       );
     } catch (err) {
-      console.warn("[Box] entry attempt failed for", cand.key, err);
-      finish("FAILED", "internal_error", null, null, null);
+      // A TECHNICAL FAULT IS NOT A MARKET OUTCOME. Classify it by the subsystem that was actually
+      // running (`stage`), keep the fixed class as the only metric label, and put the detail an
+      // operator needs into the bounded diagnostic log — never into the label.
+      const faultClass = classifyExecutionFault({ stage, error: err });
+      const recorded = this.deps.faults?.record({
+        at: Date.now(),
+        fault_class: faultClass,
+        stage,
+        execution_mode: this.deps.cfg.executionMode,
+        paper_profile: this.deps.cfg.paperExecutionProfile,
+        broker: this.deps.activeBroker?.() ?? null,
+        error_type: faultErrorType(err),
+        message: faultMessage(err),
+        stack: err instanceof Error ? err.stack ?? null : null,
+        candidate_key: cand.key,
+        reservation_held: this.deps.positions.isTaken(cand.key),
+        exposure_existed: this.deps.positions.getByKey(cand.key) !== undefined,
+        reached_broker: this.deps.cfg.executionMode === "live"
+          ? this.deps.reachedBroker?.() ?? null
+          : null,
+      });
+      // Loud for the classes that mean money or durability is at risk; a warning otherwise.
+      const severe = faultClass === "trade_persistence_error" ||
+        faultClass === "broker_state_error" ||
+        faultClass === "execution_invariant_error" ||
+        faultClass === "reservation_authority_unavailable";
+      const line = `[Box] entry ${faultClass} at stage ${stage} for ${cand.key}: ` +
+        `${recorded?.message ?? faultMessage(err)}`;
+      if (severe) console.error(line, err);
+      else console.warn(line, err);
+      // Also count it in the scanner's own stats and the trade-event ledger, so a technical fault
+      // is not invisible everywhere except one metric. Previously the catch skipped both.
+      this.stats.rejectedExecution++;
+      this.logRejection("ENTRY_REJECTED_EXECUTION", cand, detection, `${faultClass}: ${stage}`);
+      finish("FAILED", faultClass, null, null, null);
       this.deps.positions.release(cand.key);
     } finally {
       this.entryInFlight.delete(cand.key);

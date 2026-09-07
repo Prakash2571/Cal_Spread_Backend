@@ -14,6 +14,11 @@
  * one sort of a few hundred numbers is free.
  */
 
+import {
+  isBoxParentAttemptReason,
+  type BoxParentAttemptReason,
+} from "./executionFaults.js";
+
 /** A fixed-size ring of numeric samples with lazily computed percentiles. */
 export class RingBuffer {
   private readonly buf: Float64Array;
@@ -294,6 +299,12 @@ export class BoxMetrics {
     residual_flatten_failure: 0,
     manual_legging_exits: 0,
     invariant_failures: 0,
+    /**
+     * Parent-attempt labels that were not in the closed taxonomy and had to be folded into
+     * `unknown_internal_error`. Should always be 0; a non-zero value means a caller drifted from
+     * `BoxParentAttemptReason` and the dashboard is under-reporting a real category.
+     */
+    unclassified_rejection_labels: 0,
   };
   /** Highest partial-exit remaining-role count seen (bounded gauge, not a sum). */
   private partialExitRemainingRoles = 0;
@@ -364,7 +375,7 @@ export class BoxMetrics {
   finishLogicalAttempt(
     attemptId: string,
     outcome: "SUCCESS" | "FAILED" | "PARTIAL_RECOVERED" | "PARTIAL_UNRESOLVED" | "ABORTED",
-    reason?: string | null,
+    reason?: BoxParentAttemptReason | null,
     observations?: {
       decisionDeterioration?: number | null;
       arrivalExecutionSlippage?: number | null;
@@ -387,7 +398,15 @@ export class BoxMetrics {
       case "PARTIAL_UNRESOLVED": this.counters.logical_partial_unresolved++; break;
       case "ABORTED": this.counters.logical_aborted++; break;
     }
-    if (reason) this.logicalRejections.set(reason, (this.logicalRejections.get(reason) ?? 0) + 1);
+    if (reason) {
+      // THE LABEL SPACE IS CLOSED. `rejection_categories` is published over HTTP and lives for the
+      // life of the process, so an unrecognised string here would be a permanent, unbounded metric
+      // label. The type already forbids it; this is the runtime backstop for JS callers, and an
+      // unknown label is counted rather than silently dropped so the drift itself is visible.
+      const label = isBoxParentAttemptReason(reason) ? reason : "unknown_internal_error";
+      if (label !== reason) this.counters.unclassified_rejection_labels++;
+      this.logicalRejections.set(label, (this.logicalRejections.get(label) ?? 0) + 1);
+    }
     if (observations) {
       this.decisionDeterioration.push(observations.decisionDeterioration ?? Number.NaN);
       this.arrivalExecutionSlippage.push(observations.arrivalExecutionSlippage ?? Number.NaN);
@@ -626,6 +645,12 @@ export class BoxMetrics {
           detection_to_fill_ms: this.decisionToFill.summary(),
         },
         terminal_conflicts: c.logical_terminal_conflicts,
+        /**
+         * Labels a caller supplied that were NOT in the closed parent-attempt taxonomy and had to
+         * be folded into `unknown_internal_error`. Always 0 in a correct build; a non-zero value
+         * means `rejection_categories` is under-reporting a real category.
+         */
+        unclassified_rejection_labels: c.unclassified_rejection_labels,
       },
       legging: {
         outcomes: {

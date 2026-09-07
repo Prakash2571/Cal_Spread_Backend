@@ -48,6 +48,7 @@ import { ExecutionTimingRecorder } from "./executionTiming.js";
 import { CalibrationPersistenceBuffer } from "./calibrationPersistence.js";
 import { BrokerTimingStore } from "./brokerTimingStore.js";
 import { ExecutionOutcomeStore } from "./executionOutcomes.js";
+import { ExecutionFaultLog } from "./executionFaults.js";
 import { QueueCalibrationEstimator } from "./queueCalibration.js";
 import { computeExecutionShortfall, type ExecutionShortfall } from "./executionShortfall.js";
 import { buildParityReports } from "./parityReport.js";
@@ -276,6 +277,15 @@ export class BoxEngine {
   private readonly calibrationPersistence: CalibrationPersistenceBuffer;
   /** Measured outcome and reject-family rates (Phases 9, 19). */
   private readonly outcomeStore = new ExecutionOutcomeStore();
+  /**
+   * Bounded store of TECHNICAL entry-pipeline faults, classified into a fixed taxonomy.
+   *
+   * Exists so the dashboard can distinguish "Mongo is down" from "the durable reservation
+   * authority is unreachable" from "a programming bug", instead of collapsing all of them into
+   * one `internal_error` counter. Bounded on both axes: a 50-entry ring and a closed set of
+   * class counters, so neither memory nor metric cardinality grows with traffic.
+   */
+  private readonly entryFaults = new ExecutionFaultLog();
   /** Advisory queue/haircut recommender fed by live limit-order evidence (Phases 10, 26). */
   private readonly queueEstimator: QueueCalibrationEstimator;
   /** Most recent implementation-shortfall attribution, surfaced in diagnostics. */
@@ -626,6 +636,11 @@ export class BoxEngine {
       executionSim: this.execution,
       metrics: this.metrics,
       positions: this.positions,
+      faults: this.entryFaults,
+      activeBroker: () => this.deps.activeBroker(),
+      // LIVE ONLY: whether this attempt's orders actually reached the broker. In paper there is
+      // no broker, so the field stays null rather than pretending to know.
+      reachedBroker: () => (this.orderManager?.status().inFlight ?? 0) > 0,
       openPaperTrade: (args) => this.openPaperTrade(args),
       onExecutionAttempt: (candidate, legging, reason, detail, detectedGrossEdge) =>
         void this.persistExecutionAttempt(candidate, legging, reason, detail, detectedGrossEdge),
@@ -3659,6 +3674,13 @@ export class BoxEngine {
       // Measured outcome and reject rates for the active broker.
       outcomes: this.outcomeStore.outcomeCounts(this.deps.activeBroker(), "MARKETABLE_LIMIT"),
       rejects: this.outcomeStore.rejectCounts(this.deps.activeBroker()),
+      // TECHNICAL entry-pipeline faults, classified. Fixed keys (always all ten, so a zero reads
+      // as a zero) plus a bounded ring of recent detail. `candidate_key` and stack traces are
+      // stripped here by `publicRecent()`: they go to the server log and the trade-event ledger,
+      // never to a metric label or this endpoint, which is counts/statuses only.
+      entry_fault_classes: this.entryFaults.counts(),
+      entry_faults_total: this.entryFaults.total,
+      recent_entry_faults: this.entryFaults.publicRecent(20),
       // Advisory only. Never applied automatically; never a claim about NSE queue position.
       queue_calibration: this.queueEstimator.recommendAll(),
       last_implementation_shortfall: this.lastShortfall,
