@@ -6,9 +6,16 @@ import {
   boxClientOrderId,
 } from "./brokerAdapter.js";
 import {
+  boxCapitalSummary,
+  evaluateBoxCapitalAdmission,
+  grossEntryOrderNotional,
+  type BoxCapitalReport,
+} from "./boxCapital.js";
+import {
   OrderPersistenceAfterFillError,
   type BoxOrderManager,
   type CheckedFeedStamp,
+  type EntryCapitalStamp,
 } from "./orderManager.js";
 import {
   carryResidualForward,
@@ -118,12 +125,16 @@ export function checkedFeedBlockReason(args: {
  */
 export class CentralBoxExecutionGateway implements BoxExecutionGateway {
   readonly mode: BoxConfig["executionMode"];
+  /** The most recent per-Box capital decision, for status. Never a correctness input. */
+  private lastCapitalReport: BoxCapitalReport | null = null;
 
   constructor(private readonly deps: {
     cfg: BoxConfig;
     simulator: BoxExecutionSimulator;
     quotes: BoxQuoteStore;
     manager?: BoxOrderManager;
+    /** The active broker, for attributing a capital refusal. Diagnostics only. */
+    broker?: () => string;
     /** Allocates the Mongo identity before any live intent is created. */
     allocateTradeId?: () => string;
     isTokenWarm?: (token: number) => boolean;
@@ -203,8 +214,45 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       return liveEntryFailure(args.candidate, args.detection.at, submittedAt, [], "insufficient_quantity", errorMessage(error), this.deps.cfg, tradeId);
     }
 
+    // ── MAXIMUM ₹ PER BOX: the authoritative pre-trade gate ────────────────────────────────
+    //
+    // Evaluated HERE, from the four IMMUTABLE bounded LIMIT requests that would be
+    // transmitted, and BEFORE the first `manager.submit`. Two properties matter:
+    //
+    //   1. It uses the actual order LIMIT prices, never an LTP or a mid. A cap checked against
+    //      a stale last-traded price is not a cap on what the orders can transact.
+    //   2. Nothing has reached the broker yet, so a refusal here is a genuine PRE-TRADE
+    //      refusal with no exposure to unwind.
+    //
+    // A quantity/price change between detection and here is therefore already accounted for:
+    // the requests were rebuilt from the current book a few lines above.
+    const capital = this.evaluateEntryCapital(requests, args.candidate, "pre_submit");
+    this.lastCapitalReport = capital;
+    if (!capital.allowed) {
+      return liveEntryFailure(
+        args.candidate,
+        args.detection.at,
+        submittedAt,
+        [],
+        "box_capital_limit",
+        capital.detail ?? "per-Box capital limit refused entry",
+        this.deps.cfg,
+        tradeId,
+      );
+    }
+
+    // The Box-level decision is stamped onto every leg so the manager can RE-VERIFY it at
+    // dequeue, the last safe moment before a broker mutation. A per-leg check could not: the
+    // cap is a property of the whole four-leg set, which no single leg can see.
+    const capitalStamp: EntryCapitalStamp = {
+      candidate_key: args.candidate.key,
+      box_notional_paise: capital.metrics.gross_entry_order_notional_paise,
+      configured_max_rupees: capital.configured_max_rupees,
+      checked_at: capital.at,
+    };
+
     const settled = await Promise.allSettled(
-      requests.map((request) => manager.submit(request, checkedFeed.get(request.client_order_id))),
+      requests.map((request) => manager.submit(request, checkedFeed.get(request.client_order_id), capitalStamp)),
     );
     const orders = ordersFromSettled(settled);
     const uncertain = settled.some((item) => item.status === "rejected" &&
@@ -661,6 +709,72 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
         max_chase_ticks: pricing.max_chase_ticks,
         limit_price: pricing.limit_price,
       },
+    };
+  }
+
+  /**
+   * The per-Box ₹ cap in force for the CURRENT execution mode.
+   *
+   * LIVE is the authoritative safety gate. Paper has its own optional mirror so a
+   * `live_parity` run can exercise the identical admission arithmetic without a real account;
+   * a paper cap can never relax the live one because they are different config keys and only
+   * the live one is consulted in live mode.
+   */
+  private capitalLimitRupees(): number {
+    return this.mode === "live"
+      ? this.deps.cfg.liveMaxBoxCapitalRupees
+      : this.deps.cfg.paperMaxBoxCapitalRupees;
+  }
+
+  /** Compute and judge the gross entry-order notional for a built request set. */
+  private evaluateEntryCapital(
+    requests: readonly BrokerOrderRequest[],
+    candidate: BoxCandidate,
+    stage: BoxCapitalReport["stage"],
+  ): BoxCapitalReport {
+    return evaluateBoxCapitalAdmission({
+      metrics: grossEntryOrderNotional(requests, BOX_LEG_ROLES.length),
+      limitRupees: this.capitalLimitRupees(),
+      broker: this.deps.broker?.() ?? "unknown",
+      candidateKey: candidate.key,
+      at: this.now(),
+      stage,
+    });
+  }
+
+  /**
+   * ADVISORY capital metric for a candidate, for UI visibility during qualification.
+   *
+   * Uses the same arithmetic as the gate but is explicitly NOT the gate: it is computed from
+   * detection reference prices rather than from built order requests, so it is an estimate.
+   * Nothing may be admitted on the strength of this number — {@link evaluateEntryCapital} at
+   * `pre_submit` is the only decision that counts.
+   */
+  quoteCandidateCapital(candidate: BoxCandidate, legs: readonly BoxLegEvaluation[]): BoxCapitalReport | null {
+    const priced = legs.filter((leg) => leg.price !== null);
+    if (priced.length !== BOX_LEG_ROLES.length) return null;
+    const pseudo = priced.map((leg) => ({
+      role: leg.role,
+      side: leg.side,
+      tradingsymbol: leg.tradingsymbol,
+      quantity: candidate.lot_size,
+      pricing: { limit_price: leg.price as number },
+    }));
+    return evaluateBoxCapitalAdmission({
+      metrics: grossEntryOrderNotional(pseudo, BOX_LEG_ROLES.length),
+      limitRupees: this.capitalLimitRupees(),
+      broker: this.deps.broker?.() ?? "unknown",
+      candidateKey: candidate.key,
+      at: this.now(),
+      stage: "qualification",
+    });
+  }
+
+  /** The last capital decision, for status/diagnostics. Bounded, low-cardinality. */
+  capitalDiagnostics(): ReturnType<typeof boxCapitalSummary> & { limit_source: "live" | "paper" } {
+    return {
+      ...boxCapitalSummary(this.lastCapitalReport),
+      limit_source: this.mode === "live" ? "live" : "paper",
     };
   }
 

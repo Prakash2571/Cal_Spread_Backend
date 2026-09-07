@@ -55,6 +55,26 @@ export interface CheckedFeedStamp {
   readonly checked_at: number;
 }
 
+/**
+ * The BOX-LEVEL per-Box ₹ capital decision, stamped onto every ENTRY leg of one Box.
+ *
+ * WHY THIS EXISTS. The cap is a property of the whole four-leg set, but the manager schedules
+ * one leg at a time and can never see the set. Without the stamp there would be no way to
+ * re-verify the cap at dequeue — the last safe moment before a broker mutation — so a config
+ * change or a rebuilt request set between admission and transmission would go unnoticed.
+ *
+ * EPHEMERAL EVIDENCE ONLY, exactly like {@link CheckedFeedStamp}: never copied into the
+ * durable intent and never sent to the broker.
+ */
+export interface EntryCapitalStamp {
+  readonly candidate_key: string;
+  /** Gross entry-order notional in integer PAISE, from the bounded LIMIT requests. */
+  readonly box_notional_paise: number;
+  /** The cap that was in force when the decision was taken (₹). 0 ⇒ disabled. */
+  readonly configured_max_rupees: number;
+  readonly checked_at: number;
+}
+
 export interface OrderIntentPersistence {
   create(intent: IBoxOrderIntent): Promise<IBoxOrderIntent>;
   update(
@@ -183,6 +203,13 @@ export interface OrderManagerLimits {
    * pre-burst behaviour exactly.
    */
   entrySubmitConcurrency: number;
+  /**
+   * Per-Box gross entry-order notional cap (₹). `0` disables the gate.
+   *
+   * Held here so the DEQUEUE re-check has its own authority and does not depend on the stamp
+   * agreeing with itself. See `boxCapital.ts` for why this is not broker margin.
+   */
+  maxBoxCapitalRupees: number;
   maxResidualLegs: number;
   dailyLossLimit: number;
   rejectLimit: number;
@@ -198,6 +225,7 @@ export function orderManagerLimitsFromConfig(cfg: BoxConfig): OrderManagerLimits
     maxOpenBoxes: cfg.liveMaxOpenBoxes,
     maxConcurrentExecutions: cfg.liveMaxConcurrentExecutions,
     entrySubmitConcurrency: cfg.liveEntrySubmitConcurrency,
+    maxBoxCapitalRupees: cfg.liveMaxBoxCapitalRupees,
     maxResidualLegs: cfg.liveMaxResidualLegs,
     dailyLossLimit: cfg.liveDailyLossLimit,
     rejectLimit: cfg.liveRejectLimit,
@@ -224,6 +252,8 @@ interface SubmitQueueAction {
   request: BrokerOrderRequest;
   /** Ephemeral evidence only; never copied into the durable intent or broker payload. */
   checkedFeed?: CheckedFeedStamp;
+  /** Box-level ₹ capital evidence for an ENTRY leg. Ephemeral, like `checkedFeed`. */
+  capital?: EntryCapitalStamp;
   resolve: (order: BrokerOrder) => void;
   reject: (error: unknown) => void;
   sequence: number;
@@ -662,7 +692,11 @@ export class BoxOrderManager {
     return this.canManageExposure() && this.safeAttributedReductionReady;
   }
 
-  submit(request: BrokerOrderRequest, checkedFeed?: CheckedFeedStamp): Promise<BrokerOrder> {
+  submit(
+    request: BrokerOrderRequest,
+    checkedFeed?: CheckedFeedStamp,
+    capital?: EntryCapitalStamp,
+  ): Promise<BrokerOrder> {
     if (request.purpose === "ENTRY" && !this.canEnter(request)) {
       return Promise.reject(new Error("OrderManager entry controls or limits are closed."));
     }
@@ -694,6 +728,7 @@ export class BoxOrderManager {
         kind: "submit",
         request,
         ...(checkedFeed ? { checkedFeed } : {}),
+        ...(capital ? { capital } : {}),
         resolve,
         reject,
         sequence: this.sequence++,
@@ -1044,6 +1079,39 @@ export class BoxOrderManager {
     };
   }
 
+  /**
+   * RE-VERIFY the per-Box ₹ cap at dequeue — the last safe moment before a broker mutation.
+   *
+   * Three distinct refusals, and the middle one is the important one:
+   *
+   *   - cap disabled ⇒ no opinion, exactly as before this feature existed.
+   *   - cap enabled but NO STAMP ⇒ REFUSE. An ENTRY that reached the queue without a capital
+   *     decision cannot be proven compliant, and an unprovable safety gate is not a safety
+   *     gate. This is what stops a new ENTRY submission path from silently bypassing the cap.
+   *   - stamped notional over the cap ⇒ REFUSE. Catches the case where the cap was tightened,
+   *     or the request set rebuilt, between admission and transmission.
+   *
+   * Deliberately reached ONLY for `purpose === "ENTRY"`. An EXIT, PROTECTIVE_CANCEL or
+   * EMERGENCY_RESIDUAL reduces exposure we already own, and a capital cap on new exposure must
+   * never be able to prevent that.
+   */
+  private capitalBlockReason(action: SubmitQueueAction): string | null {
+    const limit = this.deps.limits.maxBoxCapitalRupees;
+    if (!Number.isFinite(limit) || limit <= 0) return null;
+    const stamp = action.capital;
+    if (!stamp) {
+      return "Box capital evidence is missing; entry refused because the per-Box ₹ cap cannot be verified.";
+    }
+    const limitPaise = Math.round(limit * 100);
+    if (stamp.box_notional_paise > limitPaise) {
+      return (
+        `Box gross entry-order notional ₹${(stamp.box_notional_paise / 100).toFixed(2)} exceeded the ` +
+        `₹${limit} per-Box cap while the order was queued.`
+      );
+    }
+    return null;
+  }
+
   /** Re-check mutable gates at the last safe point before any broker mutation. */
   private queuedActionBlockReason(action: QueueAction): string | null {
     if (action.kind === "cancel") {
@@ -1056,6 +1124,8 @@ export class BoxOrderManager {
           this.grossOpenLegQuantity + this.reservedEntryQuantity > this.deps.limits.maxGrossOpenLegQuantity) {
         return "Order exceeded live quantity limits while queued.";
       }
+      const capital = this.capitalBlockReason(action);
+      if (capital) return capital;
       return null;
     }
     if (!this.canManageExposure()) {

@@ -617,7 +617,33 @@ export type BoxExecutionFailureReason =
    * The box is never opened; instead all four legs are immediately reversed and
    * the true cost of that round trip is booked as the abort P&L.
    */
-  | "abort_after_fill";
+  | "abort_after_fill"
+  /**
+   * The four bounded ENTRY orders' GROSS NOTIONAL exceeds
+   * `BOX_LIVE_MAX_BOX_CAPITAL_RUPEES`.
+   *
+   * A PRE-TRADE refusal: it is decided from the immutable bounded LIMIT requests before any
+   * broker mutation, so nothing reached the market. Note the metric is gross option-order
+   * notional, NOT broker margin — see boxCapital.ts.
+   */
+  | "box_capital_limit"
+  /**
+   * `BOX_ONE_ACTIVE_BOX_PER_UNDERLYING` is enabled and this underlying already carries an
+   * active Box, partial position, recovery position, residual exposure or in-flight entry.
+   *
+   * DELIBERATELY DISTINCT from a contract-reservation conflict: the two Boxes may share no
+   * option at all. Reporting this as a reservation conflict would misdescribe the cause and
+   * point an operator at the wrong remedy.
+   */
+  | "underlying_already_active"
+  /**
+   * The armed trading session has consumed its permitted Box lifecycles
+   * (`BOX_SESSION_MAX_COMPLETED_TRADES`), or no session is armed.
+   *
+   * Blocks NEW ENTRY ONLY. Monitoring, exit, residual flattening, reconciliation and recovery
+   * all continue — a spent session budget must never be a reason exposure cannot be reduced.
+   */
+  | "session_limit_reached";
 
 /** One leg's detection → execution comparison. */
 export interface BoxExecutionLeg {

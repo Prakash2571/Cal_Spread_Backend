@@ -647,6 +647,9 @@ export class BoxEngine {
       simulator: this.executionSim,
       quotes: this.quotes,
       ...(this.orderManager ? { manager: this.orderManager, allocateTradeId: allocateBoxTradeId } : {}),
+      // Attributes a per-Box capital refusal to the broker it was judged against. Diagnostics
+      // only: the capital metric itself is broker-independent.
+      broker: () => this.deps.activeBroker(),
       isTokenWarm: (token) => this.tokenFeedGeneration.get(token) === this.feedGeneration,
       feedGeneration: () => this.feedGeneration,
       // So LIVE residual flattening bills its own fees, exactly as the paper path already did.
