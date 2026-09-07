@@ -996,6 +996,37 @@ export interface ResidualLegExposure {
  * plus the charges and adverse touch of unwinding them. That legging loss is the
  * whole reason this model exists.
  */
+/**
+ * HOW A BOX ENTRY ATTEMPT ENDED, as one label an operator can read.
+ *
+ * The distinction that matters, and the reason this type exists:
+ *
+ *   REFUSED_BEFORE_SUBMIT       nothing reached the broker. No exposure, no cost.
+ *   NO_FILL                     orders reached the broker and none filled.
+ *   PARTIAL_ENTRY_UNWOUND       some legs filled; the confirmed exposure was reversed.
+ *   PARTIAL_ENTRY_RESIDUAL      some legs filled and the reversal was incomplete — exposure
+ *                               is still held and is being worked by the flatten loop.
+ *   FILLED_THEN_ECONOMICS_ABORT ALL FOUR legs filled, so a complete hedged Box genuinely
+ *                               existed, but the economics computed on the EXECUTED prices no
+ *                               longer qualified, so the whole Box was reversed immediately.
+ *   QUARANTINED_UNKNOWN         broker state is unprovable; nothing may be unwound or opened
+ *                               until reconciliation resolves it.
+ *   OPENED                      a valid four-leg Box was opened.
+ *
+ * `FILLED_THEN_ECONOMICS_ABORT` must never be presented as an ordinary rejected candidate.
+ * There was no legging RISK — the Box was briefly complete and hedged — but there was a real
+ * cost, and its charges, slippage and P&L are tracked separately on the durable attempt row
+ * (`gross_abort_pnl`, `net_abort_pnl`, `partial_entry_charges`, `unwind_charges`).
+ */
+export type BoxEntryOutcomeClass =
+  | "OPENED"
+  | "REFUSED_BEFORE_SUBMIT"
+  | "NO_FILL"
+  | "PARTIAL_ENTRY_UNWOUND"
+  | "PARTIAL_ENTRY_RESIDUAL"
+  | "FILLED_THEN_ECONOMICS_ABORT"
+  | "QUARANTINED_UNKNOWN";
+
 export interface PaperLeggingExecutionRecord {
   /** Honest execution source: live records must never be labelled simulated. */
   mode: "paper_legging" | "live";
@@ -1059,6 +1090,15 @@ export interface PaperLeggingExecutionRecord {
   final_expected_net_profit: number | null;
   /** The gate that figure was tested against (₹). */
   required_expected_net_profit: number | null;
+  /**
+   * A SINGLE, UI-FACING label for how this attempt ended.
+   *
+   * Exists because `abort_after_fill` was previously only a boolean buried in the record, so a
+   * 4/4-filled Box that failed final economics rendered as an ordinary failed candidate. It is
+   * not one: real orders really filled, a real position really existed, and a real round trip
+   * was really paid. See {@link BoxEntryOutcomeClass}.
+   */
+  outcome_class?: BoxEntryOutcomeClass;
   /* ---- four-leg temporal coherence (analytics; see math.ts) ---- */
   temporal: BoxTemporalCoherence | null;
   /* ---- residual exposure: outstanding simulated contracts, if any ---- */
@@ -1253,6 +1293,12 @@ export interface IBoxExecutionAttempt {
    * the executed prices, whole box reversed immediately.
    */
   abort_after_fill?: boolean;
+  /**
+   * How the attempt ended, hoisted from `legging.outcome_class` for direct querying and for the
+   * admin attempts list. `FILLED_THEN_ECONOMICS_ABORT` is the one that must never be rendered as
+   * an ordinary rejected candidate.
+   */
+  outcome_class?: BoxEntryOutcomeClass | null;
   filled_leg_count: number;
   failed_legs: BoxLegRole[];
   failure_reason: BoxExecutionFailureReason | null;

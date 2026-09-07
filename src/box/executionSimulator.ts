@@ -834,6 +834,9 @@ export class BoxExecutionSimulator {
          */
         if (!decision.qualifies) {
           record.abort_after_fill = true;
+          // The SAME label live uses, so paper and live report one vocabulary and a parity run
+          // exercises the identical UI path.
+          record.outcome_class = "FILLED_THEN_ECONOMICS_ABORT";
           record.emergency_unwind = true;
           const unwind = await this.emergencyUnwind(candidate, legs, key, args.stillWanted);
           record.partial_entry_charges = unwind.partial_entry_charges;
@@ -865,6 +868,7 @@ export class BoxExecutionSimulator {
         }
 
         record.opened = true;
+        record.outcome_class = "OPENED";
         this.deps.metrics?.recordLeggingOutcome(4, 0);
         // Detection → the box actually being complete (the LAST leg's fill).
         this.deps.metrics?.recordExecutionFilled(totalEntrySlippage, round2(completedAt - detection.at));
@@ -1485,6 +1489,13 @@ export class BoxExecutionSimulator {
   ): BoxLeggingResult {
     record.failure_reason = reason;
     record.failure_detail = detail;
+    // A refusal reached here only when NOTHING filled, so it cost nothing. Labelled distinctly
+    // from a partial entry precisely so the UI can stop treating the two as the same event.
+    if (record.outcome_class === undefined) {
+      record.outcome_class = record.legs.some((leg) => leg.fill_qty > 0)
+        ? "PARTIAL_ENTRY_UNWOUND"
+        : "REFUSED_BEFORE_SUBMIT";
+    }
     this.deps.metrics?.recordExecutionFailed(reason);
     return { ok: false, legging: record, reason, detail };
   }

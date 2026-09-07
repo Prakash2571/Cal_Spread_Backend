@@ -637,6 +637,14 @@ const boxExecutionAttemptSchema = new mongoose.Schema(
     // EXECUTION_ABORT_AFTER_FILL: 4/4 filled, executed economics failed the gate,
     // whole box reversed immediately. Stored flat so it can be queried directly.
     abort_after_fill: { type: Boolean, default: false },
+    /**
+     * One readable label for how the attempt ended, hoisted flat for querying.
+     *
+     * `abort_after_fill` alone could not distinguish "no fill" from "partial, unwound" from
+     * "partial, residual still held", so an operator reading the attempts list could not tell a
+     * costless refusal from a real round trip. See BoxEntryOutcomeClass.
+     */
+    outcome_class: { type: String, default: null },
     required_expected_net_profit: { type: Number, default: null },
     charge_rate_version: { type: String, default: null },
     // The full per-leg legging record: an append-only audit blob.

@@ -6,6 +6,12 @@ import {
   boxClientOrderId,
 } from "./brokerAdapter.js";
 import {
+  planPartialEntryRecovery,
+  verifyQuantityConservation,
+  type EntryLegOutcome,
+  type PartialEntryPlan,
+} from "./partialEntryRecovery.js";
+import {
   boxCapitalSummary,
   evaluateBoxCapitalAdmission,
   grossEntryOrderNotional,
@@ -273,29 +279,137 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     const fullyFilled =
       orders.length === requests.length && orders.every((order) => order.filled_quantity >= order.quantity);
     if (!fullyFilled) {
-      const unwindOrders = await this.unwindConfirmed(orders, args.candidate.legs, tradeId, `${attemptId}:unwind`);
+      // ── PARTIAL ENTRY: the explicit, ordered recovery sequence ───────────────────────
+      //
+      // The RULE is unchanged: if all four legs did not reach their requested quantity there is
+      // no valid Box, and the trade record is never opened as one. What is new is that the
+      // recovery is now DECIDED by a pure, testable plan rather than implied by control flow.
+      //
+      // Steps 1-3 of the sequence are already guaranteed upstream and are asserted here rather
+      // than re-implemented: `adapter.submitOrder` polls to a terminal state (protectively
+      // cancelling on timeout), and the `uncertain` check above has already quarantined anything
+      // whose terminal quantity is unprovable. So every order in hand is terminal with a
+      // broker-confirmed cumulative quantity, which is the only basis on which an unwind may be
+      // sized — a cancel can race a fill, so a pre-terminal snapshot would strand the raced part.
+      const plan = planPartialEntryRecovery({
+        legs: entryLegOutcomes(requests, orders),
+        expectedRoles: BOX_LEG_ROLES,
+      });
+
+      // DEFENCE IN DEPTH. Unreachable given the guarantees above, but if a future change ever
+      // lets a non-terminal or unprovable leg reach here, quarantine — never unwind. Unwinding an
+      // unproven quantity would create opposite naked exposure, which is strictly worse than the
+      // exposure it was trying to remove.
+      if (plan.action === "quarantine_unknown" || plan.action === "await_terminal") {
+        manager.invariantViolation(
+          `live entry ${attemptId} reached partial-entry recovery with a non-terminal or unprovable leg ` +
+            `(${plan.action}); quarantined instead of unwinding`,
+        );
+        const quarantined = liveEntryFailure(args.candidate, args.detection.at, submittedAt, orders, "legging_incomplete", `entry quarantined: ${plan.detail}`, this.deps.cfg, tradeId);
+        quarantined.legging.outcome_class = "QUARANTINED_UNKNOWN";
+        return quarantined;
+      }
+
+      // Steps 4-6: unwind EXACTLY the confirmed exposure, per role, at the reversed side. Skipped
+      // entirely when nothing filled — there is no exposure, so there is nothing to reverse and
+      // no charges to pay.
+      const unwindOrders = plan.action === "no_exposure"
+        ? []
+        : await this.unwindConfirmed(orders, args.candidate.legs, tradeId, `${attemptId}:unwind`);
+
+      // Steps 7-8: whatever the unwind did not cover becomes durable residual exposure, which the
+      // flatten loop works and which blocks new entry under the existing rules.
       const residual = residualAfterUnwind(orders, unwindOrders);
-      return liveEntryFailure(args.candidate, args.detection.at, submittedAt, orders, "legging_incomplete", "entry incomplete; confirmed fills were protectively unwound", this.deps.cfg, tradeId, residual, unwindOrders);
+      this.verifyEntryConservation(plan, orders, unwindOrders, attemptId, "partial_entry");
+
+      const failed = liveEntryFailure(args.candidate, args.detection.at, submittedAt, orders, "legging_incomplete", plan.action === "no_exposure" ? "entry did not fill; no exposure to unwind" : "entry incomplete; confirmed fills were protectively unwound", this.deps.cfg, tradeId, residual, unwindOrders);
+      failed.legging.outcome_class = plan.action === "no_exposure"
+        ? "NO_FILL"
+        : residual.length > 0
+          ? "PARTIAL_ENTRY_RESIDUAL"
+          : "PARTIAL_ENTRY_UNWOUND";
+      return failed;
     }
 
     const evaluation = evaluationFromFills(args.detection, orders);
     const measured = slippageFromFills(args.detection.legs, orders);
     const decision = args.qualify(evaluation, measured);
     if (!decision.qualifies) {
+      // ── 4/4 FILLED, THEN ECONOMICS FAILED ────────────────────────────────────────────
+      //
+      // A complete hedged Box genuinely existed. There was no legging RISK, but there IS a real
+      // cost: the round-trip spread and charges on all four legs. Reversed immediately, and
+      // labelled distinctly so it is never rendered as an ordinary rejected candidate.
       const unwindOrders = await this.unwindConfirmed(orders, args.candidate.legs, tradeId, `${attemptId}:economics-unwind`);
-      const failed = liveEntryFailure(args.candidate, args.detection.at, submittedAt, orders, "abort_after_fill", "executed prices failed final economics; confirmed box was unwound", this.deps.cfg, tradeId, residualAfterUnwind(orders, unwindOrders), unwindOrders);
+      const residual = residualAfterUnwind(orders, unwindOrders);
+      this.verifyEntryConservation(
+        planPartialEntryRecovery({ legs: entryLegOutcomes(requests, orders), expectedRoles: BOX_LEG_ROLES }),
+        orders,
+        unwindOrders,
+        attemptId,
+        "economics_abort",
+      );
+      const failed = liveEntryFailure(args.candidate, args.detection.at, submittedAt, orders, "abort_after_fill", "executed prices failed final economics; confirmed box was unwound", this.deps.cfg, tradeId, residual, unwindOrders);
       failed.legging.abort_after_fill = true;
+      failed.legging.outcome_class = "FILLED_THEN_ECONOMICS_ABORT";
       failed.legging.final_expected_net_profit = decision.expected_net_profit;
       failed.legging.required_expected_net_profit = decision.min_expected_net_profit;
       return failed;
     }
 
-    return {
-      ok: true,
-      evaluation,
-      decision,
-      legging: liveRecord(args.detection.at, submittedAt, orders, true, this.deps.cfg, undefined, tradeId),
-    };
+    const opened = liveRecord(args.detection.at, submittedAt, orders, true, this.deps.cfg, undefined, tradeId);
+    opened.outcome_class = "OPENED";
+    return { ok: true, evaluation, decision, legging: opened };
+  }
+
+  /**
+   * Assert EXACT per-role quantity conservation across an entry and its unwind.
+   *
+   * THE INVARIANT: for every role, `residual = confirmed_entry_fill - confirmed_unwind_fill`, and
+   * that residual is never negative. A negative residual means we sold something we never bought
+   * — brand-new naked exposure created by the very code meant to remove some. An overfill means
+   * broker truth has proven our quantity model wrong, so every downstream exposure number is
+   * suspect.
+   *
+   * Either way the response is RECOVERY, not a clamp and a shrug: `invariantViolation` sets
+   * `recoveryActive`, trips the breaker and kicks reconciliation. Verification itself never
+   * throws, because a bookkeeping check must not be able to abort a recovery already in progress.
+   */
+  private verifyEntryConservation(
+    plan: PartialEntryPlan,
+    entryOrders: BrokerOrder[],
+    unwindOrders: BrokerOrder[],
+    attemptId: string,
+    phase: "partial_entry" | "economics_abort",
+  ): void {
+    try {
+      const unwoundByRole: Partial<Record<BoxLegRole, number>> = {};
+      for (const order of unwindOrders) {
+        unwoundByRole[order.role] = (unwoundByRole[order.role] ?? 0) + order.filled_quantity;
+      }
+      const result = verifyQuantityConservation({
+        entry: entryOrders.map((order) => ({
+          role: order.role,
+          side: order.side,
+          requested: order.quantity,
+          confirmedFilled: order.filled_quantity,
+          terminal: true,
+          submitted: true,
+          brokerStateKnown: true,
+        })),
+        unwoundByRole,
+      });
+      if (result.conserved) return;
+      const detail = result.violations
+        .map((violation) => `${violation.role}:${violation.kind}(${violation.detail})`)
+        .join("; ");
+      this.deps.manager?.invariantViolation(
+        `live entry ${attemptId} (${phase}) violated quantity conservation: ${detail}. ` +
+          `Planned unwind was ${plan.unwind.length} leg(s).`,
+      );
+    } catch {
+      /* a conservation CHECK must never abort the recovery it is verifying */
+    }
   }
 
   simulateExit(args: Parameters<BoxExecutionSimulator["simulateExit"]>[0]): Promise<BoxExitExecutionResult> {
@@ -1093,6 +1207,61 @@ function legsFromOrders(orders: BrokerOrder[], instruments: Record<BoxLegRole, B
       age_ms: quote ? now - quote.at : null,
       fresh: true,
       executable: order.average_price !== null && order.average_price > 0,
+    };
+  });
+}
+
+/**
+ * Project the settled entry into the authoritative per-role outcomes the recovery plan needs.
+ *
+ * A role with NO order snapshot was not submitted, or was refused before any POST. That is safe
+ * to report as `submitted: false` — and NOT as unknown — only because the caller has already
+ * quarantined every ambiguous case: `ordersFromSettled` surfaces an order for an ambiguous submit
+ * and for a persistence-after-fill, and the `uncertain` check refuses to continue when any such
+ * order is present. So by construction, a missing snapshot here means "no exposure was created",
+ * while a present one is terminal with a broker-confirmed cumulative quantity.
+ *
+ * ON TERMINALITY, and why it is NOT `isBrokerOrderTerminal(order.state)`.
+ *
+ * By the time `manager.submit` resolves, the adapter has already driven the order to a settled
+ * outcome — polling to a terminal state and, on timeout, protectively cancelling and CONFIRMING
+ * the final cumulative quantity. An order it could not settle surfaces as `UNKNOWN` or
+ * `RECONCILIATION_REQUIRED`, which the caller has already quarantined.
+ *
+ * So a `PARTIALLY_FILLED` snapshot arriving here is not "still working": it is a settled partial
+ * whose `filled_quantity` is the authoritative final quantity. Gating the unwind on the lifecycle
+ * enum instead of on PROVABILITY would refuse to reverse exactly those confirmed partial fills and
+ * strand them as naked exposure. Both fields are therefore derived from the single question that
+ * actually matters — is the quantity provable? — which is what the pre-existing code trusted.
+ */
+function entryLegOutcomes(
+  requests: readonly BrokerOrderRequest[],
+  orders: readonly BrokerOrder[],
+): EntryLegOutcome[] {
+  const byRole = new Map(orders.map((order) => [order.role, order]));
+  return requests.map((request) => {
+    const order = byRole.get(request.role);
+    if (!order) {
+      return {
+        role: request.role,
+        side: request.side,
+        requested: request.quantity,
+        confirmedFilled: 0,
+        terminal: true,
+        submitted: false,
+        brokerStateKnown: true,
+      };
+    }
+    const provable = order.state !== "UNKNOWN" && order.state !== "RECONCILIATION_REQUIRED";
+    return {
+      role: order.role,
+      side: order.side,
+      requested: order.quantity,
+      // BROKER CUMULATIVE FILLED QUANTITY — the only fill authority.
+      confirmedFilled: order.filled_quantity,
+      terminal: provable,
+      submitted: true,
+      brokerStateKnown: provable,
     };
   });
 }

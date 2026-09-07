@@ -2309,6 +2309,9 @@ export class BoxEngine {
       expected_net_profit: legging.final_expected_net_profit,
       required_expected_net_profit: legging.required_expected_net_profit,
       abort_after_fill: legging.abort_after_fill,
+      // Hoisted so the attempts list can distinguish a costless refusal from a real round trip
+      // without unpacking the legging blob.
+      outcome_class: legging.outcome_class ?? null,
       charge_rate_version: this.localCharges.rates.rateVersion,
       filled_leg_count: legging.filled_leg_count,
       failed_legs: legging.failed_legs,
