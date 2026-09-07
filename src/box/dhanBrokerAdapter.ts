@@ -31,8 +31,10 @@ import {
   BrokerAmbiguousSubmitError,
   BrokerDisabledError,
   BrokerOrderRejectedError,
+  BrokerPreSubmitRefusedError,
   isBrokerOrderTerminal,
   type BrokerAdapter,
+  type BeforeBrokerPost,
   type BrokerHealth,
   type BrokerMargin,
   type BrokerModifyRequest,
@@ -275,7 +277,7 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     return { ...req, tag: correlation };
   }
 
-  async submitOrder(req: BrokerOrderRequest): Promise<BrokerOrder> {
+  async submitOrder(req: BrokerOrderRequest, beforePost?: BeforeBrokerPost): Promise<BrokerOrder> {
     this.ensureTradingReady();
     // Bounded LIMIT, always. This is what stops Box from ever placing a MARKET order.
     assertBoundedLimit(req, this.cfg.maxChaseTicks);
@@ -301,6 +303,9 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     this.mark(req.client_order_id, "transport_started");
     try {
       placed = await this.call(() => {
+        // Run after pacing, at the final local boundary before the placement
+        // mutation. A thrown refusal proves placeOrder was never called.
+        beforePost?.();
         // HTTP REQUEST START: inside the paced callback, so post_to_http_response_ms measures the
         // network and Dhan, NOT our own rate limiter.
         this.mark(req.client_order_id, "http_request_started");
@@ -320,6 +325,12 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       });
       this.mark(req.client_order_id, "http_response");
     } catch (err) {
+      if (err instanceof BrokerPreSubmitRefusedError) {
+        // No HTTP request started and therefore no correlation lookup is needed.
+        this.orders.delete(req.client_order_id);
+        this.clientByCorrelation.delete(correlationId);
+        throw err;
+      }
       // Recorded on the failure path too: a timeout's duration is only measurable if the
       // response event is marked whether or not it succeeded.
       this.mark(req.client_order_id, "http_response");

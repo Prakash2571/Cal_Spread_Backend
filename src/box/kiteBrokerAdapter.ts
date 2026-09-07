@@ -2,9 +2,11 @@ import {
   BrokerAmbiguousSubmitError,
   BrokerDisabledError,
   BrokerOrderRejectedError,
+  BrokerPreSubmitRefusedError,
   assertBoundedLimit,
   isBrokerOrderTerminal,
   type BrokerAdapter,
+  type BeforeBrokerPost,
   type BrokerHealth,
   type BrokerMargin,
   type BrokerModifyRequest,
@@ -298,7 +300,7 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     };
   }
 
-  async submitOrder(req: BrokerOrderRequest): Promise<BrokerOrder> {
+  async submitOrder(req: BrokerOrderRequest, beforePost?: BeforeBrokerPost): Promise<BrokerOrder> {
     this.ensureEnabled();
     const prepared = this.prepareOrder(req);
     assertBoundedLimit(prepared, this.config.maxChaseTicks);
@@ -317,6 +319,9 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     let placed: { order_id: string };
     try {
       placed = await this.call(() => {
+        // Run after pacing, at the final local boundary before the placement
+        // mutation. A thrown refusal proves placeOrder was never called.
+        beforePost?.();
         // HTTP REQUEST START: inside the paced callback, so post_to_http_response_ms measures
         // the network and the broker, NOT our own rate limiter.
         this.mark(req.client_order_id, "http_request_started");
@@ -334,6 +339,12 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       });
       this.mark(req.client_order_id, "http_response");
     } catch (error) {
+      if (error instanceof BrokerPreSubmitRefusedError) {
+        // No HTTP request started. Remove only the session-local projection so a
+        // durable local REJECTED row cannot look like a working broker order.
+        this.orders.delete(req.client_order_id);
+        throw error;
+      }
       // The response is an observable event whether it succeeded or failed. Recording it on the
       // failure path is what makes a timeout's duration measurable instead of invisible.
       this.mark(req.client_order_id, "http_response");

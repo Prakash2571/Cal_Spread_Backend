@@ -57,7 +57,11 @@ import type { LatencyProfile } from "./latencyModel.js";
 import { shadowModeStatus } from "./shadowMode.js";
 import { profileReportBanner } from "./stressProfile.js";
 import { formatCalibrationBlock } from "./calibratedLatencySource.js";
-import { CentralBoxExecutionGateway, type BoxExecutionGateway } from "./executionGateway.js";
+import {
+  CentralBoxExecutionGateway,
+  checkedFeedBlockReason,
+  type BoxExecutionGateway,
+} from "./executionGateway.js";
 import { CoordinatedBoxExecutionGateway } from "./executionCoordinator.js";
 // The BARREL, not the `instrumentReservations.js` shim: this is the one module that
 // needs the Mongo-bound factory, and the engine is already database-bound.
@@ -393,6 +397,8 @@ export class BoxEngine {
   /** Cached exchange-hours state, refreshed on the market timer. */
   private marketOpen = false;
   private feedHealthy = false;
+  /** Raw current-socket arrival clock; intentionally independent of depth books. */
+  private lastRawTickAt: number | null = null;
   private feedGeneration = 0;
   private readonly tokenFeedGeneration = new Map<number, number>();
   private marketTimer: NodeJS.Timeout | null = null;
@@ -565,6 +571,17 @@ export class BoxEngine {
         onBrokerReject: (order, reason) => {
           this.outcomeStore.recordReject(this.deps.activeBroker(), order?.reject_family ?? null, reason);
         },
+        revalidateQueuedRequest: (request, stamp) => checkedFeedBlockReason({
+          request,
+          stamp,
+          currentGeneration: this.feedGeneration,
+          tokenCurrent: this.tokenFeedGeneration.get(request.token) === this.feedGeneration,
+          quote: this.quotes.get(request.token),
+          now: Date.now(),
+          quoteMaxAgeMs: this.cfg.quoteMaxAgeMs,
+          queueModel: this.cfg.queueModel,
+          queueLiquidityHaircutPct: this.cfg.queueLiquidityHaircutPct,
+        }),
       });
     }
     const centralGateway = new CentralBoxExecutionGateway({
@@ -573,6 +590,7 @@ export class BoxEngine {
       quotes: this.quotes,
       ...(this.orderManager ? { manager: this.orderManager, allocateTradeId: allocateBoxTradeId } : {}),
       isTokenWarm: (token) => this.tokenFeedGeneration.get(token) === this.feedGeneration,
+      feedGeneration: () => this.feedGeneration,
       // So LIVE residual flattening bills its own fees, exactly as the paper path already did.
       chargeTotal: (orders) => this.localCharges.legs(orders).total,
     });
@@ -1568,10 +1586,14 @@ export class BoxEngine {
     }
   }
 
-  /** Every socket open/close creates a fresh book generation. */
+  /** Every socket open/close creates a fresh executable-book generation. */
   private invalidateFeedGeneration(): void {
     this.feedGeneration++;
     this.tokenFeedGeneration.clear();
+    this.lastRawTickAt = null;
+    this.quotes.invalidateGeneration();
+    this.spots.clear();
+    this.scanner.clearOpportunities();
     this.feedHealthy = false;
     this.scanner.setFeedHealthy(false);
     this.orderManager?.setFeedHealthy(false);
@@ -1586,7 +1608,12 @@ export class BoxEngine {
    * frontend round trip. The UI is updated separately on its own slow cadence.
    */
   private onTicks(ticks: Tick[]): void {
+    if (ticks.length === 0) return;
     const now = Date.now();
+    // Raw socket liveness is independent of executable depth. LTP-only index,
+    // futures and option ticks keep analytics/feed health alive but cannot warm a
+    // token's executable-book generation.
+    this.lastRawTickAt = now;
     // Underlying values first: the strike window depends on them.
     for (const t of ticks) {
       if (this.subscribedSpotTokens.has(t.token) && t.last_price > 0) {
@@ -1600,40 +1627,42 @@ export class BoxEngine {
     }
     this.metrics.ticks.mark(ticks.length, now);
     const changed = this.quotes.applyTicks(ticks, now);
-    for (const token of changed) this.tokenFeedGeneration.set(token, this.feedGeneration);
+    for (const token of changed) {
+      if (this.quotes.get(token)) this.tokenFeedGeneration.set(token, this.feedGeneration);
+      else this.tokenFeedGeneration.delete(token);
+    }
     if (changed.length > 0) {
       this.metrics.wsUpdates.mark(changed.length, now);
-      // A tick arriving IS the feed-liveness signal, so the gate reopens here
-      // rather than waiting for the next timer.
-      if (!this.feedHealthy) {
-        this.feedHealthy = true;
-        this.scanner.setFeedHealthy(true);
-        this.orderManager?.setFeedHealthy(true);
-      }
-      // Open-position exits get first look at every changed WS book. This is the
-      // primary exit path; the monitor timer is only a watchdog.
+      // Open-position exits get first look at every authoritative observation,
+      // including an empty invalidation that must make pending work fail closed.
       this.monitor.onTokensUpdated(changed);
       this.scanner.onTokensUpdated(changed, now);
     }
+    // Any raw packet on the current socket restores GLOBAL liveness. Per-token
+    // execution remains guarded by current-generation usable books above.
+    if (this.marketOpen && !this.feedHealthy) {
+      this.feedHealthy = true;
+      this.scanner.setFeedHealthy(true);
+      this.orderManager?.setFeedHealthy(true);
+    }
   }
 
-  /**
-   * Whether the upstream feed is alive: has ANY book in the universe updated
-   * recently?
-   *
-   * With hundreds of instruments subscribed something is always trading during
-   * market hours, so silence across all of them means the connection is broken —
-   * whereas one quiet strike means nothing at all.
-   */
+  /** Whether the current socket has delivered any raw tick recently. */
   private isFeedHealthy(): boolean {
     if (!this.marketOpen) return false;
-    const at = this.quotes.lastUpdateAt;
+    const at = this.lastRawTickAt;
     if (at === null) return false;
     return Date.now() - at <= this.cfg.feedMaxAgeMs;
   }
 
-  /** Age (ms) of the newest tick anywhere in the box universe. */
+  /** Age (ms) of the newest raw tick anywhere in the box universe. */
   private feedAgeMs(): number | null {
+    const at = this.lastRawTickAt;
+    return at === null ? null : Date.now() - at;
+  }
+
+  /** Age of the newest authoritative book observation (usable or invalidating). */
+  private bookObservationAgeMs(): number | null {
     const at = this.quotes.lastUpdateAt;
     return at === null ? null : Date.now() - at;
   }
@@ -3804,8 +3833,12 @@ export class BoxEngine {
       hub_connected: this.deps.feed.isConnected(),
       quotes: this.quotes.size,
       quote_updates: this.quotes.updateCount,
-      /** Feed liveness: age of the newest tick anywhere, and the verdict. */
+      /** Preserved field: now correctly reports RAW current-socket tick age. */
       feed_age_ms: this.feedAgeMs(),
+      raw_tick_age_ms: this.feedAgeMs(),
+      book_observation_age_ms: this.bookObservationAgeMs(),
+      executable_books: this.quotes.size,
+      executable_book_diagnostics: this.quotes.diagnostics(),
       feed_healthy: this.isFeedHealthy(),
       /**
        * APPROXIMATE lag behind the exchange, from Kite's second-resolution
@@ -3949,9 +3982,8 @@ export class BoxEngine {
 
   invalidateBooks(): void {
     this.invalidateFeedGeneration();
-    this.quotes.clear();
-    this.spots.clear();
-    this.scanner.clearOpportunities();
+    // Broker-switch-only transport ownership reset. Executable state is already
+    // cleared by every generation invalidation above.
     this.subscribedOptionTokens.clear();
     this.subscribedSpotTokens.clear();
   }

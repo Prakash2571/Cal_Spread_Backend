@@ -114,15 +114,16 @@ export function buildOrderPricing(args: {
  * same configuration always yield the same effective quantity.
  */
 export function effectiveQty(displayed: number, model: BoxQueueModel, haircutPct: number): number {
-  if (!(displayed > 0)) return 0;
-  if (model === "none") return Math.floor(displayed);
+  if (!Number.isSafeInteger(displayed) || displayed <= 0) return 0;
+  if (model === "none") return displayed;
+  if (!Number.isFinite(haircutPct)) return 0;
   const pct = Math.min(100, Math.max(0, haircutPct));
   return Math.floor(displayed * (1 - pct / 100));
 }
 
 /** Whether a level's price is executable for a side against a limit. */
 function withinLimit(side: OrderSide, price: number, limit: number): boolean {
-  if (!(price > 0)) return false;
+  if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(limit) || limit <= 0) return false;
   return side === "BUY" ? price <= limit + EPS : price >= limit - EPS;
 }
 
@@ -168,7 +169,11 @@ export function walkDepth(args: {
 }): DepthWalkResult {
   const { side, levels, remainingQty, limitPrice, queueModel, haircutPct, at, quoteVersion, reserved } = args;
   const slices: PaperFillSlice[] = [];
-  let remaining = Math.max(0, remainingQty);
+  if (!Number.isSafeInteger(remainingQty) || remainingQty <= 0 ||
+      !Number.isFinite(limitPrice) || limitPrice <= 0) {
+    return { filled_qty: 0, average_price: null, slices, executable_within_limit: 0 };
+  }
+  let remaining = remainingQty;
   let filled = 0;
   let valueSum = 0;
   let executableWithinLimit = 0;
@@ -176,7 +181,8 @@ export function walkDepth(args: {
   // Best price first: ascending for a BUY (cheapest ask), descending for a SELL
   // (richest bid). Sorting a COPY leaves the caller's book untouched.
   const ordered = [...levels]
-    .filter((l) => l.price > 0 && l.qty > 0)
+    .filter((l) => Number.isFinite(l.price) && l.price > 0 && Number.isFinite(l.price * 100) &&
+      Number.isSafeInteger(l.qty) && l.qty > 0 && Number.isFinite(l.price * l.qty))
     .sort((a, b) => (side === "BUY" ? a.price - b.price : b.price - a.price));
 
   for (const lv of ordered) {
@@ -185,9 +191,10 @@ export function walkDepth(args: {
     // Subtract liquidity earlier concurrent paper attempts already reserved at this
     // exact level+version. `reserved` is undefined outside live-parity paper, so this is
     // a no-op and the result is identical to before.
-    const already = reserved ? Math.max(0, reserved(lv.price, quoteVersion)) : 0;
+    const reservedQty = reserved ? reserved(lv.price, quoteVersion) : 0;
+    const already = Number.isSafeInteger(reservedQty) && reservedQty > 0 ? reservedQty : 0;
     const effective = Math.max(0, effectiveRaw - already);
-    executableWithinLimit += effective;
+    executableWithinLimit = Math.min(Number.MAX_SAFE_INTEGER, executableWithinLimit + effective);
     if (remaining <= 0 || effective <= 0) continue;
     const take = Math.min(remaining, effective);
     if (take <= 0) continue;
@@ -286,7 +293,8 @@ export function touchPrice(side: OrderSide, bids: BoxDepthLevel[], asks: BoxDept
   const levels = side === "BUY" ? asks : bids;
   let best: number | null = null;
   for (const l of levels) {
-    if (!(l.price > 0)) continue;
+    if (!Number.isFinite(l.price) || l.price <= 0 ||
+        !Number.isSafeInteger(l.qty) || l.qty <= 0) continue;
     if (best === null) best = l.price;
     else best = side === "BUY" ? Math.min(best, l.price) : Math.max(best, l.price);
   }

@@ -288,17 +288,25 @@ export class TickerHub {
         ask: t.ask,
         ...(t.bids ? { bids: t.bids } : {}),
         ...(t.asks ? { asks: t.asks } : {}),
+        ...(t.depth_updated !== undefined ? { depth_updated: t.depth_updated } : {}),
         ...(t.exchange_ts ? { exchange_ts: t.exchange_ts } : {}),
       };
       this.latest.set(t.token, s);
       this.latestAt.set(t.token, now);
-      if (t.bids && t.asks && (t.bids.length > 0 || t.asks.length > 0)) {
-        this.latestLadder.set(t.token, {
-          last: t.last_price,
-          bids: t.bids,
-          asks: t.asks,
-        });
-        this.latestLadderAt.set(t.token, now);
+      const legacyDepth = t.depth_updated === undefined &&
+        (Object.prototype.hasOwnProperty.call(t, "bids") || Object.prototype.hasOwnProperty.call(t, "asks"));
+      const authoritativeDepth = t.depth_updated === true || legacyDepth;
+      if (authoritativeDepth) {
+        const bids = t.bids ?? [];
+        const asks = t.asks ?? [];
+        if (bids.length > 0 || asks.length > 0) {
+          this.latestLadder.set(t.token, { last: t.last_price, bids, asks });
+          this.latestLadderAt.set(t.token, now);
+        } else {
+          // An authoritative empty ladder invalidates the retained UI snapshot too.
+          this.latestLadder.delete(t.token);
+          this.latestLadderAt.delete(t.token);
+        }
       }
       slim.push(s);
     }

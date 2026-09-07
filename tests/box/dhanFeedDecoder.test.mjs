@@ -20,7 +20,8 @@ import {
   DHAN_FEED_CODE,
   DHAN_HEADER_BYTES,
 } from "../../dist/brokers/dhan/feedDecoder.js";
-import { toTick } from "../../dist/brokers/dhan/feed.js";
+import { DhanFeed, toTick } from "../../dist/brokers/dhan/feed.js";
+import { BoxQuoteStore } from "../../dist/box/quotes.js";
 
 /** Build one packet with Dhan's 8-byte header. All writes little-endian. */
 function packet(code, byteLength, segmentCode, securityId, fill) {
@@ -339,4 +340,42 @@ test("toTick reports a missing side as 0 rather than guessing a price", () => {
   });
   assert.equal(tick.bid, 0);
   assert.equal(tick.ask, 6);
+});
+
+
+
+test("production Dhan frame handling marks FULL authoritative and retained partial depth non-authoritative", () => {
+  const internalToken = 7_654_321;
+  const batches = [];
+  const feed = new DhanFeed({
+    accessToken: () => null,
+    clientId: () => "",
+    onTicks: (ticks) => batches.push(ticks),
+    resolve: (token) => token === internalToken ? { segment: "NSE_FNO", securityId: SECURITY } : null,
+  });
+  // TypeScript private state is ordinary runtime state in the compiled JS. Seed the
+  // requested token without opening a network socket, then drive the real decoder,
+  // merge, provenance derivation, and onTicks path through handleFrame.
+  feed.wanted.add(internalToken);
+
+  feed.handleFrame(fullPacket({ bids: [[100, 75, 3]], asks: [[101, 50, 2]] }));
+  feed.handleFrame(packet(DHAN_FEED_CODE.TICKER, 16, NSE_FNO, SECURITY, (v) => {
+    v.setFloat32(8, 102.5, true);
+    v.setInt32(12, 1_760_000_500, true);
+  }));
+
+  assert.equal(batches.length, 2);
+  const full = batches[0][0];
+  const partial = batches[1][0];
+  assert.equal(full.depth_updated, true);
+  assert.equal(partial.depth_updated, false);
+  assert.deepEqual(partial.bids, full.bids, "merged ladders remain available for UI compatibility");
+  assert.deepEqual(partial.asks, full.asks);
+
+  const store = new BoxQuoteStore();
+  store.applyTicks([full], 1_000);
+  const accepted = store.get(internalToken);
+  store.applyTicks([partial], 2_000);
+  assert.equal(store.get(internalToken).version, accepted.version);
+  assert.equal(store.get(internalToken).at, 1_000);
 });

@@ -1345,12 +1345,14 @@ export async function updateBoxOrderIntent(
   clientOrderId: string,
   patch: BoxOrderIntentPatch,
   audit: BoxOrderIntentAudit,
+  expectedStates?: readonly BoxOrderIntentState[],
 ): Promise<BoxOrderIntentUpdateResult> {
   if (!isBoxDbEnabled()) {
     throw new Error("Box persistence is unavailable while updating a live order intent.");
   }
   const guards: Record<string, unknown>[] = [];
   if (patch.state) guards.push({ state: { $in: INTENT_STATE_PREDECESSORS[patch.state] } });
+  if (expectedStates) guards.push({ state: { $in: expectedStates } });
   if (patch.filled_quantity !== undefined) {
     guards.push({ filled_quantity: { $lte: patch.filled_quantity } });
   }

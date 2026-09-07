@@ -33,9 +33,10 @@
  *                              per `client_order_id`) decides what that means: a `CREATED`
  *                              intent is submitted (no POST had happened), anything later is
  *                              adopted through `adapter.getOrder`. Never a duplicate order.
- *   crash after that write  -> the previous generation reached a TERMINAL broker outcome before
- *                              we advanced (that is the only disposition that advances), so its
- *                              identity is spent and the new one is genuinely new.
+ *   crash after that write  -> the previous generation reached a TERMINAL durable outcome before
+ *                              we advanced: either a terminal broker result or a local refusal
+ *                              whose audit proves no POST. Its identity is spent and the new one
+ *                              is genuinely new.
  *
  * The generation is therefore never a loose in-memory counter, never `Date.now()` and never
  * random: each attempt is represented explicitly by its own row in `box_order_intents`.
@@ -65,8 +66,9 @@ export type ResidualFlattenDisposition =
   /** Nothing is left. The residual is gone. */
   | "flattened"
   /**
-   * This identity reached a TERMINAL broker outcome (COMPLETE / CANCELLED / REJECTED) and
-   * quantity remains. The identity is SPENT: the remainder needs a NEW generation, otherwise
+   * This identity reached a TERMINAL durable outcome: either a terminal broker
+   * result or a local pre-POST refusal that proves no broker mutation occurred,
+   * and quantity remains. The identity is SPENT: the remainder needs a NEW generation, otherwise
    * the durable intent's immutable `quantity` blocks it forever.
    */
   | "retire_attempt"
@@ -92,6 +94,8 @@ export type ResidualFlattenFailureKind =
   | "gate_refused"
   /** The identity is already queued or in flight in this process. */
   | "already_in_flight"
+  /** The gateway admitted a book, but queue/pre-POST revalidation refused it locally. */
+  | "local_pre_submit_refused"
   /** The broker refused the order and said so. A known outcome. */
   | "broker_rejected"
   /** The broker filled it but the durable snapshot failed. Broker truth wins. */
@@ -209,8 +213,10 @@ export function dispositionForFailure(kind: ResidualFlattenFailureKind): Residua
     case "already_in_flight":
       // Nothing reached the broker. The identity is untouched and must be reused.
       return "reuse_attempt";
+    case "local_pre_submit_refused":
     case "broker_rejected":
-      // The broker terminally refused this order. The identity is spent.
+      // A durable terminal outcome spends the identity. For a local refusal the
+      // audit proves no broker POST; for a broker rejection the broker is terminal.
       return "retire_attempt";
     case "identity_conflict":
       // A stale immutable snapshot must never be able to strand exposure. Retire past it.
@@ -237,6 +243,7 @@ export function residualFailurePhrase(kind: ResidualFlattenFailureKind): string 
     case "no_executable_book": return "no executable book on the reducing side";
     case "gate_refused": return "an order-manager gate refused the reduction before the broker";
     case "already_in_flight": return "the same attempt is already queued or in flight";
+    case "local_pre_submit_refused": return "current executable-feed authority refused before broker POST";
     case "broker_rejected": return "the broker terminally rejected the reduction";
     case "persistence_after_fill": return "filled but its durable snapshot failed";
     case "broker_state_unknown": return "uncertain broker terminal quantity; quarantined for reconciliation";

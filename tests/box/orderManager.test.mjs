@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { BrokerAmbiguousSubmitError } from "../../dist/box/brokerAdapter.js";
+import {
+  BrokerAmbiguousSubmitError,
+  BrokerPreSubmitRefusedError,
+} from "../../dist/box/brokerAdapter.js";
 import {
   BoxOrderManager,
   OrderPersistenceAfterFillError,
@@ -133,11 +136,19 @@ class MemoryPersistence {
    * cumulative quantity matches and reports `applied: true` — because that is what makes a naive
    * caller-snapshot delta double-count.
    */
-  async update(clientOrderId, patch, audit) {
+  async update(clientOrderId, patch, audit, expectedStates) {
     const current = this.rows.get(clientOrderId);
     this.events.push(["update", clientOrderId, patch.state ?? current?.state]);
     if (!current) {
       return { intent: null, applied: false, previous_filled_quantity: null, current_filled_quantity: null };
+    }
+    if (expectedStates && !expectedStates.includes(current.state)) {
+      return {
+        intent: clone(current),
+        applied: false,
+        previous_filled_quantity: current.filled_quantity,
+        current_filled_quantity: current.filled_quantity,
+      };
     }
     if (patch.filled_quantity !== undefined && patch.filled_quantity < current.filled_quantity) {
       return {
@@ -181,7 +192,9 @@ function fakeAdapter(options = {}) {
     orders,
     get maxActive() { return maxActive; },
     prepareOrder: (req) => ({ ...req, pricing: { ...req.pricing }, tag: req.tag ?? `TAG${req.role}` }),
-    submitOrder: async (req) => {
+    submitOrder: async (req, beforePost) => {
+      await options.beforePost?.(req, adapter);
+      beforePost?.();
       calls.push(["submit", req.purpose, req.role, req.client_order_id, req.quantity]);
       active++;
       maxActive = Math.max(maxActive, active);
@@ -223,7 +236,13 @@ const limits = (overrides = {}) => ({
   ...overrides,
 });
 
-async function managerHarness({ persistence = new MemoryPersistence(), adapter = fakeAdapter(), limitOverrides = {}, reconcile = true } = {}) {
+async function managerHarness({
+  persistence = new MemoryPersistence(),
+  adapter = fakeAdapter(),
+  limitOverrides = {},
+  reconcile = true,
+  revalidateQueuedRequest,
+} = {}) {
   let now = 10_000;
   const manager = new BoxOrderManager({
     adapter,
@@ -232,6 +251,7 @@ async function managerHarness({ persistence = new MemoryPersistence(), adapter =
     controls: { entryEnabled: true, liveOrderEnabled: true, emergencyFlatten: true },
     clock: { now: () => now++ },
     istDayKey: () => "2026-09-02",
+    ...(revalidateQueuedRequest ? { revalidateQueuedRequest } : {}),
   });
   manager.seedLimits({ tradingDay: "2026-09-02" });
   manager.setFeedHealthy(true);
@@ -240,6 +260,13 @@ async function managerHarness({ persistence = new MemoryPersistence(), adapter =
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+const feedStamp = (req, generation = 1, version = 1, at = 9_000) => ({
+  token: req.token,
+  feed_generation: generation,
+  quote_version: version,
+  quote_at: at,
+  checked_at: at,
+});
 
 test("CREATED and SUBMITTING are durable before transport submission", async () => {
   const persistence = new MemoryPersistence();
@@ -314,6 +341,256 @@ test("queued work is ordered emergency > cancel > exit > entry", async () => {
       .map(([name, purpose]) => name === "cancel" ? "PROTECTIVE_CANCEL" : purpose),
     ["ENTRY", "EMERGENCY_RESIDUAL", "PROTECTIVE_CANCEL", "EXIT", "ENTRY"],
   );
+});
+
+test("queued ENTRY, EXIT, and emergency reductions cannot cross a feed generation", async (t) => {
+  for (const purpose of ["ENTRY", "EXIT", "EMERGENCY_RESIDUAL"]) {
+    await t.test(purpose, async () => {
+      let release;
+      const held = new Promise((resolve) => { release = resolve; });
+      let holdFirst = true;
+      let generation = 1;
+      const adapter = fakeAdapter({
+        submit: async (req) => {
+          if (holdFirst) {
+            holdFirst = false;
+            await held;
+          }
+          return orderFrom(req);
+        },
+      });
+      const validate = (req, stamp) =>
+        !stamp || stamp.token !== req.token || stamp.feed_generation !== generation
+          ? "feed generation changed while order was queued"
+          : null;
+      const h = await managerHarness({ adapter, revalidateQueuedRequest: validate });
+      const blockerReq = request({ role: "k1_ce", attempt_id: `blocker-${purpose}` });
+      const blocker = h.manager.submit(blockerReq, feedStamp(blockerReq));
+      await tick();
+
+      const queuedReq = purpose === "ENTRY"
+        ? request({ role: "k2_ce", purpose, attempt_id: `stale-${purpose}` })
+        : request({
+            role: "k2_ce",
+            purpose,
+            attempt_id: `stale-${purpose}`,
+            phase: purpose === "EXIT" ? "exit" : "unwind",
+            tradingsymbol: `REDUCE-${purpose}`,
+            token: 8_000 + (purpose === "EXIT" ? 1 : 2),
+            side: "SELL",
+          });
+      if (purpose !== "ENTRY") {
+        h.manager.setAttributedBoxPositions([{
+          token: queuedReq.token,
+          exchange: "NFO",
+          tradingsymbol: queuedReq.tradingsymbol,
+          net_quantity: queuedReq.quantity,
+          average_price: 100,
+        }]);
+      }
+      const queued = h.manager.submit(queuedReq, feedStamp(queuedReq));
+      generation = 2;
+      release();
+      await blocker;
+      const error = await queued.then(() => null, (reason) => reason);
+
+      assert.ok(error instanceof BrokerPreSubmitRefusedError);
+      assert.equal(error.stage, "dequeue");
+      assert.equal(error.durableIdentitySpent, true);
+      assert.equal(h.persistence.rows.get(queuedReq.client_order_id).state, "REJECTED");
+      assert.equal(
+        adapter.calls.some(([name, , , clientId]) => name === "submit" && clientId === queuedReq.client_order_id),
+        false,
+        "the stale queued request made no adapter POST",
+      );
+      assert.equal(h.manager.status().rejects, 0, "a local refusal is not a broker rejection");
+    });
+  }
+});
+
+test("generation change after SUBMITTING but before broker POST is locally terminal", async () => {
+  let generation = 1;
+  const req = request({ attempt_id: "pre-post-reset" });
+  const adapter = fakeAdapter({
+    beforePost: async (candidate) => {
+      if (candidate.client_order_id === req.client_order_id) generation = 2;
+    },
+  });
+  const h = await managerHarness({
+    adapter,
+    revalidateQueuedRequest: (candidate, stamp) =>
+      stamp?.token === candidate.token && stamp.feed_generation === generation
+        ? null
+        : "feed generation changed before broker POST",
+  });
+
+  const error = await h.manager.submit(req, feedStamp(req)).then(() => null, (reason) => reason);
+  assert.ok(error instanceof BrokerPreSubmitRefusedError);
+  assert.equal(error.stage, "pre_post");
+  assert.equal(h.persistence.rows.get(req.client_order_id).state, "REJECTED");
+  assert.equal("feed_generation" in h.persistence.rows.get(req.client_order_id), false);
+  assert.equal("quote_version" in h.persistence.rows.get(req.client_order_id), false);
+  assert.equal(adapter.calls.filter(([name]) => name === "submit").length, 0);
+  assert.equal(h.manager.status().unknownOrders, 0, "known local refusal is not broker uncertainty");
+  assert.equal(h.manager.status().rejects, 0);
+});
+
+test("a lost pre-POST refusal CAS is reconciliation, never local no-POST provenance", async () => {
+  let generation = 1;
+  const req = request({ attempt_id: "pre-post-refusal-cas-loser" });
+  const persistence = new MemoryPersistence();
+  const update = persistence.update.bind(persistence);
+  persistence.update = async (clientOrderId, patch, audit, expectedStates) => {
+    if (patch.state === "REJECTED" && expectedStates?.includes("SUBMITTING")) {
+      const current = persistence.rows.get(clientOrderId);
+      const externallyAdvanced = {
+        ...current,
+        state: "REJECTED",
+        reject_reason: "external broker outcome",
+        terminal_at: new Date(10_002),
+      };
+      persistence.rows.set(clientOrderId, externallyAdvanced);
+      return {
+        intent: clone(externallyAdvanced),
+        applied: false,
+        previous_filled_quantity: current.filled_quantity,
+        current_filled_quantity: current.filled_quantity,
+      };
+    }
+    return update(clientOrderId, patch, audit, expectedStates);
+  };
+  const adapter = fakeAdapter({
+    beforePost: async () => { generation = 2; },
+  });
+  const h = await managerHarness({
+    persistence,
+    adapter,
+    revalidateQueuedRequest: (candidate, stamp) =>
+      stamp?.token === candidate.token && stamp.feed_generation === generation
+        ? null
+        : "generation changed at final boundary",
+  });
+
+  const error = await h.manager.submit(req, feedStamp(req)).then(() => null, (reason) => reason);
+  assert.ok(error instanceof BrokerAmbiguousSubmitError);
+  assert.equal(error instanceof BrokerPreSubmitRefusedError, false);
+  assert.equal(adapter.calls.filter(([name]) => name === "submit").length, 0);
+  assert.match(error.message, /reconciliation is required/);
+});
+
+test("stale feed evidence never hides adoption of an existing non-CREATED intent", async () => {
+  const req = request({
+    purpose: "EMERGENCY_RESIDUAL",
+    phase: "unwind",
+    side: "SELL",
+    attempt_id: "adopt-across-feed-reset",
+  });
+  const durable = intentFrom(req, "SUBMITTING", 0);
+  const broker = orderFrom(req);
+  const persistence = new MemoryPersistence([durable]);
+  const adapter = fakeAdapter({ orders: [broker] });
+  const h = await managerHarness({
+    persistence,
+    adapter,
+    reconcile: false,
+    revalidateQueuedRequest: () => "feed generation is stale",
+  });
+
+  h.manager.setAttributedBoxPositions([{
+    token: req.token,
+    exchange: req.exchange,
+    tradingsymbol: req.tradingsymbol,
+    net_quantity: req.quantity,
+    average_price: 100,
+  }]);
+  const adopted = await h.manager.submit(req, feedStamp(req));
+  assert.equal(adopted.state, "COMPLETE");
+  assert.equal(adapter.calls.filter(([name]) => name === "submit").length, 0);
+  assert.equal(adapter.calls.filter(([name]) => name === "get").length, 1);
+  assert.equal(persistence.rows.get(req.client_order_id).state, "COMPLETE");
+});
+
+test("two managers racing one CREATED identity produce exactly one broker placement", async () => {
+  const persistence = new MemoryPersistence();
+  const create = persistence.create.bind(persistence);
+  let arrivals = 0;
+  let releaseCreates;
+  const bothCreated = new Promise((resolve) => { releaseCreates = resolve; });
+  persistence.create = async (intent) => {
+    const created = await create(intent);
+    arrivals++;
+    if (arrivals === 2) releaseCreates();
+    await bothCreated;
+    return created;
+  };
+  let placements = 0;
+  const adapterA = fakeAdapter({ submit: async (req) => { placements++; return orderFrom(req); } });
+  const adapterB = fakeAdapter({ submit: async (req) => { placements++; return orderFrom(req); } });
+  const [a, b] = await Promise.all([
+    managerHarness({ persistence, adapter: adapterA }),
+    managerHarness({ persistence, adapter: adapterB }),
+  ]);
+  const req = request({
+    purpose: "EMERGENCY_RESIDUAL",
+    phase: "unwind",
+    side: "SELL",
+    attempt_id: "cross-process-race",
+  });
+  for (const h of [a, b]) {
+    h.manager.setAttributedBoxPositions([{
+      token: req.token,
+      exchange: req.exchange,
+      tradingsymbol: req.tradingsymbol,
+      net_quantity: req.quantity,
+      average_price: 100,
+    }]);
+  }
+
+  const settled = await Promise.allSettled([
+    a.manager.submit(req),
+    b.manager.submit(req),
+  ]);
+  assert.equal(placements, 1, "only the applied CREATED -> SUBMITTING CAS winner may POST");
+  assert.equal(settled.filter((item) => item.status === "fulfilled").length, 1);
+  const loser = settled.find((item) => item.status === "rejected");
+  assert.ok(loser.reason instanceof BrokerAmbiguousSubmitError);
+  assert.match(loser.reason.message, /attempted no broker POST/);
+  assert.equal(persistence.rows.get(req.client_order_id).state, "COMPLETE");
+});
+
+test("a lost local-refusal CAS cannot claim no-POST provenance", async () => {
+  const req = request({ attempt_id: "local-refusal-cas-loser" });
+  const persistence = new MemoryPersistence();
+  const update = persistence.update.bind(persistence);
+  persistence.update = async (clientOrderId, patch, audit, expectedStates) => {
+    if (patch.state === "REJECTED" && expectedStates) {
+      const current = persistence.rows.get(clientOrderId);
+      const brokerRejected = {
+        ...current,
+        state: "REJECTED",
+        reject_reason: "broker rejected elsewhere",
+        terminal_at: new Date(10_001),
+      };
+      persistence.rows.set(clientOrderId, brokerRejected);
+      return {
+        intent: clone(brokerRejected),
+        applied: false,
+        previous_filled_quantity: current.filled_quantity,
+        current_filled_quantity: current.filled_quantity,
+      };
+    }
+    return update(clientOrderId, patch, audit, expectedStates);
+  };
+  const h = await managerHarness({
+    persistence,
+    revalidateQueuedRequest: () => "feed generation changed",
+  });
+
+  const error = await h.manager.submit(req, feedStamp(req)).then(() => null, (reason) => reason);
+  assert.ok(error instanceof BrokerAmbiguousSubmitError);
+  assert.equal(error instanceof BrokerPreSubmitRefusedError, false);
+  assert.equal(h.adapter.calls.filter(([name]) => name === "submit").length, 0);
+  assert.equal(h.manager.status().durableTransitionRefusals, 1);
 });
 
 test("reductions must use the exact reducing side/quantity and cannot cross flat", async () => {

@@ -1,6 +1,15 @@
 import type { BrokerOrder, BrokerOrderRequest } from "./brokerAdapter.js";
-import { BrokerAmbiguousSubmitError, BrokerOrderRejectedError, boxClientOrderId } from "./brokerAdapter.js";
-import { OrderPersistenceAfterFillError, type BoxOrderManager } from "./orderManager.js";
+import {
+  BrokerAmbiguousSubmitError,
+  BrokerOrderRejectedError,
+  BrokerPreSubmitRefusedError,
+  boxClientOrderId,
+} from "./brokerAdapter.js";
+import {
+  OrderPersistenceAfterFillError,
+  type BoxOrderManager,
+  type CheckedFeedStamp,
+} from "./orderManager.js";
 import {
   carryResidualForward,
   classifyResidualFlattenErrorMessage,
@@ -57,6 +66,51 @@ export interface BoxExecutionGateway {
 }
 
 /**
+ * Re-check a gateway admission stamp against the newest book in the SAME socket
+ * generation. A newer book may proceed only when it still executes the immutable
+ * quantity within the immutable bounded LIMIT; generation changes always refuse.
+ */
+export function checkedFeedBlockReason(args: {
+  request: BrokerOrderRequest;
+  stamp: CheckedFeedStamp | undefined;
+  currentGeneration: number;
+  tokenCurrent: boolean;
+  quote: ReturnType<BoxQuoteStore["get"]>;
+  now: number;
+  quoteMaxAgeMs: number;
+  queueModel: BoxConfig["queueModel"];
+  queueLiquidityHaircutPct: number;
+}): string | null {
+  const { request, stamp, quote } = args;
+  if (!stamp) return "checked executable-feed evidence is missing";
+  if (stamp.token !== request.token) return "checked executable-feed token does not match request";
+  if (stamp.feed_generation !== args.currentGeneration) return "feed generation changed while order was queued";
+  if (!args.tokenCurrent) return "token has no executable book in the current feed generation";
+  if (!quote) return "current executable book is absent";
+  if (!Number.isSafeInteger(stamp.quote_version) || quote.version < stamp.quote_version || quote.at < stamp.quote_at) {
+    return "executable book identity regressed after bounded-depth admission";
+  }
+  const age = args.now - quote.at;
+  if (!Number.isFinite(stamp.checked_at) || stamp.checked_at < stamp.quote_at || stamp.checked_at > args.now ||
+      !Number.isFinite(age) || age < 0 || age > args.quoteMaxAgeMs) {
+    return "checked executable book is stale or has invalid timing";
+  }
+  const walk = walkDepth({
+    side: request.side,
+    levels: request.side === "BUY" ? quote.asks : quote.bids,
+    remainingQty: request.quantity,
+    limitPrice: request.pricing.limit_price,
+    queueModel: args.queueModel,
+    haircutPct: args.queueLiquidityHaircutPct,
+    at: quote.at,
+    quoteVersion: quote.version,
+  });
+  return walk.executable_within_limit >= request.quantity
+    ? null
+    : "current executable book no longer covers bounded order quantity";
+}
+
+/**
  * Central execution facade. Paper modes delegate byte-for-byte to the existing
  * deterministic simulator; live mode emits bounded LIMIT intents through the
  * durable BoxOrderManager and trusts broker cumulative fills only.
@@ -72,6 +126,8 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     /** Allocates the Mongo identity before any live intent is created. */
     allocateTradeId?: () => string;
     isTokenWarm?: (token: number) => boolean;
+    /** Current socket generation, captured with each checked executable book. */
+    feedGeneration?: () => number;
     now?: () => number;
     /**
      * Total charges (₹) for a set of orders, from the LOCAL fee calculator.
@@ -110,6 +166,7 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     }
     const submittedAt = this.now();
     const requests: BrokerOrderRequest[] = [];
+    let checkedFeed = new Map<string, CheckedFeedStamp>();
     try {
       for (const role of BOX_LEG_ROLES) {
         const leg = args.detection.legs.find((item) => item.role === role);
@@ -126,12 +183,14 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           phase: "entry",
         }));
       }
-      this.precheck(requests);
+      checkedFeed = this.precheck(requests);
     } catch (error) {
       return liveEntryFailure(args.candidate, args.detection.at, submittedAt, [], "insufficient_quantity", errorMessage(error), this.deps.cfg, tradeId);
     }
 
-    const settled = await Promise.allSettled(requests.map((request) => manager.submit(request)));
+    const settled = await Promise.allSettled(
+      requests.map((request) => manager.submit(request, checkedFeed.get(request.client_order_id))),
+    );
     const orders = ordersFromSettled(settled);
     const uncertain = settled.some((item) => item.status === "rejected" &&
       (item.reason instanceof OrderPersistenceAfterFillError ||
@@ -200,15 +259,20 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       const record = liveRecord(args.detectedAt, this.now(), [], false, this.deps.cfg, undefined, args.position.id);
       return { ok: false, record, reason: "legging_incomplete", detail: "position already flat" };
     }
+    let checkedFeed: Map<string, CheckedFeedStamp>;
     try {
-      this.precheck(requests);
+      checkedFeed = this.precheck(requests);
     } catch (error) {
       const record = liveRecord(args.detectedAt, this.now(), [], false, this.deps.cfg, requests.length, args.position.id);
       return { ok: false, record, reason: "insufficient_quantity", detail: errorMessage(error) };
     }
-    const settled = await Promise.allSettled(requests.map((request) => manager.submit(request)));
+    const settled = await Promise.allSettled(
+      requests.map((request) => manager.submit(request, checkedFeed.get(request.client_order_id))),
+    );
     const orders = ordersFromSettled(settled);
-    const uncertain = settled.some((item) => item.status === "rejected") || orders.some((order) => order.state === "UNKNOWN" || order.state === "RECONCILIATION_REQUIRED");
+    const uncertain = settled.some((item) => item.status === "rejected" &&
+      !(item.reason instanceof BrokerPreSubmitRefusedError)) ||
+      orders.some((order) => order.state === "UNKNOWN" || order.state === "RECONCILIATION_REQUIRED");
     if (uncertain) manager.invariantViolation(`live exit ${attemptId} has uncertain broker terminal quantity`);
     const record = liveRecord(args.detectedAt, this.now(), orders, false, this.deps.cfg, requests.length, args.position.id);
     const legs = legsFromOrders(orders, args.position.legs, this.deps.quotes, this.now());
@@ -240,8 +304,8 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
    * See `residualFlatten.ts` for the state machine and the crash-safety argument.
    *
    * Nothing here is allowed to swallow an error. Each leg's outcome is classified into a fixed
-   * disposition that decides ONE thing: may the next pass reuse this identity? Only a terminal
-   * broker outcome (or a durable identity conflict, which is a bug) retires a generation.
+   * disposition that decides ONE thing: may the next pass reuse this identity? A terminal
+   * durable outcome spends it only when the broker is terminal or a local guard proves no POST.
    */
   async flattenResidual(args: Parameters<BoxExecutionSimulator["flattenResidual"]>[0]): ReturnType<BoxExecutionSimulator["flattenResidual"]> {
     if (this.mode !== "live") return this.deps.simulator.flattenResidual(args);
@@ -315,12 +379,14 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       return { residual, attempt, order, disposition: dispositionForFailure(kind), failure: kind, detail };
     };
 
-    const quote = this.deps.quotes.get(residual.token);
     const side: OrderSide = residual.side === "BUY" ? "SELL" : "BUY";
+    const quote = this.deps.quotes.get(residual.token);
     const reference = quote ? touchPrice(side, quote.bids, quote.asks) : null;
-    if (!reference) {
+    const enforceCurrentGeneration = this.deps.isTokenWarm !== undefined;
+    if (!reference || (this.deps.isTokenWarm && !this.deps.isTokenWarm(residual.token)) ||
+        !quote || (enforceCurrentGeneration && this.now() - quote.at > this.deps.cfg.quoteMaxAgeMs)) {
       // Nothing was sent, so the identity is still unused and MUST be reused next pass.
-      return fail("no_executable_book", `no executable ${side} touch for ${residual.tradingsymbol}`);
+      return fail("no_executable_book", `no current executable ${side} touch for ${residual.tradingsymbol}`);
     }
 
     const inst: BoxOptionInstrument = {
@@ -334,7 +400,7 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     };
 
     try {
-      const order = await manager.submit(this.request({
+      const request = this.request({
         role: residual.role,
         inst,
         side,
@@ -344,7 +410,16 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
         attemptId: residualFlattenAttemptId(base, attempt),
         purpose: "EMERGENCY_RESIDUAL",
         phase: "unwind",
-      }));
+      });
+      // Residual reduction bypasses entry discovery/warmup, but never bounded
+      // quantity, freshness, relevant-side depth, or generation checks.
+      let checkedFeed: Map<string, CheckedFeedStamp>;
+      try {
+        checkedFeed = this.precheck([request]);
+      } catch (error) {
+        return fail("no_executable_book", errorMessage(error));
+      }
+      const order = await manager.submit(request, checkedFeed.get(request.client_order_id));
       const disposition = classifyResidualOrder(order, residual.quantity);
       if (disposition === "adopt_attempt") {
         // A working or unknown order still owns this identity. Keep it and reconcile.
@@ -356,6 +431,11 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       // quantity is credited, and trip the invariant.
       if (error instanceof OrderPersistenceAfterFillError) {
         return fail("persistence_after_fill", errorMessage(error), error.order);
+      }
+      // A durable local refusal proves no broker POST and terminally spends this
+      // identity, so the still-outstanding quantity must advance to attempt N+1.
+      if (error instanceof BrokerPreSubmitRefusedError) {
+        return fail("local_pre_submit_refused", errorMessage(error));
       }
       // A KNOWN market refusal. Terminal, so the identity is spent — but it is not a fault.
       if (error instanceof BrokerOrderRejectedError) {
@@ -451,13 +531,20 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     };
   }
 
-  private precheck(requests: BrokerOrderRequest[]): void {
+  private precheck(requests: BrokerOrderRequest[]): Map<string, CheckedFeedStamp> {
+    const checked = new Map<string, CheckedFeedStamp>();
+    const checkedAt = this.now();
+    const feedGeneration = this.deps.feedGeneration?.() ?? 0;
     for (const request of requests) {
       if (this.mode === "live" && this.deps.isTokenWarm && !this.deps.isTokenWarm(request.token)) {
         throw new Error(`${request.tradingsymbol} has not received a WebSocket tick in the current feed generation.`);
       }
       const quote = this.deps.quotes.get(request.token);
       if (!quote) throw new Error(`${request.tradingsymbol} has no live depth.`);
+      const age = checkedAt - quote.at;
+      if (this.deps.isTokenWarm && (!Number.isFinite(age) || age < 0 || age > this.deps.cfg.quoteMaxAgeMs)) {
+        throw new Error(`${request.tradingsymbol} has no current executable depth.`);
+      }
       const walk = walkDepth({
         side: request.side,
         levels: request.side === "BUY" ? quote.asks : quote.bids,
@@ -471,7 +558,15 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       if (walk.executable_within_limit < request.quantity) {
         throw new Error(`${request.tradingsymbol} has ${walk.executable_within_limit} safe quantity within bounded limit; needs ${request.quantity}.`);
       }
+      checked.set(request.client_order_id, {
+        token: request.token,
+        feed_generation: feedGeneration,
+        quote_version: quote.version,
+        quote_at: quote.at,
+        checked_at: checkedAt,
+      });
     }
+    return checked;
   }
 
   private async unwindConfirmed(orders: BrokerOrder[], instruments: Record<BoxLegRole, BoxOptionInstrument>, tradeId: string, attemptId: string): Promise<BrokerOrder[]> {
@@ -487,7 +582,7 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
         continue;
       }
       try {
-        unwinds.push(await manager.submit(this.request({
+        const request = this.request({
           role: order.role,
           inst: instruments[order.role],
           side,
@@ -497,7 +592,9 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           attemptId,
           purpose: "EMERGENCY_RESIDUAL",
           phase: "unwind",
-        })));
+        });
+        const checkedFeed = this.precheck([request]);
+        unwinds.push(await manager.submit(request, checkedFeed.get(request.client_order_id)));
       } catch (error) {
         if (error instanceof OrderPersistenceAfterFillError) {
           unwinds.push(error.order);

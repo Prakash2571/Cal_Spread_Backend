@@ -2,7 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { CentralBoxExecutionGateway } from "../../dist/box/executionGateway.js";
-import { OrderPersistenceAfterFillError } from "../../dist/box/orderManager.js";
+import {
+  BrokerPreSubmitRefusedError,
+} from "../../dist/box/brokerAdapter.js";
+import {
+  OrderPersistenceAfterFillError,
+} from "../../dist/box/orderManager.js";
 import { entrySideFor, exitSideFor } from "../../dist/box/math.js";
 import { BoxQuoteStore } from "../../dist/box/quotes.js";
 import {
@@ -44,17 +49,19 @@ function brokerOrder(req, filled = req.quantity) {
   };
 }
 
-function liveHarness({ fillByRole = {} } = {}) {
+function liveHarness({ fillByRole = {}, warm = true } = {}) {
   const { candidate } = goodCandidate();
   const now = 10_000;
   const quotes = new BoxQuoteStore();
   seedStore(quotes, exitQuotes(candidate, 198, { at: now, qty: 500 }), now);
   const submitted = [];
+  const checkedFeed = [];
   const violations = [];
   const manager = {
     status: () => ({ inFlight: 0, queued: 0 }),
-    submit: async (req) => {
+    submit: async (req, stamp) => {
       submitted.push(structuredClone(req));
+      checkedFeed.push(structuredClone(stamp));
       return brokerOrder(req, fillByRole[req.role] ?? req.quantity);
     },
     invariantViolation: (reason) => violations.push(reason),
@@ -75,10 +82,25 @@ function liveHarness({ fillByRole = {} } = {}) {
     quotes,
     manager,
     allocateTradeId: () => "allocated-trade",
-    isTokenWarm: () => true,
+    isTokenWarm: () => warm,
+    feedGeneration: () => 7,
     now: () => now,
   });
-  return { candidate, quotes, submitted, violations, manager, gateway, now };
+  return { candidate, quotes, submitted, checkedFeed, violations, manager, gateway, now };
+}
+
+function assertCheckedStamp(h, index) {
+  const req = h.submitted[index];
+  const stamp = h.checkedFeed[index];
+  const quote = h.quotes.get(req.token);
+  assert.deepEqual(stamp, {
+    token: req.token,
+    feed_generation: 7,
+    quote_version: quote.version,
+    quote_at: quote.at,
+    checked_at: h.now,
+  });
+  assert.equal("checkedFeed" in req, false, "feed evidence is not embedded in the broker request");
 }
 
 function detectionLegs(candidate, quotes, sideFor = exitSideFor) {
@@ -134,6 +156,7 @@ test("live gateway submits exactly the 1-4 nonzero outstanding roles and trusts 
         ROLES.slice(0, count).map((role, index) => [role, quantities[index]]),
       );
       assert.equal(h.submitted.every((req) => req.quantity > 0 && req.pricing.order_type === "LIMIT"), true);
+      h.submitted.forEach((_, index) => assertCheckedStamp(h, index));
       assert.deepEqual(
         Object.entries(result.record.fills_by_role),
         ROLES.slice(0, count).map((role, index) => [role, quantities[index]]),
@@ -221,6 +244,30 @@ test("paper gateway delegation remains byte-for-byte unchanged", async () => {
   assert.equal(gateway.estimateExecutableExit(args, 123), values.estimate);
   assert.equal(await gateway.flattenResidual(args), values.flatten);
   assert.equal(calls.every((call) => call[1] === args), true, "paper arguments are delegated by identity without rewriting");
+});
+
+
+test("entry and protective unwind pass exact ephemeral feed stamps", async () => {
+  const h = liveHarness();
+  const detection = {
+    candidate: h.candidate,
+    at: h.now,
+    legs: detectionLegs(h.candidate, h.quotes, entrySideFor),
+  };
+
+  const result = await h.gateway.simulateLeggingEntry({
+    candidate: h.candidate,
+    detection,
+    qualify: () => ({ qualifies: false, expected_net_profit: 0, min_expected_net_profit: 1 }),
+    stillWanted: () => true,
+  });
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(h.submitted.map((req) => req.purpose), [
+    "ENTRY", "ENTRY", "ENTRY", "ENTRY",
+    "EMERGENCY_RESIDUAL", "EMERGENCY_RESIDUAL", "EMERGENCY_RESIDUAL", "EMERGENCY_RESIDUAL",
+  ]);
+  h.submitted.forEach((_, index) => assertCheckedStamp(h, index));
 });
 
 
@@ -336,4 +383,147 @@ test("protective unwind retains a confirmed reduction after persistence loss", a
   assert.deepEqual(result.legging.residual_exposure, []);
   assert.equal(result.legging.legs.find((leg) => leg.role === "k1_ce").unwound_qty, h.candidate.lot_size);
   assert.equal(h.violations.some((reason) => reason.includes("protective unwind failed")), true);
+});
+
+
+
+test("local pre-submit exit refusal is known-zero, not broker uncertainty", async () => {
+  const h = liveHarness();
+  h.manager.submit = async (req, stamp) => {
+    h.submitted.push(structuredClone(req));
+    h.checkedFeed.push(structuredClone(stamp));
+    throw new BrokerPreSubmitRefusedError(req.client_order_id, "dequeue", true, "feed generation changed");
+  };
+  const position = positionFrom(h.candidate, {
+    id: "local-exit-refusal",
+    remaining_qty_by_role: { k1_ce: 35, k2_ce: 0, k2_pe: 0, k1_pe: 0 },
+    position_state: "PARTIALLY_EXITED",
+  });
+
+  const result = await h.gateway.simulateLeggingExit({
+    position,
+    detectionLegs: detectionLegs(h.candidate, h.quotes),
+    detectedAt: h.now,
+    stillWanted: () => true,
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.detail, /partially filled/);
+  assert.equal(h.violations.length, 0, "proven no-POST refusal must not quarantine broker quantity");
+  assertCheckedStamp(h, 0);
+});
+
+test("durable local residual refusal retires the spent identity", async () => {
+  const h = liveHarness();
+  h.manager.submit = async (req, stamp) => {
+    h.submitted.push(structuredClone(req));
+    h.checkedFeed.push(structuredClone(stamp));
+    throw new BrokerPreSubmitRefusedError(req.client_order_id, "pre_post", true, "book changed");
+  };
+  const inst = h.candidate.legs.k1_ce;
+  const result = await h.gateway.flattenResidual({
+    keyPrefix: "local-residual-refusal",
+    residual: [{
+      token: inst.token,
+      tradingsymbol: inst.tradingsymbol,
+      exchange: inst.exchange,
+      role: "k1_ce",
+      side: "BUY",
+      quantity: 35,
+      average_price: 100,
+      source: "partial_entry",
+      created_at: h.now,
+      flatten_attempt: 1,
+    }],
+  });
+
+  assert.equal(result.remaining.length, 1);
+  assert.equal(result.remaining[0].quantity, 35);
+  assert.equal(result.remaining[0].flatten_attempt, 2);
+  assert.equal(h.violations.length, 0);
+  assertCheckedStamp(h, 0);
+});
+
+
+test("live residual flatten refuses a non-current book and retains exposure", async () => {
+  const h = liveHarness({ warm: false });
+  const inst = h.candidate.legs.k1_ce;
+  const residual = [{
+    role: "k1_ce",
+    token: inst.token,
+    tradingsymbol: inst.tradingsymbol,
+    exchange: inst.exchange,
+    side: "BUY",
+    quantity: 35,
+    average_price: 100,
+    source: "partial_entry",
+    created_at: h.now,
+  }];
+  const result = await h.gateway.flattenResidual({ residual, keyPrefix: "non-current" });
+  assert.equal(h.submitted.length, 0);
+  assert.equal(result.remaining.length, 1);
+  assert.equal(result.remaining[0].quantity, 35);
+});
+
+test("live residual flatten uses a current one-sided relevant book", async () => {
+  const h = liveHarness({ warm: true });
+  const inst = h.candidate.legs.k1_ce;
+  h.quotes.applyTicks([{
+    token: inst.token,
+    last_price: 100,
+    close_price: 99,
+    oi: 0,
+    bid: 99.9,
+    ask: 0,
+    bids: [{ price: 99.9, qty: 100, orders: 1 }],
+    asks: [],
+    depth_updated: true,
+  }], h.now);
+  const residual = [{
+    role: "k1_ce",
+    token: inst.token,
+    tradingsymbol: inst.tradingsymbol,
+    exchange: inst.exchange,
+    side: "BUY",
+    quantity: 35,
+    average_price: 100,
+    source: "partial_entry",
+    created_at: h.now,
+  }];
+  const result = await h.gateway.flattenResidual({ residual, keyPrefix: "current-side" });
+  assert.equal(h.submitted.length, 1);
+  assert.equal(h.submitted[0].side, "SELL");
+  assert.equal(h.submitted[0].quantity, 35);
+  assertCheckedStamp(h, 0);
+  assert.deepEqual(result.remaining, []);
+});
+
+test("live residual flatten refuses a missing relevant side and retains exposure", async () => {
+  const h = liveHarness({ warm: true });
+  const inst = h.candidate.legs.k1_ce;
+  h.quotes.applyTicks([{
+    token: inst.token,
+    last_price: 100,
+    close_price: 99,
+    oi: 0,
+    bid: 0,
+    ask: 100.1,
+    bids: [],
+    asks: [{ price: 100.1, qty: 100, orders: 1 }],
+    depth_updated: true,
+  }], h.now);
+  const residual = [{
+    role: "k1_ce",
+    token: inst.token,
+    tradingsymbol: inst.tradingsymbol,
+    exchange: inst.exchange,
+    side: "BUY",
+    quantity: 35,
+    average_price: 100,
+    source: "partial_entry",
+    created_at: h.now,
+  }];
+  const result = await h.gateway.flattenResidual({ residual, keyPrefix: "wrong-side" });
+  assert.equal(h.submitted.length, 0);
+  assert.equal(result.remaining[0].quantity, 35);
 });

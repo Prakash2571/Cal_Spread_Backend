@@ -1,6 +1,7 @@
 import {
   BrokerAmbiguousSubmitError,
   BrokerOrderRejectedError,
+  BrokerPreSubmitRefusedError,
   isBrokerOrderTerminal,
   type BrokerAdapter,
   type BrokerOrder,
@@ -39,12 +40,23 @@ export interface OrderIntentUpdateResult {
   current_filled_quantity?: number | null;
 }
 
+export interface CheckedFeedStamp {
+  /** Token whose exact executable snapshot was checked. */
+  readonly token: number;
+  readonly feed_generation: number;
+  readonly quote_version: number;
+  readonly quote_at: number;
+  readonly checked_at: number;
+}
+
 export interface OrderIntentPersistence {
   create(intent: IBoxOrderIntent): Promise<IBoxOrderIntent>;
   update(
     clientOrderId: string,
     patch: BoxOrderIntentPatch,
     audit: BoxOrderIntentAudit,
+    /** Optional compare-and-set guard for safety-critical local transitions. */
+    expectedStates?: readonly BoxOrderIntentState[],
   ): Promise<OrderIntentUpdateResult>;
   loadNonterminal(): Promise<IBoxOrderIntent[]>;
   loadOwned?(): Promise<IBoxOrderIntent[]>;
@@ -154,6 +166,8 @@ export interface OrderManagerReconcileReport {
 interface SubmitQueueAction {
   kind: "submit";
   request: BrokerOrderRequest;
+  /** Ephemeral evidence only; never copied into the durable intent or broker payload. */
+  checkedFeed?: CheckedFeedStamp;
   resolve: (order: BrokerOrder) => void;
   reject: (error: unknown) => void;
   sequence: number;
@@ -276,6 +290,15 @@ export class BoxOrderManager {
        * rejection is handled.
        */
       onBrokerReject?: (order: BrokerOrder | null, reason: string) => void;
+      /**
+       * Re-check the exact executable quote admitted by the gateway. Production
+       * installs this fail-closed authority; optionality preserves isolated manager
+       * use where no market-data source exists.
+       */
+      revalidateQueuedRequest?: (
+        request: BrokerOrderRequest,
+        stamp: CheckedFeedStamp | undefined,
+      ) => string | null;
       /**
        * Which broker these samples belong to. Required for timing to be recorded at all,
        * because a sample that cannot be attributed to a broker must never be filed — pooling
@@ -453,7 +476,7 @@ export class BoxOrderManager {
     return this.canManageExposure() && this.safeAttributedReductionReady;
   }
 
-  submit(request: BrokerOrderRequest): Promise<BrokerOrder> {
+  submit(request: BrokerOrderRequest, checkedFeed?: CheckedFeedStamp): Promise<BrokerOrder> {
     if (request.purpose === "ENTRY" && !this.canEnter(request)) {
       return Promise.reject(new Error("OrderManager entry controls or limits are closed."));
     }
@@ -481,7 +504,14 @@ export class BoxOrderManager {
     // construction: `beginTrace` swallows everything.
     this.beginTrace(request);
     return new Promise<BrokerOrder>((resolve, reject) => {
-      this.queue.push({ kind: "submit", request, resolve, reject, sequence: this.sequence++ });
+      this.queue.push({
+        kind: "submit",
+        request,
+        ...(checkedFeed ? { checkedFeed } : {}),
+        resolve,
+        reject,
+        sequence: this.sequence++,
+      });
       this.sortQueue();
       this.pump();
     });
@@ -776,14 +806,49 @@ export class BoxOrderManager {
       this.knownIntents.set(intent.client_order_id, intent);
       this.health.persistence = "healthy";
       if (intent.state !== "CREATED") {
-        // A prior submission exists. Reconcile it; never blindly resubmit.
+        // A prior submission exists. Reconcile it; never let current feed state
+        // hide or rewrite an identity that may already exist at the broker.
         const reconciled = await this.deps.adapter.getOrder(request.client_order_id);
         if (!reconciled) throw new Error("Existing durable intent requires reconciliation before resubmit.");
         await this.persistOrder(intent, reconciled, "existing intent reconciled before resubmit");
         action.resolve(reconciled);
         return;
       }
-      intent = await this.transition(intent, "SUBMITTING", null, "transport submission starting");
+
+      const dequeueReason = this.checkedFeedBlockReason(request, action.checkedFeed);
+      if (dequeueReason) {
+        const refusal = new BrokerPreSubmitRefusedError(
+          request.client_order_id,
+          "dequeue",
+          true,
+          dequeueReason,
+        );
+        const terminalized = await this.persistLocalPreSubmitRefusal(intent, refusal);
+        if (!terminalized) {
+          await this.resolveConcurrentSubmissionOwner(action, this.knownIntents.get(intent.client_order_id) ?? intent);
+          return;
+        }
+        action.reject(refusal);
+        return;
+      }
+
+      const submitting = await this.transitionResult(
+        intent,
+        "SUBMITTING",
+        null,
+        "transport submission starting",
+        ["CREATED"],
+      );
+      if (!submitting.applied) {
+        // Another process won the deterministic identity. Never POST from this
+        // process; adopt a known snapshot or leave the identity to reconciliation.
+        await this.resolveConcurrentSubmissionOwner(action, submitting.intent);
+        return;
+      }
+      intent = submitting.intent;
+      if (intent.state !== "SUBMITTING") {
+        throw new Error(`Order intent ${intent.client_order_id} did not durably enter SUBMITTING; broker POST blocked.`);
+      }
       // DURABLE PERSISTENCE COMPLETE. Both Mongo writes are done and the order may now be
       // transmitted, so this closes `persistence_wait_ms` and opens `transport_wait_ms`. Recorded
       // here rather than being left inside the pacing span, because a database round trip reported
@@ -792,8 +857,30 @@ export class BoxOrderManager {
 
       let order: BrokerOrder;
       try {
-        order = await this.deps.adapter.submitOrder(persistedRequest);
+        order = await this.deps.adapter.submitOrder(persistedRequest, () => {
+          const reason = this.checkedFeedBlockReason(request, action.checkedFeed);
+          if (reason) {
+            throw new BrokerPreSubmitRefusedError(
+              request.client_order_id,
+              "pre_post",
+              true,
+              reason,
+            );
+          }
+        });
       } catch (error) {
+        if (error instanceof BrokerPreSubmitRefusedError) {
+          const terminalized = await this.persistLocalPreSubmitRefusal(intent, error);
+          if (!terminalized) {
+            await this.resolveConcurrentSubmissionOwner(
+              action,
+              this.knownIntents.get(intent.client_order_id) ?? intent,
+            );
+            return;
+          }
+          action.reject(error);
+          return;
+        }
         if (error instanceof BrokerOrderRejectedError) {
           await this.persistOrder(intent, error.order, "broker rejected order");
           this.rejects++;
@@ -849,6 +936,61 @@ export class BoxOrderManager {
       this.noteFailure("order intent persistence failure");
       action.reject(error);
     }
+  }
+
+  /** Current-feed authority for one queued request. A validator fault fails closed. */
+  private checkedFeedBlockReason(
+    request: BrokerOrderRequest,
+    stamp: CheckedFeedStamp | undefined,
+  ): string | null {
+    const validate = this.deps.revalidateQueuedRequest;
+    if (!validate) return null;
+    try {
+      return validate(request, stamp);
+    } catch {
+      return "current executable-feed validation failed closed";
+    }
+  }
+
+  /**
+   * Terminalize a proven local no-POST outcome without counting it as a broker
+   * rejection or uncertainty. The expected-state CAS prevents this process from
+   * overwriting a concurrent actor that advanced the identity toward the broker.
+   */
+  private async persistLocalPreSubmitRefusal(
+    intent: IBoxOrderIntent,
+    refusal: BrokerPreSubmitRefusedError,
+  ): Promise<boolean> {
+    const result = await this.transitionResult(
+      intent,
+      "REJECTED",
+      null,
+      `local pre-submit refusal; no broker POST attempted (${refusal.stage}): ${refusal.reason}`,
+      [intent.state],
+    );
+    // Provenance matters: an already-REJECTED fresh row may be a real broker
+    // rejection written by another actor. Only THIS applied CAS proves no POST.
+    return result.applied && result.intent.state === "REJECTED";
+  }
+
+  /** Adopt another process's winner when possible; otherwise quarantine locally without POST. */
+  private async resolveConcurrentSubmissionOwner(
+    action: SubmitQueueAction,
+    current: IBoxOrderIntent,
+  ): Promise<void> {
+    this.knownIntents.set(current.client_order_id, current);
+    const reconciled = await this.deps.adapter.getOrder(current.client_order_id);
+    if (reconciled) {
+      await this.persistOrder(current, reconciled, "concurrent durable submission owner reconciled");
+      action.resolve(reconciled);
+      return;
+    }
+    if (!isBrokerOrderTerminal(current.state)) this.unknownOrders++;
+    action.reject(new BrokerAmbiguousSubmitError(
+      current.client_order_id,
+      `Another process advanced durable intent ${current.client_order_id} to ${current.state}; ` +
+        "this process attempted no broker POST and reconciliation is required.",
+    ));
   }
 
   private async performReconcile(): Promise<OrderManagerReconcileReport> {
@@ -1159,7 +1301,19 @@ export class BoxOrderManager {
     state: BoxOrderIntentState,
     brokerOrderId: string | null,
     message: string,
+    expectedStates?: readonly BoxOrderIntentState[],
   ): Promise<IBoxOrderIntent> {
+    return (await this.transitionResult(intent, state, brokerOrderId, message, expectedStates)).intent;
+  }
+
+  /** Same transition, retaining whether THIS atomic compare-and-set won. */
+  private async transitionResult(
+    intent: IBoxOrderIntent,
+    state: BoxOrderIntentState,
+    brokerOrderId: string | null,
+    message: string,
+    expectedStates?: readonly BoxOrderIntentState[],
+  ): Promise<OrderIntentUpdateResult & { intent: IBoxOrderIntent }> {
     const at = this.now();
     const result = await this.deps.persistence.update(
       intent.client_order_id,
@@ -1172,6 +1326,7 @@ export class BoxOrderManager {
           : null,
       },
       auditFor(intent, state, brokerOrderId, message, null, at),
+      expectedStates,
     );
     const updated = result.intent;
     if (!updated) throw new Error(`Order intent ${intent.client_order_id} disappeared.`);
@@ -1192,7 +1347,7 @@ export class BoxOrderManager {
       }
     }
     this.knownIntents.set(updated.client_order_id, updated);
-    return updated;
+    return { ...result, intent: updated };
   }
 
   /**
