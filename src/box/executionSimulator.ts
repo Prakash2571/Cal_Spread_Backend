@@ -71,6 +71,7 @@ import {
 } from "./math.js";
 import { touchPrice, walkDepth } from "./orderPricing.js";
 import { outstandingRoles, type BoxOpenPosition } from "./positions.js";
+import { singleLotCandidateViolation } from "./singleLotInvariant.js";
 import type { BoxQuoteStore } from "./quotes.js";
 import {
   BOX_LEG_ROLES,
@@ -509,6 +510,15 @@ export class BoxExecutionSimulator {
       );
     }
 
+    const quantityViolation = singleLotCandidateViolation(candidate);
+    if (quantityViolation) {
+      return this.refuse(
+        detection,
+        "insufficient_quantity",
+        `single-lot entry invariant refused execution: ${quantityViolation}`,
+      );
+    }
+
     if (this.inFlight.has(key)) {
       return this.refuse(detection, "duplicate", "an execution pipeline is already running for this candidate");
     }
@@ -665,6 +675,15 @@ export class BoxExecutionSimulator {
       failure_reason: null,
       failure_detail: null,
     });
+
+    const quantityViolation = singleLotCandidateViolation(candidate);
+    if (quantityViolation) {
+      return this.leggingRefuse(
+        baseRecord(),
+        "insufficient_quantity",
+        `single-lot entry invariant refused execution: ${quantityViolation}`,
+      );
+    }
 
     if (this.inFlight.has(key)) {
       return { ok: false, legging: baseRecord(), reason: "duplicate", detail: "a legging pipeline is already running for this candidate" };

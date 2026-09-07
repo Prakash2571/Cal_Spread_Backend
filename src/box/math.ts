@@ -35,6 +35,7 @@
 
 import type { BoxConfig } from "./config.js";
 import { requiredNetProfit } from "./config.js";
+import { singleLotLegViolation } from "./singleLotInvariant.js";
 import {
   BOX_ENTRY_SIDES_BY_DIRECTION,
   BOX_LEG_ROLES,
@@ -341,6 +342,9 @@ export function buildCandidates(args: {
   pe: Map<number, BoxOptionInstrument>;
   directions?: readonly BoxDirection[];
 }): BoxCandidate[] {
+  // Box V1 is exactly one exchange lot. Invalid metadata must remove the
+  // candidate before it can reach qualification or any execution boundary.
+  if (!Number.isSafeInteger(args.lot_size) || args.lot_size <= 0) return [];
   const sorted = [...new Set(args.strikes)].sort((a, b) => a - b);
   const directions = args.directions ?? (["LONG_BOX"] as const);
   const out: BoxCandidate[] = [];
@@ -353,6 +357,8 @@ export function buildCandidates(args: {
       const k2pe = args.pe.get(k2);
       const k1pe = args.pe.get(k1);
       if (!k1ce || !k2ce || !k2pe || !k1pe) continue;
+      const legs = { k1_ce: k1ce, k2_ce: k2ce, k2_pe: k2pe, k1_pe: k1pe };
+      if (singleLotLegViolation(args.lot_size, legs)) continue;
       for (const direction of directions) {
         out.push({
           key: candidateKey(args.underlying, args.expiry, k1, k2, direction),
@@ -365,7 +371,7 @@ export function buildCandidates(args: {
           upper_strike: k2,
           box_width: round2(k2 - k1),
           lot_size: args.lot_size,
-          legs: { k1_ce: k1ce, k2_ce: k2ce, k2_pe: k2pe, k1_pe: k1pe },
+          legs,
         });
       }
     }

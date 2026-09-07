@@ -34,6 +34,7 @@ import type {
 import { entrySideFor, exitSideFor, round2 } from "./math.js";
 import { buildOrderPricing, touchPrice, walkDepth } from "./orderPricing.js";
 import { outstandingRoles, type BoxOpenPosition } from "./positions.js";
+import { singleLotCandidateViolation } from "./singleLotInvariant.js";
 import type { BoxQuoteStore } from "./quotes.js";
 import {
   BOX_LEG_ROLES,
@@ -158,6 +159,20 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
   async simulateLeggingEntry(args: Parameters<BoxExecutionSimulator["simulateLeggingEntry"]>[0]): Promise<BoxLeggingResult> {
     if (this.mode !== "live") return this.deps.simulator.simulateLeggingEntry(args);
     const manager = this.requireManager();
+    const quantityViolation = singleLotCandidateViolation(args.candidate);
+    if (quantityViolation) {
+      manager.invariantViolation(`live entry ${args.candidate.key} violated single-lot invariant: ${quantityViolation}`);
+      return liveEntryFailure(
+        args.candidate,
+        args.detection.at,
+        this.now(),
+        [],
+        "insufficient_quantity",
+        `single-lot entry invariant refused execution: ${quantityViolation}`,
+        this.deps.cfg,
+        null,
+      );
+    }
     const attemptId = stableAttemptId(args.candidate.key, args.detection.at, "ENTRY");
     const tradeId = this.deps.allocateTradeId?.();
     if (!tradeId) {

@@ -83,6 +83,7 @@ import {
 } from "./instruments.js";
 import { buildCandidates, round2 } from "./math.js";
 import { BoxPositionBook, deriveBoxPositionState, fullLotByRole, isBoxPositionFlat, outstandingRoles, type BoxOpenPosition } from "./positions.js";
+import { exactEntryFillViolation, singleLotCandidateViolation, singleLotPositionViolation } from "./singleLotInvariant.js";
 import { BoxPositionMonitor } from "./positionMonitor.js";
 import { BoxQuoteStore, SpotStore } from "./quotes.js";
 import { initBoxConnection } from "../db.js";
@@ -1295,10 +1296,13 @@ export class BoxEngine {
     for (const position of positions) {
       if (position.position_state === "RECOVERY") {
         // Reconciliation established exact broker equality with the durable map;
-        // this is the only transition that authorises recovery execution.
-        position.position_state = outstandingRoles(position).length === BOX_LEG_ROLES.length
-          ? "BOX"
-          : "PARTIALLY_EXITED";
+        // this is the only transition that authorises recovery execution. A
+        // malformed/overfilled map is NEVER promoted to BOX: emergency handling
+        // works its exact quantities only as reduction-only partial exposure.
+        const violation = singleLotPositionViolation(position);
+        position.position_state = violation
+          ? "PARTIALLY_EXITED"
+          : deriveBoxPositionState(position.remaining_qty_by_role);
       }
       results.push(await this.monitor.closeManually(position.id));
     }
@@ -2141,12 +2145,28 @@ export class BoxEngine {
     legging?: PaperLeggingExecutionRecord | null;
   }): Promise<string | null> {
     const { candidate, evaluation, decision, execution } = args;
+    const candidateViolation = singleLotCandidateViolation(candidate);
+    if (candidateViolation) {
+      this.orderManager?.invariantViolation(
+        `entry ${candidate.key} reached persistence with an invalid single-lot candidate: ${candidateViolation}`,
+      );
+      return null;
+    }
     const confirmedEntryQty = {} as Record<BoxLegRole, number>;
     for (const role of BOX_LEG_ROLES) {
       const confirmed = args.legging?.fills_by_role[role];
-      confirmedEntryQty[role] = Number.isInteger(confirmed) && confirmed! >= 0
+      confirmedEntryQty[role] = Number.isSafeInteger(confirmed) && confirmed! >= 0
         ? confirmed!
         : candidate.lot_size;
+    }
+    const entryFillViolation = args.legging
+      ? exactEntryFillViolation(candidate.lot_size, args.legging.fills_by_role)
+      : null;
+    const entryPositionState = entryFillViolation ? "RECOVERY" as const : "BOX" as const;
+    if (entryFillViolation) {
+      this.orderManager?.invariantViolation(
+        `entry ${candidate.key} did not acquire exactly one lot on every role: ${entryFillViolation}`,
+      );
     }
     const direction = candidate.direction ?? "LONG_BOX";
     const byRole = new Map(evaluation.legs.map((l) => [l.role, l]));
@@ -2219,9 +2239,10 @@ export class BoxEngine {
       lot_size: candidate.lot_size,
       quantity: candidate.lot_size,
       status: "open",
-      // A freshly entered box holds one lot on every role and is a whole box.
+      // A normal entry is exactly one lot on every role. Broker-confirmed
+      // overfill/malformed fill truth is preserved but quarantined in RECOVERY.
       remaining_qty_by_role: confirmedEntryQty,
-      position_state: "BOX",
+      position_state: entryPositionState,
       exit_attempts: [],
       cumulative_exit_charges: 0,
       legs,
@@ -2266,7 +2287,9 @@ export class BoxEngine {
       exit_blocked_reason: null,
       expiry_safety: false,
       scanner_config_snapshot: configSnapshot(this.cfg),
-      error: null,
+      error: entryFillViolation
+        ? `single-lot entry invariant: ${entryFillViolation}`
+        : null,
     };
 
     // DURABILITY: the four legs have FILLED, so this box exists. Live execution
@@ -2330,11 +2353,13 @@ export class BoxEngine {
       legs: candidate.legs,
       entry_prices: entryPrices,
       remaining_qty_by_role: confirmedEntryQty,
-      position_state: "BOX",
+      position_state: entryPositionState,
       cumulative_exit_charges: 0,
       exit_attempts: [],
       metrics: null,
-      exit_blocked_reason: null,
+      exit_blocked_reason: entryFillViolation
+        ? `single-lot entry invariant: ${entryFillViolation}`
+        : null,
       expiry_safety: false,
       closing: false,
       last_persist_at: Date.now(),
@@ -2783,7 +2808,15 @@ export class BoxEngine {
       entryPrices[role] = l.entry_price;
     }
     const restoredRemaining = this.remainingByRoleFromDoc(doc);
-    const invalidRemaining = this.hasInvalidRemainingByRole(doc);
+    const durableRemaining = doc.remaining_qty_by_role ?? fullLotByRole(doc.quantity);
+    const positionViolation = singleLotPositionViolation({
+      lot_size: doc.lot_size,
+      quantity: doc.quantity,
+      // Validate the RAW durable map. The conservative restoration fallback must
+      // never conceal a missing/non-numeric role and promote corruption to BOX.
+      remaining_qty_by_role: durableRemaining,
+      legs,
+    });
     this.positions.add({
       id: doc._id.toString(),
       key: tradeKey(doc),
@@ -2826,13 +2859,15 @@ export class BoxEngine {
       // a whole, un-exited box (never destructive). A partially-closed trade
       // therefore resumes with ONLY its true outstanding exposure.
       remaining_qty_by_role: restoredRemaining,
-      position_state: invalidRemaining
+      position_state: positionViolation
         ? "RECOVERY"
         : deriveBoxPositionState(restoredRemaining, doc.position_state ?? "BOX"),
       cumulative_exit_charges: doc.cumulative_exit_charges ?? 0,
       exit_attempts: Array.isArray(doc.exit_attempts) ? doc.exit_attempts : [],
       metrics: null,
-      exit_blocked_reason: doc.exit_blocked_reason,
+      exit_blocked_reason: positionViolation
+        ? `single-lot position invariant: ${positionViolation}`
+        : doc.exit_blocked_reason,
       expiry_safety: doc.expiry_safety,
       closing: false,
       last_persist_at: Date.now(),
@@ -3080,29 +3115,20 @@ export class BoxEngine {
   }
 
   /**
-   * Per-role remaining quantity from a stored document, defaulting to a full lot
-   * on every role when the field is absent (old documents) or malformed. Never
-   * returns a quantity above the trade's lot size or below zero.
+   * Restore the stored quantities without normalising broker truth. Numeric
+   * overfills, fractions, or negatives are retained verbatim and the shared
+   * invariant moves the position to RECOVERY. A missing/non-numeric role falls
+   * back conservatively to the document quantity, also causing RECOVERY when the
+   * document is not an exact one-lot position.
    */
   private remainingByRoleFromDoc(doc: BoxTradeRecord): Record<BoxLegRole, number> {
     const stored = doc.remaining_qty_by_role ?? null;
     const out = {} as Record<BoxLegRole, number>;
     for (const role of BOX_LEG_ROLES) {
       const raw = stored === null ? doc.quantity : stored[role];
-      out[role] = typeof raw === "number" && Number.isInteger(raw) && raw >= 0
-        ? raw
-        : doc.quantity;
+      out[role] = typeof raw === "number" ? raw : doc.quantity;
     }
     return out;
-  }
-
-  private hasInvalidRemainingByRole(doc: BoxTradeRecord): boolean {
-    const stored = doc.remaining_qty_by_role ?? null;
-    if (stored === null) return false;
-    return BOX_LEG_ROLES.some((role) => {
-      const quantity = stored[role];
-      return typeof quantity !== "number" || !Number.isInteger(quantity) || quantity < 0;
-    });
   }
 
   /* ----------------------- execution durability --------------------------- */
@@ -3577,23 +3603,34 @@ export class BoxEngine {
         let valid = true;
         for (const role of BOX_LEG_ROLES) {
           const quantity = projected[role] ?? 0;
-          if (!Number.isInteger(quantity) || quantity < 0 || quantity > position.quantity) valid = false;
+          // Preserve broker-confirmed integer overfill exactly. It is abnormal
+          // position truth, not permission to normalize back to one lot.
+          if (!Number.isSafeInteger(quantity) || quantity < 0) valid = false;
           exact[role] = quantity;
         }
         const changed = BOX_LEG_ROLES.some((role) => exact[role] !== position.remaining_qty_by_role[role]);
         if (!valid) {
           affectedIds.add(position.id);
-        } else if (changed) {
-          const projectedState = isBoxPositionFlat(exact)
+        } else {
+          const projectedViolation = singleLotPositionViolation({
+            ...position,
+            remaining_qty_by_role: exact,
+          });
+          const projectedState = isBoxPositionFlat(exact) || projectedViolation
             ? "RECOVERY" as const
             : deriveBoxPositionState(exact, position.position_state);
-          const persisted = await applyBoxReconciledProjection(position.id, exact, projectedState);
-          if (!persisted) throw new Error(`failed to persist reconciled quantity projection for ${position.id}`);
-          position.remaining_qty_by_role = exact;
-          position.position_state = projectedState;
-          if (projectedState === "RECOVERY") {
-            position.exit_blocked_reason = "broker-confirmed flat quantity requires terminal close-accounting recovery";
+          if (changed) {
+            const persisted = await applyBoxReconciledProjection(position.id, exact, projectedState);
+            if (!persisted) throw new Error(`failed to persist reconciled quantity projection for ${position.id}`);
+            position.remaining_qty_by_role = exact;
+            position.position_state = projectedState;
+            if (projectedState === "RECOVERY") {
+              position.exit_blocked_reason = projectedViolation
+                ? `broker-confirmed quantity violates single-lot position invariant: ${projectedViolation}`
+                : "broker-confirmed flat quantity requires terminal close-accounting recovery";
+            }
           }
+          if (projectedViolation) affectedIds.add(position.id);
         }
       }
 
