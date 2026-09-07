@@ -672,10 +672,29 @@ const INTENT_STATE_PREDECESSORS: Readonly<Record<BoxOrderIntentState, readonly B
 /**
  * Apply a monotonic state/fill snapshot and append one audit event exactly once.
  * Stale OPEN/lower-fill snapshots cannot regress a terminal or newer document.
+ *
+ * THE RESULT IS THE AUTHORITATIVE TRANSITION, not just the resulting document.
+ *
+ * Callers attribute broker fills to internal positions. If they derive the delta from their own
+ * in-memory snapshot they double-count, because two async contexts routinely hold the SAME stale
+ * snapshot for one order (the live submit path and a concurrent reconcile pass), so both compute
+ * `post - 0` for a single 40-lot fill and attribute 80. The `$lte` fill guard does not save them:
+ * it is deliberately NON-strict, so re-writing the same cumulative quantity matches and reports
+ * `applied: true`.
+ *
+ * So the write reports what it actually established:
+ *
+ *   delta = current_filled_quantity - previous_filled_quantity      (and 0 when applied is false)
+ *
+ * which is 0 for a duplicate replay and exactly the real increment for whichever caller won.
  */
 export interface BoxOrderIntentUpdateResult {
   intent: BoxOrderIntentRecord | null;
   applied: boolean;
+  /** Cumulative filled quantity this document held before this update. Null when unknowable. */
+  previous_filled_quantity: number | null;
+  /** Cumulative filled quantity this document holds after this update. Null when unknowable. */
+  current_filled_quantity: number | null;
 }
 
 export async function updateBoxOrderIntent(
@@ -706,6 +725,12 @@ export async function updateBoxOrderIntent(
     [{
       $set: {
         ...setPatch,
+        // THE PRE-IMAGE, captured by the same atomic write. Every expression in an aggregation
+        // `$set` stage is evaluated against the INPUT document, so `$filled_quantity` here is the
+        // value before `setPatch` replaces it — even though both are set in one stage. This is
+        // what makes the reported delta a property of the durable transition rather than of
+        // whatever the caller happened to have in memory.
+        previous_filled_quantity: { $ifNull: ["$filled_quantity", 0] },
         audit: {
           $cond: [
             { $in: [audit.audit_id, { $ifNull: ["$audit.audit_id", []] }] },
@@ -718,9 +743,26 @@ export async function updateBoxOrderIntent(
     { new: true },
   ).lean<BoxOrderIntentRecord>();
   if (!row) {
-    return { intent: await findBoxOrderIntentByClientId(clientOrderId), applied: false };
+    // The guard refused (stale state, regressing fill, or a conflicting broker id). Nothing was
+    // written, so the transition this call established is EMPTY: report an explicit zero-width
+    // transition rather than a null the caller might read as "unknown, guess from my snapshot".
+    const fresh = await findBoxOrderIntentByClientId(clientOrderId);
+    const current = typeof fresh?.filled_quantity === "number" ? fresh.filled_quantity : null;
+    return {
+      intent: fresh,
+      applied: false,
+      previous_filled_quantity: current,
+      current_filled_quantity: current,
+    };
   }
-  return { intent: row, applied: true };
+  return {
+    intent: row,
+    applied: true,
+    previous_filled_quantity: typeof row.previous_filled_quantity === "number"
+      ? row.previous_filled_quantity
+      : null,
+    current_filled_quantity: typeof row.filled_quantity === "number" ? row.filled_quantity : null,
+  };
 }
 
 /** Ready-to-inject durable persistence contract for OrderManager. */

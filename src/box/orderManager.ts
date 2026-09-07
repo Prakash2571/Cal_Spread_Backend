@@ -24,9 +24,19 @@ import type {
   ResidualLegExposure,
 } from "./types.js";
 
+/**
+ * The outcome of one guarded durable update — the TRANSITION, not merely the resulting document.
+ *
+ * `previous_filled_quantity` / `current_filled_quantity` are what make position attribution safe.
+ * See `durableFillDelta` and `repository.updateBoxOrderIntent` for the double-count this exists
+ * to prevent. A persistence implementation that cannot report the transition must leave them
+ * null; the manager then attributes nothing and raises an invariant rather than guessing.
+ */
 export interface OrderIntentUpdateResult {
   intent: IBoxOrderIntent | null;
   applied: boolean;
+  previous_filled_quantity?: number | null;
+  current_filled_quantity?: number | null;
 }
 
 export interface OrderIntentPersistence {
@@ -94,6 +104,13 @@ export interface OrderManagerStatus {
   openBoxes: number;
   orphanOrders: BrokerOrder[];
   lastReconciledAt: number | null;
+  /**
+   * How many durable state transitions the intent state machine REFUSED this session.
+   *
+   * A bounded counter, not a label: a refused transition used to be indistinguishable from a
+   * successful one because the guarded write returns the unchanged document either way.
+   */
+  durableTransitionRefusals: number;
 }
 
 export interface OrderManagerLimits {
@@ -230,6 +247,8 @@ export class BoxOrderManager {
   private reconcileTimer: NodeJS.Timeout | null = null;
   private disposed = false;
   private lastReconciledAt: number | null = null;
+  /** Guarded durable transitions the intent state machine refused. Bounded counter. */
+  private durableTransitionRefusals = 0;
 
   constructor(
     private readonly deps: {
@@ -641,6 +660,7 @@ export class BoxOrderManager {
       openBoxes: this.openBoxes,
       orphanOrders: this.orphanOrders.map(cloneOrder),
       lastReconciledAt: this.lastReconciledAt,
+      durableTransitionRefusals: this.durableTransitionRefusals,
     };
   }
 
@@ -1099,7 +1119,13 @@ export class BoxOrderManager {
       );
       const updated = result.intent;
       if (!updated) throw new Error(`Order intent ${intent.client_order_id} disappeared.`);
-      const delta = updated.filled_quantity - intent.filled_quantity;
+      // ATTRIBUTION FOLLOWS THE DURABLE WRITE, NEVER THE CALLER'S SNAPSHOT.
+      // `intent` here is whatever this async context loaded before its awaits, and a concurrent
+      // reconcile pass legitimately holds the same stale copy. Attributing
+      // `updated.filled_quantity - intent.filled_quantity` therefore credited one broker fill
+      // twice, inflating `attributedBoxPositions` — the permission boundary for reduction and
+      // recovery orders — so the manager could authorise reducing more than is actually held.
+      const delta = this.durableFillDelta(result, intent);
       if (delta > 0) {
         const key = `${updated.exchange}:${updated.tradingsymbol}`;
         const prior = this.attributedBoxPositions.get(key) ?? 0;
@@ -1149,8 +1175,72 @@ export class BoxOrderManager {
     );
     const updated = result.intent;
     if (!updated) throw new Error(`Order intent ${intent.client_order_id} disappeared.`);
+    if (!result.applied) {
+      // The intent state machine REFUSED this transition. Returning the unchanged document made
+      // that indistinguishable from success, so a caller could believe it had quarantined an
+      // order that is still working.
+      this.durableTransitionRefusals++;
+      console.warn(
+        `[Box] durable state transition ${intent.state} -> ${state} for ` +
+          `${intent.client_order_id} was refused; the document is still ${updated.state}.`,
+      );
+      if (state === "RECONCILIATION_REQUIRED" && !RECONCILE_STATES.has(updated.state)) {
+        // A refused quarantine is not survivable silently: uncertain broker state would look
+        // resolved. Trip directly rather than via invariantViolation, which would recurse into
+        // reconcile from inside a persistence path.
+        this.trip(`quarantine transition refused for ${intent.client_order_id}`);
+      }
+    }
     this.knownIntents.set(updated.client_order_id, updated);
     return updated;
+  }
+
+  /**
+   * The fill quantity THIS caller's durable write actually established.
+   *
+   * The only safe source is the guarded write's own pre-image/post-image pair:
+   *
+   *   applied === false            => 0. The write was refused, so this caller advanced nothing.
+   *   applied === true             => current - previous, as recorded by the atomic update.
+   *
+   * Worked example of the race this closes — two callers holding `filled_quantity: 0` for one
+   * order the broker filled 40:
+   *
+   *   A persists 40  ->  applied, pre 0,  post 40  ->  delta 40
+   *   B persists 40  ->  applied, pre 40, post 40  ->  delta  0     (the `$lte` guard is
+   *                                                                  deliberately non-strict, so
+   *                                                                  B's write matches and is
+   *                                                                  reported applied — but it
+   *                                                                  advanced nothing)
+   *
+   * Total attributed 40, which is the truth. The old stale-snapshot arithmetic gave 80.
+   *
+   * A persistence layer that cannot report the transition gets NOTHING attributed and trips the
+   * invariant. That direction is deliberate: under-attribution blocks reductions (safe), while
+   * over-attribution authorises reducing more than is held (not safe). Reconciliation rebuilds
+   * the map absolutely from the journal, so a missed increment is repaired rather than compounded.
+   */
+  private durableFillDelta(result: OrderIntentUpdateResult, intent: IBoxOrderIntent): number {
+    if (!result.applied) return 0;
+    const previous = result.previous_filled_quantity;
+    const current = result.current_filled_quantity;
+    if (typeof previous !== "number" || typeof current !== "number") {
+      this.invariantViolation(
+        `durable persistence did not report the fill transition for ${intent.client_order_id}; ` +
+          `no exposure was attributed`,
+      );
+      return 0;
+    }
+    const delta = current - previous;
+    if (delta < 0) {
+      // The monotonic `$lte` guard forbids this. If it ever happens the durable quantity moved
+      // backwards, which is a corruption, not a reduction — never feed it into exposure.
+      this.invariantViolation(
+        `durable filled quantity for ${intent.client_order_id} regressed ${previous} -> ${current}`,
+      );
+      return 0;
+    }
+    return delta;
   }
 
   private recalculateGrossAttributedQuantity(): void {

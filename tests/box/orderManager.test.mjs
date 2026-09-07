@@ -125,17 +125,37 @@ class MemoryPersistence {
     this.rows.set(intent.client_order_id, clone(intent));
     return clone(intent);
   }
+  /**
+   * Models the real guarded write, INCLUDING the property that makes attribution safe: the
+   * update reports the transition it established (`previous_filled_quantity` /
+   * `current_filled_quantity`), stamped from the pre-image, exactly as the Mongo aggregation
+   * `$set` does. The `$lte` fill guard is deliberately NON-strict here too — re-writing the same
+   * cumulative quantity matches and reports `applied: true` — because that is what makes a naive
+   * caller-snapshot delta double-count.
+   */
   async update(clientOrderId, patch, audit) {
     const current = this.rows.get(clientOrderId);
     this.events.push(["update", clientOrderId, patch.state ?? current?.state]);
-    if (!current) return { intent: null, applied: false };
-    if (patch.filled_quantity !== undefined && patch.filled_quantity < current.filled_quantity) {
-      return { intent: clone(current), applied: false };
+    if (!current) {
+      return { intent: null, applied: false, previous_filled_quantity: null, current_filled_quantity: null };
     }
-    const next = { ...current, ...clone(patch) };
+    if (patch.filled_quantity !== undefined && patch.filled_quantity < current.filled_quantity) {
+      return {
+        intent: clone(current),
+        applied: false,
+        previous_filled_quantity: current.filled_quantity,
+        current_filled_quantity: current.filled_quantity,
+      };
+    }
+    const next = { ...current, ...clone(patch), previous_filled_quantity: current.filled_quantity };
     if (!next.audit.some((item) => item.audit_id === audit.audit_id)) next.audit = [...next.audit, clone(audit)];
     this.rows.set(clientOrderId, next);
-    return { intent: clone(next), applied: true };
+    return {
+      intent: clone(next),
+      applied: true,
+      previous_filled_quantity: current.filled_quantity,
+      current_filled_quantity: next.filled_quantity,
+    };
   }
   async loadNonterminal() {
     return [...this.rows.values()]

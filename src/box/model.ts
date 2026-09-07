@@ -549,6 +549,13 @@ const boxOrderIntentSchema = new mongoose.Schema(
       default: "CREATED",
     },
     filled_quantity: { type: Number, default: 0 },
+    /**
+     * Pre-image of `filled_quantity` for the most recent guarded update, stamped by that same
+     * atomic update. This is what makes position attribution authoritative: the delta comes from
+     * the durable transition the write established, never from a caller's stale snapshot. Absent
+     * on documents written before this field existed.
+     */
+    previous_filled_quantity: { type: Number, default: null },
     average_price: { type: Number, default: null },
     broker_tag: { type: String, default: null },
     reject_family: { type: String, default: null },
