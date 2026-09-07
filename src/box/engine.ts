@@ -35,8 +35,24 @@ import {
   requiredNetProfit,
   validateTuning,
   type BoxConfig,
+  type BoxPaperProfile,
   type BoxTuning,
 } from "./config.js";
+import type { BrokerAdapter } from "./brokerAdapter.js";
+import {
+  burstPacingBudgetMs,
+  resolveBrokerPacing,
+  type EffectiveBrokerPacing,
+} from "./brokerPacing.js";
+import {
+  currentSelection,
+  evaluateLiveArm,
+  evaluateModeTransition,
+  executionModeLabel,
+  transitionBlockers,
+  type ExecutionModeSelection,
+  type ModeTransitionSnapshot,
+} from "./liveModeTransition.js";
 import { BoxChargeEstimator, buildEntryChargeLegs, type BoxChargeLeg, type PriceChargeGroupsFn } from "./charges.js";
 import { BoxChargeReconciler } from "./chargeReconciler.js";
 import { activeUnderlyings, type UnderlyingActivity } from "./underlyingLock.js";
@@ -478,6 +494,23 @@ export class BoxEngine {
    * unarmed one.
    */
   private readonly session: BoxTradingSessionManager;
+  /**
+   * The live broker adapter, when one was constructed.
+   *
+   * Null in every paper deployment — which is the structural guarantee that a paper process
+   * contains no object capable of placing a real order, and is why `BOX_EXECUTION_MODE` stays a
+   * startup-only construction boundary.
+   */
+  private liveAdapter: BrokerAdapter | null = null;
+  /**
+   * The inner (uncoordinated) gateway.
+   *
+   * Retained only so read-only diagnostics can reach the per-Box capital report, which is computed
+   * where the bounded order requests are built. Execution always goes through `this.coordinator`.
+   */
+  private readonly centralGateway: CentralBoxExecutionGateway;
+  /** The paper profile currently in force. Mutable at runtime; LIVE is not. */
+  private paperProfile: BoxPaperProfile;
   /** Durable projection version/content corresponding to each in-memory residual. */
   private residualProjectionVersion = new Map<string, number>();
   private residualProjectionIdentity = new Map<string, string>();
@@ -502,6 +535,10 @@ export class BoxEngine {
     this.directions = this.cfg.enableShortBox ? BOX_DIRECTIONS : (["LONG_BOX"] as const);
     this.strikeLevel = this.cfg.defaultStrikeLevel;
     this.baseMinGrossEdge = this.cfg.minGrossEdge;
+    // The paper profile is the one execution-shape knob an operator may change at runtime,
+    // because switching between paper timing models creates no new capability. LIVE is not
+    // runtime-selectable — see liveModeTransition.ts for why that boundary is deliberate.
+    this.paperProfile = this.cfg.paperExecutionProfile;
 
     // ── Calibration infrastructure, built before the simulator so it can consume it ──
     this.executionClock = createExecutionClock();
@@ -597,6 +634,10 @@ export class BoxEngine {
         cfg: this.cfg,
         timing: this.timingRecorder,
       });
+      // Retained ONLY so diagnostics can report the pacing the adapter is really enforcing.
+      // Re-deriving it from config would usually agree, but "usually" is not a diagnostic: if the
+      // adapter ever clamps differently the operator must see the adapter's number, not ours.
+      this.liveAdapter = adapter;
       this.orderManager = new BoxOrderManager({
         adapter,
         persistence: boxOrderIntentPersistence,
@@ -665,7 +706,7 @@ export class BoxEngine {
         }),
       });
     }
-    const centralGateway = new CentralBoxExecutionGateway({
+    const centralGateway = this.centralGateway = new CentralBoxExecutionGateway({
       cfg: this.cfg,
       simulator: this.executionSim,
       quotes: this.quotes,
@@ -4340,6 +4381,307 @@ export class BoxEngine {
         hasOrderManager: this.orderManager !== null,
       }),
     };
+  }
+
+  /**
+   * Is this DEPLOYMENT capable of placing real orders?
+   *
+   * All three conditions are startup facts, not runtime state: the mode the process was
+   * constructed in, the deployment kill switch, and whether a mutation-capable adapter actually
+   * exists. No runtime action and no UI click can change any of them, which is precisely the
+   * property the kill switch needs.
+   */
+  private liveCapability(): { capable: boolean; detail: string } {
+    if (this.cfg.executionMode !== "live") {
+      return { capable: false, detail: `BOX_EXECUTION_MODE is "${this.cfg.executionMode}", not "live"` };
+    }
+    if (!this.cfg.liveTradingEnabled) {
+      return { capable: false, detail: "BOX_LIVE_TRADING_ENABLED is false" };
+    }
+    if (!this.orderManager || !this.liveAdapter) {
+      return { capable: false, detail: "no live broker adapter was constructed in this process" };
+    }
+    return { capable: true, detail: "live-capable" };
+  }
+
+  /**
+   * The pacing ACTUALLY in force, read from the adapter when there is one.
+   *
+   * Falls back to re-deriving it from config for a paper deployment, where there is no adapter to
+   * ask. The fallback is labelled so an operator can tell "this is what the adapter is doing" from
+   * "this is what a live adapter would do if you started one".
+   */
+  private effectivePacing(): EffectiveBrokerPacing & { source_of_truth: "adapter" | "config_projection" } {
+    const adapter = this.liveAdapter as (BrokerAdapter & { effectivePacing?: () => EffectiveBrokerPacing }) | null;
+    if (adapter?.effectivePacing) {
+      return { ...adapter.effectivePacing(), source_of_truth: "adapter" };
+    }
+    return {
+      ...resolveBrokerPacing(
+        this.deps.activeBroker(),
+        this.cfg.liveBrokerMinIntervalMs,
+        this.cfg.liveBrokerOrderMinIntervalMs,
+      ),
+      source_of_truth: "config_projection",
+    };
+  }
+
+  /** The snapshot the mode-transition and arming predicates need. */
+  private modeTransitionSnapshot(): ModeTransitionSnapshot {
+    const live = this.orderManager?.status() ?? null;
+    const capability = this.liveCapability();
+    let partial = 0;
+    let recovery = 0;
+    for (const position of this.positions.list()) {
+      if (position.position_state === "PARTIALLY_EXITED") partial++;
+      if (position.position_state === "RECOVERY") recovery++;
+    }
+    return {
+      deploymentLiveCapable: capability.capable,
+      liveCapabilityDetail: capability.detail,
+      openBoxes: this.positions.size,
+      partiallyExitedBoxes: partial,
+      recoveryBoxes: recovery,
+      residualLegs: this.residualLegCount(),
+      recoveryActive: live?.recoveryActive ?? false,
+      workingBrokerOrders: live ? live.inFlight + live.queued : 0,
+      queuedExecutions: live?.queued ?? 0,
+      inFlightExecutions: live?.inFlight ?? 0,
+      // An orphan order is an intent whose broker state we could not attribute; it is exactly the
+      // kind of unresolved intent that must block a mode change.
+      unresolvedIntents: live?.orphanOrders.length ?? 0,
+      unknownOrders: live?.unknownOrders ?? 0,
+      reconciliationHealthy: live ? live.health.reconciliation !== "failed" : true,
+      reconciliationIncidentActive: live ? !live.health.reconciliation_complete : false,
+      scannerRunning: this.running,
+      paperSimulationsInFlight: this.executionSim.activeCount,
+    };
+  }
+
+  /**
+   * THE EXECUTION CONTROL SURFACE (Part 15).
+   *
+   * One read-only payload answering "what is this process allowed to do right now, and why".
+   * Deliberately separate from `getStatus()` so the UI's Execution panel has a stable contract of
+   * its own rather than mining a 60-field status blob.
+   *
+   * NO SECRETS: modes, labels, counts, booleans and configured numbers only. No access token, no
+   * session id, no credential — `armed_by` is an admin ROLE label, never a token.
+   */
+  getExecutionControl(): Record<string, unknown> {
+    const live = this.orderManager?.status() ?? null;
+    const capability = this.liveCapability();
+    const broker = this.deps.activeBroker();
+    const selection = currentSelection(this.cfg.executionMode, this.paperProfile);
+    const pacing = this.effectivePacing();
+    const sessionVerdict = this.session.evaluateEntry(this.recoveryActive());
+    const activeUnderlyingMap = this.activeUnderlyings();
+
+    const armPreconditions = {
+      deploymentLiveCapable: capability.capable,
+      brokerAuthenticated: this.deps.marketData.isAuthenticated(),
+      reconciliationHealthy: live ? live.health.reconciliation !== "failed" : false,
+      reconciliationComplete: live?.health.reconciliation_complete ?? false,
+      feedHealthy: this.feedHealthy,
+      feedWarmedUp: live ? live.health.feed === "healthy" : false,
+      circuitClosed: live ? !live.circuitBreaker.tripped : false,
+      recoveryActive: live?.recoveryActive ?? false,
+      unknownOrders: live?.unknownOrders ?? 0,
+      durableReservationsAvailable: !this.coordinator.coordinationHealth().liveEntryBlocked,
+    };
+
+    return {
+      execution_mode: this.cfg.executionMode,
+      paper_execution_profile: this.paperProfile,
+      broker,
+      /** Immutable for the process lifetime. A UI click can never make this true. */
+      deployment_live_capable: capability.capable,
+      live_capability_detail: capability.detail,
+      /** Whether live ORDER HANDLING (exposure management) is armed. */
+      live_runtime_armed: live?.controls.liveOrderEnabled ?? false,
+      /** Whether NEW ENTRY is permitted. Independent of the above, on purpose. */
+      entry_enabled: live?.controls.entryEnabled ?? false,
+      emergency_flatten_enabled: live?.controls.emergencyFlatten ?? false,
+
+      mode: {
+        selection,
+        label: executionModeLabel(this.cfg.executionMode, this.paperProfile, broker),
+        /**
+         * Paper profiles are runtime-selectable; LIVE is not. Stated explicitly so the UI reports
+         * "restart required" honestly instead of offering a control that cannot work.
+         */
+        runtime_selectable: ["paper_latency", "paper_legging", "paper_legging_live_parity"],
+        live_requires_restart: true,
+        transition_blockers: transitionBlockers(this.modeTransitionSnapshot()),
+      },
+
+      session: this.session.status({
+        entryInProgress: this.executionSim.activeCount > 0,
+        openBoxes: this.positions.size,
+        // The monitor exposes no in-flight exit count, so an exit is "in progress" exactly when a
+        // manager operation is at the broker. Inventing a field would be worse than reusing the
+        // one signal that is actually authoritative.
+        exitInProgress: (live?.inFlight ?? 0) > 0,
+        recoveryActive: live?.recoveryActive ?? false,
+        entryBlockedExternally: live ? !live.controls.entryEnabled : true,
+      }),
+
+      risk: {
+        /** The per-Box GROSS ENTRY-ORDER NOTIONAL cap (₹). 0 = disabled. NOT broker margin. */
+        max_box_capital_rupees: this.cfg.executionMode === "live"
+          ? this.cfg.liveMaxBoxCapitalRupees
+          : this.cfg.paperMaxBoxCapitalRupees,
+        max_box_capital_metric: "gross_entry_order_notional_rupees",
+        capital: this.centralGateway.capitalDiagnostics(),
+        one_active_box_per_underlying: this.cfg.oneActiveBoxPerUnderlying,
+        active_underlyings: [...activeUnderlyingMap.values()].map((activity) => ({
+          underlying: activity.underlying,
+          kinds: activity.kinds,
+        })),
+        claimed_underlyings: this.coordinator.claimedUnderlyings(),
+        max_open_boxes: this.cfg.liveMaxOpenBoxes,
+        open_boxes: this.positions.size,
+        residual_legs: this.residualLegCount(),
+        daily_loss_limit: this.cfg.liveDailyLossLimit,
+        realised_pnl_today: live?.realisedPnlToday ?? null,
+      },
+
+      execution: {
+        live_entry_submit_concurrency: this.cfg.liveEntrySubmitConcurrency,
+        max_concurrent_executions: this.cfg.liveMaxConcurrentExecutions,
+        /** GENERAL transport pacing: status polls, lists, positions, margins. */
+        effective_broker_min_interval_ms: pacing.generalMinIntervalMs,
+        /** ORDER-MUTATION pacing: place / modify / cancel. A real rate limit, never zero. */
+        effective_broker_order_min_interval_ms: pacing.orderMutationMinIntervalMs,
+        broker_order_interval_floor_ms: pacing.floorMs,
+        broker_order_interval_source: pacing.source,
+        broker_pacing_rationale: pacing.rationale,
+        pacing_source_of_truth: pacing.source_of_truth,
+        /** Worst-case pacing cost of the four-leg entry burst, without placing an order. */
+        four_leg_burst_pacing_budget_ms: burstPacingBudgetMs(pacing, BOX_LEG_ROLES.length),
+        entry_burst: this.orderManager?.entryBurstDiagnostics() ?? null,
+        queued: live?.queued ?? 0,
+        in_flight: live?.inFlight ?? 0,
+        circuit: live?.health.circuit ?? "closed",
+        /**
+         * NO ARTIFICIAL LATENCY IS APPLIED TO LIVE EXECUTION.
+         *
+         * Stated as data rather than only in a comment so an operator can verify it from the API,
+         * and so a regression test can assert it. The simulated values are reported alongside
+         * precisely to show they belong to PAPER: they are not consulted on the live path.
+         */
+        artificial_latency_applied_to_live: false,
+        paper_only_simulated_decision_ms: this.cfg.simulatedDecisionMs,
+        paper_only_simulated_latency_ms: this.cfg.simulatedLatencyMs,
+      },
+
+      arm: {
+        preconditions: armPreconditions,
+        entry: evaluateLiveArm({ permission: "entryEnabled", pre: armPreconditions }),
+        exposure_management: evaluateLiveArm({ permission: "liveOrderEnabled", pre: armPreconditions }),
+        emergency_flatten: evaluateLiveArm({ permission: "emergencyFlatten", pre: armPreconditions }),
+      },
+
+      block_reason: sessionVerdict.reason,
+      block_detail: sessionVerdict.detail,
+    };
+  }
+
+  /**
+   * Change the PAPER execution profile at runtime.
+   *
+   * Permitted because it creates no new capability: both profiles are simulations, and no
+   * mutation-capable adapter is constructed either way. Refused while anything is in flight,
+   * because changing the timing model under a running simulated execution would corrupt its
+   * record. Refused outright in live mode — there is no paper profile to change there, and
+   * pretending otherwise would imply live timing is configurable when it is not.
+   */
+  setPaperExecutionProfile(
+    profile: BoxPaperProfile,
+    actor: string | null,
+  ): { ok: true; profile: BoxPaperProfile } | { ok: false; code: number; error: string; blockers?: unknown } {
+    if (this.cfg.executionMode === "live") {
+      return {
+        ok: false,
+        code: 409,
+        error:
+          "The paper execution profile cannot be changed in live mode. BOX_EXECUTION_MODE is a " +
+          "startup-only construction boundary; crossing the paper/live boundary requires an " +
+          "environment change and a restart.",
+      };
+    }
+    const from = currentSelection(this.cfg.executionMode, this.paperProfile);
+    const to = currentSelection(this.cfg.executionMode, profile);
+    const verdict = evaluateModeTransition({ from, to, snapshot: this.modeTransitionSnapshot() });
+    if (verdict.outcome === "refused") {
+      return {
+        ok: false,
+        code: 409,
+        error: "The execution profile cannot be changed while executions or exposure are outstanding.",
+        blockers: verdict.blockers,
+      };
+    }
+    if (verdict.outcome === "restart_required") {
+      return { ok: false, code: 409, error: verdict.detail };
+    }
+    this.paperProfile = profile;
+    this.cfg.paperExecutionProfile = profile;
+    console.warn(`[Box] paper execution profile changed to "${profile}" by ${actor ?? "unknown"}.`);
+    return { ok: true, profile };
+  }
+
+  /**
+   * Report what a requested execution-mode change would do, without doing it.
+   *
+   * The UI calls this to render an honest answer — including "restart required" and the exact
+   * environment variables involved — instead of offering a selector that silently fails.
+   */
+  previewModeTransition(to: ExecutionModeSelection): ReturnType<typeof evaluateModeTransition> {
+    return evaluateModeTransition({
+      from: currentSelection(this.cfg.executionMode, this.paperProfile),
+      to,
+      snapshot: this.modeTransitionSnapshot(),
+    });
+  }
+
+  /** Arm a trading session (Part 7). Full-admin only; enforced by the route. */
+  async armTradingSession(args: {
+    maxCompletedTrades?: number;
+    actor: string | null;
+  }): Promise<{ ok: true; session: unknown } | { ok: false; code: number; error: string }> {
+    const live = this.orderManager?.status() ?? null;
+    const armed = await this.session.arm({
+      ...(args.maxCompletedTrades === undefined ? {} : { maxCompletedTrades: args.maxCompletedTrades }),
+      armedBy: args.actor,
+      openBoxes: this.positions.size,
+      residualLegs: this.residualLegCount(),
+      recoveryActive: live?.recoveryActive ?? false,
+    });
+    if (!armed.ok) return { ok: false, code: 409, error: armed.reason };
+    console.warn(
+      `[Box] trading session armed by ${args.actor ?? "unknown"} with a limit of ` +
+        `${armed.record.max_completed_trades === 0 ? "UNLIMITED" : armed.record.max_completed_trades} cycle(s).`,
+    );
+    return { ok: true, session: this.sessionStatusPayload() };
+  }
+
+  /** Disarm the trading session. Counters are preserved, never cleared. */
+  async disarmTradingSession(actor: string | null): Promise<{ ok: boolean; session: unknown }> {
+    const ok = await this.session.disarm();
+    if (ok) console.warn(`[Box] trading session disarmed by ${actor ?? "unknown"}.`);
+    return { ok, session: this.sessionStatusPayload() };
+  }
+
+  /** The session status projection, using live activity. */
+  private sessionStatusPayload(): unknown {
+    const live = this.orderManager?.status() ?? null;
+    return this.session.status({
+      entryInProgress: this.executionSim.activeCount > 0,
+      openBoxes: this.positions.size,
+      exitInProgress: false,
+      recoveryActive: live?.recoveryActive ?? false,
+      entryBlockedExternally: live ? !live.controls.entryEnabled : true,
+    });
   }
 
   getStatus() {

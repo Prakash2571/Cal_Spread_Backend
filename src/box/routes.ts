@@ -193,6 +193,119 @@ export function registerBoxRoutes(app: Express, deps: BoxRouteDeps): void {
     });
   }
 
+  /* --------------------- execution control (Part 8/9/15) -------------------- */
+
+  /**
+   * READ-ONLY execution control surface: mode, broker, deployment live capability, arming state,
+   * session budget, risk limits and effective pacing.
+   *
+   * The UI's Execution panel reads this rather than mining `getStatus()`. Contains no secrets:
+   * modes, labels, counts, booleans and configured numbers only.
+   */
+  app.get("/api/box/execution-control", requireAdmin, (_req: Request, res: Response) => {
+    try {
+      res.json(engine.getExecutionControl());
+    } catch (err) { fail(res, err); }
+  });
+
+  /**
+   * Preview what a requested execution-mode change WOULD do, without doing it.
+   *
+   * Lets the UI report "restart required" and the exact environment variables involved, instead of
+   * offering a selector that silently fails. Read-only, so plain admin auth.
+   */
+  app.post("/api/box/execution-mode/preview", requireAdmin, (req: Request, res: Response) => {
+    const to = (req.body as { selection?: unknown } | undefined)?.selection;
+    const allowed = ["paper_latency", "paper_legging", "paper_legging_live_parity", "live"] as const;
+    if (typeof to !== "string" || !(allowed as readonly string[]).includes(to)) {
+      res.status(400).json({ error: `selection must be one of: ${allowed.join(", ")}.` });
+      return;
+    }
+    try {
+      res.json(engine.previewModeTransition(to as (typeof allowed)[number]));
+    } catch (err) { fail(res, err); }
+  });
+
+  /**
+   * Change the PAPER execution profile at runtime. FULL ADMIN.
+   *
+   * Only paper profiles are runtime-selectable, because switching between two simulations creates
+   * no new capability. LIVE is NOT reachable from here at any privilege level: `BOX_EXECUTION_MODE`
+   * is a startup-only construction boundary, so a paper deployment contains no object able to place
+   * a real order. Backend validation is independent of the frontend's.
+   */
+  app.post("/api/box/execution-mode/paper-profile", requireAdmin, (req: Request, res: Response) => {
+    if (!requireFull(req, res)) return;
+    const profile = (req.body as { profile?: unknown } | undefined)?.profile;
+    const allowed = ["standard", "live_parity", "stress"] as const;
+    if (typeof profile !== "string" || !(allowed as readonly string[]).includes(profile)) {
+      res.status(400).json({ error: `profile must be one of: ${allowed.join(", ")}.` });
+      return;
+    }
+    try {
+      const result = engine.setPaperExecutionProfile(
+        profile as (typeof allowed)[number],
+        deps.getAdminRole(req.header("x-admin-token") ?? undefined),
+      );
+      if (!result.ok) {
+        res.status(result.code).json({ error: result.error, ...(result.blockers ? { blockers: result.blockers } : {}) });
+        return;
+      }
+      res.json({ ok: true, execution: engine.getExecutionControl() });
+    } catch (err) { fail(res, err); }
+  });
+
+  /* ------------------------- trading session (Part 7) ----------------------- */
+
+  /**
+   * ARM a trading session. FULL ADMIN.
+   *
+   * Arming resets the cycle counters, which makes it the most attractive way around a spent
+   * one-shot budget — so the engine refuses it while any consumed cycle still has live exposure.
+   * `max_completed_trades` is optional; omitted, the configured
+   * `BOX_SESSION_MAX_COMPLETED_TRADES` is used. The value is SNAPSHOTTED, so a later config change
+   * cannot widen a session already armed.
+   */
+  app.post("/api/box/session/arm", requireAdmin, async (req: Request, res: Response) => {
+    if (!requireFull(req, res)) return;
+    const raw = (req.body as { max_completed_trades?: unknown } | undefined)?.max_completed_trades;
+    let max: number | undefined;
+    if (raw !== undefined && raw !== null) {
+      if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0 || raw > 10_000) {
+        res.status(400).json({ error: "max_completed_trades must be an integer between 0 and 10000 (0 = unlimited)." });
+        return;
+      }
+      max = raw;
+    }
+    try {
+      const result = await engine.armTradingSession({
+        ...(max === undefined ? {} : { maxCompletedTrades: max }),
+        actor: deps.getAdminRole(req.header("x-admin-token") ?? undefined),
+      });
+      if (!result.ok) {
+        res.status(result.code).json({ error: result.error, execution: engine.getExecutionControl() });
+        return;
+      }
+      res.json({ ok: true, session: result.session, execution: engine.getExecutionControl() });
+    } catch (err) { fail(res, err); }
+  });
+
+  /**
+   * DISARM the trading session. FULL ADMIN.
+   *
+   * Stops new entry; does NOT clear the counters, so disarm-then-arm cannot be used to skip the
+   * exposure guard on arming. Every reduction path is unaffected.
+   */
+  app.post("/api/box/session/disarm", requireAdmin, async (req: Request, res: Response) => {
+    if (!requireFull(req, res)) return;
+    try {
+      const result = await engine.disarmTradingSession(
+        deps.getAdminRole(req.header("x-admin-token") ?? undefined),
+      );
+      res.json({ ok: result.ok, session: result.session, execution: engine.getExecutionControl() });
+    } catch (err) { fail(res, err); }
+  });
+
   app.post("/api/box/live/reconcile", requireAdmin, async (req: Request, res: Response) => {
     if (!requireFull(req, res)) return;
     try {
