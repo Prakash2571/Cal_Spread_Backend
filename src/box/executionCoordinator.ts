@@ -77,6 +77,13 @@ import {
   type InstrumentConflict,
   type InstrumentLegRef,
 } from "./instrumentKey.js";
+import {
+  evaluateUnderlyingAdmission,
+  isUnderlyingReservationKey,
+  underlyingLegRef,
+  UNDERLYING_ALREADY_ACTIVE_REASON,
+  type UnderlyingActivity,
+} from "./underlyingLock.js";
 // Imported from the LEAF modules rather than the `instrumentReservations.js` barrel on
 // purpose: the barrel re-exports the Mongo adapter, and the coordinator has no business
 // pulling mongoose into its module graph just to name a type.
@@ -234,6 +241,17 @@ export interface CoordinatorDeps {
   generation?: () => number;
   /** Process/deployment identity. Generated once at startup. */
   identity?: ProcessIdentity;
+  /**
+   * LAYER 1a of the underlying lock: underlyings that currently carry, or may carry,
+   * attributable Box exposure — derived from DURABLE state (open/partial/recovery positions,
+   * unresolved residual legs, unresolved order intents).
+   *
+   * SYNCHRONOUS BY CONTRACT, for two reasons. It is consulted inside `coordinateEntry`'s
+   * synchronous prologue, where an `await` would reintroduce the exact TOCTOU that prologue
+   * exists to prevent. And it must reflect state reconstructed from Mongo at boot, so the lock
+   * survives a restart rather than depending on a lease that can expire.
+   */
+  activeUnderlyings?: () => ReadonlyMap<string, UnderlyingActivity>;
   now?: () => number;
   /** Injected so tests can drive waiting deterministically. */
   sleep?: (ms: number) => Promise<void>;
@@ -269,6 +287,19 @@ interface UncertainHold {
   reason: string;
 }
 
+/** A durable reservation held for as long as a Box remains open on an underlying. */
+interface PositionUnderlyingClaim {
+  readonly owner: string;
+  lease: ReservationLease;
+  context: ReservationContext;
+  readonly keys: string[];
+  readonly underlying: string;
+  /** Trade ids relying on this claim. The claim is released when this empties. */
+  readonly tradeIds: Set<string>;
+  claimedAt: number;
+  ownershipLost: boolean;
+}
+
 export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
   readonly mode: BoxConfig["executionMode"];
 
@@ -283,6 +314,31 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
    * its execution call returned — while they no longer count as executions in flight.
    */
   private holds = new Map<string, UncertainHold>();
+  /**
+   * DURABLE OPEN-POSITION OWNERSHIP of an underlying — Layer 1c of the underlying lock.
+   *
+   * WHY THIS EXISTS. On a clean settle the entry lease is RELEASED, and it must be: an entry
+   * pipeline should not hold contracts forever. But `activeUnderlyings` (Layer 1a) reads this
+   * process's in-memory position book, which a SIBLING PROCESS cannot see. So between "entry
+   * settled" and "the sibling reboots and adopts open trades from Mongo" there was a window in
+   * which a second worker could open a second Box on an underlying that already had one.
+   *
+   * A successful entry therefore CONVERTS its lease into a position claim instead of releasing
+   * it. Nothing is released and re-acquired, so there is no gap to race through. The claim is
+   * renewed by the same heartbeat as every other lease and is dropped only when the engine
+   * reports the Box flat.
+   *
+   * ON THE TTL. The spec is explicit that a TTL lease must not be the ONLY representation of an
+   * open position, and it is not: the claim is backed by the heartbeat while the process lives,
+   * by Layer 1a's durable-state check in-process, and — decisively — by the engine RE-CLAIMING
+   * at boot from adopted Mongo state. A lapsed TTL therefore degrades to "the durable state
+   * check still blocks", never to "nothing blocks".
+   *
+   * Keyed by `<BROKER>:<UNDERLYING>` and reference-counted by trade id, because two trades on
+   * one underlying (possible only when the restriction is off, or across a config change) must
+   * not have the first release drop the second's protection.
+   */
+  private positionClaims = new Map<string, PositionUnderlyingClaim>();
   /** Canonical opportunity identity -> execution id, for duplicate suppression. */
   private activeOpportunities = new Map<string, string>();
   private waiting = 0;
@@ -304,6 +360,10 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     renewSuccess: 0,
     renewFailure: 0,
     uncertainHoldsAbandoned: 0,
+    underlyingAlreadyActive: 0,
+    positionClaimsHeld: 0,
+    positionClaimsReleased: 0,
+    positionClaimFailures: 0,
   };
   private waitSamples = new BoundedSamples();
   /** Deterministic retry jitter. See `pollDelay()`. */
@@ -408,6 +468,21 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
         ...args,
         stillWanted: this.ownershipGuard(gate.executionId, args.stillWanted),
       });
+      // A SUCCESSFUL entry converts its lease into a durable open-position claim rather than
+      // releasing it. Done BEFORE `settle`, and by transfer rather than release-then-reacquire,
+      // so there is no instant at which the underlying is unprotected.
+      if (result.ok === true && this.deps.cfg.oneActiveBoxPerUnderlying) {
+        const converted = this.convertLeaseToPositionClaim(
+          gate.executionId,
+          args.candidate.underlying,
+          result.legging?.trade_id ?? null,
+        );
+        if (converted) {
+          this.abandon(gate.executionId);
+          if (gate.opportunityId !== null) this.activeOpportunities.delete(gate.opportunityId);
+          return result;
+        }
+      }
       await this.settle(gate.executionId, gate.opportunityId, uncertaintyOf(result));
       return result;
     } catch (error) {
@@ -634,6 +709,37 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       return { ok: false, reason: "duplicate", detail: `identical opportunity already executing as ${incumbent}` };
     }
 
+    // ── UNDERLYING LOCK, LAYER 1a: DURABLE POSITION OWNERSHIP ──────────────────────────
+    //
+    // Checked here, synchronously, BEFORE any reservation is taken, and derived from durable
+    // state rather than from a lease. That is what makes it survive a restart: an open Box, a
+    // partial position, a RECOVERY position or an unresolved residual leg blocks a second Box
+    // on the same underlying even though no lease exists for it — and would still block after
+    // a process restart, when every lease has expired.
+    //
+    // Layer 1b (the lease, acquired below alongside the contract keys) covers only the window
+    // between admission and durable state existing. The two hand off, which is why the lock is
+    // neither lost while a position is open nor retained once it is fully flat.
+    if (this.deps.cfg.oneActiveBoxPerUnderlying) {
+      const admission = evaluateUnderlyingAdmission({
+        enabled: true,
+        underlying: candidate.underlying,
+        active: this.deps.activeUnderlyings?.() ?? new Map<string, UnderlyingActivity>(),
+      });
+      if (!admission.allowed) {
+        this.stats.underlyingAlreadyActive++;
+        this.log({
+          execution: executionId,
+          broker,
+          underlying: candidate.underlying,
+          status: "suppressed_underlying_active",
+          reason: UNDERLYING_ALREADY_ACTIVE_REASON,
+          kinds: admission.activity.kinds.join(","),
+        });
+        return { ok: false, reason: UNDERLYING_ALREADY_ACTIVE_REASON, detail: admission.detail };
+      }
+    }
+
     const refs = this.refsForEntry(candidate);
     const keys = keysOf(refs);
 
@@ -678,6 +784,31 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     }
 
     if (attempt.kind === "conflict") {
+      // A conflict on the UNDERLYING key is a different fact from a conflict on a contract, and
+      // must be reported as such. Waiting would be pointless too: the incumbent holds the
+      // underlying for its whole entry pipeline, not for a moment of book contention.
+      const underlyingConflict = attempt.conflicts.find((c) => isUnderlyingReservationKey(c.key));
+      if (underlyingConflict) {
+        this.abandon(executionId);
+        this.stats.underlyingAlreadyActive++;
+        this.log({
+          execution: executionId,
+          broker,
+          underlying: candidate.underlying,
+          status: "suppressed_underlying_active",
+          reason: UNDERLYING_ALREADY_ACTIVE_REASON,
+          incumbent: underlyingConflict.heldBy,
+        });
+        return {
+          ok: false,
+          reason: UNDERLYING_ALREADY_ACTIVE_REASON,
+          detail:
+            `${candidate.underlying} is already held by entry pipeline ${underlyingConflict.heldBy}; ` +
+            "BOX_ONE_ACTIVE_BOX_PER_UNDERLYING is enabled, so a second Box on this underlying may not " +
+            "enter regardless of strike pair, expiry or direction. This is NOT a contract reservation " +
+            "conflict — the two Boxes need not share any option.",
+        };
+      }
       waited = true;
       this.stats.reservationConflicts++;
       const described = attempt.conflicts.map((c) => c.kind).join(",");
@@ -1084,12 +1215,26 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
 
   private refsForEntry(candidate: BoxCandidate): InstrumentLegRef[] {
     const direction = candidate.direction ?? "LONG_BOX";
-    return boxInstrumentRefs(
+    const refs = boxInstrumentRefs(
       this.deps.broker(),
       candidate.legs,
       (role: BoxLegRole): OrderSide => entrySideFor(role, direction),
       BOX_LEG_ROLES,
     );
+    // ── UNDERLYING LOCK, LAYER 1b: ENTRY PIPELINE OWNERSHIP ────────────────────────────
+    //
+    // The underlying key joins the SAME key set as the four contracts, so it is claimed
+    // ATOMICALLY with them by the same unique multikey index — all five or none. It therefore
+    // inherits the fencing token, broker-generation filter, deployment namespace, TTL, crash
+    // recovery and renewal heartbeat without a line of new infrastructure.
+    //
+    // ENTRY ONLY. `refsForExit` deliberately does not add it: an exit reduces exposure we
+    // already own, and an entry restriction must never be able to block that.
+    if (this.deps.cfg.oneActiveBoxPerUnderlying) {
+      // BOX_LEG_ROLES[0] is a label for logs only; the reservation tiers compare keys.
+      refs.push(underlyingLegRef(this.deps.broker(), candidate.underlying, BOX_LEG_ROLES[0] as BoxLegRole));
+    }
+    return refs;
   }
 
   private refsForExit(position: {
@@ -1162,6 +1307,143 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       ),
     );
     return { kind: "conflict", conflicts };
+  }
+
+  /** The claim key for an underlying under the CURRENT broker. */
+  private positionClaimKey(underlying: string): string {
+    return `${this.deps.broker().trim().toUpperCase()}:${underlying.trim().toUpperCase()}`;
+  }
+
+  /**
+   * Hand a successful entry's lease over to the position-claim registry.
+   *
+   * A TRANSFER, not a release plus an acquire: the same owner id keeps the same durable row, so
+   * no other worker can slip between the two operations. Returns false when there is nothing to
+   * transfer, in which case the caller settles normally.
+   */
+  private convertLeaseToPositionClaim(
+    executionId: string,
+    underlying: string,
+    tradeId: string | null,
+  ): boolean {
+    const exec = this.active.get(executionId);
+    if (!exec || exec.lease === null || exec.ownershipLost) return false;
+    const claimKey = this.positionClaimKey(underlying);
+    const existing = this.positionClaims.get(claimKey);
+    if (existing) {
+      // Already claimed for this underlying (a second trade, or a re-entry after a config
+      // change). Add the trade and release this execution's now-redundant lease normally.
+      if (tradeId) existing.tradeIds.add(tradeId);
+      return false;
+    }
+    this.positionClaims.set(claimKey, {
+      owner: executionId,
+      lease: exec.lease,
+      context: exec.context,
+      keys: exec.keys,
+      underlying: underlying.trim().toUpperCase(),
+      // A successful entry with no trade id would otherwise be unreleasable. Fall back to the
+      // execution id so the claim still has an owner the engine can clear.
+      tradeIds: new Set([tradeId ?? executionId]),
+      claimedAt: this.now(),
+      ownershipLost: false,
+    });
+    this.stats.positionClaimsHeld++;
+    this.ensureHeartbeat();
+    this.log({
+      execution: executionId,
+      broker: exec.context.broker,
+      underlying,
+      status: "underlying_claim_held",
+      tradeId: tradeId ?? "-",
+    });
+    return true;
+  }
+
+  /**
+   * Claim an underlying for an already-open Box.
+   *
+   * Called by the engine at BOOT for every adopted position and unresolved residual attempt,
+   * which is what makes the lock survive a restart: after a reboot every lease has expired, so
+   * the protection is re-established from durable Mongo state rather than assumed.
+   *
+   * Idempotent per (underlying, tradeId). A failure to acquire is reported but never throws:
+   * refusing to adopt a position because a lock could not be taken would strand real exposure.
+   */
+  async claimUnderlyingForPosition(underlying: string, tradeId: string): Promise<boolean> {
+    if (!this.deps.cfg.oneActiveBoxPerUnderlying) return false;
+    const claimKey = this.positionClaimKey(underlying);
+    const existing = this.positionClaims.get(claimKey);
+    if (existing) {
+      existing.tradeIds.add(tradeId);
+      return true;
+    }
+    const owner = this.mintId("position");
+    const context = this.context();
+    const refs = [underlyingLegRef(this.deps.broker(), underlying, BOX_LEG_ROLES[0] as BoxLegRole)];
+    try {
+      const attempt = await this.acquire(owner, refs, context);
+      if (attempt.kind !== "acquired") {
+        // Another process already protects this underlying, or the authority is down. Either way
+        // Layer 1a still blocks locally, so this is a degraded-protection note, not a failure.
+        this.stats.positionClaimFailures++;
+        this.log({
+          execution: owner,
+          broker: context.broker,
+          underlying,
+          status: "underlying_claim_unavailable",
+          reason: attempt.kind,
+        });
+        return false;
+      }
+      this.positionClaims.set(claimKey, {
+        owner,
+        lease: attempt.lease,
+        context,
+        keys: attempt.lease.keys as string[],
+        underlying: underlying.trim().toUpperCase(),
+        tradeIds: new Set([tradeId]),
+        claimedAt: this.now(),
+        ownershipLost: false,
+      });
+      this.stats.positionClaimsHeld++;
+      this.ensureHeartbeat();
+      return true;
+    } catch {
+      this.stats.positionClaimFailures++;
+      return false;
+    }
+  }
+
+  /**
+   * Drop a trade's reliance on an underlying claim, releasing it when the last one goes.
+   *
+   * Called by the engine when a Box becomes fully FLAT and its residual exposure is resolved.
+   * Releasing here — rather than letting a TTL lapse — is what stops the lock being incorrectly
+   * retained after the position is flat.
+   */
+  async releaseUnderlyingForPosition(underlying: string, tradeId: string): Promise<void> {
+    const claimKey = this.positionClaimKey(underlying);
+    const claim = this.positionClaims.get(claimKey);
+    if (!claim) return;
+    claim.tradeIds.delete(tradeId);
+    if (claim.tradeIds.size > 0) return;
+    this.positionClaims.delete(claimKey);
+    this.stats.positionClaimsReleased++;
+    await this.releaseLease(claim.owner, claim.lease);
+    this.stopHeartbeatIfIdle();
+    this.log({
+      execution: claim.owner,
+      broker: claim.context.broker,
+      underlying,
+      status: "underlying_claim_released",
+      tradeId,
+    });
+  }
+
+  /** Underlyings this process currently protects on behalf of an open Box. Diagnostics. */
+  claimedUnderlyings(): string[] {
+    return [...this.positionClaims.values()].map((claim) => claim.underlying).sort();
   }
 
   private async releaseLease(executionId: string, lease: ReservationLease | null): Promise<void> {
@@ -1251,7 +1533,7 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
   private ensureHeartbeat(): void {
     if (this.disposed) return;
     if (this.heartbeat !== null) return;
-    if (this.active.size === 0 && this.holds.size === 0) return;
+    if (this.active.size === 0 && this.holds.size === 0 && this.positionClaims.size === 0) return;
     const interval = this.deps.cfg.reservationRenewIntervalMs;
     const set =
       this.deps.setTimer ??
@@ -1269,7 +1551,9 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
 
   private stopHeartbeatIfIdle(): void {
     if (this.heartbeat === null) return;
-    if (this.active.size > 0 || this.holds.size > 0) return;
+    // A position claim outlives every execution, so the heartbeat must outlive them too:
+    // stopping it here would let an open Box's underlying protection lapse by TTL.
+    if (this.active.size > 0 || this.holds.size > 0 || this.positionClaims.size > 0) return;
     const clear = this.deps.clearTimer ?? ((h: unknown) => clearInterval(h as ReturnType<typeof setInterval>));
     clear(this.heartbeat);
     this.heartbeat = null;
@@ -1389,6 +1673,38 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
           reason: outcome.reason,
         });
       }
+
+      // OPEN-POSITION UNDERLYING CLAIMS. Renewed indefinitely and deliberately UNBOUNDED by
+      // `reservationUncertainHoldMaxMs`: an uncertain hold is a temporary ambiguity, whereas
+      // this represents a Box that really is open, and an open Box may be held for hours. The
+      // claim ends when the engine reports it flat, not when a timer says so.
+      //
+      // A failed renewal is recorded but the claim is NOT dropped. Losing the reservation does
+      // not mean the position closed, and forgetting it here would remove Layer 1c's protection
+      // while the exposure remained. Layer 1a still blocks locally, so the degradation is
+      // bounded and visible rather than silent.
+      for (const [claimKey, claim] of [...this.positionClaims]) {
+        const outcome = await this.renewLease(claim.owner, claim.lease, ttl, now, current);
+        if (outcome.ok) {
+          this.stats.renewSuccess++;
+          claim.lease = { ...claim.lease, expiresAt: outcome.expiresAt, fence: outcome.fence };
+          claim.ownershipLost = false;
+          continue;
+        }
+        this.stats.renewFailure++;
+        if (!claim.ownershipLost) {
+          claim.ownershipLost = true;
+          this.log({
+            execution: claim.owner,
+            broker: claim.context.broker,
+            underlying: claim.underlying,
+            status: "underlying_claim_renew_failed",
+            reason: outcome.reason,
+            detail: outcome.detail,
+            claimKey,
+          });
+        }
+      }
       this.stopHeartbeatIfIdle();
     } finally {
       this.heartbeatRunning = false;
@@ -1504,13 +1820,17 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     if (local !== undefined && local !== this.deps.reservations) await local.clear();
     this.active.clear();
     this.holds.clear();
+    // Position claims are keyed by the OUTGOING broker's namespace, so their rows are gone with
+    // the `clear()` above and their bookkeeping would be stale. The engine re-claims under the
+    // new broker as part of the switch, exactly as it does at boot.
+    this.positionClaims.clear();
     this.activeOpportunities.clear();
     this.stopHeartbeatIfIdle();
   }
 
-  /** True while this process holds any reservation, including uncertain holds. */
+  /** True while this process holds any reservation, including uncertain holds and claims. */
   get holdsReservations(): boolean {
-    return this.active.size > 0 || this.holds.size > 0;
+    return this.active.size > 0 || this.holds.size > 0 || this.positionClaims.size > 0;
   }
 
   /** Stop the heartbeat. Called from the engine's shutdown path. */

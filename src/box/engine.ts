@@ -39,6 +39,7 @@ import {
 } from "./config.js";
 import { BoxChargeEstimator, buildEntryChargeLegs, type BoxChargeLeg, type PriceChargeGroupsFn } from "./charges.js";
 import { BoxChargeReconciler } from "./chargeReconciler.js";
+import { activeUnderlyings, type UnderlyingActivity } from "./underlyingLock.js";
 import { BoxExecutionSimulator } from "./executionSimulator.js";
 import { createExecutionClock, type ExecutionClock } from "./executionClock.js";
 import { ExecutionEnvironmentMonitor } from "./executionEnvironment.js";
@@ -455,6 +456,16 @@ export class BoxEngine {
    * attempts, so an interrupted unwind is resumed whether or not RUN is pressed.
    */
   private residualByAttempt = new Map<string, ResidualLegExposure[]>();
+  /**
+   * Which UNDERLYING each residual attempt belongs to.
+   *
+   * Residual legs are keyed by attempt id and carry only per-contract identity, so on their own
+   * they cannot answer "does RELIANCE have unresolved exposure?". The attribution is recorded at
+   * both registration sites — the live entry path, which knows the candidate, and boot
+   * reconciliation, which reads `underlying` off the durable execution attempt — so the
+   * underlying lock's answer survives a restart.
+   */
+  private residualUnderlyingByAttempt = new Map<string, string>();
   /** Durable projection version/content corresponding to each in-memory residual. */
   private residualProjectionVersion = new Map<string, number>();
   private residualProjectionIdentity = new Map<string, string>();
@@ -685,6 +696,9 @@ export class BoxEngine {
       broker: () => this.deps.activeBroker(),
       generation: () => this.deps.brokerGeneration?.() ?? 0,
       identity: this.reservations.identity,
+      // LAYER 1a of the underlying lock. Synchronous and durable-state derived, so the lock
+      // cannot be lost by a lease expiring while a position is still open.
+      activeUnderlyings: () => this.activeUnderlyings(),
     });
     this.execution = this.coordinator;
 
@@ -947,6 +961,14 @@ export class BoxEngine {
         await this.reconcileResidualExposure();
       } catch (err) {
         console.warn("[Box] failed to reconcile residual exposure:", err);
+      }
+      // Rebuild underlying-level protection from the state just adopted. Runs AFTER both
+      // position adoption and residual reconciliation, so it sees every underlying that carries
+      // exposure — a claim taken before residuals were loaded would miss some.
+      try {
+        await this.reclaimUnderlyingsForOpenExposure();
+      } catch (err) {
+        console.warn("[Box] failed to re-claim underlying locks at startup:", err);
       }
       if (this.orderManager) {
         this.syncManagerExposure();
@@ -2288,7 +2310,13 @@ export class BoxEngine {
     if (residual.length > 0) {
       // Track the outstanding exposure so it is never lost, and start the flatten
       // loop. The id lets a later flatten mark this attempt resolved.
-      this.registerResidual(attemptId ?? `local:${candidate.key}:${Date.now()}`, residual);
+      this.registerResidual(
+        attemptId ?? `local:${candidate.key}:${Date.now()}`,
+        residual,
+        0,
+        residualProjectionIdentity(residual),
+        candidate.underlying,
+      );
       console.warn(
         `[Box] ${residual.length} residual execution leg(s) left OUTSTANDING by ${candidate.key} ` +
           `(could not be flattened) — recorded and being worked by the flatten loop.`,
@@ -2776,6 +2804,11 @@ export class BoxEngine {
     this.positions.remove(position.id);
     this.syncManagerExposure();
     this.marginBackfillTries.delete(position.id);
+    // The Box is FLAT and durably closed, so the underlying-level protection must end. Doing it
+    // here rather than letting a TTL lapse is what stops the lock being incorrectly retained
+    // after a position is fully flat. `releaseUnderlyingForPosition` is reference-counted, so a
+    // second Box on the same underlying keeps its own protection.
+    void this.releaseUnderlyingClaim(position.underlying, position.id);
 
     // Fold the realised result into the running day-P&L tally.
     this.rollClosedTodayDay();
@@ -3174,6 +3207,8 @@ export class BoxEngine {
       if (position) {
         this.positions.remove(id);          // also frees the byKey / reserved entry
         this.syncManagerExposure();         // exposure counts the manager enforces
+        // The record is being destroyed, so nothing could ever release the claim later.
+        void this.releaseUnderlyingClaim(position.underlying, id);
         this.marginBackfillTries.delete(id);
         this.marginInFlight.delete(id);
         const wasHeld = this.monitor.forgetPosition(id);
@@ -3448,6 +3483,9 @@ export class BoxEngine {
           ? a.projection_version!
           : 0,
         a.residual_projection_identity ?? residualProjectionIdentity(residual),
+        // Read off the durable row, so the underlying lock blocks this symbol again after a
+        // restart exactly as it did before one.
+        a.underlying,
       );
       total += residual.length;
     }
@@ -3500,23 +3538,107 @@ export class BoxEngine {
     };
   }
 
-  /** Register outstanding residual exposure and make sure the flatten loop runs. */
+  /**
+   * Register outstanding residual exposure and make sure the flatten loop runs.
+   *
+   * `underlying` is recorded so the underlying-level entry lock can see that this symbol still
+   * carries unresolved exposure. It is optional only so a legacy caller keeps compiling; both
+   * production call sites supply it.
+   */
   private registerResidual(
     attemptId: string,
     residual: ResidualLegExposure[],
     projectionVersion = 0,
     projectionIdentity = residualProjectionIdentity(residual),
+    underlying?: string,
   ): void {
     this.residualProjectionVersion.set(attemptId, projectionVersion);
     this.residualProjectionIdentity.set(attemptId, projectionIdentity);
     if (residual.length === 0) {
       this.residualByAttempt.delete(attemptId);
+      this.residualUnderlyingByAttempt.delete(attemptId);
     } else {
       this.residualByAttempt.set(attemptId, residual);
+      if (underlying) this.residualUnderlyingByAttempt.set(attemptId, underlying.trim().toUpperCase());
       this.ensureFeed(); // outstanding exposure needs live books to flatten
       this.ensureResidualFlattenTimer();
     }
     this.orderManager?.setExposure({ residualLegs: this.residualLegCount() });
+  }
+
+  /**
+   * Release the durable underlying claim for a trade. Never throws.
+   *
+   * A failure here would leave the underlying protected for longer than necessary, which is the
+   * safe direction, so it is logged rather than propagated into a close/delete path.
+   */
+  private async releaseUnderlyingClaim(underlying: string, tradeId: string): Promise<void> {
+    if (!this.cfg.oneActiveBoxPerUnderlying) return;
+    try {
+      await this.coordinator.releaseUnderlyingForPosition(underlying, tradeId);
+    } catch (error) {
+      console.warn(`[Box] failed to release the ${underlying} underlying claim for ${tradeId}:`, error);
+    }
+  }
+
+  /**
+   * RE-ESTABLISH underlying claims from durable state.
+   *
+   * Called at boot after positions and residual attempts are adopted, and after a broker switch.
+   * This is what makes the underlying lock survive a restart: every lease expired while the
+   * process was down, so protection is rebuilt from Mongo rather than assumed to have persisted.
+   *
+   * Failures are counted, not fatal. Refusing to boot because a lock could not be taken would
+   * strand real exposure — the same trade-off the durable-reservation boot warning already makes.
+   */
+  private async reclaimUnderlyingsForOpenExposure(): Promise<void> {
+    if (!this.cfg.oneActiveBoxPerUnderlying) return;
+    const wanted = new Map<string, string>();
+    for (const position of this.positions.list()) {
+      if (position.position_state === "FLAT") continue;
+      if (!wanted.has(position.underlying)) wanted.set(position.underlying, position.id);
+    }
+    for (const [attemptId, legs] of this.residualByAttempt) {
+      if (legs.length === 0) continue;
+      const underlying = this.residualUnderlyingByAttempt.get(attemptId);
+      if (underlying && !wanted.has(underlying)) wanted.set(underlying, attemptId);
+    }
+    let claimed = 0;
+    for (const [underlying, tradeId] of wanted) {
+      if (await this.coordinator.claimUnderlyingForPosition(underlying, tradeId)) claimed++;
+    }
+    if (wanted.size > 0) {
+      console.warn(
+        `[Box] re-claimed ${claimed}/${wanted.size} underlying lock(s) for exposure adopted at startup ` +
+          `(BOX_ONE_ACTIVE_BOX_PER_UNDERLYING is enabled).`,
+      );
+    }
+  }
+
+  /**
+   * LAYER 1a OF THE UNDERLYING LOCK: which underlyings carry, or may carry, Box exposure.
+   *
+   * Derived entirely from state reconstructed from Mongo at boot — open/partial/RECOVERY
+   * positions and unresolved residual attempts — so the answer is identical before and after a
+   * restart. Nothing here depends on a lease, a timer or a TTL, which is precisely the point:
+   * a lock that expired while a position stayed open would not be a lock.
+   *
+   * SYNCHRONOUS by contract; the coordinator consults it inside a prologue that must not yield.
+   */
+  private activeUnderlyings(): ReadonlyMap<string, UnderlyingActivity> {
+    return activeUnderlyings({
+      positions: this.positions.list().map((position) => ({
+        underlying: position.underlying,
+        ...(position.position_state ? { position_state: position.position_state } : {}),
+        remaining_qty_by_role: position.remaining_qty_by_role,
+      })),
+      residuals: [...this.residualByAttempt].map(([attemptId, legs]) => ({
+        // An unattributed residual is reported under a sentinel rather than dropped: losing it
+        // would silently unlock the underlying it belongs to.
+        underlying: this.residualUnderlyingByAttempt.get(attemptId) ?? "__UNATTRIBUTED__",
+        legs: legs.length,
+      })),
+    });
   }
 
   private ensureResidualFlattenTimer(): void {
@@ -3799,6 +3921,9 @@ export class BoxEngine {
         result.residual_exposure,
         result.projection_version,
         result.projection_identity,
+        // Carry the existing attribution forward: a shrinking residual must not lose the
+        // underlying it belongs to, or the lock would silently release mid-flatten.
+        this.residualUnderlyingByAttempt.get(attemptId),
       );
       if (result.residual_exposure.length === 0) {
         // This attempt is authoritatively resolved and its acknowledgement is no longer pending,

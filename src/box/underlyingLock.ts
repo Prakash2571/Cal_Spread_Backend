@@ -113,6 +113,47 @@ export function isUnderlyingReservationKey(key: string): boolean {
 }
 
 /**
+ * The underlying lock expressed as a leg reference, so it can ride in the SAME reservation
+ * document as the four contract keys.
+ *
+ * WHY REUSE THE EXISTING DOCUMENT rather than build a second reservation namespace: one
+ * document holds the complete key set behind a unique multikey `{deployment, keys}` index, so
+ * adding the underlying key makes it participate in the identical ALL-OR-NONE atomic claim. It
+ * inherits — with no new code and no new failure mode — the fencing token, the broker
+ * generation filter, the deployment namespace, the TTL and crash recovery, the renewal
+ * heartbeat, and the Mongo compare-and-set. A parallel namespace would have to re-earn every
+ * one of those properties, and its acquisition could not be atomic with the contract keys.
+ *
+ * `side` is deliberately CONSTANT. The underlying lock is direction-agnostic: any two Boxes on
+ * one underlying conflict, whatever sides their legs take. A constant side makes every such
+ * pair classify as same-side, which is exactly the intended "serialise or refuse".
+ *
+ * `token: 0` and the `UNDERLYING` pseudo-exchange are never used to identify an instrument —
+ * only the `key` matters to the reservation tiers, which treat keys as opaque strings.
+ */
+export function underlyingLegRef(
+  broker: string,
+  underlying: string,
+  role: BoxLegRole,
+): {
+  readonly key: string;
+  readonly role: BoxLegRole;
+  readonly side: "BUY";
+  readonly token: number;
+  readonly tradingsymbol: string;
+  readonly exchange: string;
+} {
+  return {
+    key: underlyingReservationKey(broker, underlying),
+    role,
+    side: "BUY",
+    token: 0,
+    tradingsymbol: underlying.trim().toUpperCase(),
+    exchange: UNDERLYING_KEY_CLASS,
+  };
+}
+
+/**
  * The underlying encoded in an underlying-level key, or null when `key` is not one.
  *
  * Total: never throws, so a malformed key from a legacy row degrades to "not an underlying
