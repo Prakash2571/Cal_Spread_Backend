@@ -149,7 +149,11 @@ function adapterFor(script, options = {}) {
     gets,
     orders,
     prepareOrder: (req) => ({ ...req, pricing: { ...req.pricing }, tag: `TAG${req.role}` }),
-    submitOrder: async (req) => {
+    submitOrder: async (req, beforePost) => {
+      await options.beforePost?.(req);
+      // This callback is the manager's final executable-feed guard. It runs
+      // before `submits` is mutated because that array represents an external POST.
+      beforePost?.();
       submits.push({ id: req.client_order_id, role: req.role, quantity: req.quantity, side: req.side });
       const generation = Number(/attempt-(\d+)$/.exec(req.client_order_id)?.[1] ?? 0);
       const outcome = script({ req, generation, submitIndex: submits.length - 1 });
@@ -190,8 +194,15 @@ const LIMITS = {
  * A live gateway over a real manager. `held` seeds the ATTRIBUTED exposure the residual is
  * reducing — without it the manager's reduction gate (correctly) refuses every order.
  */
-async function build({ script, journal = new Journal(), held, invariants = [] } = {}) {
-  const adapter = adapterFor(script);
+async function build({
+  script,
+  journal = new Journal(),
+  held,
+  invariants = [],
+  generation = { value: 0 },
+  beforePost,
+} = {}) {
+  const adapter = adapterFor(script, { beforePost });
   let now = 10_000;
   const manager = new BoxOrderManager({
     adapter,
@@ -200,6 +211,10 @@ async function build({ script, journal = new Journal(), held, invariants = [] } 
     controls: { entryEnabled: true, liveOrderEnabled: true, emergencyFlatten: true },
     clock: { now: () => now++ },
     istDayKey: () => "2026-09-07",
+    revalidateQueuedRequest: (_req, stamp) =>
+      stamp?.feed_generation === generation.value
+        ? null
+        : "feed generation changed before broker POST",
   });
   // Spy on the REAL invariant hook rather than replacing it: the breaker must still trip.
   const realInvariant = manager.invariantViolation.bind(manager);
@@ -224,6 +239,7 @@ async function build({ script, journal = new Journal(), held, invariants = [] } 
     },
     quotes,
     manager,
+    feedGeneration: () => generation.value,
     chargeTotal: () => 20,
   });
 
@@ -555,6 +571,43 @@ test("R16: a gate refusal keeps the identity and never reports a phantom fill", 
   assert.equal(b.adapter.submits.length, 0, "a reduction with no attributed exposure must never reach the broker");
   assert.equal(res.remaining[0].quantity, 75, "the exposure is unchanged");
   assert.equal(res.remaining[0].flatten_attempt, 1, "and the unused identity is preserved");
+});
+
+test("R17: an applied local pre-POST refusal spends exactly one generation and retries the exact remainder", async () => {
+  const generation = { value: 1 };
+  let firstBoundary = true;
+  const b = await build({
+    generation,
+    beforePost: async () => {
+      if (firstBoundary) {
+        firstBoundary = false;
+        generation.value = 2;
+      }
+    },
+    script: ({ req }) => ({ state: "COMPLETE", filled: req.quantity }),
+    held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 75 }],
+  });
+
+  const first = await b.gateway.flattenResidual({
+    residual: [residual("k1_ce")],
+    keyPrefix: "att-local-refusal",
+  });
+  assert.equal(b.adapter.submits.length, 0, "the stale generation made no external POST");
+  assert.equal(first.flattened_by_role.k1_ce, 0);
+  assert.equal(first.remaining[0].quantity, 75, "a local refusal cannot invent a fill");
+  assert.equal(first.remaining[0].flatten_attempt, 2, "the durably rejected identity is spent exactly once");
+  const firstId = [...b.journal.rows.keys()].find((id) => /attempt-1$/.test(id));
+  assert.equal(b.journal.rows.get(firstId).state, "REJECTED", "no-POST provenance is durable");
+
+  const second = await b.gateway.flattenResidual({
+    residual: first.remaining,
+    keyPrefix: "att-local-refusal",
+  });
+  assert.equal(b.adapter.submits.length, 1, "the next logical attempt reaches the broker once");
+  assert.match(b.adapter.submits[0].id, /attempt-2$/);
+  assert.equal(b.adapter.submits[0].quantity, 75, "the retry uses the exact still-outstanding quantity");
+  assert.equal(second.flattened_by_role.k1_ce, 75);
+  assert.equal(second.remaining.length, 0);
 });
 
 /* ══════════════════ NEGATIVE CONTROL ══════════════════ */
