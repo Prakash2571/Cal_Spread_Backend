@@ -62,6 +62,7 @@ import { INDEX_SPOT_MAP, indexSpotCandidates, resolveIndexSpotSymbol } from "./i
 import { MarketDataSessionStore } from "./marketDataSession.js";
 import { checkTokenPasscode, readPasscode } from "./tokenRouteAuth.js";
 import { generateAdminToken } from "./adminToken.js";
+import { describeSecret, isSecretUsable } from "./secretConfigStatus.js";
 import { ShutdownCoordinator, shutdownExitCode } from "./shutdown.js";
 import { clearTrackedIntervals, trackInterval } from "./trackedTimers.js";
 import { closeDbConnections } from "./db.js";
@@ -1110,6 +1111,18 @@ app.get("/api/status", (_req: Request, res: Response) => {
     generation: brokerManager.generation,
     /** Zerodha's own session, for the admin UI only. Never gates market data. */
     zerodha_session: kite.hasSession(),
+    /**
+     * Whether the login secrets are visible TO THIS PROCESS. Booleans only — never the
+     * value, never its length.
+     *
+     * Here so "did the server actually pick up my .env edit?" is one unauthenticated
+     * curl instead of an SSH session and a log hunt. It discloses nothing new:
+     * `/api/admin/verify` already distinguishes an unconfigured secret (500) from a wrong
+     * one (401) without any credential, so this single bit is already observable — it is
+     * just currently only reachable by attempting a login.
+     */
+    admin_secret_configured: isSecretUsable(ADMIN_SECRET),
+    access_secret_configured: isSecretUsable(ACCESS_SECRET),
   });
 });
 
@@ -5342,6 +5355,20 @@ const httpServer = app.listen(PORT, () => {
     console.warn(
       "WARNING: KITE_API_KEY / KITE_API_SECRET are not set. Copy .env.example to .env and fill them in.",
     );
+  }
+  // Report the ADMIN/ACCESS secrets at boot.
+  //
+  // Without this, an unset ADMIN_SECRET is only discoverable by trying to log in and
+  // reading "Admin secret not configured on server" in the browser — which says nothing
+  // about WHY the server cannot see a value the operator just wrote into .env. There was
+  // already a boot warning for the Kite keys and a status line for Redis; the credential
+  // that guards trade execution had neither. Logs the state only, never the value.
+  for (const report of [
+    describeSecret("ADMIN_SECRET", process.env.ADMIN_SECRET, "full admin access"),
+    describeSecret("ACCESS_SECRET", process.env.ACCESS_SECRET, "trade-only access"),
+  ]) {
+    if (report.level === "warn") console.warn(`WARNING: ${report.message}`);
+    else console.log(`[Config] ${report.message}`);
   }
   // Connect to MongoDB for trade persistence (no-op if MONGODB_URI is unset).
   void initDb().then(async () => {
