@@ -47,6 +47,7 @@
 import type { BoxExecutionPolicy, ExecutionPhase } from "./executionPolicy.js";
 import { round2, slippagePerUnit } from "./math.js";
 import { classifyOrderProfile, touchPrice, walkDepth } from "./orderPricing.js";
+import { paperRunTimelineViolations } from "./paperLegTimeline.js";
 import type { BoxQuoteStore } from "./quotes.js";
 import type {
   BoxExecutionFailureReason,
@@ -178,6 +179,15 @@ export interface LegRunResult {
   /** Set when the run was cut short (feed/market/discovery), else null. */
   aborted: { reason: BoxExecutionFailureReason; detail: string } | null;
   /**
+   * Physically impossible timelines detected in this run's legs — empty in every correct run.
+   *
+   * A non-empty array means the simulation produced something that cannot happen (a fill before
+   * exchange arrival, most importantly), so the run's fill/residual/parity statistics are not
+   * evidence of anything. Surfaced rather than swallowed: a modelling bug that silently flatters
+   * paper is the most expensive kind.
+   */
+  timelineViolations: string[];
+  /**
    * token → the EXACT book each leg last filled a slice from.
    *
    * Essential for final qualification and depth audit: legs fill at different
@@ -288,6 +298,11 @@ export class LegExecutor {
           continue;
         }
         if (!touched.has(st.req.inst.token)) continue;
+        // AN ORDER CANNOT FILL BEFORE IT ARRIVES. Every fillable status above is now reachable
+        // only through `arriveAtExchange`, so this is a standing invariant rather than a live
+        // branch — it is the one place a future scheduling change could otherwise reintroduce
+        // `fill_at < arrival_at`.
+        if (st.leg.pending_since === null || at < st.leg.arrival_at) continue;
         // A cancelled order must not be revived by a tick after its terminal confirmation.
         if (st.leg.cancel_confirmed_at !== null && at > st.leg.cancel_confirmed_at) continue;
         // A timed-out order must not be revived by a later tick. While a cancel is racing,
@@ -345,13 +360,11 @@ export class LegExecutor {
         for (const st of states) {
           if (st.done || st.leg.status !== "IN_FLIGHT") continue;
           if (st.leg.arrival_at > at) continue;
-          st.leg.status = "PENDING";
-          st.leg.pending_since = at;
-          st.leg.timeout_at = st.leg.arrival_at + timeout;
+          this.arriveAtExchange(st, at);
 
           // EVENT-LOOP OVERSHOOT: if we woke after this order's deadline, it expired
           // in the market — it must not fill at a price from after its own timeout.
-          if (at > st.leg.timeout_at) {
+          if (st.leg.timeout_at !== null && at > st.leg.timeout_at) {
             this.expire(st, timeout);
             if (sequential) this.cancelRemaining(states, st);
             continue;
@@ -399,7 +412,20 @@ export class LegExecutor {
       if (!st.done) this.abandon(st, st.leg.fail_reason ?? "unresolved when the run ended");
     }
 
-    return { legs: states.map((s) => s.leg), aborted, booksAtFill };
+    const legs = states.map((s) => s.leg);
+    // RUNTIME ASSERTION of the timeline invariants. This should never fire; it exists so a future
+    // scheduling change cannot silently reintroduce a physically impossible fill, because every
+    // statistic this module produces would then be describing something that cannot happen.
+    const timelineViolations = paperRunTimelineViolations(legs);
+    if (timelineViolations.length > 0) {
+      console.error(
+        `[Box] PAPER TIMELINE INVARIANT VIOLATED for ${args.orderIdPrefix}: ` +
+          `${timelineViolations.join("; ")}. A simulated order cannot fill before it reaches the ` +
+          `simulated exchange, so every statistic derived from this run is untrustworthy.`,
+      );
+    }
+
+    return { legs, aborted, booksAtFill, timelineViolations };
   }
 
   /* ------------------------------- internals ------------------------------ */
@@ -485,6 +511,34 @@ export class LegExecutor {
       st.done = true;
       return;
     }
+
+    // AN ORDER CANNOT FILL BEFORE IT REACHES THE EXCHANGE.
+    //
+    // The cancel-vs-fill race is real only for an order actually RESTING on the book. Cancelling
+    // something that is still in transport — or, in sequential mode, was never submitted at all —
+    // removes it before it could ever match, so it must NOT enter `CANCEL_REQUESTED`, which the
+    // quote subscriber deliberately treats as fillable while skipping the timeout guard. Without
+    // this split, an aborted run could produce `fill_at < arrival_at`, or fills on a leg whose
+    // `submit_at`/`arrival_at` were both still 0.
+    if (st.leg.status === "CREATED") {
+      st.leg.cancel_stage = "pre_submission";
+      this.abandon(st, detail);
+      return;
+    }
+    if (st.leg.status === "IN_FLIGHT") {
+      const nowMs = this.deps.now();
+      if (st.leg.arrival_at > nowMs) {
+        st.leg.cancel_stage = "in_transport";
+        this.abandon(st, detail);
+        return;
+      }
+      // CANCEL EXACTLY AT (OR AFTER) ARRIVAL: the order IS live at the exchange; the run loop
+      // simply has not promoted it yet this iteration, because the abort sweep runs before the
+      // arrival sweep. Promote it first, so the race it now legitimately joins starts from a real
+      // arrival and `pending_since >= arrival_at` still holds.
+      this.arriveAtExchange(st, nowMs);
+    }
+
     const race = this.deps.cancelRace;
     if (!race) {
       if (cause === "timeout") {
@@ -510,7 +564,23 @@ export class LegExecutor {
     st.leg.cancel_confirmed_at = at + latency;
     st.leg.status = "CANCEL_REQUESTED";
     st.leg.fail_reason = detail;
+    // Reached only for an order proven to be resting at the exchange (see the arrival split
+    // above), which is the sole stage where a cancel can genuinely lose a race to a fill.
+    st.leg.cancel_stage = "at_exchange";
     // Deliberately NOT done. The order is live at the exchange until the confirmation lands.
+  }
+
+  /**
+   * Promote an arrived order to RESTING at the simulated exchange.
+   *
+   * The single definition of "this order is now live at the exchange": it writes `pending_since`
+   * (the authoritative arrival marker every fill guard tests) and starts the order's own
+   * deadline from its ARRIVAL, not from the wake-up that noticed it.
+   */
+  private arriveAtExchange(st: LegState, at: number): void {
+    st.leg.status = "PENDING";
+    st.leg.pending_since = at;
+    st.leg.timeout_at = st.leg.arrival_at + this.deps.policy.legTimeoutMs;
   }
 
   /**
@@ -616,6 +686,14 @@ export class LegExecutor {
     booksAtFill: Map<number, BoxQuote>,
   ): "filled" | "partial" | "none" {
     const { leg, req } = st;
+    // THE HARD INVARIANT, enforced at the only place quantity is ever created. An order that has
+    // not reached the simulated exchange has no queue position, no resting quantity and cannot
+    // match. Refusing here means no caller — present or future — can manufacture a pre-arrival
+    // fill, whatever status juggling happens upstream.
+    if (leg.pending_since === null || at < leg.arrival_at) {
+      leg.fail_reason = "not yet live at the exchange";
+      return "none";
+    }
     const quote = this.deps.quotes.get(req.inst.token);
     if (!quote) {
       leg.fail_reason = "no book for this instrument yet";
@@ -797,6 +875,7 @@ function blankLeg(req: LegOrderRequest, orderIdPrefix: string, phase: ExecutionP
     cancel_confirmed_at: null,
     fill_qty_at_cancel_request: null,
     raced_fill_qty: 0,
+    cancel_stage: null,
     executable_within_limit_at_arrival: null,
     displayed_qty_at_arrival: null,
     limit_offset_ticks: null,

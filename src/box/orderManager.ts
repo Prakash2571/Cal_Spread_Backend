@@ -1,6 +1,7 @@
 import {
   BrokerAmbiguousSubmitError,
   BrokerOrderRejectedError,
+  BrokerPreSubmitRefusedError,
   isBrokerOrderTerminal,
   type BrokerAdapter,
   type BrokerOrder,
@@ -24,9 +25,28 @@ import type {
   ResidualLegExposure,
 } from "./types.js";
 
+/**
+ * The outcome of one guarded durable update — the TRANSITION, not merely the resulting document.
+ *
+ * `previous_filled_quantity` / `current_filled_quantity` are what make position attribution safe.
+ * See `durableFillDelta` and `repository.updateBoxOrderIntent` for the double-count this exists
+ * to prevent. A persistence implementation that cannot report the transition must leave them
+ * null; the manager then attributes nothing and raises an invariant rather than guessing.
+ */
 export interface OrderIntentUpdateResult {
   intent: IBoxOrderIntent | null;
   applied: boolean;
+  previous_filled_quantity?: number | null;
+  current_filled_quantity?: number | null;
+}
+
+export interface CheckedFeedStamp {
+  /** Token whose exact executable snapshot was checked. */
+  readonly token: number;
+  readonly feed_generation: number;
+  readonly quote_version: number;
+  readonly quote_at: number;
+  readonly checked_at: number;
 }
 
 export interface OrderIntentPersistence {
@@ -35,6 +55,8 @@ export interface OrderIntentPersistence {
     clientOrderId: string,
     patch: BoxOrderIntentPatch,
     audit: BoxOrderIntentAudit,
+    /** Optional compare-and-set guard for safety-critical local transitions. */
+    expectedStates?: readonly BoxOrderIntentState[],
   ): Promise<OrderIntentUpdateResult>;
   loadNonterminal(): Promise<IBoxOrderIntent[]>;
   loadOwned?(): Promise<IBoxOrderIntent[]>;
@@ -75,6 +97,40 @@ export interface OrderManagerHealth {
   circuit: "closed" | "open";
 }
 
+export interface DailyRiskSeed {
+  realisedPnl: number;
+  rejects: number;
+  consecutiveFailures: number;
+  /** Authoritative charge total for this seed's trading day, keyed by execution attempt. */
+  flattenChargeBaselinesForDay?: Record<string, number>;
+  /**
+   * The loader could not prove it read every contributing row. An understated loss must never
+   * present itself as an authoritative seed, so this keeps `daily_risk_seed` unhealthy — and
+   * therefore entry closed — while still installing the counters for observability.
+   */
+  incomplete?: boolean;
+}
+
+/** Generation captured immediately before an asynchronous daily-risk load begins. */
+export interface DailyRiskSeedToken {
+  readonly tradingDay: string;
+  readonly mutationGeneration: number;
+  /** Unique loader/token generation; late completions are accepted only while this is active. */
+  readonly loadGeneration: number;
+}
+
+export interface DailyRiskSeedTimer {
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+interface FlattenChargeMutation {
+  readonly generation: number;
+  readonly attemptId: string;
+  readonly previousChargesForDay: number;
+  readonly chargesForDay: number;
+}
+
 export interface OrderManagerStatus {
   controls: OrderManagerControls;
   health: OrderManagerHealth;
@@ -86,7 +142,15 @@ export interface OrderManagerStatus {
   unknownOrders: number;
   recoveryActive: boolean;
   safeAttributedReductionReady: boolean;
+  /** Matching crash-only exposure exists but its unique durable recovery boundary is unavailable. */
+  crashRecoveryEntryQuarantined: boolean;
   tradingDay: string;
+  riskBookkeeping: {
+    activeSeedTokens: number;
+    activeLoadGeneration: number | null;
+    retainedMutationCount: number;
+    retainedMutationDayBuckets: number;
+  };
   rejects: number;
   consecutiveFailures: number;
   realisedPnlToday: number;
@@ -94,6 +158,13 @@ export interface OrderManagerStatus {
   openBoxes: number;
   orphanOrders: BrokerOrder[];
   lastReconciledAt: number | null;
+  /**
+   * How many durable state transitions the intent state machine REFUSED this session.
+   *
+   * A bounded counter, not a label: a refused transition used to be indistinguishable from a
+   * successful one because the guarded write returns the unchanged document either way.
+   */
+  durableTransitionRefusals: number;
 }
 
 export interface OrderManagerLimits {
@@ -137,6 +208,8 @@ export interface OrderManagerReconcileReport {
 interface SubmitQueueAction {
   kind: "submit";
   request: BrokerOrderRequest;
+  /** Ephemeral evidence only; never copied into the durable intent or broker payload. */
+  checkedFeed?: CheckedFeedStamp;
   resolve: (order: BrokerOrder) => void;
   reject: (error: unknown) => void;
   sequence: number;
@@ -226,10 +299,28 @@ export class BoxOrderManager {
   private breakerReason: string | null = null;
   private breakerAt: number | null = null;
   private reconcilePromise: Promise<OrderManagerReconcileReport> | null = null;
-  private dailyRiskSeedPromise: Promise<void> | null = null;
+  private dailyRiskLoadGeneration = 0;
+  private activeDailyRiskLoad: {
+    generation: number;
+    day: string;
+    token: DailyRiskSeedToken;
+    timeout: unknown;
+  } | null = null;
+  private readonly activeDailyRiskSeedTokens = new Map<number, DailyRiskSeedToken>();
+  private crashOnlyAttributedExposure = false;
+  /**
+   * Local flatten observations are generation-stamped per day. A seed loader captures the
+   * generation before issuing any query, then installation merges only ranges absent from the
+   * loader's authoritative per-attempt day buckets. This is the serialization boundary between
+   * Mongo reconstruction and in-process risk mutation.
+   */
+  private flattenChargeMutationGeneration = 0;
+  private readonly flattenChargeMutationsByDay = new Map<string, FlattenChargeMutation[]>();
   private reconcileTimer: NodeJS.Timeout | null = null;
   private disposed = false;
   private lastReconciledAt: number | null = null;
+  /** Guarded durable transitions the intent state machine refused. Bounded counter. */
+  private durableTransitionRefusals = 0;
 
   constructor(
     private readonly deps: {
@@ -241,7 +332,13 @@ export class BoxOrderManager {
       istDayKey?: (at: number) => string;
       onPersistenceLossAfterFill?: (order: BrokerOrder, error: unknown) => void;
       onReconciliationIssue?: (report: OrderManagerReconcileReport) => void | Promise<void>;
-      loadDailyRiskSeed?: (tradingDay: string) => Promise<{ realisedPnl: number; rejects: number; consecutiveFailures: number }>;
+      loadDailyRiskSeed?: (tradingDay: string) => Promise<DailyRiskSeed>;
+      /** Logical cancellation bound for a seed query that the database driver cannot abort. */
+      dailyRiskSeedTimeoutMs?: number;
+      /** Injectable deterministic timer used by seed timeout tests. */
+      dailyRiskSeedTimer?: DailyRiskSeedTimer;
+      /** Process/connection/index-scoped readiness; read at every entry decision. */
+      isCrashRecoveryPersistenceReady?: () => boolean;
       onCircuitTrip?: (reason: string) => void;
       /**
        * LIVE TIMING INSTRUMENTATION (Phase 2). Optional and FAIL-OPEN: when absent the manager
@@ -257,6 +354,15 @@ export class BoxOrderManager {
        * rejection is handled.
        */
       onBrokerReject?: (order: BrokerOrder | null, reason: string) => void;
+      /**
+       * Re-check the exact executable quote admitted by the gateway. Production
+       * installs this fail-closed authority; optionality preserves isolated manager
+       * use where no market-data source exists.
+       */
+      revalidateQueuedRequest?: (
+        request: BrokerOrderRequest,
+        stamp: CheckedFeedStamp | undefined,
+      ) => string | null;
       /**
        * Which broker these samples belong to. Required for timing to be recorded at all,
        * because a sample that cannot be attributed to a broker must never be filed — pooling
@@ -298,6 +404,76 @@ export class BoxOrderManager {
     this.controls = { ...this.controls, ...patch };
   }
 
+  /** Capture and register the local mutation boundary immediately before a daily-risk load starts. */
+  beginDailyRiskSeed(tradingDay: string): DailyRiskSeedToken {
+    const token: DailyRiskSeedToken = {
+      tradingDay,
+      mutationGeneration: this.flattenChargeMutationGeneration,
+      loadGeneration: ++this.dailyRiskLoadGeneration,
+    };
+    this.activeDailyRiskSeedTokens.set(token.loadGeneration, token);
+    return token;
+  }
+
+  /**
+   * Release a daily-risk seed token whose load will never install anything.
+   *
+   * `seedLimits` settles the token on the installing path; every other exit needs this one, or the
+   * token stays "active" forever and `compactFlattenChargeMutations` must retain the whole day's
+   * merge journal — the unbounded growth the generation bound exists to close, re-opened once per
+   * failed boot. Idempotent (an already-settled token is not registered) and it never discards a
+   * merge a genuinely active loader still needs: compaction keeps the suffix above the oldest
+   * REMAINING active generation for the day.
+   */
+  abandonDailyRiskSeed(token: DailyRiskSeedToken): void {
+    if (!this.activeDailyRiskSeedTokens.has(token.loadGeneration)) return;
+    this.settleDailyRiskSeedToken(token);
+  }
+
+  /**
+   * Reconciliation/engine seam for crash-only exposure not represented by projected trades.
+   * Entry reads persistence readiness dynamically; ordinary exits never consult this flag.
+   */
+  setCrashOnlyAttributedExposure(exists: boolean): void {
+    this.crashOnlyAttributedExposure = exists;
+  }
+
+  /**
+   * Record one authoritative per-attempt/day bucket advance. Lifetime bookkeeping lives in the
+   * engine; this manager owns only the trading-day debit and the seed-install merge journal.
+   */
+  recordFlattenCharge(args: {
+    attemptId: string;
+    chargeDay: string;
+    previousChargesForDay: number;
+    chargesForDay: number;
+  }): void {
+    if (!args.chargeDay || !Number.isFinite(args.previousChargesForDay) ||
+        !Number.isFinite(args.chargesForDay)) return;
+    const previous = Math.round(Math.max(0, args.previousChargesForDay) * 100) / 100;
+    const current = Math.round(Math.max(0, args.chargesForDay) * 100) / 100;
+    if (current <= previous || args.chargeDay !== this.tradingDay) return;
+    const generation = ++this.flattenChargeMutationGeneration;
+    const activeLoaderCanNeedMutation = [...this.activeDailyRiskSeedTokens.values()].some(
+      (token) => token.tradingDay === args.chargeDay && token.mutationGeneration < generation,
+    );
+    if (activeLoaderCanNeedMutation) {
+      const mutation: FlattenChargeMutation = {
+        generation,
+        attemptId: args.attemptId,
+        previousChargesForDay: previous,
+        chargesForDay: current,
+      };
+      const mutations = this.flattenChargeMutationsByDay.get(args.chargeDay) ?? [];
+      mutations.push(mutation);
+      this.flattenChargeMutationsByDay.set(args.chargeDay, mutations);
+    }
+    if (args.chargeDay === this.tradingDay) {
+      this.realisedPnlToday = Math.round((this.realisedPnlToday - (current - previous)) * 100) / 100;
+      this.evaluateLimits();
+    }
+  }
+
   /** Seed durable/reconciled counters before entry is allowed. */
   seedLimits(args: {
     tradingDay: string;
@@ -306,14 +482,33 @@ export class BoxOrderManager {
     consecutiveFailures?: number;
     openBoxes?: number;
     residualLegs?: number;
+    seedToken?: DailyRiskSeedToken | undefined;
+    flattenChargeBaselinesForDay?: Record<string, number> | undefined;
+    /** The reconstruction may be missing loss rows; see `DailyRiskSeed.incomplete`. */
+    incomplete?: boolean | undefined;
   }): void {
+    if (args.seedToken && !this.activeDailyRiskSeedTokens.has(args.seedToken.loadGeneration)) {
+      // Timed-out/rolled-over loader completion. Its scalar and baselines are no longer allowed to
+      // mutate current risk, and its mutation range has already been compacted.
+      return;
+    }
     this.tradingDay = args.tradingDay;
-    this.realisedPnlToday = Number.isFinite(args.realisedPnlToday) ? args.realisedPnlToday! : 0;
+    const seedPnl = Number.isFinite(args.realisedPnlToday) ? args.realisedPnlToday! : 0;
+    this.realisedPnlToday = this.mergePostLoadFlattenCharges(
+      args.tradingDay,
+      seedPnl,
+      args.seedToken,
+      args.flattenChargeBaselinesForDay,
+    );
     this.rejects = Math.max(0, Math.floor(args.rejects ?? 0));
     this.consecutiveFailures = Math.max(0, Math.floor(args.consecutiveFailures ?? 0));
     this.openBoxes = Math.max(0, Math.floor(args.openBoxes ?? 0));
     this.residualLegs = Math.max(0, Math.floor(args.residualLegs ?? 0));
-    this.health.daily_risk_seed = "healthy";
+    // A truncated reconstruction can only understate a loss, which would LOOSEN the daily-loss
+    // gate. Counters are still installed so an operator can see them, but the seed is not called
+    // healthy, and `canEnter()` already treats anything other than healthy as closed.
+    this.health.daily_risk_seed = args.incomplete === true ? "failed" : "healthy";
+    if (args.seedToken) this.settleDailyRiskSeedToken(args.seedToken);
     this.evaluateLimits();
   }
 
@@ -381,6 +576,16 @@ export class BoxOrderManager {
     return out;
   }
 
+  /**
+   * Read one durable order intent by client id.
+   *
+   * Exposed so residual flattening can resolve its DURABLE attempt generation from the intent
+   * journal rather than from an in-memory counter. Read-only, and it never creates an intent.
+   */
+  findDurableIntent(clientOrderId: string): Promise<IBoxOrderIntent | null> {
+    return this.deps.persistence.findByClientId(clientOrderId);
+  }
+
   setFeedHealthy(healthy: boolean): void {
     const now = this.now();
     if (healthy && !this.feedHealthy) this.feedWarmUntil = now + this.deps.limits.feedReconnectWarmupMs;
@@ -405,6 +610,7 @@ export class BoxOrderManager {
         this.health.broker_orders_api !== "healthy" ||
         this.health.broker_positions_api !== "healthy") return false;
     if (this.unknownOrders > 0 || this.recoveryActive) return false;
+    if (this.isCrashRecoveryEntryQuarantined()) return false;
     if (!this.feedHealthy || this.now() < this.feedWarmUntil) return false;
     if (this.openBoxes >= this.deps.limits.maxOpenBoxes) return false;
     if (this.residualLegs > this.deps.limits.maxResidualLegs) return false;
@@ -424,7 +630,7 @@ export class BoxOrderManager {
     return this.canManageExposure() && this.safeAttributedReductionReady;
   }
 
-  submit(request: BrokerOrderRequest): Promise<BrokerOrder> {
+  submit(request: BrokerOrderRequest, checkedFeed?: CheckedFeedStamp): Promise<BrokerOrder> {
     if (request.purpose === "ENTRY" && !this.canEnter(request)) {
       return Promise.reject(new Error("OrderManager entry controls or limits are closed."));
     }
@@ -452,7 +658,14 @@ export class BoxOrderManager {
     // construction: `beginTrace` swallows everything.
     this.beginTrace(request);
     return new Promise<BrokerOrder>((resolve, reject) => {
-      this.queue.push({ kind: "submit", request, resolve, reject, sequence: this.sequence++ });
+      this.queue.push({
+        kind: "submit",
+        request,
+        ...(checkedFeed ? { checkedFeed } : {}),
+        resolve,
+        reject,
+        sequence: this.sequence++,
+      });
       this.sortQueue();
       this.pump();
     });
@@ -623,7 +836,15 @@ export class BoxOrderManager {
       unknownOrders: this.unknownOrders,
       recoveryActive: this.recoveryActive,
       safeAttributedReductionReady: this.safeAttributedReductionReady,
+      crashRecoveryEntryQuarantined: this.isCrashRecoveryEntryQuarantined(),
       tradingDay: this.tradingDay,
+      riskBookkeeping: {
+        activeSeedTokens: this.activeDailyRiskSeedTokens.size,
+        activeLoadGeneration: this.activeDailyRiskLoad?.generation ?? null,
+        retainedMutationCount: [...this.flattenChargeMutationsByDay.values()]
+          .reduce((sum, mutations) => sum + mutations.length, 0),
+        retainedMutationDayBuckets: this.flattenChargeMutationsByDay.size,
+      },
       rejects: this.rejects,
       consecutiveFailures: this.consecutiveFailures,
       realisedPnlToday: this.realisedPnlToday,
@@ -631,6 +852,7 @@ export class BoxOrderManager {
       openBoxes: this.openBoxes,
       orphanOrders: this.orphanOrders.map(cloneOrder),
       lastReconciledAt: this.lastReconciledAt,
+      durableTransitionRefusals: this.durableTransitionRefusals,
     };
   }
 
@@ -638,6 +860,12 @@ export class BoxOrderManager {
     this.disposed = true;
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
     this.reconcileTimer = null;
+    if (this.activeDailyRiskLoad) {
+      this.seedTimer().clearTimeout(this.activeDailyRiskLoad.timeout);
+      this.activeDailyRiskLoad = null;
+    }
+    this.activeDailyRiskSeedTokens.clear();
+    this.flattenChargeMutationsByDay.clear();
     for (const action of this.queue.splice(0)) {
       if (action.kind === "submit") {
         this.activeClientIds.delete(action.request.client_order_id);
@@ -746,14 +974,49 @@ export class BoxOrderManager {
       this.knownIntents.set(intent.client_order_id, intent);
       this.health.persistence = "healthy";
       if (intent.state !== "CREATED") {
-        // A prior submission exists. Reconcile it; never blindly resubmit.
+        // A prior submission exists. Reconcile it; never let current feed state
+        // hide or rewrite an identity that may already exist at the broker.
         const reconciled = await this.deps.adapter.getOrder(request.client_order_id);
         if (!reconciled) throw new Error("Existing durable intent requires reconciliation before resubmit.");
         await this.persistOrder(intent, reconciled, "existing intent reconciled before resubmit");
         action.resolve(reconciled);
         return;
       }
-      intent = await this.transition(intent, "SUBMITTING", null, "transport submission starting");
+
+      const dequeueReason = this.checkedFeedBlockReason(request, action.checkedFeed);
+      if (dequeueReason) {
+        const refusal = new BrokerPreSubmitRefusedError(
+          request.client_order_id,
+          "dequeue",
+          true,
+          dequeueReason,
+        );
+        const terminalized = await this.persistLocalPreSubmitRefusal(intent, refusal);
+        if (!terminalized) {
+          await this.resolveConcurrentSubmissionOwner(action, this.knownIntents.get(intent.client_order_id) ?? intent);
+          return;
+        }
+        action.reject(refusal);
+        return;
+      }
+
+      const submitting = await this.transitionResult(
+        intent,
+        "SUBMITTING",
+        null,
+        "transport submission starting",
+        ["CREATED"],
+      );
+      if (!submitting.applied) {
+        // Another process won the deterministic identity. Never POST from this
+        // process; adopt a known snapshot or leave the identity to reconciliation.
+        await this.resolveConcurrentSubmissionOwner(action, submitting.intent);
+        return;
+      }
+      intent = submitting.intent;
+      if (intent.state !== "SUBMITTING") {
+        throw new Error(`Order intent ${intent.client_order_id} did not durably enter SUBMITTING; broker POST blocked.`);
+      }
       // DURABLE PERSISTENCE COMPLETE. Both Mongo writes are done and the order may now be
       // transmitted, so this closes `persistence_wait_ms` and opens `transport_wait_ms`. Recorded
       // here rather than being left inside the pacing span, because a database round trip reported
@@ -762,8 +1025,30 @@ export class BoxOrderManager {
 
       let order: BrokerOrder;
       try {
-        order = await this.deps.adapter.submitOrder(persistedRequest);
+        order = await this.deps.adapter.submitOrder(persistedRequest, () => {
+          const reason = this.checkedFeedBlockReason(request, action.checkedFeed);
+          if (reason) {
+            throw new BrokerPreSubmitRefusedError(
+              request.client_order_id,
+              "pre_post",
+              true,
+              reason,
+            );
+          }
+        });
       } catch (error) {
+        if (error instanceof BrokerPreSubmitRefusedError) {
+          const terminalized = await this.persistLocalPreSubmitRefusal(intent, error);
+          if (!terminalized) {
+            await this.resolveConcurrentSubmissionOwner(
+              action,
+              this.knownIntents.get(intent.client_order_id) ?? intent,
+            );
+            return;
+          }
+          action.reject(error);
+          return;
+        }
         if (error instanceof BrokerOrderRejectedError) {
           await this.persistOrder(intent, error.order, "broker rejected order");
           this.rejects++;
@@ -819,6 +1104,67 @@ export class BoxOrderManager {
       this.noteFailure("order intent persistence failure");
       action.reject(error);
     }
+  }
+
+  /** Current-feed authority for one queued request. A validator fault fails closed. */
+  private checkedFeedBlockReason(
+    request: BrokerOrderRequest,
+    stamp: CheckedFeedStamp | undefined,
+  ): string | null {
+    const validate = this.deps.revalidateQueuedRequest;
+    if (!validate) return null;
+    try {
+      return validate(request, stamp);
+    } catch {
+      return "current executable-feed validation failed closed";
+    }
+  }
+
+  /**
+   * Terminalize a proven local no-POST outcome without counting it as a broker
+   * rejection or uncertainty. The expected-state CAS prevents this process from
+   * overwriting a concurrent actor that advanced the identity toward the broker.
+   */
+  private async persistLocalPreSubmitRefusal(
+    intent: IBoxOrderIntent,
+    refusal: BrokerPreSubmitRefusedError,
+  ): Promise<boolean> {
+    const result = await this.transitionResult(
+      intent,
+      "REJECTED",
+      null,
+      `local pre-submit refusal; no broker POST attempted (${refusal.stage}): ${refusal.reason}`,
+      [intent.state],
+      {
+        origin: "local_pre_submit_refusal",
+        no_broker_post: true,
+        stage: refusal.stage,
+        reason: refusal.reason,
+      },
+    );
+    // Provenance matters: an already-REJECTED fresh row may be a real broker
+    // rejection written by another actor. Only THIS applied CAS proves no POST.
+    return result.applied && result.intent.state === "REJECTED";
+  }
+
+  /** Adopt another process's winner when possible; otherwise quarantine locally without POST. */
+  private async resolveConcurrentSubmissionOwner(
+    action: SubmitQueueAction,
+    current: IBoxOrderIntent,
+  ): Promise<void> {
+    this.knownIntents.set(current.client_order_id, current);
+    const reconciled = await this.deps.adapter.getOrder(current.client_order_id);
+    if (reconciled) {
+      await this.persistOrder(current, reconciled, "concurrent durable submission owner reconciled");
+      action.resolve(reconciled);
+      return;
+    }
+    if (!isBrokerOrderTerminal(current.state)) this.unknownOrders++;
+    action.reject(new BrokerAmbiguousSubmitError(
+      current.client_order_id,
+      `Another process advanced durable intent ${current.client_order_id} to ${current.state}; ` +
+        "this process attempted no broker POST and reconciliation is required.",
+    ));
   }
 
   private async performReconcile(): Promise<OrderManagerReconcileReport> {
@@ -1089,7 +1435,13 @@ export class BoxOrderManager {
       );
       const updated = result.intent;
       if (!updated) throw new Error(`Order intent ${intent.client_order_id} disappeared.`);
-      const delta = updated.filled_quantity - intent.filled_quantity;
+      // ATTRIBUTION FOLLOWS THE DURABLE WRITE, NEVER THE CALLER'S SNAPSHOT.
+      // `intent` here is whatever this async context loaded before its awaits, and a concurrent
+      // reconcile pass legitimately holds the same stale copy. Attributing
+      // `updated.filled_quantity - intent.filled_quantity` therefore credited one broker fill
+      // twice, inflating `attributedBoxPositions` — the permission boundary for reduction and
+      // recovery orders — so the manager could authorise reducing more than is actually held.
+      const delta = this.durableFillDelta(result, intent);
       if (delta > 0) {
         const key = `${updated.exchange}:${updated.tradingsymbol}`;
         const prior = this.attributedBoxPositions.get(key) ?? 0;
@@ -1123,7 +1475,20 @@ export class BoxOrderManager {
     state: BoxOrderIntentState,
     brokerOrderId: string | null,
     message: string,
+    expectedStates?: readonly BoxOrderIntentState[],
   ): Promise<IBoxOrderIntent> {
+    return (await this.transitionResult(intent, state, brokerOrderId, message, expectedStates)).intent;
+  }
+
+  /** Same transition, retaining whether THIS atomic compare-and-set won. */
+  private async transitionResult(
+    intent: IBoxOrderIntent,
+    state: BoxOrderIntentState,
+    brokerOrderId: string | null,
+    message: string,
+    expectedStates?: readonly BoxOrderIntentState[],
+    payload?: Record<string, unknown> | null,
+  ): Promise<OrderIntentUpdateResult & { intent: IBoxOrderIntent }> {
     const at = this.now();
     const result = await this.deps.persistence.update(
       intent.client_order_id,
@@ -1135,12 +1500,77 @@ export class BoxOrderManager {
           ? new Date(at)
           : null,
       },
-      auditFor(intent, state, brokerOrderId, message, null, at),
+      auditFor(intent, state, brokerOrderId, message, null, at, payload),
+      expectedStates,
     );
     const updated = result.intent;
     if (!updated) throw new Error(`Order intent ${intent.client_order_id} disappeared.`);
+    if (!result.applied) {
+      // The intent state machine REFUSED this transition. Returning the unchanged document made
+      // that indistinguishable from success, so a caller could believe it had quarantined an
+      // order that is still working.
+      this.durableTransitionRefusals++;
+      console.warn(
+        `[Box] durable state transition ${intent.state} -> ${state} for ` +
+          `${intent.client_order_id} was refused; the document is still ${updated.state}.`,
+      );
+      if (state === "RECONCILIATION_REQUIRED" && !RECONCILE_STATES.has(updated.state)) {
+        // A refused quarantine is not survivable silently: uncertain broker state would look
+        // resolved. Trip directly rather than via invariantViolation, which would recurse into
+        // reconcile from inside a persistence path.
+        this.trip(`quarantine transition refused for ${intent.client_order_id}`);
+      }
+    }
     this.knownIntents.set(updated.client_order_id, updated);
-    return updated;
+    return { ...result, intent: updated };
+  }
+
+  /**
+   * The fill quantity THIS caller's durable write actually established.
+   *
+   * The only safe source is the guarded write's own pre-image/post-image pair:
+   *
+   *   applied === false            => 0. The write was refused, so this caller advanced nothing.
+   *   applied === true             => current - previous, as recorded by the atomic update.
+   *
+   * Worked example of the race this closes — two callers holding `filled_quantity: 0` for one
+   * order the broker filled 40:
+   *
+   *   A persists 40  ->  applied, pre 0,  post 40  ->  delta 40
+   *   B persists 40  ->  applied, pre 40, post 40  ->  delta  0     (the `$lte` guard is
+   *                                                                  deliberately non-strict, so
+   *                                                                  B's write matches and is
+   *                                                                  reported applied — but it
+   *                                                                  advanced nothing)
+   *
+   * Total attributed 40, which is the truth. The old stale-snapshot arithmetic gave 80.
+   *
+   * A persistence layer that cannot report the transition gets NOTHING attributed and trips the
+   * invariant. That direction is deliberate: under-attribution blocks reductions (safe), while
+   * over-attribution authorises reducing more than is held (not safe). Reconciliation rebuilds
+   * the map absolutely from the journal, so a missed increment is repaired rather than compounded.
+   */
+  private durableFillDelta(result: OrderIntentUpdateResult, intent: IBoxOrderIntent): number {
+    if (!result.applied) return 0;
+    const previous = result.previous_filled_quantity;
+    const current = result.current_filled_quantity;
+    if (typeof previous !== "number" || typeof current !== "number") {
+      this.invariantViolation(
+        `durable persistence did not report the fill transition for ${intent.client_order_id}; ` +
+          `no exposure was attributed`,
+      );
+      return 0;
+    }
+    const delta = current - previous;
+    if (delta < 0) {
+      // The monotonic `$lte` guard forbids this. If it ever happens the durable quantity moved
+      // backwards, which is a corruption, not a reduction — never feed it into exposure.
+      this.invariantViolation(
+        `durable filled quantity for ${intent.client_order_id} regressed ${previous} -> ${current}`,
+      );
+      return 0;
+    }
+    return delta;
   }
 
   private recalculateGrossAttributedQuantity(): void {
@@ -1177,10 +1607,68 @@ export class BoxOrderManager {
     }
   }
 
+  private mergePostLoadFlattenCharges(
+    day: string,
+    seedPnl: number,
+    token: DailyRiskSeedToken | undefined,
+    baselines: Record<string, number> | undefined,
+  ): number {
+    if (!token || token.tradingDay !== day) return seedPnl;
+    let unseededCharges = 0;
+    for (const mutation of this.flattenChargeMutationsByDay.get(day) ?? []) {
+      if (mutation.generation <= token.mutationGeneration) continue;
+      const seedBaselineValue = baselines?.[mutation.attemptId];
+      const seedBaseline = Number.isFinite(seedBaselineValue)
+        ? Math.round(Math.max(0, seedBaselineValue!) * 100) / 100
+        : 0;
+      // A loader may have observed none, part, or all of this local range. Add exactly the suffix
+      // above both the mutation's prior watermark and the authoritative seed bucket.
+      const representedThrough = Math.max(mutation.previousChargesForDay, seedBaseline);
+      if (mutation.chargesForDay > representedThrough) {
+        unseededCharges += mutation.chargesForDay - representedThrough;
+      }
+    }
+    return Math.round((seedPnl - unseededCharges) * 100) / 100;
+  }
+
+  private settleDailyRiskSeedToken(token: DailyRiskSeedToken): void {
+    this.activeDailyRiskSeedTokens.delete(token.loadGeneration);
+    this.compactFlattenChargeMutations(token.tradingDay);
+  }
+
+  /** Retain exactly the mutation suffix an active loader can still need. */
+  private compactFlattenChargeMutations(day: string): void {
+    const active = [...this.activeDailyRiskSeedTokens.values()]
+      .filter((token) => token.tradingDay === day);
+    if (active.length === 0) {
+      this.flattenChargeMutationsByDay.delete(day);
+      return;
+    }
+    const oldestBoundary = Math.min(...active.map((token) => token.mutationGeneration));
+    const retained = (this.flattenChargeMutationsByDay.get(day) ?? [])
+      .filter((mutation) => mutation.generation > oldestBoundary);
+    if (retained.length === 0) this.flattenChargeMutationsByDay.delete(day);
+    else this.flattenChargeMutationsByDay.set(day, retained);
+  }
+
   private rollTradingDay(): void {
     const next = this.dayKey();
     if (next === this.tradingDay) return;
     this.tradingDay = next;
+    // No prior-day loader may pin memory or occupy the one current-day slot. Logical cancellation
+    // is enough even when the database operation itself cannot be aborted: generation checks make
+    // every eventual completion inert.
+    if (this.activeDailyRiskLoad && this.activeDailyRiskLoad.day !== next) {
+      this.seedTimer().clearTimeout(this.activeDailyRiskLoad.timeout);
+      this.settleDailyRiskSeedToken(this.activeDailyRiskLoad.token);
+      this.activeDailyRiskLoad = null;
+    }
+    for (const token of [...this.activeDailyRiskSeedTokens.values()]) {
+      if (token.tradingDay !== next) this.settleDailyRiskSeedToken(token);
+    }
+    for (const day of [...this.flattenChargeMutationsByDay.keys()]) {
+      if (day !== next) this.flattenChargeMutationsByDay.delete(day);
+    }
     // Never reopen on a process-local zero at midnight. Entry remains blocked
     // until the new IST day's durable closes, aborts, and rejects are reloaded.
     this.realisedPnlToday = 0;
@@ -1193,33 +1681,81 @@ export class BoxOrderManager {
   }
 
   private refreshDailyRiskSeed(): void {
-    if (this.dailyRiskSeedPromise || this.disposed) return;
+    if (this.activeDailyRiskLoad || this.disposed) return;
     const day = this.tradingDay;
     const loader = this.deps.loadDailyRiskSeed;
     if (!loader) {
       this.health.daily_risk_seed = "failed";
       return;
     }
+    const token = this.beginDailyRiskSeed(day);
+    const generation = token.loadGeneration;
     this.health.daily_risk_seed = "seeding";
-    this.dailyRiskSeedPromise = loader(day)
+    const timeout = this.seedTimer().setTimeout(() => {
+      const active = this.activeDailyRiskLoad;
+      if (!active || active.generation !== generation) return;
+      this.activeDailyRiskLoad = null;
+      this.settleDailyRiskSeedToken(token);
+      if (day === this.tradingDay) this.health.daily_risk_seed = "failed";
+      // Release the slot and immediately request the newest day. The timed-out promise may settle
+      // later, but it no longer owns a generation and therefore cannot install anything.
+      if (!this.disposed) {
+        this.rollTradingDay();
+        this.refreshDailyRiskSeed();
+      }
+    }, Math.max(1, this.deps.dailyRiskSeedTimeoutMs ?? 30_000));
+    this.activeDailyRiskLoad = { generation, day, token, timeout };
+
+    void Promise.resolve()
+      .then(() => loader(day))
       .then((seed) => {
-        // Ignore a slow prior-day response that crossed another IST rollover.
-        if (day !== this.tradingDay) return;
-        this.realisedPnlToday = Number.isFinite(seed.realisedPnl) ? seed.realisedPnl : 0;
-        this.rejects = Math.max(0, Math.floor(seed.rejects));
-        this.consecutiveFailures = Math.max(0, Math.floor(seed.consecutiveFailures));
-        this.health.daily_risk_seed = "healthy";
-        this.evaluateLimits();
-        // Reconciliation owns the final entry-ready flag. Defer so this promise is
-        // cleared before reconcile can request another seed.
-        setTimeout(() => void this.reconcile().catch(() => undefined), 0).unref?.();
+        const active = this.activeDailyRiskLoad;
+        if (!active || active.generation !== generation || day !== this.tradingDay ||
+            !this.activeDailyRiskSeedTokens.has(token.loadGeneration)) return;
+        this.seedTimer().clearTimeout(active.timeout);
+        this.activeDailyRiskLoad = null;
+        this.seedLimits({
+          tradingDay: day,
+          realisedPnlToday: Number.isFinite(seed.realisedPnl) ? seed.realisedPnl : 0,
+          rejects: seed.rejects,
+          consecutiveFailures: seed.consecutiveFailures,
+          seedToken: token,
+          flattenChargeBaselinesForDay: seed.flattenChargeBaselinesForDay,
+          incomplete: seed.incomplete,
+        });
+        // Reconciliation owns the final entry-ready flag. Defer so the load slot is visibly free.
+        const deferred = setTimeout(() => void this.reconcile().catch(() => undefined), 0);
+        deferred.unref?.();
       })
       .catch(() => {
+        const active = this.activeDailyRiskLoad;
+        if (!active || active.generation !== generation) return;
+        this.seedTimer().clearTimeout(active.timeout);
+        this.activeDailyRiskLoad = null;
+        this.settleDailyRiskSeedToken(token);
         if (day === this.tradingDay) this.health.daily_risk_seed = "failed";
-      })
-      .finally(() => {
-        this.dailyRiskSeedPromise = null;
       });
+  }
+
+  private seedTimer(): DailyRiskSeedTimer {
+    if (this.deps.dailyRiskSeedTimer) return this.deps.dailyRiskSeedTimer;
+    return {
+      setTimeout: (callback, delayMs) => {
+        const handle = setTimeout(callback, delayMs);
+        handle.unref?.();
+        return handle;
+      },
+      clearTimeout: (handle) => clearTimeout(handle as NodeJS.Timeout),
+    };
+  }
+
+  private isCrashRecoveryEntryQuarantined(): boolean {
+    if (!this.crashOnlyAttributedExposure) return false;
+    try {
+      return !(this.deps.isCrashRecoveryPersistenceReady?.() ?? false);
+    } catch {
+      return true;
+    }
   }
 
   private dayKey(): string {
@@ -1345,6 +1881,7 @@ function auditFor(
   message: string,
   fillIdentity: string | null,
   now: number,
+  payload: Record<string, unknown> | null = null,
 ): BoxOrderIntentAudit {
   return {
     audit_id: `${intent.client_order_id}:${intent.state}->${state}:${brokerOrderId ?? "none"}:${fillIdentity ?? "none"}`,
@@ -1354,6 +1891,7 @@ function auditFor(
     broker_order_id: brokerOrderId,
     message,
     fill_identity: fillIdentity,
+    payload,
   };
 }
 

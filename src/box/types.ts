@@ -25,6 +25,10 @@
  */
 
 import type { BrokerId } from "../brokers/types.js";
+import type { PaperLegCancelStage } from "./paperLegTimeline.js";
+import type { PartialExitMark } from "./partialExitPnl.js";
+
+export type { PaperLegCancelStage, PartialExitMark };
 
 /**
  * One order's charges, as billed by Zerodha's virtual contract note (or by the
@@ -842,6 +846,19 @@ export interface PaperLegExecution {
   /** Quantity that filled AFTER the cancel was requested. The race, quantified. */
   raced_fill_qty: number;
   /**
+   * WHERE the order was when a cancel was requested — null when none ever was.
+   *
+   * Only `at_exchange` may participate in the cancel-vs-fill race. A cancel issued while the
+   * order was still in transport (`in_transport`) or before it was ever submitted
+   * (`pre_submission`) removes an order that was never resting on the book, so it cannot fill:
+   * previously the abort path made every unresolved leg `CANCEL_REQUESTED` regardless of
+   * arrival, which let a leg in flight produce `fill_at < arrival_at`.
+   *
+   * See `paperLegTimeline.ts`. Recorded so parity statistics can separate "cancelled in
+   * transport" from "cancelled while working", which are different market events.
+   */
+  cancel_stage: PaperLegCancelStage | null;
+  /**
    * Executable quantity WITHIN THE LIMIT on the first book this order was offered, before any of it
    * was consumed (queue haircut applied, concurrent reservations subtracted).
    *
@@ -915,6 +932,34 @@ export interface ResidualLegExposure {
   /** Where this residual came from. */
   source: ResidualExposureSource;
   created_at: number;
+  /**
+   * DURABLE FLATTEN GENERATION — the attempt number the NEXT flatten submission must use.
+   *
+   * `created_at` is deliberately preserved when a shrunken residual is written back, so it
+   * cannot distinguish one flatten attempt from the next. Without a generation every pass
+   * regenerates the same `client_order_id`, and a live residual can therefore never be
+   * flattened a second time (see `residualFlatten.ts` for the full failure analysis).
+   *
+   * Persisted inside `BoxExecutionAttempt.residual_exposure` by the SAME write that persists
+   * the new remaining quantity, so advancing the generation and shrinking the exposure are one
+   * atomic durable transition.
+   *
+   * OPTIONAL FOR BACKWARDS COMPATIBILITY: rows written before this field existed read as
+   * attempt 1, which is the safe reading — attempt 1's durable intent is adopted rather than
+   * duplicated if it already exists.
+   */
+  flatten_attempt?: number;
+  /**
+   * Broker cumulative fill already represented by this residual projection for
+   * `flatten_attempt`. Optional legacy rows start at zero.
+   */
+  flatten_accounted_filled?: number;
+  /**
+   * Cumulative charge estimate already represented for the same durable flatten
+   * identity. Stored beside quantity so replay after a crash can bill only the
+   * incremental cumulative charge.
+   */
+  flatten_accounted_charges?: number;
 }
 
 /**
@@ -1108,6 +1153,23 @@ export interface IBoxOrderIntent {
   limit_price: number;
   state: BoxOrderIntentState;
   filled_quantity: number;
+  /**
+   * The cumulative filled quantity this document held IMMEDIATELY BEFORE the most recent
+   * guarded update, written by the same atomic update that advanced `filled_quantity`.
+   *
+   * WHY IT IS DURABLE RATHER THAN COMPUTED BY THE CALLER
+   * Position attribution needs the delta a write actually established. Deriving it from the
+   * caller's in-memory snapshot double-counts whenever two async contexts hold the same stale
+   * snapshot (a live submit and a reconcile pass routinely do), because both then compute
+   * `post - 0` for one broker fill. The persistence layer is the only place that can know the
+   * real transition, so it records it: `delta = filled_quantity - previous_filled_quantity`.
+   *
+   * OPTIONAL FOR BACKWARDS COMPATIBILITY: absent on documents written before this field
+   * existed. A caller that cannot read an authoritative transition must attribute NOTHING
+   * rather than guess — under-attribution blocks reductions (safe), over-attribution
+   * authorises reducing more than is held (not safe).
+   */
+  previous_filled_quantity?: number | null;
   average_price: number | null;
   broker_tag: string | null;
   reject_family: string | null;
@@ -1180,6 +1242,15 @@ export interface IBoxExecutionAttempt {
    * flattening is the later (possibly multi-pass) work of clearing what the unwind could not.
    */
   flatten_charges?: number | null;
+  /** IST day receiving the most recent flatten charge and the amount attributed to that day. */
+  flatten_charge_day?: string | null;
+  flatten_charges_for_day?: number | null;
+  /** Monotonic residual/charge projection version. Missing legacy rows are version 0. */
+  projection_version?: number | null;
+  /** Stable content identity of `residual_exposure`; optional for migration-free legacy reads. */
+  residual_projection_identity?: string | null;
+  /** Bounded ring of recent residual-projection application ids. */
+  applied_flatten_applications?: string[] | null;
   gross_abort_pnl: number | null;
   net_abort_pnl: number | null;
   /**
@@ -1669,6 +1740,23 @@ export interface BoxExitMetrics {
   blocked_reason: BoxExitBlockedReason;
   /** The full structured decision this metrics object was derived from. */
   decision: BoxExitDecision;
+  /**
+   * Present ONLY when this position has already closed some quantity.
+   *
+   * When set, the P&L fields above (`gross_pnl_if_closed_now`, `current_net_pnl`,
+   * `realisable_net_pnl`, `estimated_exit_charges`, `total_round_trip_charges`) are the
+   * PARTIAL-AWARE figures: realised gross frozen on closed quantity plus a mark on the
+   * remaining quantity only, and exit charges = already paid + an estimate for what is left.
+   * `pos.quantity`/`pos.lot_size` are never decremented by a partial exit, so without this the
+   * mark re-valued already-flat legs at a full lot on every tick.
+   *
+   * The EDGE family (`entry_edge`, `remaining_edge`, `captured_edge`, `captured_pct`,
+   * `convergence_threshold`, `profit_capture_target`) and `decision` deliberately remain
+   * whole-box, full-lot reference figures: they describe a BOX, and a partially exited position
+   * is not one. That is why `evaluatePosition` sends a `PARTIALLY_EXITED` position straight to
+   * flattening and never consults `decision`. See `partialExitPnl.ts`.
+   */
+  partial_exit_mark?: PartialExitMark;
 }
 
 /**

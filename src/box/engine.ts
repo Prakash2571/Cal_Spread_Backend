@@ -48,6 +48,7 @@ import { ExecutionTimingRecorder } from "./executionTiming.js";
 import { CalibrationPersistenceBuffer } from "./calibrationPersistence.js";
 import { BrokerTimingStore } from "./brokerTimingStore.js";
 import { ExecutionOutcomeStore } from "./executionOutcomes.js";
+import { ExecutionFaultLog } from "./executionFaults.js";
 import { QueueCalibrationEstimator } from "./queueCalibration.js";
 import { computeExecutionShortfall, type ExecutionShortfall } from "./executionShortfall.js";
 import { buildParityReports } from "./parityReport.js";
@@ -56,7 +57,27 @@ import type { LatencyProfile } from "./latencyModel.js";
 import { shadowModeStatus } from "./shadowMode.js";
 import { profileReportBanner } from "./stressProfile.js";
 import { formatCalibrationBlock } from "./calibratedLatencySource.js";
-import { CentralBoxExecutionGateway, type BoxExecutionGateway } from "./executionGateway.js";
+import {
+  CentralBoxExecutionGateway,
+  checkedFeedBlockReason,
+  type BoxExecutionGateway,
+} from "./executionGateway.js";
+import {
+  adoptObservedFlattenCharges,
+  compactObservedFlattenChargeWatermarks,
+  compactResidualProjectionBookkeeping,
+  createResidualProjectionCommand,
+  persistOwnedResidualProjection,
+  recoveryExecutionAttemptId,
+  residualProjectionChanges,
+  residualProjectionIdentity,
+  runInitialRegisteredResidualPass,
+  seedObservedFlattenCharges,
+  seedObservedFlattenChargesForDay,
+  type BoxExecutionAttemptProjectionCommand,
+  type BoxExecutionAttemptProjectionResult,
+  type FlattenChargeDayObservation,
+} from "./executionAttemptProjection.js";
 import { CoordinatedBoxExecutionGateway } from "./executionCoordinator.js";
 // The BARREL, not the `instrumentReservations.js` shim: this is the one module that
 // needs the Mongo-bound factory, and the engine is already database-bound.
@@ -78,24 +99,35 @@ import {
 } from "./instruments.js";
 import { buildCandidates, round2 } from "./math.js";
 import { BoxPositionBook, deriveBoxPositionState, fullLotByRole, isBoxPositionFlat, outstandingRoles, type BoxOpenPosition } from "./positions.js";
+import { exactEntryFillViolation, singleLotCandidateViolation, singleLotPositionViolation } from "./singleLotInvariant.js";
 import { BoxPositionMonitor } from "./positionMonitor.js";
 import { BoxQuoteStore, SpotStore } from "./quotes.js";
 import { initBoxConnection } from "../db.js";
 import {
   appendBoxEvent,
   allocateBoxTradeId,
+  applyBoxExecutionAttemptProjection,
   applyBoxPartialExit,
   applyBoxReconciledProjection,
+  cancelBoxPnlDeletion,
   closeBoxTrade,
   deleteBoxDailyPnlForTrade,
+  deleteBoxDailyPnlRows,
   deleteBoxTrade,
+  filterExistingBoxTradeIds,
   findBoxTradeById,
+  ensureBoxRecoveryExecutionAttempt,
+  initialiseBoxExecutionAttemptPersistence,
+  isBoxRecoveryPersistenceReady,
   insertBoxExecutionAttempt,
   insertBoxTrade,
+  isBoxDailyPnlSnapshotComplete,
   isBoxDbEnabled,
   isValidBoxId,
-  loadBoxDailyPnlTradeIds,
+  loadBoxDailyPnlSnapshot,
   loadBoxMarginIntervalsSince,
+  markBoxDailyPnlComplete,
+  markBoxDailyPnlIncomplete,
   loadBoxExecutionAttempts,
   loadBoxLiveRiskSeed,
   loadBoxSettings,
@@ -105,8 +137,8 @@ import {
   markBoxTradeRecovery,
   loadBoxCalibrationSamples,
   persistBoxCalibrationSamples,
-  resolveBoxExecutionAttempt,
-  updateBoxExecutionAttemptResidual,
+  prepareBoxPnlDeletion,
+  reconcileBoxDailyPnlOrphans,
   saveBoxSettings,
   serializeBoxTrade,
   setBoxChargeReconciliation,
@@ -276,6 +308,15 @@ export class BoxEngine {
   private readonly calibrationPersistence: CalibrationPersistenceBuffer;
   /** Measured outcome and reject-family rates (Phases 9, 19). */
   private readonly outcomeStore = new ExecutionOutcomeStore();
+  /**
+   * Bounded store of TECHNICAL entry-pipeline faults, classified into a fixed taxonomy.
+   *
+   * Exists so the dashboard can distinguish "Mongo is down" from "the durable reservation
+   * authority is unreachable" from "a programming bug", instead of collapsing all of them into
+   * one `internal_error` counter. Bounded on both axes: a 50-entry ring and a closed set of
+   * class counters, so neither memory nor metric cardinality grows with traffic.
+   */
+  private readonly entryFaults = new ExecutionFaultLog();
   /** Advisory queue/haircut recommender fed by live limit-order evidence (Phases 10, 26). */
   private readonly queueEstimator: QueueCalibrationEstimator;
   /** Most recent implementation-shortfall attribution, surfaced in diagnostics. */
@@ -375,6 +416,8 @@ export class BoxEngine {
   /** Cached exchange-hours state, refreshed on the market timer. */
   private marketOpen = false;
   private feedHealthy = false;
+  /** Raw current-socket arrival clock; intentionally independent of depth books. */
+  private lastRawTickAt: number | null = null;
   private feedGeneration = 0;
   private readonly tokenFeedGeneration = new Map<number, number>();
   private marketTimer: NodeJS.Timeout | null = null;
@@ -412,8 +455,15 @@ export class BoxEngine {
    * attempts, so an interrupted unwind is resumed whether or not RUN is pressed.
    */
   private residualByAttempt = new Map<string, ResidualLegExposure[]>();
-  /** Confirmed residual fills awaiting persistence; skipped by the execution loop. */
-  private pendingResidualPersists = new Map<string, ResidualLegExposure[]>();
+  /** Durable projection version/content corresponding to each in-memory residual. */
+  private residualProjectionVersion = new Map<string, number>();
+  private residualProjectionIdentity = new Map<string, string>();
+  /** Highest durable cumulative flatten charge this process has included per attempt. */
+  private observedFlattenCharges = new Map<string, number>();
+  /** Highest authoritative charge bucket observed for each attempt/day pair. */
+  private observedFlattenChargesByDay = new Map<string, number>();
+  /** Full immutable commands whose durable acknowledgement was lost. */
+  private pendingResidualPersists = new Map<string, BoxExecutionAttemptProjectionCommand>();
   /** Attempt ids whose residual is being flattened right now (concurrency guard). */
   private residualFlattenInFlight = new Set<string>();
   /** Bounded watchdog that works outstanding residuals; runs only while any exist. */
@@ -538,8 +588,40 @@ export class BoxEngine {
             void markBoxTradeRecovery(position.id, this.lastError).catch(() => undefined);
           }
         },
-        onReconciliationIssue: (report) => this.markReconciliationRecovery(report),
-        loadDailyRiskSeed: (day) => loadBoxLiveRiskSeed(istDayStartMs(day)),
+        onReconciliationIssue: async (report) => {
+          await this.markReconciliationRecovery(report);
+          this.refreshCrashRecoveryEntryQuarantine();
+        },
+        isCrashRecoveryPersistenceReady: () => isBoxRecoveryPersistenceReady(),
+        loadDailyRiskSeed: async (day) => {
+          const seed = await loadBoxLiveRiskSeed(istDayStartMs(day), day);
+          // Install lifetime and day-bucket watermarks synchronously before returning the scalar
+          // seed. The manager's generation token then merges any post-load local ranges absent
+          // from these authoritative buckets. A slow prior-day response mutates neither map.
+          if (day === this.deps.istDayKey()) {
+            compactObservedFlattenChargeWatermarks({
+              observedByAttempt: this.observedFlattenCharges,
+              observedByAttemptDay: this.observedFlattenChargesByDay,
+              // Unresolved attempts the seed represents, PLUS anything this process can still
+              // project: dropping a live/pending attempt's watermark would let its next
+              // acknowledgement look like a brand-new charge and debit the day twice.
+              retainAttemptIds: this.retainedRiskAttemptIds(
+                Object.keys(seed.flattenChargeBaselines),
+              ),
+              currentDay: day,
+            });
+            for (const [attemptId, cumulative] of Object.entries(seed.flattenChargeBaselines)) {
+              seedObservedFlattenCharges(this.observedFlattenCharges, attemptId, cumulative);
+              seedObservedFlattenChargesForDay(
+                this.observedFlattenChargesByDay,
+                attemptId,
+                day,
+                seed.flattenChargeBaselinesForDay[attemptId],
+              );
+            }
+          }
+          return seed;
+        },
         // Live timing instrumentation. The manager owns the scheduler stages and the terminal
         // publish; the adapter marks the transport/ACK/fill/cancel stages on the same trace.
         timing: this.timingRecorder,
@@ -547,6 +629,17 @@ export class BoxEngine {
         onBrokerReject: (order, reason) => {
           this.outcomeStore.recordReject(this.deps.activeBroker(), order?.reject_family ?? null, reason);
         },
+        revalidateQueuedRequest: (request, stamp) => checkedFeedBlockReason({
+          request,
+          stamp,
+          currentGeneration: this.feedGeneration,
+          tokenCurrent: this.tokenFeedGeneration.get(request.token) === this.feedGeneration,
+          quote: this.quotes.get(request.token),
+          now: Date.now(),
+          quoteMaxAgeMs: this.cfg.quoteMaxAgeMs,
+          queueModel: this.cfg.queueModel,
+          queueLiquidityHaircutPct: this.cfg.queueLiquidityHaircutPct,
+        }),
       });
     }
     const centralGateway = new CentralBoxExecutionGateway({
@@ -555,6 +648,7 @@ export class BoxEngine {
       quotes: this.quotes,
       ...(this.orderManager ? { manager: this.orderManager, allocateTradeId: allocateBoxTradeId } : {}),
       isTokenWarm: (token) => this.tokenFeedGeneration.get(token) === this.feedGeneration,
+      feedGeneration: () => this.feedGeneration,
       // So LIVE residual flattening bills its own fees, exactly as the paper path already did.
       chargeTotal: (orders) => this.localCharges.legs(orders).total,
     });
@@ -626,6 +720,11 @@ export class BoxEngine {
       executionSim: this.execution,
       metrics: this.metrics,
       positions: this.positions,
+      faults: this.entryFaults,
+      activeBroker: () => this.deps.activeBroker(),
+      // LIVE ONLY: whether this attempt's orders actually reached the broker. In paper there is
+      // no broker, so the field stays null rather than pretending to know.
+      reachedBroker: () => (this.orderManager?.status().inFlight ?? 0) > 0,
       openPaperTrade: (args) => this.openPaperTrade(args),
       onExecutionAttempt: (candidate, legging, reason, detail, detectedGrossEdge) =>
         void this.persistExecutionAttempt(candidate, legging, reason, detail, detectedGrossEdge),
@@ -720,7 +819,13 @@ export class BoxEngine {
       getOpenPnl: () => this.openPnlInputs(),
       loadClosedSince: (sinceMs) => this.closedPnlInputs(sinceMs),
       upsert: (doc) => upsertBoxDailyPnl(doc),
-      loadPersistedIds: (day) => loadBoxDailyPnlTradeIds(day),
+      filterExistingTradeIds: (ids) => filterExistingBoxTradeIds(ids),
+      loadPersistedDay: (day) => loadBoxDailyPnlSnapshot(day),
+      isPersistedDayComplete: (day, ids) => isBoxDailyPnlSnapshotComplete(day, ids),
+      markPersistedDayIncomplete: (day) => markBoxDailyPnlIncomplete(day),
+      markPersistedDayComplete: (day, ids) => markBoxDailyPnlComplete(day, ids),
+      deletePersistedRows: (day, ids) => deleteBoxDailyPnlRows(day, ids),
+      reconcileDurableOrphans: () => reconcileBoxDailyPnlOrphans(),
       istDayKey: () => this.deps.istDayKey(),
       // A Date whose UTC fields read as IST, matching the EOD scheduler's clock.
       istNow: () => new Date(Date.now() + 5.5 * 60 * 60 * 1000),
@@ -748,6 +853,17 @@ export class BoxEngine {
     // Open the box database first (BOX_MONGODB_URI when set, otherwise the main
     // one) so the positions below are read from the right place.
     await initBoxConnection();
+    // Crash-only recovery is safe only behind its explicitly established and verified partial
+    // unique index. Failure quarantines that direct path while ordinary residual exits continue.
+    try {
+      await initialiseBoxExecutionAttemptPersistence();
+      console.log("[Box] crash-recovery execution-attempt persistence READY.");
+    } catch (err) {
+      console.error(
+        "[Box] crash-only attributed recovery is QUARANTINED until persistence is repaired:",
+        err,
+      );
+    }
     // Bring the durable reservation tier up: create and VERIFY its indexes, measure the
     // authority's clock, and reclaim reservations that have already lost their lease.
     // It never throws — an unreachable authority is an operating state the coordinator
@@ -806,59 +922,105 @@ export class BoxEngine {
     await this.loadPersistedTuning();
     this.marketOpen = this.deps.isMarketOpen();
     this.scanner.setMarketOpen(this.marketOpen);
+    // Capture before adoption can register/work residuals. Every local flatten observation from
+    // this point until seed installation is generation-stamped and merged against the loader's
+    // per-attempt day buckets, regardless of when each Mongo query took its snapshot.
+    const startupTradingDay = this.deps.istDayKey();
+    const startupRiskSeedToken = this.orderManager?.beginDailyRiskSeed(startupTradingDay);
+    // Everything from here to seed installation runs under that token, so every exit from this
+    // region must settle it (see the `finally` below).
     try {
-      await this.adoptOpenPositions();
-    } catch (err) {
-      console.warn("[Box] failed to adopt open positions:", err);
-      if (this.cfg.executionMode === "live") {
-        throw new Error(`[Box] live execution blocked: open-position adoption failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-    // Re-adopt any outstanding residual exposure from an interrupted unwind, so it
-    // is resumed regardless of whether RUN is ever pressed.
-    try {
-      await this.reconcileResidualExposure();
-    } catch (err) {
-      console.warn("[Box] failed to reconcile residual exposure:", err);
-    }
-    if (this.orderManager) {
-      this.syncManagerExposure();
-      const riskSeed = await loadBoxLiveRiskSeed(istDayStartMs(this.deps.istDayKey()));
-      this.orderManager.seedLimits({
-        tradingDay: this.deps.istDayKey(),
-        realisedPnlToday: riskSeed.realisedPnl,
-        rejects: riskSeed.rejects,
-        consecutiveFailures: riskSeed.consecutiveFailures,
-        openBoxes: this.positions.size,
-        residualLegs: this.residualLegCount(),
-      });
       try {
-        const report = await this.orderManager.start();
-        if (report.positionMismatches.length > 0 || report.missingAtBroker.length > 0) {
-          const mismatchSymbols = new Set(report.positionMismatches.map((item) => item.symbol));
-          const affectedIds = new Set(report.affectedTradeIds);
-          for (const position of this.positions.list()) {
-            const symbolAffected = BOX_LEG_ROLES.some((role) => {
-              const inst = position.legs[role];
-              return mismatchSymbols.has(`${inst.exchange}:${inst.tradingsymbol}`);
-            });
-            if (!symbolAffected && !affectedIds.has(position.id)) continue;
-            const detail = "live broker reconciliation found an order or attributed-position mismatch";
+        await this.adoptOpenPositions();
+      } catch (err) {
+        console.warn("[Box] failed to adopt open positions:", err);
+        if (this.cfg.executionMode === "live") {
+          throw new Error(`[Box] live execution blocked: open-position adoption failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      // Re-adopt any outstanding residual exposure from an interrupted unwind, so it
+      // is resumed regardless of whether RUN is ever pressed.
+      try {
+        await this.reconcileResidualExposure();
+      } catch (err) {
+        console.warn("[Box] failed to reconcile residual exposure:", err);
+      }
+      if (this.orderManager) {
+        this.syncManagerExposure();
+        const riskSeed = await loadBoxLiveRiskSeed(
+          istDayStartMs(startupTradingDay),
+          startupTradingDay,
+        );
+        // Never let a boot loader that crossed midnight install its old scalar or watermarks. The
+        // manager's first reconciliation will roll and load the new day instead.
+        if (startupTradingDay === this.deps.istDayKey()) {
+          compactObservedFlattenChargeWatermarks({
+            observedByAttempt: this.observedFlattenCharges,
+            observedByAttemptDay: this.observedFlattenChargesByDay,
+            retainAttemptIds: this.retainedRiskAttemptIds(
+              Object.keys(riskSeed.flattenChargeBaselines),
+            ),
+            currentDay: startupTradingDay,
+          });
+          for (const [attemptId, cumulative] of Object.entries(riskSeed.flattenChargeBaselines)) {
+            seedObservedFlattenCharges(this.observedFlattenCharges, attemptId, cumulative);
+            seedObservedFlattenChargesForDay(
+              this.observedFlattenChargesByDay,
+              attemptId,
+              startupTradingDay,
+              riskSeed.flattenChargeBaselinesForDay[attemptId],
+            );
+          }
+          this.orderManager.seedLimits({
+            tradingDay: startupTradingDay,
+            realisedPnlToday: riskSeed.realisedPnl,
+            rejects: riskSeed.rejects,
+            consecutiveFailures: riskSeed.consecutiveFailures,
+            openBoxes: this.positions.size,
+            residualLegs: this.residualLegCount(),
+            seedToken: startupRiskSeedToken,
+            flattenChargeBaselinesForDay: riskSeed.flattenChargeBaselinesForDay,
+            incomplete: riskSeed.incomplete,
+          });
+        }
+        try {
+          const report = await this.orderManager.start();
+          if (report.positionMismatches.length > 0 || report.missingAtBroker.length > 0) {
+            const mismatchSymbols = new Set(report.positionMismatches.map((item) => item.symbol));
+            const affectedIds = new Set(report.affectedTradeIds);
+            for (const position of this.positions.list()) {
+              const symbolAffected = BOX_LEG_ROLES.some((role) => {
+                const inst = position.legs[role];
+                return mismatchSymbols.has(`${inst.exchange}:${inst.tradingsymbol}`);
+              });
+              if (!symbolAffected && !affectedIds.has(position.id)) continue;
+              const detail = "live broker reconciliation found an order or attributed-position mismatch";
+              position.position_state = "RECOVERY";
+              position.exit_blocked_reason = detail;
+              await markBoxTradeRecovery(position.id, detail);
+            }
+          }
+        } catch (err) {
+          const detail = `live reconciliation failed: ${err instanceof Error ? err.message : String(err)}`;
+          await Promise.all(this.positions.list().map(async (position) => {
             position.position_state = "RECOVERY";
             position.exit_blocked_reason = detail;
-            await markBoxTradeRecovery(position.id, detail);
-          }
+            await markBoxTradeRecovery(position.id, detail).catch(() => undefined);
+          }));
+          this.lastError = detail;
+          console.error(`[Box] ${this.lastError}`);
         }
-      } catch (err) {
-        const detail = `live reconciliation failed: ${err instanceof Error ? err.message : String(err)}`;
-        await Promise.all(this.positions.list().map(async (position) => {
-          position.position_state = "RECOVERY";
-          position.exit_blocked_reason = detail;
-          await markBoxTradeRecovery(position.id, detail).catch(() => undefined);
-        }));
-        this.lastError = detail;
-        console.error(`[Box] ${this.lastError}`);
       }
+    } finally {
+      // `seedLimits` settles the token on the installing path. EVERY other exit must release it
+      // here: a throwing adoption, a failed `loadBoxLiveRiskSeed`, a failed reconciliation, or the
+      // midnight branch that deliberately installs nothing. A leaked token stays 'active' with
+      // today's day key, so `rollTradingDay` will not settle it either, and the day's whole
+      // charge-mutation journal is pinned in memory for the rest of the day — once per boot retry,
+      // because a failed boot is caught by the caller and the process keeps running with the
+      // flatten timer armed. Abandonment is idempotent and only ever drops merges that no
+      // remaining active loader can still need.
+      if (startupRiskSeedToken) this.orderManager?.abandonDailyRiskSeed(startupRiskSeedToken);
     }
     this.monitor.start();
     // Seed the "closed today" tally AND the closed-today trade list from Mongo, so
@@ -1248,10 +1410,13 @@ export class BoxEngine {
     for (const position of positions) {
       if (position.position_state === "RECOVERY") {
         // Reconciliation established exact broker equality with the durable map;
-        // this is the only transition that authorises recovery execution.
-        position.position_state = outstandingRoles(position).length === BOX_LEG_ROLES.length
-          ? "BOX"
-          : "PARTIALLY_EXITED";
+        // this is the only transition that authorises recovery execution. A
+        // malformed/overfilled map is NEVER promoted to BOX: emergency handling
+        // works its exact quantities only as reduction-only partial exposure.
+        const violation = singleLotPositionViolation(position);
+        position.position_state = violation
+          ? "PARTIALLY_EXITED"
+          : deriveBoxPositionState(position.remaining_qty_by_role);
       }
       results.push(await this.monitor.closeManually(position.id));
     }
@@ -1262,11 +1427,79 @@ export class BoxEngine {
       (residual) => !projectedSymbols.has(`${residual.exchange ?? "NFO"}:${residual.tradingsymbol}`),
     );
     if (crashOnly.length > 0) {
-      const bootFlatten = await this.execution.flattenResidual({
+      const recoveryKey = "boot-recovery";
+      const recoveryId = recoveryExecutionAttemptId(recoveryKey, crashOnly);
+      const recovery = await ensureBoxRecoveryExecutionAttempt({
+        id: recoveryId,
+        recoveryKey,
         residual: crashOnly,
-        keyPrefix: `boot-recovery:${this.deps.istDayKey()}`,
+        executionMode: this.cfg.executionMode,
+        broker: this.deps.activeBroker(),
+        at: new Date(),
       });
-      this.noteFlattenCharges(bootFlatten.flatten_charges);
+      if (!recovery) {
+        throw new Error("Cannot flatten crash-only attributed exposure without a durable recovery ledger row.");
+      }
+      const durableRecoveryId = recovery._id.toString();
+      const durableResidual = (recovery.residual_exposure ?? []) as ResidualLegExposure[];
+      const durableVersion = Number.isSafeInteger(recovery.projection_version) &&
+        (recovery.projection_version ?? -1) >= 0 ? recovery.projection_version! : 0;
+      const durableIdentity = recovery.residual_projection_identity ??
+        residualProjectionIdentity(durableResidual);
+      adoptObservedFlattenCharges({
+        observedByAttempt: this.observedFlattenCharges,
+        observedByAttemptDay: this.observedFlattenChargesByDay,
+        attemptId: durableRecoveryId,
+        cumulativeCharges: recovery.flatten_charges,
+        currentDay: this.deps.istDayKey(),
+        chargeDay: recovery.flatten_charge_day,
+        chargesForDay: recovery.flatten_charges_for_day,
+        onNewCharge: (charge, observation) =>
+          this.noteFlattenCharges(durableRecoveryId, charge, observation),
+      });
+      const bootFlatten = await runInitialRegisteredResidualPass({
+        // Set the guard before registration arms the timer, then keep the authoritative row in the
+        // watchdog even when this first pass has no book, is gate-refused, or broker-rejected.
+        markInFlight: () => this.residualFlattenInFlight.add(durableRecoveryId),
+        register: () => this.registerResidual(
+          durableRecoveryId,
+          durableResidual,
+          durableVersion,
+          durableIdentity,
+        ),
+        flatten: async () => {
+          const flattened = await this.execution.flattenResidual({
+            residual: durableResidual,
+            keyPrefix: durableRecoveryId,
+          });
+          const command = createResidualProjectionCommand({
+            attemptId: durableRecoveryId,
+            expectedVersion: durableVersion,
+            expectedResidual: durableResidual,
+            nextResidual: flattened.remaining,
+            flattenChargeDelta: flattened.flatten_charges,
+            flattenChargeDay: this.deps.istDayKey(),
+          });
+          if (residualProjectionChanges(command)) {
+            try {
+              const projection = await this.persistResidualProjection(durableRecoveryId, command);
+              if (projection.status === "not_found") {
+                this.pendingResidualPersists.set(durableRecoveryId, command);
+                this.execution.invariantViolation("crash-only flatten durable recovery row disappeared");
+              } else if (projection.status === "stale") {
+                this.execution.invariantViolation(
+                  `crash-only flatten adopted newer durable projection version ${projection.projection_version}`,
+                );
+              }
+            } catch {
+              this.pendingResidualPersists.set(durableRecoveryId, command);
+              this.execution.invariantViolation("crash-only flatten awaits durable accounting acknowledgement");
+            }
+          }
+          return flattened;
+        },
+        clearInFlight: () => this.residualFlattenInFlight.delete(durableRecoveryId),
+      });
       results.push(bootFlatten);
     }
     return { attempted: positions.length + crashOnly.length, results };
@@ -1539,10 +1772,14 @@ export class BoxEngine {
     }
   }
 
-  /** Every socket open/close creates a fresh book generation. */
+  /** Every socket open/close creates a fresh executable-book generation. */
   private invalidateFeedGeneration(): void {
     this.feedGeneration++;
     this.tokenFeedGeneration.clear();
+    this.lastRawTickAt = null;
+    this.quotes.invalidateGeneration();
+    this.spots.clear();
+    this.scanner.clearOpportunities();
     this.feedHealthy = false;
     this.scanner.setFeedHealthy(false);
     this.orderManager?.setFeedHealthy(false);
@@ -1557,7 +1794,12 @@ export class BoxEngine {
    * frontend round trip. The UI is updated separately on its own slow cadence.
    */
   private onTicks(ticks: Tick[]): void {
+    if (ticks.length === 0) return;
     const now = Date.now();
+    // Raw socket liveness is independent of executable depth. LTP-only index,
+    // futures and option ticks keep analytics/feed health alive but cannot warm a
+    // token's executable-book generation.
+    this.lastRawTickAt = now;
     // Underlying values first: the strike window depends on them.
     for (const t of ticks) {
       if (this.subscribedSpotTokens.has(t.token) && t.last_price > 0) {
@@ -1571,40 +1813,42 @@ export class BoxEngine {
     }
     this.metrics.ticks.mark(ticks.length, now);
     const changed = this.quotes.applyTicks(ticks, now);
-    for (const token of changed) this.tokenFeedGeneration.set(token, this.feedGeneration);
+    for (const token of changed) {
+      if (this.quotes.get(token)) this.tokenFeedGeneration.set(token, this.feedGeneration);
+      else this.tokenFeedGeneration.delete(token);
+    }
     if (changed.length > 0) {
       this.metrics.wsUpdates.mark(changed.length, now);
-      // A tick arriving IS the feed-liveness signal, so the gate reopens here
-      // rather than waiting for the next timer.
-      if (!this.feedHealthy) {
-        this.feedHealthy = true;
-        this.scanner.setFeedHealthy(true);
-        this.orderManager?.setFeedHealthy(true);
-      }
-      // Open-position exits get first look at every changed WS book. This is the
-      // primary exit path; the monitor timer is only a watchdog.
+      // Open-position exits get first look at every authoritative observation,
+      // including an empty invalidation that must make pending work fail closed.
       this.monitor.onTokensUpdated(changed);
       this.scanner.onTokensUpdated(changed, now);
     }
+    // Any raw packet on the current socket restores GLOBAL liveness. Per-token
+    // execution remains guarded by current-generation usable books above.
+    if (this.marketOpen && !this.feedHealthy) {
+      this.feedHealthy = true;
+      this.scanner.setFeedHealthy(true);
+      this.orderManager?.setFeedHealthy(true);
+    }
   }
 
-  /**
-   * Whether the upstream feed is alive: has ANY book in the universe updated
-   * recently?
-   *
-   * With hundreds of instruments subscribed something is always trading during
-   * market hours, so silence across all of them means the connection is broken —
-   * whereas one quiet strike means nothing at all.
-   */
+  /** Whether the current socket has delivered any raw tick recently. */
   private isFeedHealthy(): boolean {
     if (!this.marketOpen) return false;
-    const at = this.quotes.lastUpdateAt;
+    const at = this.lastRawTickAt;
     if (at === null) return false;
     return Date.now() - at <= this.cfg.feedMaxAgeMs;
   }
 
-  /** Age (ms) of the newest tick anywhere in the box universe. */
+  /** Age (ms) of the newest raw tick anywhere in the box universe. */
   private feedAgeMs(): number | null {
+    const at = this.lastRawTickAt;
+    return at === null ? null : Date.now() - at;
+  }
+
+  /** Age of the newest authoritative book observation (usable or invalidating). */
+  private bookObservationAgeMs(): number | null {
     const at = this.quotes.lastUpdateAt;
     return at === null ? null : Date.now() - at;
   }
@@ -2023,11 +2267,17 @@ export class BoxEngine {
       // this attempt visible to startup reconciliation until it is flattened.
       residual_exposure: residual.length > 0 ? residual : [],
       resolved: residual.length === 0,
+      projection_version: 0,
+      residual_projection_identity: residualProjectionIdentity(residual),
+      applied_flatten_applications: [],
+      flatten_charge_day: null,
+      flatten_charges_for_day: 0,
     };
     // Feed the calibration surface BEFORE persistence, so an attempt is observed even if its
     // durable projection fails (the failure is handled separately below).
     this.observeAttempt(legging, false, detectedGrossEdge ?? null);
     const attemptId = await insertBoxExecutionAttempt(attempt);
+    if (attemptId) seedObservedFlattenCharges(this.observedFlattenCharges, attemptId, 0);
     if (this.orderManager && this.cfg.executionMode === "live") {
       if (attemptId) this.orderManager.recordRealisedPnl(netAbort ?? 0);
       else this.orderManager.invariantViolation(`live abort ${candidate.key} was not durably projected`);
@@ -2083,12 +2333,28 @@ export class BoxEngine {
     legging?: PaperLeggingExecutionRecord | null;
   }): Promise<string | null> {
     const { candidate, evaluation, decision, execution } = args;
+    const candidateViolation = singleLotCandidateViolation(candidate);
+    if (candidateViolation) {
+      this.orderManager?.invariantViolation(
+        `entry ${candidate.key} reached persistence with an invalid single-lot candidate: ${candidateViolation}`,
+      );
+      return null;
+    }
     const confirmedEntryQty = {} as Record<BoxLegRole, number>;
     for (const role of BOX_LEG_ROLES) {
       const confirmed = args.legging?.fills_by_role[role];
-      confirmedEntryQty[role] = Number.isInteger(confirmed) && confirmed! >= 0
+      confirmedEntryQty[role] = Number.isSafeInteger(confirmed) && confirmed! >= 0
         ? confirmed!
         : candidate.lot_size;
+    }
+    const entryFillViolation = args.legging
+      ? exactEntryFillViolation(candidate.lot_size, args.legging.fills_by_role)
+      : null;
+    const entryPositionState = entryFillViolation ? "RECOVERY" as const : "BOX" as const;
+    if (entryFillViolation) {
+      this.orderManager?.invariantViolation(
+        `entry ${candidate.key} did not acquire exactly one lot on every role: ${entryFillViolation}`,
+      );
     }
     const direction = candidate.direction ?? "LONG_BOX";
     const byRole = new Map(evaluation.legs.map((l) => [l.role, l]));
@@ -2161,9 +2427,10 @@ export class BoxEngine {
       lot_size: candidate.lot_size,
       quantity: candidate.lot_size,
       status: "open",
-      // A freshly entered box holds one lot on every role and is a whole box.
+      // A normal entry is exactly one lot on every role. Broker-confirmed
+      // overfill/malformed fill truth is preserved but quarantined in RECOVERY.
       remaining_qty_by_role: confirmedEntryQty,
-      position_state: "BOX",
+      position_state: entryPositionState,
       exit_attempts: [],
       cumulative_exit_charges: 0,
       legs,
@@ -2208,7 +2475,9 @@ export class BoxEngine {
       exit_blocked_reason: null,
       expiry_safety: false,
       scanner_config_snapshot: configSnapshot(this.cfg),
-      error: null,
+      error: entryFillViolation
+        ? `single-lot entry invariant: ${entryFillViolation}`
+        : null,
     };
 
     // DURABILITY: the four legs have FILLED, so this box exists. Live execution
@@ -2272,11 +2541,13 @@ export class BoxEngine {
       legs: candidate.legs,
       entry_prices: entryPrices,
       remaining_qty_by_role: confirmedEntryQty,
-      position_state: "BOX",
+      position_state: entryPositionState,
       cumulative_exit_charges: 0,
       exit_attempts: [],
       metrics: null,
-      exit_blocked_reason: null,
+      exit_blocked_reason: entryFillViolation
+        ? `single-lot entry invariant: ${entryFillViolation}`
+        : null,
       expiry_safety: false,
       closing: false,
       last_persist_at: Date.now(),
@@ -2725,7 +2996,15 @@ export class BoxEngine {
       entryPrices[role] = l.entry_price;
     }
     const restoredRemaining = this.remainingByRoleFromDoc(doc);
-    const invalidRemaining = this.hasInvalidRemainingByRole(doc);
+    const durableRemaining = doc.remaining_qty_by_role ?? fullLotByRole(doc.quantity);
+    const positionViolation = singleLotPositionViolation({
+      lot_size: doc.lot_size,
+      quantity: doc.quantity,
+      // Validate the RAW durable map. The conservative restoration fallback must
+      // never conceal a missing/non-numeric role and promote corruption to BOX.
+      remaining_qty_by_role: durableRemaining,
+      legs,
+    });
     this.positions.add({
       id: doc._id.toString(),
       key: tradeKey(doc),
@@ -2768,13 +3047,15 @@ export class BoxEngine {
       // a whole, un-exited box (never destructive). A partially-closed trade
       // therefore resumes with ONLY its true outstanding exposure.
       remaining_qty_by_role: restoredRemaining,
-      position_state: invalidRemaining
+      position_state: positionViolation
         ? "RECOVERY"
         : deriveBoxPositionState(restoredRemaining, doc.position_state ?? "BOX"),
       cumulative_exit_charges: doc.cumulative_exit_charges ?? 0,
       exit_attempts: Array.isArray(doc.exit_attempts) ? doc.exit_attempts : [],
       metrics: null,
-      exit_blocked_reason: doc.exit_blocked_reason,
+      exit_blocked_reason: positionViolation
+        ? `single-lot position invariant: ${positionViolation}`
+        : doc.exit_blocked_reason,
       expiry_safety: doc.expiry_safety,
       closing: false,
       last_persist_at: Date.now(),
@@ -2849,40 +3130,75 @@ export class BoxEngine {
       };
     }
 
-    const deletedCount = await deleteBoxTrade(id);
+    // Install the durable archive fence BEFORE the irreversible source delete.
+    // If the guarded delete loses its race, remove the unused pending fence.
+    await prepareBoxPnlDeletion(id);
+    let deletedCount: number;
+    try {
+      deletedCount = await deleteBoxTrade(id);
+    } catch (deleteErr) {
+      // A transport error is ambiguous: Mongo may have committed the delete. A
+      // source re-read resolves it when possible; otherwise retain the intent and
+      // actively retry reconciliation in this process (startup retries too).
+      let sourceAfterError: BoxTradeRecord | null;
+      try {
+        sourceAfterError = await findBoxTradeById(id);
+      } catch (resolveErr) {
+        this.pnlArchiver.requestDurableReconcile();
+        console.warn(`[Box] could not resolve ambiguous deletion of ${id}:`, resolveErr);
+        throw deleteErr;
+      }
+      if (sourceAfterError) {
+        await cancelBoxPnlDeletion(id).catch((cancelErr) => {
+          console.warn(`[Box] failed to cancel unused P&L deletion fence for ${id}:`, cancelErr);
+          this.pnlArchiver.requestDurableReconcile();
+        });
+        throw deleteErr;
+      }
+      console.warn(`[Box] deletion of ${id} committed despite an ambiguous response; continuing cleanup.`);
+      deletedCount = 1;
+    }
     if (deletedCount === 0) {
-      // The guarded filter refused it or it vanished between the read and here.
+      await cancelBoxPnlDeletion(id).catch((cancelErr) => {
+        console.warn(`[Box] failed to cancel unused P&L deletion fence for ${id}:`, cancelErr);
+        this.pnlArchiver.requestDurableReconcile();
+      });
       return { ok: false, code: 409, error: "The trade could not be deleted." };
     }
 
-    /* ---- 1. in-memory position book, and everything keyed off it ---- */
-    if (position) {
-      this.positions.remove(id);          // also frees the byKey / reserved entry
-      this.syncManagerExposure();         // exposure counts the manager enforces
-      this.marginBackfillTries.delete(id);
-      this.marginInFlight.delete(id);
-      // Interrupt any retry/evaluation state the monitor still holds, or the next
-      // cycle would re-persist the trade we just removed.
-      const wasHeld = this.monitor.forgetPosition(id);
-      if (wasHeld) {
-        console.warn(`[Box] deletion of ${id} interrupted in-flight monitor work for that trade.`);
+    await this.pnlArchiver.withTradeDeletion(id, async () => {
+      /* ---- 1. in-memory position book, and everything keyed off it ---- */
+      if (position) {
+        this.positions.remove(id);          // also frees the byKey / reserved entry
+        this.syncManagerExposure();         // exposure counts the manager enforces
+        this.marginBackfillTries.delete(id);
+        this.marginInFlight.delete(id);
+        const wasHeld = this.monitor.forgetPosition(id);
+        if (wasHeld) {
+          console.warn(`[Box] deletion of ${id} interrupted in-flight monitor work for that trade.`);
+        }
+        if (!this.running) this.shrinkToOpenPositions();
+        else this.maybeReleaseFeed();
       }
-      // Release feed subscriptions this position was the last claimant of. With the
-      // scanner stopped this narrows the token set; with it running the scanner's
-      // own universe keeps whatever it still wants, so nothing it needs is dropped.
-      if (!this.running) this.shrinkToOpenPositions();
-      else this.maybeReleaseFeed();
-    }
 
-    /* ---- 2. Redis mirrors (the only paths that ever remove a trade) ---- */
-    const day = this.deps.istDayKey();
-    await this.closedCache.evictTrade(day, id).catch(() => false);
-    await this.pnlCache.evictTrade(day, id).catch(() => false);
+      /* ---- 2. Redis mirrors (membership is checked before invalidation) ---- */
+      const day = this.deps.istDayKey();
+      await this.closedCache.evictTrade(day, id).catch(() => false);
+      const pnlEviction = await this.pnlCache.evictTradeEverywhere(id).catch(() => ({
+        days: [],
+        attempted_days: 0,
+        completed: false,
+      }));
 
-    /* ---- 3. the P&L archive, so a regenerated day cannot resurrect it ---- */
-    await deleteBoxDailyPnlForTrade(id).catch((err) =>
-      console.warn(`[Box] failed to drop box_daily_pnl rows for deleted trade ${id}:`, err),
-    );
+      /* ---- 3. durable archive cleanup; failures remain pending for restart ---- */
+      await deleteBoxDailyPnlForTrade(id, pnlEviction.days).catch((err) => {
+        console.warn(
+          `[Box] box_daily_pnl cleanup for deleted trade ${id} is pending durable retry:`,
+          err,
+        );
+        this.pnlArchiver.requestDurableReconcile();
+      });
+    });
 
     /* ---- 4. RECOMPUTE every trade-derived figure from what remains ---- */
     await this.recomputeTradeDerivedStatistics();
@@ -2987,29 +3303,20 @@ export class BoxEngine {
   }
 
   /**
-   * Per-role remaining quantity from a stored document, defaulting to a full lot
-   * on every role when the field is absent (old documents) or malformed. Never
-   * returns a quantity above the trade's lot size or below zero.
+   * Restore the stored quantities without normalising broker truth. Numeric
+   * overfills, fractions, or negatives are retained verbatim and the shared
+   * invariant moves the position to RECOVERY. A missing/non-numeric role falls
+   * back conservatively to the document quantity, also causing RECOVERY when the
+   * document is not an exact one-lot position.
    */
   private remainingByRoleFromDoc(doc: BoxTradeRecord): Record<BoxLegRole, number> {
     const stored = doc.remaining_qty_by_role ?? null;
     const out = {} as Record<BoxLegRole, number>;
     for (const role of BOX_LEG_ROLES) {
       const raw = stored === null ? doc.quantity : stored[role];
-      out[role] = typeof raw === "number" && Number.isInteger(raw) && raw >= 0
-        ? raw
-        : doc.quantity;
+      out[role] = typeof raw === "number" ? raw : doc.quantity;
     }
     return out;
-  }
-
-  private hasInvalidRemainingByRole(doc: BoxTradeRecord): boolean {
-    const stored = doc.remaining_qty_by_role ?? null;
-    if (stored === null) return false;
-    return BOX_LEG_ROLES.some((role) => {
-      const quantity = stored[role];
-      return typeof quantity !== "number" || !Number.isInteger(quantity) || quantity < 0;
-    });
   }
 
   /* ----------------------- execution durability --------------------------- */
@@ -3120,7 +3427,25 @@ export class BoxEngine {
     for (const a of attempts) {
       const residual = (a.residual_exposure ?? []) as ResidualLegExposure[];
       if (!Array.isArray(residual) || residual.length === 0) continue;
-      this.registerResidual(a._id.toString(), residual);
+      const attemptId = a._id.toString();
+      // The boot daily-risk seed includes this cumulative total. Record the same baseline before
+      // the watchdog can observe an acknowledgement, otherwise it would debit historical charges
+      // a second time in this process.
+      seedObservedFlattenCharges(this.observedFlattenCharges, attemptId, a.flatten_charges);
+      seedObservedFlattenChargesForDay(
+        this.observedFlattenChargesByDay,
+        attemptId,
+        a.flatten_charge_day,
+        a.flatten_charges_for_day,
+      );
+      this.registerResidual(
+        attemptId,
+        residual,
+        Number.isSafeInteger(a.projection_version) && (a.projection_version ?? -1) >= 0
+          ? a.projection_version!
+          : 0,
+        a.residual_projection_identity ?? residualProjectionIdentity(residual),
+      );
       total += residual.length;
     }
     if (total > 0) {
@@ -3138,8 +3463,49 @@ export class BoxEngine {
     return n;
   }
 
+  /**
+   * Attempt ids whose per-attempt risk bookkeeping must survive compaction.
+   *
+   * An attempt is retained while this process can still emit a projection for it — exposure the
+   * flatten loop is still working, or an immutable command whose durable acknowledgement was lost
+   * and will be retried. `extra` carries the authoritative unresolved set of a daily-risk seed,
+   * which is a superset in the healthy case and deliberately not assumed to be one: a row that
+   * resolved between the two reads must not lose the watermark that keeps its late acknowledgement
+   * idempotent.
+   */
+  private retainedRiskAttemptIds(extra?: Iterable<string>): Set<string> {
+    const retained = new Set<string>(this.residualByAttempt.keys());
+    for (const attemptId of this.pendingResidualPersists.keys()) retained.add(attemptId);
+    if (extra) for (const attemptId of extra) retained.add(attemptId);
+    return retained;
+  }
+
+  /** Bounded per-attempt risk bookkeeping sizes. A diagnostics seam, never a control input. */
+  private riskBookkeepingDiagnostics(): {
+    observed_charge_attempts: number;
+    observed_charge_day_buckets: number;
+    projection_versions: number;
+    projection_identities: number;
+    pending_projection_acknowledgements: number;
+  } {
+    return {
+      observed_charge_attempts: this.observedFlattenCharges.size,
+      observed_charge_day_buckets: this.observedFlattenChargesByDay.size,
+      projection_versions: this.residualProjectionVersion.size,
+      projection_identities: this.residualProjectionIdentity.size,
+      pending_projection_acknowledgements: this.pendingResidualPersists.size,
+    };
+  }
+
   /** Register outstanding residual exposure and make sure the flatten loop runs. */
-  private registerResidual(attemptId: string, residual: ResidualLegExposure[]): void {
+  private registerResidual(
+    attemptId: string,
+    residual: ResidualLegExposure[],
+    projectionVersion = 0,
+    projectionIdentity = residualProjectionIdentity(residual),
+  ): void {
+    this.residualProjectionVersion.set(attemptId, projectionVersion);
+    this.residualProjectionIdentity.set(attemptId, projectionIdentity);
     if (residual.length === 0) {
       this.residualByAttempt.delete(attemptId);
     } else {
@@ -3389,30 +3755,89 @@ export class BoxEngine {
    * already recorded are never mutated after the fact — the cost is recorded as its own field and
    * as realised P&L, which is the honest way to show a later cost against an earlier trade.
    */
-  private noteFlattenCharges(charges: number): void {
+  private noteFlattenCharges(
+    attemptId: string,
+    charges: number,
+    observation?: FlattenChargeDayObservation,
+  ): void {
     if (!Number.isFinite(charges) || charges <= 0) return;
-    this.orderManager?.recordRealisedPnl(-charges);
+    if (!observation) {
+      // Compatibility fallback for a legacy/custom projection persistence implementation. The
+      // production repository always returns authoritative day metadata.
+      this.orderManager?.recordRealisedPnl(-charges);
+      return;
+    }
+    this.orderManager?.recordFlattenCharge({
+      attemptId,
+      chargeDay: observation.chargeDay,
+      previousChargesForDay: observation.previousChargesForDay,
+      chargesForDay: observation.chargesForDay,
+    });
+  }
+
+  private async persistResidualProjection(
+    attemptId: string,
+    command: BoxExecutionAttemptProjectionCommand,
+  ): Promise<BoxExecutionAttemptProjectionResult> {
+    const result = await persistOwnedResidualProjection({
+      attemptId,
+      command,
+      persist: (immutableCommand) => applyBoxExecutionAttemptProjection(attemptId, immutableCommand),
+      observedFlattenCharges: this.observedFlattenCharges,
+      observedFlattenChargesByDay: this.observedFlattenChargesByDay,
+      onAppliedCharge: (charge, observation) =>
+        this.noteFlattenCharges(attemptId, charge, observation),
+    });
+    if (result.status !== "not_found" && result.residual_exposure &&
+        result.projection_version !== null && result.projection_identity !== null) {
+      this.pendingResidualPersists.delete(attemptId);
+      this.registerResidual(
+        attemptId,
+        result.residual_exposure,
+        result.projection_version,
+        result.projection_identity,
+      );
+      if (result.residual_exposure.length === 0) {
+        // This attempt is authoritatively resolved and its acknowledgement is no longer pending,
+        // so nothing in this process can project it again: release every per-attempt structure it
+        // owns rather than carrying it for the process lifetime.
+        const retained = this.retainedRiskAttemptIds();
+        compactObservedFlattenChargeWatermarks({
+          observedByAttempt: this.observedFlattenCharges,
+          observedByAttemptDay: this.observedFlattenChargesByDay,
+          retainAttemptIds: retained,
+          currentDay: this.deps.istDayKey(),
+        });
+        compactResidualProjectionBookkeeping({
+          projectionVersionByAttempt: this.residualProjectionVersion,
+          projectionIdentityByAttempt: this.residualProjectionIdentity,
+          retainAttemptIds: retained,
+        });
+      }
+    }
+    return result;
   }
 
   private async flattenResiduals(): Promise<void> {
-    if (this.residualByAttempt.size === 0) {
+    if (this.residualByAttempt.size === 0 && this.pendingResidualPersists.size === 0) {
       if (this.residualFlattenTimer) {
         clearInterval(this.residualFlattenTimer);
         this.residualFlattenTimer = null;
       }
       return;
     }
-    for (const [attemptId, projected] of [...this.pendingResidualPersists]) {
+    for (const [attemptId, command] of [...this.pendingResidualPersists]) {
       try {
-        const acknowledged = projected.length === 0
-          ? await resolveBoxExecutionAttempt(attemptId)
-          : await updateBoxExecutionAttemptResidual(attemptId, projected);
-        if (!acknowledged) continue;
-        this.pendingResidualPersists.delete(attemptId);
-        if (projected.length === 0) this.residualByAttempt.delete(attemptId);
-        else this.residualByAttempt.set(attemptId, projected);
+        const result = await this.persistResidualProjection(attemptId, command);
+        if (result.status === "not_found") continue;
+        if (result.status === "stale") {
+          this.execution.invariantViolation(
+            `residual ${attemptId} projection retry was stale and adopted durable version ${result.projection_version}`,
+          );
+        }
       } catch {
-        // Persistence-only retry. Never replay the already-confirmed broker/paper fill.
+        // Persistence-only retry with the exact same immutable application id, projection and fee.
+        // Never replay the already-confirmed broker/paper fill.
       }
     }
     if (!this.marketOpen || !this.isFeedHealthy()) return; // cannot execute now; residual is kept
@@ -3424,40 +3849,51 @@ export class BoxEngine {
       this.metrics.recordResidualFlattenAttempt();
       try {
         const res = await this.execution.flattenResidual({ residual, keyPrefix: attemptId });
-        // THE FLATTEN IS NOT FREE. Its brokerage/taxes are a real cost of clearing residual
-        // exposure, and until now they were computed and discarded (paper) or never computed at
-        // all (live). Recorded atomically with the residual projection below, and counted against
-        // the live daily risk limit, so "residual flatten -> all actual charges" is true.
-        this.noteFlattenCharges(res.flatten_charges);
-        if (res.remaining.length === 0) {
-          const acknowledged = await resolveBoxExecutionAttempt(attemptId, res.flatten_charges).catch(() => false);
-          if (!acknowledged) {
-            this.pendingResidualPersists.set(attemptId, []);
-            this.execution.invariantViolation(`residual ${attemptId} flattened but durable resolution is unacknowledged`);
-            this.metrics.recordResidualFlattenFailure();
-            continue;
-          }
-          this.residualByAttempt.delete(attemptId);
+        const command = createResidualProjectionCommand({
+          attemptId,
+          expectedVersion: this.residualProjectionVersion.get(attemptId) ?? 0,
+          expectedResidual: residual,
+          nextResidual: res.remaining,
+          flattenChargeDelta: res.flatten_charges,
+          flattenChargeDay: this.deps.istDayKey(),
+        });
+        if (!residualProjectionChanges(command)) {
+          // No broker fill, charge, or generation retirement occurred. A no-book/gate pass must
+          // not consume the projection version ahead of another worker's broker-confirmed result.
+          this.metrics.recordResidualFlattenFailure();
+          continue;
+        }
+        let result: BoxExecutionAttemptProjectionResult;
+        try {
+          result = await this.persistResidualProjection(attemptId, command);
+        } catch {
+          this.pendingResidualPersists.set(attemptId, command);
+          this.execution.invariantViolation(
+            `residual ${attemptId} flatten awaits durable versioned projection acknowledgement`,
+          );
+          this.metrics.recordResidualFlattenFailure();
+          continue;
+        }
+        if (result.status === "not_found") {
+          this.pendingResidualPersists.set(attemptId, command);
+          this.execution.invariantViolation(`residual ${attemptId} durable execution attempt was not found`);
+          this.metrics.recordResidualFlattenFailure();
+          continue;
+        }
+        if (result.status === "stale") {
+          this.execution.invariantViolation(
+            `residual ${attemptId} stale projection lost to durable version ${result.projection_version}`,
+          );
+          this.metrics.recordResidualFlattenFailure();
+          continue;
+        }
+        const authoritative = result.residual_exposure ?? [];
+        if (authoritative.length === 0) {
           this.metrics.recordResidualFlattenSuccess();
           console.log(`[Box] residual exposure for attempt ${attemptId} fully flattened.`);
         } else {
-          // Persist ONLY what remains before changing the authoritative in-memory
-          // work set, so a lost acknowledgement can never replay a stale quantity.
           const sumQty = (legs: ResidualLegExposure[]): number => legs.reduce((s, r) => s + r.quantity, 0);
-          const flattenedAny = sumQty(res.remaining) < sumQty(residual);
-          const acknowledged = await updateBoxExecutionAttemptResidual(
-            attemptId,
-            res.remaining,
-            res.flatten_charges,
-          ).catch(() => false);
-          if (!acknowledged) {
-            this.pendingResidualPersists.set(attemptId, res.remaining);
-            this.execution.invariantViolation(`residual ${attemptId} partial flatten awaits durable projection`);
-            this.metrics.recordResidualFlattenFailure();
-            continue;
-          }
-          this.residualByAttempt.set(attemptId, res.remaining);
-          if (flattenedAny) this.metrics.recordResidualFlattenPartial();
+          if (sumQty(authoritative) < sumQty(residual)) this.metrics.recordResidualFlattenPartial();
           else this.metrics.recordResidualFlattenFailure();
         }
       } catch (err) {
@@ -3468,7 +3904,8 @@ export class BoxEngine {
       }
     }
 
-    if (this.residualByAttempt.size === 0 && this.residualFlattenTimer) {
+    if (this.residualByAttempt.size === 0 && this.pendingResidualPersists.size === 0 &&
+        this.residualFlattenTimer) {
       clearInterval(this.residualFlattenTimer);
       this.residualFlattenTimer = null;
     }
@@ -3484,23 +3921,34 @@ export class BoxEngine {
         let valid = true;
         for (const role of BOX_LEG_ROLES) {
           const quantity = projected[role] ?? 0;
-          if (!Number.isInteger(quantity) || quantity < 0 || quantity > position.quantity) valid = false;
+          // Preserve broker-confirmed integer overfill exactly. It is abnormal
+          // position truth, not permission to normalize back to one lot.
+          if (!Number.isSafeInteger(quantity) || quantity < 0) valid = false;
           exact[role] = quantity;
         }
         const changed = BOX_LEG_ROLES.some((role) => exact[role] !== position.remaining_qty_by_role[role]);
         if (!valid) {
           affectedIds.add(position.id);
-        } else if (changed) {
-          const projectedState = isBoxPositionFlat(exact)
+        } else {
+          const projectedViolation = singleLotPositionViolation({
+            ...position,
+            remaining_qty_by_role: exact,
+          });
+          const projectedState = isBoxPositionFlat(exact) || projectedViolation
             ? "RECOVERY" as const
             : deriveBoxPositionState(exact, position.position_state);
-          const persisted = await applyBoxReconciledProjection(position.id, exact, projectedState);
-          if (!persisted) throw new Error(`failed to persist reconciled quantity projection for ${position.id}`);
-          position.remaining_qty_by_role = exact;
-          position.position_state = projectedState;
-          if (projectedState === "RECOVERY") {
-            position.exit_blocked_reason = "broker-confirmed flat quantity requires terminal close-accounting recovery";
+          if (changed) {
+            const persisted = await applyBoxReconciledProjection(position.id, exact, projectedState);
+            if (!persisted) throw new Error(`failed to persist reconciled quantity projection for ${position.id}`);
+            position.remaining_qty_by_role = exact;
+            position.position_state = projectedState;
+            if (projectedState === "RECOVERY") {
+              position.exit_blocked_reason = projectedViolation
+                ? `broker-confirmed quantity violates single-lot position invariant: ${projectedViolation}`
+                : "broker-confirmed flat quantity requires terminal close-accounting recovery";
+            }
           }
+          if (projectedViolation) affectedIds.add(position.id);
         }
       }
 
@@ -3514,6 +3962,23 @@ export class BoxEngine {
       position.exit_blocked_reason = detail;
       await markBoxTradeRecovery(position.id, detail);
     }
+  }
+
+  private refreshCrashRecoveryEntryQuarantine(): void {
+    if (!this.orderManager) return;
+    const projectedSymbols = new Set<string>();
+    for (const position of this.positions.list()) {
+      for (const role of BOX_LEG_ROLES) {
+        const instrument = position.legs[role];
+        projectedSymbols.add(`${instrument.exchange}:${instrument.tradingsymbol}`);
+      }
+    }
+    const hasCrashOnlyExposure = this.orderManager.attributedRecoveryExposure().some(
+      (residual) => !projectedSymbols.has(
+        `${residual.exchange ?? "NFO"}:${residual.tradingsymbol}`,
+      ),
+    );
+    this.orderManager.setCrashOnlyAttributedExposure(hasCrashOnlyExposure);
   }
 
   private syncManagerExposure(): void {
@@ -3659,6 +4124,13 @@ export class BoxEngine {
       // Measured outcome and reject rates for the active broker.
       outcomes: this.outcomeStore.outcomeCounts(this.deps.activeBroker(), "MARKETABLE_LIMIT"),
       rejects: this.outcomeStore.rejectCounts(this.deps.activeBroker()),
+      // TECHNICAL entry-pipeline faults, classified. Fixed keys (always all ten, so a zero reads
+      // as a zero) plus a bounded ring of recent detail. `candidate_key` and stack traces are
+      // stripped here by `publicRecent()`: they go to the server log and the trade-event ledger,
+      // never to a metric label or this endpoint, which is counts/statuses only.
+      entry_fault_classes: this.entryFaults.counts(),
+      entry_faults_total: this.entryFaults.total,
+      recent_entry_faults: this.entryFaults.publicRecent(20),
       // Advisory only. Never applied automatically; never a claim about NSE queue position.
       queue_calibration: this.queueEstimator.recommendAll(),
       last_implementation_shortfall: this.lastShortfall,
@@ -3733,8 +4205,12 @@ export class BoxEngine {
       hub_connected: this.deps.feed.isConnected(),
       quotes: this.quotes.size,
       quote_updates: this.quotes.updateCount,
-      /** Feed liveness: age of the newest tick anywhere, and the verdict. */
+      /** Preserved field: now correctly reports RAW current-socket tick age. */
       feed_age_ms: this.feedAgeMs(),
+      raw_tick_age_ms: this.feedAgeMs(),
+      book_observation_age_ms: this.bookObservationAgeMs(),
+      executable_books: this.quotes.size,
+      executable_book_diagnostics: this.quotes.diagnostics(),
       feed_healthy: this.isFeedHealthy(),
       /**
        * APPROXIMATE lag behind the exchange, from Kite's second-resolution
@@ -3756,6 +4232,8 @@ export class BoxEngine {
       residual_exposure_count: this.residualByAttempt.size,
       residual_exposure_legs: this.residualLegCount(),
       residual_flatten_in_flight: this.residualFlattenInFlight.size,
+      /** Bounded per-attempt risk bookkeeping. Observability only; never a control input. */
+      risk_bookkeeping: this.riskBookkeepingDiagnostics(),
       partially_exited_positions: this.positions.list().filter((p) => p.position_state === "PARTIALLY_EXITED").length,
       /** Running day P&L: open positions' current net + today's realised net. */
       day_pnl: this.computeDayPnl(),
@@ -3878,9 +4356,8 @@ export class BoxEngine {
 
   invalidateBooks(): void {
     this.invalidateFeedGeneration();
-    this.quotes.clear();
-    this.spots.clear();
-    this.scanner.clearOpportunities();
+    // Broker-switch-only transport ownership reset. Executable state is already
+    // cleared by every generation invalidation above.
     this.subscribedOptionTokens.clear();
     this.subscribedSpotTokens.clear();
   }

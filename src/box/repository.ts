@@ -11,10 +11,27 @@ import mongoose from "mongoose";
 import { isBoxConnectionReady } from "../db.js";
 import { LEGACY_BROKER, type BrokerId } from "../brokers/types.js";
 import {
+  MAX_FLATTEN_APPLICATION_IDS,
+  residualProjectionIdentity,
+  type BoxExecutionAttemptProjectionCommand,
+  type BoxExecutionAttemptProjectionResult,
+} from "./executionAttemptProjection.js";
+import {
+  BoxPnlDayProofBuilder,
+  SUMMARY_FIELD,
+  boxPnlDayProofsEqual,
+  boxPnlSummariesEqual,
+  boxPnlSummaryMatchesRows,
+  buildBoxPnlDayProof,
+  type BoxPnlDayProof,
+} from "./pnlSnapshot.js";
+import {
   BoxCalibrationSample,
   BoxDailyPnl,
   BoxExecutionAttempt,
   BoxOrderIntent,
+  BoxPnlDayState,
+  BoxPnlDeletion,
   BoxSetting,
   BoxTrade,
   BoxTradeEvent,
@@ -45,6 +62,222 @@ import type {
 
 /** Mongo duplicate-key error code. */
 const DUPLICATE_KEY = 11000;
+
+export const BOX_RECOVERY_UNIQUE_INDEX = "box_single_unresolved_crash_recovery";
+export const BOX_RECOVERY_KEY = "boot-recovery";
+
+interface BoxExecutionAttemptIndexDescription {
+  name?: string;
+  unique?: boolean;
+  key?: Record<string, unknown>;
+  partialFilterExpression?: Record<string, unknown>;
+}
+
+interface RawBoxExecutionAttemptCollection {
+  find(
+    filter: Record<string, unknown>,
+    options: { projection: Record<string, number> },
+  ): { toArray(): Promise<Array<{ _id: unknown }>> };
+  createIndexes(specs: Record<string, unknown>[]): Promise<unknown>;
+  indexes(): Promise<BoxExecutionAttemptIndexDescription[]>;
+}
+
+/** How long a failed re-verification waits before the next readiness request may retry. */
+export const BOX_RECOVERY_REVERIFY_BACKOFF_MS = 30_000;
+
+function rawBoxExecutionAttemptCollection(): RawBoxExecutionAttemptCollection {
+  return BoxExecutionAttempt.collection as unknown as RawBoxExecutionAttemptCollection;
+}
+
+function exactRecord(
+  actual: Record<string, unknown> | undefined,
+  expected: Record<string, unknown>,
+): boolean {
+  if (!actual) return false;
+  const actualKeys = Object.keys(actual);
+  const expectedKeys = Object.keys(expected);
+  return actualKeys.length === expectedKeys.length &&
+    expectedKeys.every((key) => Object.prototype.hasOwnProperty.call(actual, key) &&
+      actual[key] === expected[key]);
+}
+
+/**
+ * Pure validation used by startup and offline tests. Any duplicate unresolved recovery rows or
+ * drift in the safety-critical index is an operator-repair condition, never something to guess
+ * through by selecting one row.
+ */
+export function boxRecoveryPersistenceValidationError(
+  indexes: readonly BoxExecutionAttemptIndexDescription[],
+  unresolvedRecoveryIds: readonly string[],
+): string | null {
+  if (unresolvedRecoveryIds.length > 1) {
+    return `duplicate unresolved ${BOX_RECOVERY_KEY} rows: ${unresolvedRecoveryIds.join(", ")}`;
+  }
+  const index = indexes.find((candidate) => candidate.name === BOX_RECOVERY_UNIQUE_INDEX);
+  if (!index) return `missing ${BOX_RECOVERY_UNIQUE_INDEX} index`;
+  if (index.unique !== true) return `${BOX_RECOVERY_UNIQUE_INDEX} is not unique`;
+  if (!exactRecord(index.key, { candidate_key: 1 })) {
+    return `${BOX_RECOVERY_UNIQUE_INDEX} has incompatible keys`;
+  }
+  if (!exactRecord(index.partialFilterExpression, {
+    candidate_key: BOX_RECOVERY_KEY,
+    resolved: false,
+  })) {
+    return `${BOX_RECOVERY_UNIQUE_INDEX} has an incompatible partial filter`;
+  }
+  return null;
+}
+
+/**
+ * Readiness gate for the crash-recovery uniqueness boundary.
+ *
+ * The boundary is only trustworthy while the connection that verified it is still up, so a lost
+ * connection invalidates the verification. The bit used to be ONE-SHOT — cleared on every
+ * disconnect and set only by `boot()`, which cannot run twice — so a single routine reconnect
+ * quarantined crash-only recovery for the rest of the process: `loadUnresolvedBoxExecutionAttempts`
+ * permanently excluded `boot-recovery` rows, `ensureBoxRecoveryExecutionAttempt` permanently threw,
+ * and (with such exposure attributed) live entry stayed closed until an operator restarted.
+ *
+ * The rules this gate encodes:
+ *  - fail closed: never ready until a verification completed on the CURRENT connection;
+ *  - self-heal: a readiness request on a restored connection starts exactly one re-verification;
+ *  - never spam: at most one attempt in flight, and at most one attempt per backoff window;
+ *  - never establish the safety-critical index as a side effect of a readiness probe in a process
+ *    that never established it explicitly at boot.
+ *
+ * Extracted as a class so the reconnect path is exercised offline, with no Mongo, by driving an
+ * instance whose connection/establisher/clock are doubles.
+ */
+export class BoxRecoveryPersistenceGate {
+  private verified = false;
+  private establishedOnce = false;
+  private inFlight: Promise<void> | null = null;
+  private nextAttemptAtMs = 0;
+
+  constructor(private readonly deps: {
+    isConnected: () => boolean;
+    establish: () => Promise<void>;
+    now?: () => number;
+    reverifyBackoffMs?: number;
+  }) {}
+
+  /** Ready only while connected and explicitly verified since the last observed disconnect. */
+  isReady(): boolean {
+    if (!this.deps.isConnected()) {
+      this.verified = false;
+      return false;
+    }
+    if (!this.verified) this.requestReverification();
+    return this.verified;
+  }
+
+  /**
+   * Establish and verify now, propagating any failure. This is the explicit boot path: the caller
+   * decides what an unverifiable boundary means for the process.
+   */
+  async establishNow(): Promise<void> {
+    await this.verifyOnce();
+  }
+
+  /** The verification currently in flight, if any. Never rejects — readiness is read via `isReady`. */
+  pendingVerification(): Promise<void> {
+    return (this.inFlight ?? Promise.resolve()).catch(() => undefined);
+  }
+
+  private verifyOnce(): Promise<void> {
+    this.verified = false;
+    // A synchronous throw must never escape into the caller: `isReady()` is consulted on the live
+    // exposure paths, and its contract is "false", not "explode".
+    let started: Promise<void>;
+    try {
+      started = this.deps.establish();
+    } catch (error) {
+      started = Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+    const attempt = started.then(() => {
+      this.verified = true;
+      this.establishedOnce = true;
+    });
+    // Track the attempt so a concurrent readiness probe cannot start a second one, and release the
+    // slot however it settles.
+    const tracked: Promise<void> = attempt.finally(() => {
+      if (this.inFlight === tracked) this.inFlight = null;
+    });
+    this.inFlight = tracked;
+    return tracked;
+  }
+
+  private requestReverification(): void {
+    if (!this.establishedOnce || this.inFlight) return;
+    const now = this.deps.now?.() ?? Date.now();
+    if (now < this.nextAttemptAtMs) return;
+    this.nextAttemptAtMs = now + (this.deps.reverifyBackoffMs ?? BOX_RECOVERY_REVERIFY_BACKOFF_MS);
+    // Deliberately not awaited: the probe is synchronous and stays fail-closed until this
+    // completes. A failure is logged and retried no sooner than the backoff window.
+    void this.verifyOnce().catch((error) => {
+      console.warn(
+        "[Box] crash-recovery persistence could not be re-verified after a Box connection change; " +
+          `crash-only recovery stays quarantined: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+  }
+}
+
+const boxRecoveryPersistenceGate = new BoxRecoveryPersistenceGate({
+  isConnected: () => isBoxConnectionReady(),
+  establish: () => establishBoxExecutionAttemptPersistence(),
+});
+
+/** Ready only while connected and explicitly verified since the last observed disconnect. */
+export function isBoxRecoveryPersistenceReady(): boolean {
+  return boxRecoveryPersistenceGate.isReady();
+}
+
+/**
+ * Establish and verify the single-unresolved crash-recovery boundary before any worker can adopt
+ * or create one. Existing duplicates are quarantined for operator repair; incompatible indexes
+ * are surfaced and never dropped or silently rebuilt.
+ */
+export async function initialiseBoxExecutionAttemptPersistence(): Promise<void> {
+  await boxRecoveryPersistenceGate.establishNow();
+}
+
+/** The Mongo round trip itself. Readiness bookkeeping belongs to the gate above. */
+async function establishBoxExecutionAttemptPersistence(): Promise<void> {
+  if (!isBoxConnectionReady()) throw new Error("box MongoDB connection is not ready");
+
+  const collection = rawBoxExecutionAttemptCollection();
+  // Use the native collection so this preflight does not depend on Mongoose's background
+  // auto-index lifecycle. Duplicate detection must happen before our explicit createIndexes call.
+  const unresolved = await collection.find({
+    candidate_key: BOX_RECOVERY_KEY,
+    resolved: false,
+  }, { projection: { _id: 1 } }).toArray();
+  const unresolvedIds = unresolved.map((row) => String(row._id));
+  if (unresolvedIds.length > 1) {
+    throw new Error(
+      `cannot initialise Box crash recovery: duplicate unresolved rows require quarantine/repair (${unresolvedIds.join(", ")})`,
+    );
+  }
+
+  try {
+    await collection.createIndexes([{
+      key: { candidate_key: 1 },
+      name: BOX_RECOVERY_UNIQUE_INDEX,
+      unique: true,
+      partialFilterExpression: { candidate_key: BOX_RECOVERY_KEY, resolved: false },
+    }]);
+  } catch (error) {
+    throw new Error(
+      `failed to establish ${BOX_RECOVERY_UNIQUE_INDEX}; an incompatible index or duplicate ` +
+        `recovery row may exist: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  const indexes = await collection.indexes();
+  const validationError = boxRecoveryPersistenceValidationError(indexes, unresolvedIds);
+  if (validationError) throw new Error(`Box crash-recovery persistence is unsafe: ${validationError}`);
+}
 
 export function isDuplicateKeyError(err: unknown): boolean {
   return (
@@ -163,6 +396,39 @@ export async function loadClosedBoxTrades(
 export async function findBoxTradeById(id: string): Promise<BoxTradeRecord | null> {
   if (!isBoxDbEnabled() || !isValidBoxId(id)) return null;
   return BoxTrade.findById(id).lean<BoxTradeRecord>();
+}
+
+/**
+ * Return the subset of ids that still exist in the source trade collection.
+ *
+ * The nightly P&L archiver uses this one projected batch query before trusting
+ * cached rows. It intentionally does not catch query failures: treating an
+ * unavailable source as "nothing exists" would silently erase a valid day.
+ */
+const PNL_QUERY_CHUNK = 200;
+const PNL_SCAN_PAGE = 200;
+const MAX_DELETION_CANDIDATE_DAYS = 64;
+
+function chunks<T>(items: readonly T[], size = PNL_QUERY_CHUNK): T[][] {
+  const out: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    out.push(items.slice(index, index + size));
+  }
+  return out;
+}
+
+export async function filterExistingBoxTradeIds(ids: string[]): Promise<string[]> {
+  if (!isBoxDbEnabled()) throw new Error("Box persistence is not available.");
+  const validIds = [...new Set(ids.filter((id) => mongoose.isValidObjectId(id)))];
+  const existing: string[] = [];
+  for (const batch of chunks(validIds)) {
+    const rows = await BoxTrade.find(
+      { _id: { $in: batch } },
+      { _id: 1 },
+    ).lean<{ _id: unknown }[]>();
+    existing.push(...rows.map((row) => String(row._id)));
+  }
+  return existing;
 }
 
 /**
@@ -356,18 +622,618 @@ export async function deleteBoxTrade(id: string): Promise<number> {
 }
 
 /**
- * Drop a trade's rows from the daily-P&L ARCHIVE.
- *
- * Called after a deletion so a regenerated day summary cannot be rebuilt from a
- * trade that no longer exists. Without this, `box_daily_pnl` would keep an
- * orphaned row and every later report of that day would silently include a
- * deleted trade's P&L — precisely the "the numbers disagree" class of bug that
- * deletion is supposed to fix rather than create.
+ * Install the durable reporting-cleanup fence before removing the source trade.
+ * The record is intentionally retained after completion so a late writer in a
+ * different process can still observe the deletion.
  */
-export async function deleteBoxDailyPnlForTrade(tradeId: string): Promise<number> {
+export async function prepareBoxPnlDeletion(
+  tradeId: string,
+  candidateDays: string[] = [],
+): Promise<void> {
+  if (!isBoxDbEnabled()) throw new Error("Box persistence is not available.");
+  const now = new Date();
+  await BoxPnlDeletion.updateOne(
+    { _id: tradeId },
+    {
+      $setOnInsert: {
+        status: "pending",
+        attempts: 0,
+        created_at: now,
+        completed_at: null,
+        candidate_days: [],
+      },
+      $set: { updated_at: now, last_error: null },
+    },
+    { upsert: true },
+  );
+  const candidates = [...new Set(
+    candidateDays.slice(-MAX_DELETION_CANDIDATE_DAYS).filter(Boolean),
+  )].sort();
+  if (candidates.length > 0) {
+    await BoxPnlDeletion.updateOne(
+      { _id: tradeId },
+      [{
+        $set: {
+          candidate_days: {
+            $slice: [
+              { $setUnion: [{ $ifNull: ["$candidate_days", []] }, candidates] },
+              -MAX_DELETION_CANDIDATE_DAYS,
+            ],
+          },
+        },
+      }],
+    );
+  }
+}
+
+/** Remove a prepared fence only when the guarded source delete did not happen. */
+export async function cancelBoxPnlDeletion(tradeId: string): Promise<void> {
+  if (!isBoxDbEnabled()) return;
+  await BoxPnlDeletion.deleteOne({ _id: tradeId, status: "pending" });
+}
+
+/**
+ * Identify archive ids that are no longer legal at the durable boundary.
+ * A retained deletion fence covers a writer that raced the source delete; the
+ * source existence check also repairs legacy/crash orphans that predate fences.
+ */
+/** Pending preparation alone never invalidates a row while its source exists. */
+export function isArchivedPnlRowInvalid(
+  sourceExists: boolean,
+  fenceStatus: "pending" | "complete" | null,
+): boolean {
+  return !sourceExists || fenceStatus === "complete";
+}
+
+async function invalidArchivedTradeIds(ids: string[]): Promise<string[]> {
+  const unique = [...new Set(ids.filter((id) => id !== SUMMARY_FIELD))];
+  const invalid: string[] = [];
+  for (const batch of chunks(unique)) {
+    const validIds = batch.filter((id) => mongoose.isValidObjectId(id));
+    const sources = validIds.length > 0
+      ? await BoxTrade.find({ _id: { $in: validIds } }, { _id: 1 })
+          .lean<{ _id: unknown }[]>()
+      : [];
+    const completedFences = await BoxPnlDeletion.find(
+      { _id: { $in: batch }, status: "complete" },
+      { _id: 1, status: 1 },
+    ).lean<{ _id: string; status: "complete" }[]>();
+    const existing = new Set(sources.map((row) => String(row._id)));
+    const completed = new Set(completedFences.map((row) => String(row._id)));
+    invalid.push(...batch.filter((id) =>
+      isArchivedPnlRowInvalid(existing.has(id), completed.has(id) ? "complete" : null)));
+  }
+  return invalid;
+}
+
+export async function runBoxPnlDayMutation<T>(args: {
+  invalidate: () => Promise<void>;
+  mutate: () => Promise<T>;
+}): Promise<T> {
+  await args.invalidate();
+  let result: T | undefined;
+  let mutationError: unknown;
+  try {
+    result = await args.mutate();
+  } catch (err) {
+    mutationError = err;
+  }
+  try {
+    await args.invalidate();
+  } catch (invalidationError) {
+    if (mutationError !== undefined) {
+      throw new AggregateError(
+        [mutationError, invalidationError],
+        "Box P&L mutation and post-invalidation both failed",
+      );
+    }
+    throw invalidationError;
+  }
+  if (mutationError !== undefined) throw mutationError;
+  return result as T;
+}
+
+async function mutateDurablePnlDay<T>(day: string, mutate: () => Promise<T>): Promise<T> {
+  return runBoxPnlDayMutation({
+    invalidate: () => markBoxDailyPnlIncomplete(day, true),
+    mutate,
+  });
+}
+
+async function scanDurablePnlDay(day: string): Promise<{
+  proof: BoxPnlDayProof;
+  summary: ReturnType<BoxPnlDayProofBuilder["finish"]>["summary"];
+  invalidTradeIds: string[];
+}> {
+  const builder = new BoxPnlDayProofBuilder(day);
+  let afterTradeId = "";
+  const invalidTradeIds = new Set<string>();
+  while (true) {
+    const rows = await BoxDailyPnl.find({
+      day,
+      trade_id: afterTradeId
+        ? { $ne: SUMMARY_FIELD, $gt: afterTradeId }
+        : { $ne: SUMMARY_FIELD },
+    })
+      .sort({ trade_id: 1 })
+      .limit(PNL_SCAN_PAGE)
+      .lean<BoxDailyPnlRecord[]>();
+    if (rows.length === 0) break;
+    afterTradeId = rows.at(-1)!.trade_id;
+    const invalid = await invalidArchivedTradeIds(rows.map((row) => row.trade_id));
+    invalid.forEach((tradeId) => invalidTradeIds.add(tradeId));
+    const invalidSet = new Set(invalid);
+    for (const row of rows) {
+      if (!invalidSet.has(row.trade_id)) builder.add(row);
+    }
+    if (rows.length < PNL_SCAN_PAGE) break;
+  }
+  return { ...builder.finish(new Date().toISOString()), invalidTradeIds: [...invalidTradeIds] };
+}
+
+/** Rewrite and validate a day summary with fixed-size page residency. */
+export async function rewriteBoxDailyPnlSummary(day: string): Promise<BoxPnlDayProof> {
+  if (!isBoxDbEnabled()) throw new Error("Box persistence is not available.");
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const before = await scanDurablePnlDay(day);
+    if (before.invalidTradeIds.length > 0) {
+      throw new Error(`box_daily_pnl day ${day} contained an invalid source row`);
+    }
+    await mutateDurablePnlDay(day, async () => {
+      await BoxDailyPnl.updateOne(
+        { day, trade_id: SUMMARY_FIELD },
+        {
+          $set: {
+            day,
+            trade_id: SUMMARY_FIELD,
+            status: "summary",
+            summary: before.summary,
+            updated_at: before.summary.updated_at,
+            archived_at: new Date(),
+          },
+        },
+        { upsert: true },
+      );
+    });
+    const after = await scanDurablePnlDay(day);
+    if (after.invalidTradeIds.length === 0 && boxPnlDayProofsEqual(before.proof, after.proof)) {
+      return after.proof;
+    }
+  }
+  throw new Error(`box_daily_pnl summary for ${day} did not settle after concurrent mutations`);
+}
+
+export function shouldReproveBoxPnlDay(state: {
+  complete?: boolean;
+  needs_reproof?: boolean;
+} | null): boolean {
+  return state?.complete === true || state?.needs_reproof === true;
+}
+
+async function recordBoxPnlDeletionFailure(tradeId: string, err: unknown): Promise<void> {
+  await BoxPnlDeletion.updateOne(
+    { _id: tradeId, status: "pending" },
+    {
+      $set: {
+        updated_at: new Date(),
+        last_error: err instanceof Error ? err.message : String(err),
+      },
+      $inc: { attempts: 1 },
+    },
+  ).catch(() => undefined);
+}
+
+export interface BoxPnlIndependentRepairResult {
+  repaired: number;
+  failureCount: number;
+  /** Bounded samples; failureCount remains exact when more failures occur. */
+  errors: Error[];
+}
+
+/** Run unrelated reconciliation work to completion without one poison item starving later work. */
+export async function runIndependentBoxPnlRepairs<T>(args: {
+  scope: string;
+  items: readonly T[];
+  identify: (item: T) => string;
+  repair: (item: T) => Promise<number>;
+  maxErrorSamples?: number;
+}): Promise<BoxPnlIndependentRepairResult> {
+  let repaired = 0;
+  let failureCount = 0;
+  const errors: Error[] = [];
+  const maxErrorSamples = Math.max(1, args.maxErrorSamples ?? 20);
+  for (const item of args.items) {
+    try {
+      repaired += await args.repair(item);
+    } catch (err) {
+      failureCount++;
+      if (errors.length < maxErrorSamples) {
+        const cause = err instanceof Error ? err : new Error(String(err));
+        errors.push(new Error(`${args.scope} ${args.identify(item)} failed: ${cause.message}`, {
+          cause,
+        }));
+      }
+    }
+  }
+  return { repaired, failureCount, errors };
+}
+
+async function markBoxDailyPnlRetryIfProof(
+  day: string,
+  proof: BoxPnlDayProof,
+): Promise<void> {
+  await BoxPnlDayState.updateOne(
+    { _id: day, ...proof },
+    { $set: { complete: false, needs_reproof: true, updated_at: new Date() } },
+  );
+}
+
+async function reproveBoxDailyPnlFromDurable(
+  day: string,
+  expectedRowCount?: number,
+): Promise<void> {
+  const state = await BoxPnlDayState.findById(day)
+    .select({ snapshot_version: 1, row_count: 1, content_sha256: 1 })
+    .lean<{ snapshot_version?: number; row_count?: number; content_sha256?: string }>();
+  const lastExactProof = state ? boxPnlDayProofFromState(state) : null;
+  if (!lastExactProof) {
+    await markBoxDailyPnlIncomplete(day, true);
+    throw new Error(`box_daily_pnl day ${day} has no last exact v2 proof`);
+  }
+
+  let retryProof = lastExactProof;
+  await runBoxPnlDayProofRepair({
+    lastExactProof,
+    expectedRowCount: expectedRowCount ?? lastExactProof.row_count,
+    settle: async () => { await rewriteBoxDailyPnlSummary(day); },
+    load: () => loadBoxDailyPnlSnapshot(day),
+    validate: async (docs) => {
+      const ids = docs
+        .filter((doc) => doc.trade_id !== SUMMARY_FIELD)
+        .map((doc) => doc.trade_id);
+      if ((await invalidArchivedTradeIds(ids)).length > 0) {
+        throw new Error(`box_daily_pnl day ${day} contained an invalid source row`);
+      }
+    },
+    publish: async (priorProof, nextProof) => {
+      const result = await BoxPnlDayState.updateOne(
+        { _id: day, ...priorProof },
+        {
+          $set: { complete: true, needs_reproof: false, ...nextProof, updated_at: new Date() },
+          $unset: { expected_trade_ids: 1 },
+        },
+      );
+      if ((result.matchedCount ?? 0) !== 1) {
+        throw new Error(`box_daily_pnl day ${day} changed before re-proof publication`);
+      }
+      retryProof = nextProof;
+    },
+    markRetry: () => markBoxDailyPnlRetryIfProof(day, retryProof),
+  });
+}
+
+/**
+ * Drop a trade's rows from the daily-P&L archive and rebuild affected summaries.
+ * The durable intent remains pending on any error and is retried at startup.
+ */
+export async function deleteBoxDailyPnlForTrade(
+  tradeId: string,
+  cacheDays: string[] = [],
+): Promise<number> {
+  if (!isBoxDbEnabled()) throw new Error("Box persistence is not available.");
+  await prepareBoxPnlDeletion(tradeId, cacheDays);
+  let deleted = 0;
+  try {
+    const intent = await BoxPnlDeletion.findById(tradeId).lean<{
+      candidate_days?: string[];
+    }>();
+    const candidateDays = [...new Set([
+      ...cacheDays.slice(-MAX_DELETION_CANDIDATE_DAYS),
+      ...(intent?.candidate_days ?? []).slice(-MAX_DELETION_CANDIDATE_DAYS),
+    ].filter(Boolean))].sort().slice(-MAX_DELETION_CANDIDATE_DAYS);
+    const cleanDay = async (day: string): Promise<void> => {
+      const state = await BoxPnlDayState.findById(day)
+        .select({
+          complete: 1,
+          needs_reproof: 1,
+          snapshot_version: 1,
+          row_count: 1,
+          content_sha256: 1,
+          expected_trade_ids: 1,
+        })
+        .lean<{
+          complete?: boolean;
+          needs_reproof?: boolean;
+          snapshot_version?: number;
+          row_count?: number;
+          content_sha256?: string;
+          expected_trade_ids?: string[];
+        }>();
+      // The source/fence scan excludes invalid rows from this count, so deletion
+      // cleanup establishes the only membership reduction we may safely certify.
+      const survivors = await scanDurablePnlDay(day);
+      const result = await mutateDurablePnlDay(day, () =>
+        BoxDailyPnl.deleteOne({ day, trade_id: tradeId }));
+      deleted += result.deletedCount ?? 0;
+      if (Array.isArray(state?.expected_trade_ids)) {
+        const migrated = await migrateLegacyBoxDailyPnlState(day, state.expected_trade_ids);
+        if (!migrated) {
+          throw new Error(`box_daily_pnl legacy day ${day} could not be migrated after cleanup`);
+        }
+      } else if (shouldReproveBoxPnlDay(state)) {
+        await reproveBoxDailyPnlFromDurable(day, survivors.proof.row_count);
+      } else {
+        await rewriteBoxDailyPnlSummary(day);
+      }
+    };
+
+    for (const day of candidateDays) await cleanDay(day);
+
+    // Query/delete in pages instead of materializing every historical day. Since
+    // each processed row is removed, repeatedly taking the first page converges.
+    while (true) {
+      const rows = await BoxDailyPnl.find({ trade_id: tradeId })
+        .select({ day: 1 })
+        .limit(PNL_SCAN_PAGE)
+        .lean<{ day: string }[]>();
+      if (rows.length === 0) break;
+      for (const day of [...new Set(rows.map((row) => row.day))]) {
+        // A row can reappear in an already-processed candidate day after a stale
+        // writer races cleanup. Re-run the full fenced day cleanup; never delete
+        // it without summary repair and proof invalidation.
+        await cleanDay(day);
+      }
+    }
+
+    const now = new Date();
+    await BoxPnlDeletion.updateOne(
+      { _id: tradeId },
+      {
+        $set: {
+          status: "complete",
+          candidate_days: candidateDays,
+          updated_at: now,
+          completed_at: now,
+          last_error: null,
+        },
+        $inc: { attempts: 1 },
+      },
+    );
+    return deleted;
+  } catch (err) {
+    await BoxPnlDeletion.updateOne(
+      { _id: tradeId },
+      {
+        $set: {
+          status: "pending",
+          updated_at: new Date(),
+          last_error: err instanceof Error ? err.message : String(err),
+        },
+        $inc: { attempts: 1 },
+      },
+    ).catch(() => undefined);
+    throw err;
+  }
+}
+
+/**
+ * Validate or repair one v2 day selected by the bounded periodic scan. Complete
+ * states are deliberately inspected too: a process can crash after its row write
+ * but before the post-write invalidation, leaving the previous proof complete.
+ */
+async function repairBoxDailyPnlV2Day(day: string): Promise<number> {
+  let repaired = 0;
+  let scanned = await scanDurablePnlDay(day);
+  if (scanned.invalidTradeIds.length > 0) {
+    for (const tradeId of scanned.invalidTradeIds) {
+      // The durable intent is installed by deletion cleanup before any row is
+      // removed, making the resulting membership reduction explicit and retryable.
+      repaired += await deleteBoxDailyPnlForTrade(tradeId);
+    }
+    scanned = await scanDurablePnlDay(day);
+    if (scanned.invalidTradeIds.length > 0) {
+      throw new Error(`box_daily_pnl day ${day} retained invalid source rows after cleanup`);
+    }
+  }
+
+  const state = await BoxPnlDayState.findById(day)
+    .select({
+      complete: 1,
+      needs_reproof: 1,
+      snapshot_version: 1,
+      row_count: 1,
+      content_sha256: 1,
+    })
+    .lean<{
+      complete?: boolean;
+      needs_reproof?: boolean;
+      snapshot_version?: number;
+      row_count?: number;
+      content_sha256?: string;
+    }>();
+  const lastExactProof = state ? boxPnlDayProofFromState(state) : null;
+  if (!lastExactProof) {
+    await markBoxDailyPnlIncomplete(day, true);
+    throw new Error(`box_daily_pnl day ${day} has no safe v2 proof to repair from`);
+  }
+
+  const stored = await BoxDailyPnl.findOne({ day, trade_id: SUMMARY_FIELD })
+    .select({ summary: 1 })
+    .lean<{ summary?: ReturnType<BoxPnlDayProofBuilder["finish"]>["summary"] }>();
+  const contentMatches = boxPnlDayProofsEqual(lastExactProof, scanned.proof);
+  const summaryMatches = Boolean(
+    stored?.summary && boxPnlSummariesEqual(stored.summary, scanned.summary),
+  );
+  if (state?.complete === true && state.needs_reproof !== true &&
+      contentMatches && summaryMatches) {
+    return repaired;
+  }
+
+  // Same-count content replacement (the late same-ID writer case) is safe to
+  // reproof. Different cardinality is a potentially partial crashed generation
+  // and remains fail-closed with the last exact proof retained as retry evidence.
+  await reproveBoxDailyPnlFromDurable(day, lastExactProof.row_count);
+  return repaired + 1;
+}
+
+/**
+ * Restart repair: finish pending intents, then page through legacy/crash archive
+ * rows. Completed fences are intentionally permanent; see the model retention
+ * note for the bounded-storage-vs-safety tradeoff.
+ */
+export async function reconcileBoxDailyPnlOrphans(): Promise<number> {
   if (!isBoxDbEnabled()) return 0;
-  const res = await BoxDailyPnl.deleteMany({ trade_id: tradeId });
-  return res.deletedCount ?? 0;
+  let repaired = 0;
+  let failureCount = 0;
+  const errors: Error[] = [];
+  const record = (result: BoxPnlIndependentRepairResult): void => {
+    repaired += result.repaired;
+    failureCount += result.failureCount;
+    const available = Math.max(0, 20 - errors.length);
+    errors.push(...result.errors.slice(0, available));
+  };
+
+  let pendingAfter = "";
+  while (true) {
+    const pending = await BoxPnlDeletion.find({
+      status: "pending",
+      ...(pendingAfter ? { _id: { $gt: pendingAfter } } : {}),
+    })
+      .select({ _id: 1, candidate_days: 1 })
+      .sort({ _id: 1 })
+      .limit(PNL_SCAN_PAGE)
+      .lean<{ _id: string; candidate_days?: string[] }[]>();
+    if (pending.length === 0) break;
+    pendingAfter = String(pending.at(-1)!._id);
+    record(await runIndependentBoxPnlRepairs({
+      scope: "pending P&L deletion",
+      items: pending,
+      identify: (intent) => String(intent._id),
+      repair: async (intent) => {
+        const tradeId = String(intent._id);
+        let sourceStillExists: Awaited<ReturnType<typeof BoxTrade.exists>>;
+        try {
+          sourceStillExists = mongoose.isValidObjectId(tradeId)
+            ? await BoxTrade.exists({ _id: tradeId })
+            : null;
+        } catch (err) {
+          await recordBoxPnlDeletionFailure(tradeId, err);
+          throw err;
+        }
+        if (sourceStillExists) {
+          try {
+            await cancelBoxPnlDeletion(tradeId);
+          } catch (err) {
+            await recordBoxPnlDeletionFailure(tradeId, err);
+            throw err;
+          }
+          return 0;
+        }
+        return deleteBoxDailyPnlForTrade(
+          tradeId,
+          (intent.candidate_days ?? []).slice(-MAX_DELETION_CANDIDATE_DAYS),
+        );
+      },
+    }));
+    if (pending.length < PNL_SCAN_PAGE) break;
+  }
+
+  let archiveAfter: mongoose.Types.ObjectId | null = null;
+  while (true) {
+    const rows: { _id: mongoose.Types.ObjectId; trade_id: string }[] = await BoxDailyPnl.find({
+      trade_id: { $ne: SUMMARY_FIELD },
+      ...(archiveAfter ? { _id: { $gt: archiveAfter } } : {}),
+    })
+      .select({ _id: 1, trade_id: 1 })
+      .sort({ _id: 1 })
+      .limit(PNL_SCAN_PAGE)
+      .lean<{ _id: mongoose.Types.ObjectId; trade_id: string }[]>();
+    if (rows.length === 0) break;
+    archiveAfter = rows.at(-1)!._id;
+    const invalid = [...new Set(await invalidArchivedTradeIds(rows.map((row) => row.trade_id)))];
+    record(await runIndependentBoxPnlRepairs({
+      scope: "orphan P&L archive trade",
+      items: invalid,
+      identify: (tradeId) => tradeId,
+      repair: async (tradeId) => {
+        await prepareBoxPnlDeletion(tradeId);
+        return deleteBoxDailyPnlForTrade(tradeId);
+      },
+    }));
+    if (rows.length < PNL_SCAN_PAGE) break;
+  }
+
+  let v2After = "";
+  while (true) {
+    const states = await BoxPnlDayState.find({
+      expected_trade_ids: { $exists: false },
+      snapshot_version: 2,
+      $or: [{ complete: true }, { needs_reproof: true }],
+      ...(v2After ? { _id: { $gt: v2After } } : {}),
+    })
+      .select({ _id: 1 })
+      .sort({ _id: 1 })
+      .limit(PNL_SCAN_PAGE)
+      .lean<{ _id: string }[]>();
+    if (states.length === 0) break;
+    v2After = String(states.at(-1)!._id);
+    record(await runIndependentBoxPnlRepairs({
+      scope: "v2 P&L day repair",
+      items: states,
+      identify: (state) => String(state._id),
+      repair: (state) => repairBoxDailyPnlV2Day(String(state._id)),
+    }));
+    if (states.length < PNL_SCAN_PAGE) break;
+  }
+
+  let legacyAfter = "";
+  while (true) {
+    const states = await BoxPnlDayState.find({
+      expected_trade_ids: { $exists: true },
+      $or: [{ complete: true }, { needs_reproof: true }],
+      ...(legacyAfter ? { _id: { $gt: legacyAfter } } : {}),
+    })
+      .select({ _id: 1, expected_trade_ids: 1 })
+      .sort({ _id: 1 })
+      .limit(PNL_SCAN_PAGE)
+      .lean<{ _id: string; expected_trade_ids?: string[] }[]>();
+    if (states.length === 0) break;
+    legacyAfter = String(states.at(-1)!._id);
+    record(await runIndependentBoxPnlRepairs({
+      scope: "legacy P&L day migration",
+      items: states,
+      identify: (state) => String(state._id),
+      repair: async (state) => {
+        const migrated = await migrateLegacyBoxDailyPnlState(
+          String(state._id),
+          state.expected_trade_ids,
+        );
+        if (!migrated) throw new Error("durable rows did not safely match the legacy manifest");
+        return 1;
+      },
+    }));
+    if (states.length < PNL_SCAN_PAGE) break;
+  }
+
+  if (failureCount > 0) {
+    throw new AggregateError(
+      errors,
+      `Box P&L reconciliation completed independent work with ${failureCount} failure(s) and ${repaired} repair(s)`,
+    );
+  }
+  return repaired;
+}
+
+/** Delete exact extra day rows before verify rewrites the aggregate. */
+export async function deleteBoxDailyPnlRows(day: string, tradeIds: string[]): Promise<number> {
+  if (!isBoxDbEnabled() || tradeIds.length === 0) return 0;
+  let deleted = 0;
+  for (const batch of chunks([...new Set(tradeIds)])) {
+    const result = await mutateDurablePnlDay(day, () =>
+      BoxDailyPnl.deleteMany({ day, trade_id: { $in: batch } }));
+    deleted += result.deletedCount ?? 0;
+  }
+  return deleted;
 }
 
 /**
@@ -672,22 +1538,43 @@ const INTENT_STATE_PREDECESSORS: Readonly<Record<BoxOrderIntentState, readonly B
 /**
  * Apply a monotonic state/fill snapshot and append one audit event exactly once.
  * Stale OPEN/lower-fill snapshots cannot regress a terminal or newer document.
+ *
+ * THE RESULT IS THE AUTHORITATIVE TRANSITION, not just the resulting document.
+ *
+ * Callers attribute broker fills to internal positions. If they derive the delta from their own
+ * in-memory snapshot they double-count, because two async contexts routinely hold the SAME stale
+ * snapshot for one order (the live submit path and a concurrent reconcile pass), so both compute
+ * `post - 0` for a single 40-lot fill and attribute 80. The `$lte` fill guard does not save them:
+ * it is deliberately NON-strict, so re-writing the same cumulative quantity matches and reports
+ * `applied: true`.
+ *
+ * So the write reports what it actually established:
+ *
+ *   delta = current_filled_quantity - previous_filled_quantity      (and 0 when applied is false)
+ *
+ * which is 0 for a duplicate replay and exactly the real increment for whichever caller won.
  */
 export interface BoxOrderIntentUpdateResult {
   intent: BoxOrderIntentRecord | null;
   applied: boolean;
+  /** Cumulative filled quantity this document held before this update. Null when unknowable. */
+  previous_filled_quantity: number | null;
+  /** Cumulative filled quantity this document holds after this update. Null when unknowable. */
+  current_filled_quantity: number | null;
 }
 
 export async function updateBoxOrderIntent(
   clientOrderId: string,
   patch: BoxOrderIntentPatch,
   audit: BoxOrderIntentAudit,
+  expectedStates?: readonly BoxOrderIntentState[],
 ): Promise<BoxOrderIntentUpdateResult> {
   if (!isBoxDbEnabled()) {
     throw new Error("Box persistence is unavailable while updating a live order intent.");
   }
   const guards: Record<string, unknown>[] = [];
   if (patch.state) guards.push({ state: { $in: INTENT_STATE_PREDECESSORS[patch.state] } });
+  if (expectedStates) guards.push({ state: { $in: expectedStates } });
   if (patch.filled_quantity !== undefined) {
     guards.push({ filled_quantity: { $lte: patch.filled_quantity } });
   }
@@ -706,6 +1593,12 @@ export async function updateBoxOrderIntent(
     [{
       $set: {
         ...setPatch,
+        // THE PRE-IMAGE, captured by the same atomic write. Every expression in an aggregation
+        // `$set` stage is evaluated against the INPUT document, so `$filled_quantity` here is the
+        // value before `setPatch` replaces it — even though both are set in one stage. This is
+        // what makes the reported delta a property of the durable transition rather than of
+        // whatever the caller happened to have in memory.
+        previous_filled_quantity: { $ifNull: ["$filled_quantity", 0] },
         audit: {
           $cond: [
             { $in: [audit.audit_id, { $ifNull: ["$audit.audit_id", []] }] },
@@ -718,9 +1611,26 @@ export async function updateBoxOrderIntent(
     { new: true },
   ).lean<BoxOrderIntentRecord>();
   if (!row) {
-    return { intent: await findBoxOrderIntentByClientId(clientOrderId), applied: false };
+    // The guard refused (stale state, regressing fill, or a conflicting broker id). Nothing was
+    // written, so the transition this call established is EMPTY: report an explicit zero-width
+    // transition rather than a null the caller might read as "unknown, guess from my snapshot".
+    const fresh = await findBoxOrderIntentByClientId(clientOrderId);
+    const current = typeof fresh?.filled_quantity === "number" ? fresh.filled_quantity : null;
+    return {
+      intent: fresh,
+      applied: false,
+      previous_filled_quantity: current,
+      current_filled_quantity: current,
+    };
   }
-  return { intent: row, applied: true };
+  return {
+    intent: row,
+    applied: true,
+    previous_filled_quantity: typeof row.previous_filled_quantity === "number"
+      ? row.previous_filled_quantity
+      : null,
+    current_filled_quantity: typeof row.filled_quantity === "number" ? row.filled_quantity : null,
+  };
 }
 
 /** Ready-to-inject durable persistence contract for OrderManager. */
@@ -798,7 +1708,12 @@ export async function loadUnresolvedBoxExecutionAttempts(
 ): Promise<BoxExecutionAttemptRecord[]> {
   if (!isBoxDbEnabled()) return [];
   try {
-    return await BoxExecutionAttempt.find({ resolved: false })
+    // Crash-only rows are quarantined unless this process has explicitly established and verified
+    // their uniqueness boundary. Ordinary residual attempts remain safe to adopt and work.
+    const filter = isBoxRecoveryPersistenceReady()
+      ? { resolved: false }
+      : { resolved: false, candidate_key: { $ne: BOX_RECOVERY_KEY } };
+    return await BoxExecutionAttempt.find(filter)
       .sort({ resolved_at: -1 })
       .limit(limit)
       .lean<BoxExecutionAttemptRecord[]>();
@@ -807,97 +1722,413 @@ export async function loadUnresolvedBoxExecutionAttempts(
   }
 }
 
-/** Mark an execution attempt's residual exposure as flattened (best-effort). */
-export async function resolveBoxExecutionAttempt(
-  id: string,
-  /** Charges incurred by the final flatten pass (a delta). Applied atomically with resolution. */
-  flattenChargeDelta?: number,
-): Promise<boolean> {
-  if (!isBoxDbEnabled() || !isValidBoxId(id)) return false;
-  const update: Record<string, unknown> = { $set: { resolved: true, residual_exposure: [] } };
-  if (flattenChargeDelta !== undefined && flattenChargeDelta > 0) {
-    update.$inc = { flatten_charges: round2Repo(flattenChargeDelta) };
+function validatedRecoveryExecutionAttempt(
+  row: BoxExecutionAttemptRecord | null,
+): BoxExecutionAttemptRecord | null {
+  if (!row) return null;
+  const residual = row.residual_exposure;
+  const version = row.projection_version;
+  const charges = row.flatten_charges ?? 0;
+  if (row.candidate_key !== BOX_RECOVERY_KEY || row.resolved !== false ||
+      !Array.isArray(residual) || residual.length === 0 ||
+      !Number.isSafeInteger(version) || (version ?? -1) < 0 ||
+      !Number.isFinite(charges) || charges < 0 ||
+      row.residual_projection_identity !== residualProjectionIdentity(residual)) {
+    throw new Error(
+      `unresolved ${BOX_RECOVERY_KEY} row ${row._id.toString()} has an incompatible projection; ` +
+        "direct crash recovery is quarantined",
+    );
   }
-  const result = await BoxExecutionAttempt.updateOne({ _id: id }, update);
-  return (result.matchedCount ?? 0) > 0;
+  return row;
 }
 
 /**
- * Persist the STILL-OUTSTANDING residual after a partial flatten, idempotently.
- *
- * When `residual` is empty the attempt is resolved; otherwise the remaining
- * exposure is written back so a later flatten (or a restart) works only what is
- * left — never the quantity already flattened.
+ * Create or adopt the deterministic ledger row used by direct crash-only recovery.
+ * The fixed ObjectId makes retries and workers converge on one accounting boundary.
  */
-export async function updateBoxExecutionAttemptResidual(
-  id: string,
-  residual: unknown[],
-  /**
-   * Charges incurred by THIS flatten pass (a delta, not a running total).
-   *
-   * Applied with `$inc` in the SAME update as the residual projection, so the cost and the quantity
-   * it paid for are recorded atomically: a pass can never leave one written without the other, and
-   * retrying an unacknowledged update cannot double-charge because it applied wholly or not at all.
-   */
-  flattenChargeDelta?: number,
-): Promise<boolean> {
-  if (!isBoxDbEnabled() || !isValidBoxId(id)) return false;
-  const resolved = residual.length === 0;
-  const update: Record<string, unknown> = {
-    $set: { residual_exposure: resolved ? [] : residual, resolved },
-  };
-  if (flattenChargeDelta !== undefined && flattenChargeDelta > 0) {
-    update.$inc = { flatten_charges: round2Repo(flattenChargeDelta) };
+export async function ensureBoxRecoveryExecutionAttempt(args: {
+  id: string;
+  recoveryKey: string;
+  residual: IBoxExecutionAttempt["residual_exposure"];
+  executionMode: ExecutionMode;
+  broker: BrokerId;
+  at: Date;
+}): Promise<BoxExecutionAttemptRecord | null> {
+  if (!isBoxDbEnabled() || !isValidBoxId(args.id)) return null;
+  if (args.recoveryKey !== BOX_RECOVERY_KEY || !isBoxRecoveryPersistenceReady()) {
+    throw new Error(
+      "direct crash recovery is quarantined until its unique persistence index is verified",
+    );
   }
-  const result = await BoxExecutionAttempt.updateOne({ _id: id }, update);
-  return (result.matchedCount ?? 0) > 0;
+  const existing = await BoxExecutionAttempt.findOne({
+    candidate_key: args.recoveryKey,
+    resolved: false,
+  }).sort({ resolved_at: 1 }).lean<BoxExecutionAttemptRecord>();
+  if (existing) return validatedRecoveryExecutionAttempt(existing);
+  const residual = args.residual ?? [];
+  try {
+    const created = await BoxExecutionAttempt.findOneAndUpdate(
+      { _id: args.id },
+    {
+      $setOnInsert: {
+        candidate_key: args.recoveryKey,
+        direction: "LONG_BOX",
+        underlying: "CRASH_RECOVERY",
+        name: "Crash-only attributed recovery",
+        is_index: false,
+        expiry: "",
+        lower_strike: 0,
+        upper_strike: 0,
+        lot_size: 0,
+        quantity: residual.reduce((sum, leg) => sum + leg.quantity, 0),
+        execution_mode: args.executionMode,
+        broker: args.broker,
+        leg_execution_mode: null,
+        detected_at: args.at,
+        resolved_at: args.at,
+        detected_gross_edge: null,
+        expected_net_profit: null,
+        filled_leg_count: 0,
+        failed_legs: [],
+        failure_reason: "unwind_failed",
+        failure_detail: "durable accounting boundary for crash-only attributed flatten",
+        legging: null,
+        partial_entry_charges: null,
+        unwind_charges: null,
+        flatten_charges: 0,
+        flatten_charge_day: null,
+        flatten_charges_for_day: 0,
+        projection_version: 0,
+        residual_projection_identity: residualProjectionIdentity(residual),
+        applied_flatten_applications: [],
+        gross_abort_pnl: null,
+        net_abort_pnl: null,
+        residual_exposure: residual,
+        resolved: residual.length === 0,
+      },
+    },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    ).lean<BoxExecutionAttemptRecord>();
+    return validatedRecoveryExecutionAttempt(created);
+  } catch (error) {
+    if (!isDuplicateKeyError(error)) throw error;
+    // Another snapshot won the single-unresolved-recovery index between our read and upsert.
+    const winner = await BoxExecutionAttempt.findOne({
+      candidate_key: args.recoveryKey,
+      resolved: false,
+    }).lean<BoxExecutionAttemptRecord>();
+    return validatedRecoveryExecutionAttempt(winner);
+  }
+}
+
+function projectionResult(
+  status: BoxExecutionAttemptProjectionResult["status"],
+  row: BoxExecutionAttemptRecord | null,
+): BoxExecutionAttemptProjectionResult {
+  if (!row) {
+    return {
+      status,
+      projection_version: null,
+      projection_identity: null,
+      residual_exposure: null,
+      flatten_charges: null,
+      flatten_charge_day: null,
+      flatten_charges_for_day: null,
+    };
+  }
+  const residual = Array.isArray(row.residual_exposure) ? row.residual_exposure : [];
+  return {
+    status,
+    projection_version: Number.isSafeInteger(row.projection_version) &&
+      (row.projection_version ?? -1) >= 0 ? row.projection_version! : 0,
+    projection_identity: row.residual_projection_identity ?? residualProjectionIdentity(residual),
+    residual_exposure: residual,
+    flatten_charges: Math.round(Math.max(0, row.flatten_charges ?? 0) * 100) / 100,
+    flatten_charge_day: row.flatten_charge_day ?? null,
+    flatten_charges_for_day: Math.round(Math.max(0, row.flatten_charges_for_day ?? 0) * 100) / 100,
+  };
+}
+
+/**
+ * Atomically own one residual/charge projection transition.
+ *
+ * Exactly one writer can match the expected version/content and application id. Replaying an
+ * acknowledged-or-not command returns `already_applied`; a different winner returns `stale` with
+ * its authoritative projection, so callers can adopt rather than regress it. Missing legacy
+ * version/application fields are treated as version 0/an empty set without a migration.
+ */
+export async function applyBoxExecutionAttemptProjection(
+  id: string,
+  command: BoxExecutionAttemptProjectionCommand,
+): Promise<BoxExecutionAttemptProjectionResult> {
+  if (!isBoxDbEnabled() || !isValidBoxId(id)) return projectionResult("not_found", null);
+  const versionGuard: Record<string, unknown>[] = [{ projection_version: command.expected_version }];
+  const identityGuard: Record<string, unknown>[] = [
+    { residual_projection_identity: command.expected_projection_identity },
+  ];
+  if (command.expected_version === 0) {
+    versionGuard.push({ projection_version: { $exists: false } }, { projection_version: null });
+    identityGuard.push({
+      residual_projection_identity: null,
+      residual_exposure: command.expected_residual_exposure,
+    });
+  }
+  const row = await BoxExecutionAttempt.findOneAndUpdate(
+    {
+      _id: id,
+      applied_flatten_applications: { $ne: command.application_id },
+      $and: [{ $or: versionGuard }, { $or: identityGuard }],
+    },
+    [{
+      $set: {
+        residual_exposure: { $literal: command.residual_exposure },
+        resolved: command.residual_exposure.length === 0,
+        projection_version: { $add: [{ $ifNull: ["$projection_version", 0] }, 1] },
+        residual_projection_identity: command.next_projection_identity,
+        applied_flatten_applications: {
+          $slice: [
+            {
+              $concatArrays: [
+                { $ifNull: ["$applied_flatten_applications", []] },
+                [{ $literal: command.application_id }],
+              ],
+            },
+            -MAX_FLATTEN_APPLICATION_IDS,
+          ],
+        },
+        flatten_charges: {
+          $round: [
+            { $add: [{ $ifNull: ["$flatten_charges", 0] }, command.flatten_charge_delta] },
+            2,
+          ],
+        },
+        flatten_charge_day: command.flatten_charge_delta > 0
+          ? command.flatten_charge_day
+          : { $ifNull: ["$flatten_charge_day", null] },
+        flatten_charges_for_day: command.flatten_charge_delta > 0
+          ? {
+              $round: [
+                {
+                  $add: [
+                    {
+                      $cond: [
+                        { $eq: ["$flatten_charge_day", command.flatten_charge_day] },
+                        { $ifNull: ["$flatten_charges_for_day", 0] },
+                        0,
+                      ],
+                    },
+                    command.flatten_charge_delta,
+                  ],
+                },
+                2,
+              ],
+            }
+          : { $ifNull: ["$flatten_charges_for_day", 0] },
+      },
+    }] as unknown as Record<string, unknown>,
+    { new: true },
+  ).lean<BoxExecutionAttemptRecord>();
+  if (row) return projectionResult("applied", row);
+
+  const current = await BoxExecutionAttempt.findById(id).lean<BoxExecutionAttemptRecord>();
+  if (!current) return projectionResult("not_found", null);
+  const applied = current.applied_flatten_applications ?? [];
+  return projectionResult(
+    applied.includes(command.application_id) ? "already_applied" : "stale",
+    current,
+  );
 }
 
 function round2Repo(v: number): number {
   return Math.round(v * 100) / 100;
 }
 
-export async function loadBoxLiveRiskSeed(sinceMs: number): Promise<{
+/** Pure daily attribution rule shared by the Mongo seed and offline rollover tests. */
+export function boxExecutionAttemptDailyRiskContribution(
+  attempt: {
+    resolved_at?: Date | null;
+    net_abort_pnl?: number | null;
+    flatten_charges?: number | null;
+    flatten_charge_day?: string | null;
+    flatten_charges_for_day?: number | null;
+  },
+  sinceMs: number,
+  tradingDay: string,
+): number {
+  const resolvedToday = attempt.resolved_at instanceof Date &&
+    attempt.resolved_at.getTime() >= sinceMs;
+  const abort = resolvedToday ? (attempt.net_abort_pnl ?? 0) : 0;
+  const flattenToday = attempt.flatten_charge_day === tradingDay
+    ? Math.max(0, attempt.flatten_charges_for_day ?? 0)
+    : resolvedToday && !attempt.flatten_charge_day
+      ? Math.max(0, attempt.flatten_charges ?? 0)
+      : 0;
+  return round2Repo(abort - flattenToday);
+}
+
+/** The one attempt shape the daily-risk seed reads. */
+interface BoxDailyRiskSeedAttemptRow {
+  _id: unknown;
+  resolved_at?: Date | null;
+  resolved?: boolean;
+  net_abort_pnl?: number | null;
+  flatten_charges?: number | null;
+  flatten_charge_day?: string | null;
+  flatten_charges_for_day?: number | null;
+}
+
+const BOX_DAILY_RISK_SEED_SELECT = {
+  resolved_at: 1,
+  resolved: 1,
+  net_abort_pnl: 1,
+  flatten_charges: 1,
+  flatten_charge_day: 1,
+  flatten_charges_for_day: 1,
+} as const;
+
+/**
+ * Per-contribution bound on the daily-risk seed, matching `loadUnresolvedBoxExecutionAttempts`'s
+ * 200-row bound so the seed cannot read more attempts than startup reconciliation can work.
+ *
+ * WHY THREE BOUNDED READS RATHER THAN ONE BOUNDED `$or`
+ * The seed used to be a single unbounded `$or`, so it scanned the whole attempt collection as
+ * stranded unresolved rows accumulated. Simply bounding that `$or` would have been the UNSAFE
+ * bound: the planner's row order is not the risk order, so a truncated page can silently drop
+ * today's largest charge rows in favour of ancient unresolved ones — and a dropped charge makes
+ * the day look CHEAPER than it was, which loosens the daily-loss gate instead of tightening it.
+ *
+ * So each contribution is read and bounded on its own index, in the order that matters:
+ *   today's charge buckets -> largest same-day debit first (they move the gate the most)
+ *   today's resolutions    -> newest first, on {resolved_at: -1}
+ *   still-unresolved rows  -> newest first, on {resolved: 1, resolved_at: -1}, i.e. exactly the
+ *                             page startup reconciliation adopts and can therefore charge again
+ * The worst case of truncation is omitting the smallest same-day debits, the oldest of today's
+ * resolutions, and baselines for rows this process will not be working anyway.
+ */
+const BOX_DAILY_RISK_SEED_LIMIT = 200;
+
+export async function loadBoxLiveRiskSeed(sinceMs: number, tradingDayArg?: string): Promise<{
   realisedPnl: number;
   rejects: number;
   consecutiveFailures: number;
+  /** Full cumulative watermarks for unresolved attempts included in this day-risk reconstruction. */
+  flattenChargeBaselines: Record<string, number>;
+  /** Authoritative requested-day charge buckets for every attempt represented by this seed. */
+  flattenChargeBaselinesForDay: Record<string, number>;
+  /**
+   * True when an attempt read filled its page, so this reconstruction may be MISSING loss rows.
+   *
+   * The bound exists to stop a seed load scanning the whole collection, but a page boundary is not
+   * evidence of completeness: `resolved_at` order is not risk order, so a dropped row silently
+   * removes its `net_abort_pnl` loss and makes the day look cheaper than it was. A risk seed that
+   * errs generous is the one direction it must never err in, so incompleteness is REPORTED and the
+   * consumer keeps entry closed rather than treating a truncated page as authoritative.
+   */
+  incomplete: boolean;
 }> {
   if (!isBoxDbEnabled()) {
     throw new Error("Box persistence is unavailable while loading the live daily-risk seed.");
   }
-  const [trades, attempts, rejectedCount, recentIntents] = await Promise.all([
+  // Additive compatibility for the original one-argument API. `sinceMs` denotes the start (or a
+  // point within) the requested IST day, so shifting its timestamp produces that day key.
+  const tradingDay = tradingDayArg ??
+    new Date(sinceMs + 5.5 * 60 * 60 * 1_000).toISOString().slice(0, 10);
+  const [trades, chargedToday, resolvedToday, stillUnresolved, rejectedCount, recentIntents] = await Promise.all([
     BoxTrade.find({ closed_at: { $gte: new Date(sinceMs) } })
       .select({ realised_net_pnl: 1, net_pnl: 1 })
       .lean<Array<{ realised_net_pnl?: number | null; net_pnl?: number | null }>>(),
+    BoxExecutionAttempt.find({ flatten_charge_day: tradingDay })
+      .select(BOX_DAILY_RISK_SEED_SELECT)
+      .sort({ flatten_charges_for_day: -1 })
+      .limit(BOX_DAILY_RISK_SEED_LIMIT)
+      .lean<BoxDailyRiskSeedAttemptRow[]>(),
     BoxExecutionAttempt.find({ resolved_at: { $gte: new Date(sinceMs) } })
-      .select({ net_abort_pnl: 1, flatten_charges: 1 })
-      .lean<Array<{ net_abort_pnl?: number | null; flatten_charges?: number | null }>>(),
-    BoxOrderIntent.countDocuments({ state: "REJECTED", updated_at: { $gte: new Date(sinceMs) } }),
+      .select(BOX_DAILY_RISK_SEED_SELECT)
+      .sort({ resolved_at: -1 })
+      .limit(BOX_DAILY_RISK_SEED_LIMIT)
+      .lean<BoxDailyRiskSeedAttemptRow[]>(),
+    BoxExecutionAttempt.find({ resolved: false })
+      .select(BOX_DAILY_RISK_SEED_SELECT)
+      .sort({ resolved_at: -1 })
+      .limit(BOX_DAILY_RISK_SEED_LIMIT)
+      .lean<BoxDailyRiskSeedAttemptRow[]>(),
+    BoxOrderIntent.countDocuments({
+      state: "REJECTED",
+      updated_at: { $gte: new Date(sinceMs) },
+      $nor: [{
+        filled_quantity: 0,
+        broker_order_id: null,
+        audit: {
+          $elemMatch: {
+            to_state: "REJECTED",
+            "payload.origin": "local_pre_submit_refusal",
+            "payload.no_broker_post": true,
+          },
+        },
+      }],
+    }),
     BoxOrderIntent.find({ updated_at: { $gte: new Date(sinceMs) } })
-      .select({ state: 1 })
+      .select({ state: 1, filled_quantity: 1, broker_order_id: 1, audit: 1 })
       .sort({ updated_at: -1 })
-      .lean<Array<{ state: BoxOrderIntentState }>>(),
+      .lean<Array<Pick<IBoxOrderIntent, "state" | "filled_quantity" | "broker_order_id" | "audit">>>(),
   ]);
+  // One row can satisfy more than one contribution (a row charged today is usually also
+  // unresolved), and every downstream reducer must see it EXACTLY once or the day is
+  // double-charged. De-duplicate on `_id`, which is the attempt identity the seed keys by.
+  const attemptsById = new Map<string, BoxDailyRiskSeedAttemptRow>();
+  for (const row of [...chargedToday, ...resolvedToday, ...stillUnresolved]) {
+    attemptsById.set(String(row._id), row);
+  }
+  const attempts = [...attemptsById.values()];
   const tradePnl = trades.reduce((sum, trade) => sum + (trade.realised_net_pnl ?? trade.net_pnl ?? 0), 0);
-  // `net_abort_pnl` deliberately EXCLUDES the cost of flattening residual exposure, which is
-  // accumulated separately in `flatten_charges`. In-session the engine charges those against the
-  // daily loss limit as they are paid (`noteFlattenCharges` → `recordRealisedPnl(-charges)`), so
-  // omitting them here made the restart seed strictly more optimistic than the live counter it
-  // replaces: after a restart the day looked BETTER by the whole sum of flatten charges, and live
-  // entry could stay enabled with the true realised loss already past the limit. A risk seed that
-  // errs generous is the one direction it must never err in.
+  // `net_abort_pnl` deliberately EXCLUDES residual-flatten charges. Abort P&L belongs to the
+  // attempt's resolution day, while flatten fees belong to the IST day on which each projection
+  // paid them. The last-day bucket makes an old carryover attempt visible to today's restart seed
+  // without charging its prior-day cumulative history again. Physically legacy rows have no day
+  // bucket; when they resolved today their cumulative charge remains the additive-compatible
+  // fallback used before this metadata existed.
   const abortPnl = attempts.reduce(
-    (sum, attempt) => sum + (attempt.net_abort_pnl ?? 0) - Math.max(0, attempt.flatten_charges ?? 0),
+    (sum, attempt) => sum + boxExecutionAttemptDailyRiskContribution(attempt, sinceMs, tradingDay),
     0,
   );
+  const flattenChargeBaselines: Record<string, number> = {};
+  const flattenChargeBaselinesForDay: Record<string, number> = {};
+  for (const attempt of attempts) {
+    const attemptId = String(attempt._id);
+    if (attempt.flatten_charge_day === tradingDay) {
+      flattenChargeBaselinesForDay[attemptId] = round2Repo(
+        Math.max(0, attempt.flatten_charges_for_day ?? 0),
+      );
+    }
+    if (attempt.resolved !== false) continue;
+    flattenChargeBaselines[attemptId] = round2Repo(
+      Math.max(0, attempt.flatten_charges ?? 0),
+    );
+  }
   let consecutiveFailures = 0;
   for (const intent of recentIntents) {
     if (intent.state === "COMPLETE") break;
+    const localNoPost = intent.state === "REJECTED" && intent.filled_quantity === 0 &&
+      intent.broker_order_id === null && intent.audit.some((event) =>
+        event.to_state === "REJECTED" &&
+        event.payload?.origin === "local_pre_submit_refusal" &&
+        event.payload.no_broker_post === true);
+    if (localNoPost) continue;
     if (intent.state === "REJECTED" || intent.state === "UNKNOWN" || intent.state === "RECONCILIATION_REQUIRED") {
       consecutiveFailures++;
     }
   }
-  return { realisedPnl: tradePnl + abortPnl, rejects: rejectedCount, consecutiveFailures };
+  return {
+    realisedPnl: tradePnl + abortPnl,
+    rejects: rejectedCount,
+    consecutiveFailures,
+    flattenChargeBaselines,
+    flattenChargeBaselinesForDay,
+    // A full page means "there may be more", never "that was all of it".
+    incomplete: chargedToday.length >= BOX_DAILY_RISK_SEED_LIMIT ||
+      resolvedToday.length >= BOX_DAILY_RISK_SEED_LIMIT ||
+      stillUnresolved.length >= BOX_DAILY_RISK_SEED_LIMIT,
+  };
 }
 
 /* ----------------------------- daily P&L archive -------------------------- */
@@ -923,28 +2154,369 @@ export async function loadBoxTradesClosedSince(sinceMs: number): Promise<BoxTrad
 }
 
 /**
- * Upsert one archived P&L row (per-trade OR the day summary), keyed on
- * (day, trade_id). Idempotent by design: the nightly drain and the later verify
- * passes both call this, and re-writing an already-archived row is harmless.
+ * Generic pre/write/post handshake used by the production Mongo writer and race
+ * tests. The second permission check closes the cleanup-before-write ordering.
  */
-export async function upsertBoxDailyPnl(doc: IBoxDailyPnl): Promise<void> {
-  if (!isBoxDbEnabled()) return;
-  await BoxDailyPnl.updateOne(
-    { day: doc.day, trade_id: doc.trade_id },
-    { $set: { ...doc, archived_at: new Date() } },
+export async function runSourceSafePnlRowUpsert(args: {
+  allowed: () => Promise<boolean>;
+  write: () => Promise<void>;
+  remove: () => Promise<void>;
+  rewriteSummary: () => Promise<void>;
+}): Promise<"skipped" | "written" | "self_cleaned"> {
+  if (!(await args.allowed())) return "skipped";
+  await args.write();
+  if (await args.allowed()) return "written";
+  await args.remove();
+  await args.rewriteSummary();
+  return "self_cleaned";
+}
+
+/**
+ * Invalidate completeness without erasing the last exact proof. Retaining v2
+ * metadata is what lets periodic repair distinguish a same-membership late write
+ * from an uncertifiable partial generation after a crash.
+ */
+export async function markBoxDailyPnlIncomplete(
+  day: string,
+  needsReproof = true,
+): Promise<void> {
+  if (!isBoxDbEnabled()) throw new Error("Box persistence is not available.");
+  await BoxPnlDayState.updateOne(
+    { _id: day },
+    {
+      $set: { complete: false, needs_reproof: needsReproof, updated_at: new Date() },
+      $setOnInsert: { _id: day },
+    },
     { upsert: true },
   );
 }
 
-/** The trade ids already archived for a day (used to compute what verify must still drain). */
-export async function loadBoxDailyPnlTradeIds(day: string): Promise<string[]> {
-  if (!isBoxDbEnabled()) return [];
+export function boxPnlDayProofFromState(state: {
+  snapshot_version?: number;
+  row_count?: number;
+  content_sha256?: string;
+}): BoxPnlDayProof | null {
+  return state.snapshot_version === 2 && Number.isInteger(state.row_count) &&
+    (state.row_count ?? -1) >= 0 && /^[a-f0-9]{64}$/.test(state.content_sha256 ?? "")
+    ? {
+        snapshot_version: 2,
+        row_count: state.row_count!,
+        content_sha256: state.content_sha256!,
+      }
+    : null;
+}
+
+/**
+ * Testable pre/publish/post protocol. Both reads compare full canonical content,
+ * so an update to an existing trade id cannot be hidden by unchanged membership.
+ */
+export async function runBoxPnlDayProofCommit(args: {
+  expected: IBoxDailyPnl[];
+  settle: () => Promise<void>;
+  load: () => Promise<IBoxDailyPnl[]>;
+  publish: (proof: BoxPnlDayProof) => Promise<void>;
+  invalidate: () => Promise<void>;
+}): Promise<BoxPnlDayProof> {
+  const expectedProof = buildBoxPnlDayProof(args.expected);
+  const matches = (docs: IBoxDailyPnl[]) =>
+    boxPnlSummaryMatchesRows(docs) &&
+    boxPnlDayProofsEqual(expectedProof, buildBoxPnlDayProof(docs));
   try {
-    const rows = await BoxDailyPnl.find({ day }).lean<BoxDailyPnlRecord[]>();
-    return rows.map((r) => r.trade_id);
-  } catch {
-    return [];
+    await args.settle();
+    if (!matches(await args.load())) {
+      throw new Error("day content changed before completion proof publication");
+    }
+    await args.publish(expectedProof);
+    if (!matches(await args.load())) {
+      throw new Error("day content changed while publishing completion proof");
+    }
+    return expectedProof;
+  } catch (err) {
+    await args.invalidate();
+    throw err;
   }
+}
+
+/**
+ * Re-proof durable content only when its row cardinality is still the exact
+ * membership count authorized by the prior proof (or by explicit deletion
+ * cleanup). Content may change for the same IDs; partial generations may not be
+ * promoted merely because their rows and summary are internally consistent.
+ */
+export async function runBoxPnlDayProofRepair(args: {
+  lastExactProof: BoxPnlDayProof;
+  expectedRowCount: number;
+  settle: () => Promise<void>;
+  load: () => Promise<IBoxDailyPnl[]>;
+  validate: (docs: IBoxDailyPnl[]) => Promise<void>;
+  publish: (lastExactProof: BoxPnlDayProof, nextProof: BoxPnlDayProof) => Promise<void>;
+  markRetry: () => Promise<void>;
+}): Promise<BoxPnlDayProof> {
+  const loadValid = async (requireSummary: boolean): Promise<{
+    docs: IBoxDailyPnl[];
+    proof: BoxPnlDayProof;
+  }> => {
+    const docs = await args.load();
+    await args.validate(docs);
+    const proof = buildBoxPnlDayProof(docs);
+    if (proof.row_count !== args.expectedRowCount) {
+      throw new Error(
+        `day membership count ${proof.row_count} differs from last exact row_count ` +
+        `${args.expectedRowCount}`,
+      );
+    }
+    if (requireSummary && !boxPnlSummaryMatchesRows(docs)) {
+      throw new Error("day summary does not match rows during re-proof");
+    }
+    return { docs, proof };
+  };
+
+  try {
+    await loadValid(false);
+    await args.settle();
+    const before = await loadValid(true);
+    await args.publish(args.lastExactProof, before.proof);
+    const after = await loadValid(true);
+    if (!boxPnlDayProofsEqual(before.proof, after.proof)) {
+      throw new Error("day content changed while publishing repaired proof");
+    }
+    return after.proof;
+  } catch (err) {
+    await args.markRetry();
+    throw err;
+  }
+}
+
+/**
+ * Safely upgrade a legacy ID-only manifest. The old manifest is evidence of the
+ * expected generation, never proof by itself: durable rows are settled, source-
+ * validated, compared exactly, then reloaded after v2 proof publication.
+ */
+export async function runLegacyBoxPnlDayMigration(args: {
+  expectedTradeIds: unknown;
+  settleAndLoad: () => Promise<IBoxDailyPnl[]>;
+  filterSourceValidExpectedIds: (ids: string[]) => Promise<string[]>;
+  publishV2: (docs: IBoxDailyPnl[]) => Promise<void>;
+  loadPublished: () => Promise<{
+    docs: IBoxDailyPnl[];
+    state: { snapshot_version?: number; row_count?: number; content_sha256?: string } | null;
+  }>;
+  finalizeV2: (proof: BoxPnlDayProof) => Promise<void>;
+  markRetry: () => Promise<void>;
+}): Promise<boolean> {
+  try {
+    if (!Array.isArray(args.expectedTradeIds) ||
+        args.expectedTradeIds.some((id) =>
+          typeof id !== "string" || id.length === 0 || id === SUMMARY_FIELD) ||
+        new Set(args.expectedTradeIds).size !== args.expectedTradeIds.length) {
+      throw new Error("legacy day manifest contains invalid or duplicate trade ids");
+    }
+    const expectedIds = args.expectedTradeIds as string[];
+    const sourceValidExpected = [...new Set(
+      await args.filterSourceValidExpectedIds(expectedIds),
+    )].sort();
+    const settled = await args.settleAndLoad();
+    const settledIds = settled
+      .filter((doc) => doc.trade_id !== SUMMARY_FIELD)
+      .map((doc) => doc.trade_id)
+      .sort();
+    if (new Set(settledIds).size !== settledIds.length ||
+        settledIds.length !== sourceValidExpected.length ||
+        settledIds.some((id, index) => id !== sourceValidExpected[index]) ||
+        !boxPnlSummaryMatchesRows(settled)) {
+      throw new Error("source-valid durable rows do not match the legacy day manifest");
+    }
+
+    await args.publishV2(settled);
+    const published = await args.loadPublished();
+    const proof = published.state ? boxPnlDayProofFromState(published.state) : null;
+    if (proof === null || !boxPnlSummaryMatchesRows(published.docs) ||
+        !boxPnlDayProofsEqual(proof, buildBoxPnlDayProof(published.docs))) {
+      throw new Error("v2 day proof did not remain stable after publication");
+    }
+    await args.finalizeV2(proof);
+    return true;
+  } catch {
+    await args.markRetry();
+    return false;
+  }
+}
+
+async function migrateLegacyBoxDailyPnlState(
+  day: string,
+  expectedTradeIds: unknown,
+): Promise<boolean> {
+  return runLegacyBoxPnlDayMigration({
+    expectedTradeIds,
+    filterSourceValidExpectedIds: async (ids) => {
+      const invalid = new Set(await invalidArchivedTradeIds(ids));
+      return ids.filter((id) => !invalid.has(id));
+    },
+    settleAndLoad: async () => {
+      await rewriteBoxDailyPnlSummary(day);
+      return loadBoxDailyPnlSnapshot(day);
+    },
+    publishV2: async (docs) => {
+      const ids = docs
+        .filter((doc) => doc.trade_id !== SUMMARY_FIELD)
+        .map((doc) => doc.trade_id);
+      if ((await invalidArchivedTradeIds(ids)).length > 0) {
+        throw new Error(`box_daily_pnl legacy day ${day} changed during source validation`);
+      }
+      const proof = buildBoxPnlDayProof(docs);
+      await BoxPnlDayState.updateOne(
+        { _id: day, expected_trade_ids: { $exists: true } },
+        {
+          $set: { complete: true, needs_reproof: false, ...proof, updated_at: new Date() },
+        },
+      );
+    },
+    loadPublished: async () => ({
+      docs: await loadBoxDailyPnlSnapshot(day),
+      state: await BoxPnlDayState.findById(day)
+        .select({ snapshot_version: 1, row_count: 1, content_sha256: 1 })
+        .lean<{ snapshot_version?: number; row_count?: number; content_sha256?: string }>(),
+    }),
+    finalizeV2: async (proof) => {
+      const result = await BoxPnlDayState.updateOne(
+        { _id: day, ...proof, expected_trade_ids: { $exists: true } },
+        { $unset: { expected_trade_ids: 1 } },
+      );
+      if ((result.matchedCount ?? 0) !== 1) {
+        throw new Error(`box_daily_pnl legacy day ${day} changed before migration finalization`);
+      }
+    },
+    // Preserve the v1 manifest so transient failures can retry safely. It is
+    // removed only by the successful v2 publication.
+    markRetry: async () => {
+      await BoxPnlDayState.updateOne(
+        { _id: day, expected_trade_ids: { $exists: true } },
+        { $set: { needs_reproof: true, updated_at: new Date() } },
+      );
+    },
+  });
+}
+
+/** Commit a fixed-size exact-content proof after rows and summary settle. */
+export async function markBoxDailyPnlComplete(
+  day: string,
+  expectedDocs: IBoxDailyPnl[],
+): Promise<void> {
+  if (!isBoxDbEnabled()) throw new Error("Box persistence is not available.");
+  const expectedIds = expectedDocs
+    .filter((doc) => doc.trade_id !== SUMMARY_FIELD)
+    .map((doc) => doc.trade_id);
+  if ((await invalidArchivedTradeIds(expectedIds)).length > 0) {
+    await markBoxDailyPnlIncomplete(day, true);
+    throw new Error(`box_daily_pnl day ${day} contains a deleted source row`);
+  }
+
+  await runBoxPnlDayProofCommit({
+    expected: expectedDocs,
+    settle: async () => { await rewriteBoxDailyPnlSummary(day); },
+    load: async () => {
+      const docs = await loadBoxDailyPnlSnapshot(day);
+      const ids = docs
+        .filter((doc) => doc.trade_id !== SUMMARY_FIELD)
+        .map((doc) => doc.trade_id);
+      if ((await invalidArchivedTradeIds(ids)).length > 0) {
+        throw new Error(`box_daily_pnl day ${day} changed during source validation`);
+      }
+      return docs;
+    },
+    publish: async (proof) => {
+      await BoxPnlDayState.updateOne(
+        { _id: day },
+        {
+          $set: { complete: true, needs_reproof: false, ...proof, updated_at: new Date() },
+          $unset: { expected_trade_ids: 1 },
+          $setOnInsert: { _id: day },
+        },
+        { upsert: true },
+      );
+    },
+    invalidate: () => markBoxDailyPnlIncomplete(day, true),
+  });
+}
+
+/** Validate a durable day generation, migrating a complete legacy manifest safely. */
+export async function isBoxDailyPnlSnapshotComplete(
+  day: string,
+  docs: IBoxDailyPnl[],
+): Promise<boolean> {
+  if (!isBoxDbEnabled()) return false;
+  const state = await BoxPnlDayState.findById(day).lean<{
+    complete?: boolean;
+    snapshot_version?: number;
+    row_count?: number;
+    content_sha256?: string;
+    expected_trade_ids?: string[];
+  }>();
+  if (!state?.complete) return false;
+  const proof = boxPnlDayProofFromState(state);
+  if (!proof) {
+    if (Array.isArray(state.expected_trade_ids)) {
+      // Never trust the v1 membership list directly. Migration settles and
+      // source-validates Mongo, regenerates the summary, and publishes v2.
+      return migrateLegacyBoxDailyPnlState(day, state.expected_trade_ids);
+    }
+    await markBoxDailyPnlIncomplete(day);
+    return false;
+  }
+  const matches = boxPnlSummaryMatchesRows(docs) &&
+    boxPnlDayProofsEqual(proof, buildBoxPnlDayProof(docs));
+  if (!matches) await markBoxDailyPnlRetryIfProof(day, proof);
+  return matches;
+}
+
+/**
+ * Upsert one archived P&L row with a durable source-existence handshake.
+ *
+ * A trade row is admitted only when its source exists and no deletion fence is
+ * present, then checked again after the write. Thus cleanup wins when it runs
+ * after us, while writer self-cleanup wins when cleanup ran between our checks.
+ * A crash between write and post-check is repaired by startup orphan scanning.
+ * Summary payloads are never trusted directly; they are regenerated from settled
+ * durable survivor rows.
+ */
+export async function upsertBoxDailyPnl(doc: IBoxDailyPnl): Promise<void> {
+  if (!isBoxDbEnabled()) throw new Error("Box persistence is not available.");
+  if (doc.trade_id === SUMMARY_FIELD) {
+    await rewriteBoxDailyPnlSummary(doc.day);
+    return;
+  }
+
+  const allowed = async () => (await invalidArchivedTradeIds([doc.trade_id])).length === 0;
+  await runSourceSafePnlRowUpsert({
+    allowed,
+    write: async () => {
+      await mutateDurablePnlDay(doc.day, async () => {
+        await BoxDailyPnl.updateOne(
+          { day: doc.day, trade_id: doc.trade_id },
+          { $set: { ...doc, archived_at: new Date() } },
+          { upsert: true },
+        );
+      });
+    },
+    remove: async () => {
+      await mutateDurablePnlDay(doc.day, async () => {
+        await BoxDailyPnl.deleteOne({ day: doc.day, trade_id: doc.trade_id });
+      });
+    },
+    rewriteSummary: async () => { await rewriteBoxDailyPnlSummary(doc.day); },
+  });
+}
+
+/** The persisted documents for an exact day. Errors deliberately propagate. */
+export async function loadBoxDailyPnlSnapshot(day: string): Promise<BoxDailyPnlRecord[]> {
+  if (!isBoxDbEnabled()) throw new Error("Box persistence is not available.");
+  return BoxDailyPnl.find({ day }).lean<BoxDailyPnlRecord[]>();
+}
+
+/** The trade ids already archived for a day (compatibility helper). */
+export async function loadBoxDailyPnlTradeIds(day: string): Promise<string[]> {
+  const rows = await loadBoxDailyPnlSnapshot(day);
+  return rows.map((row) => row.trade_id);
 }
 
 /** All archived P&L rows for a day, newest-updated first (for a reporting view). */

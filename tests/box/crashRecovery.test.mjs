@@ -136,15 +136,29 @@ class DurableJournal {
   async update(clientOrderId, patch, audit) {
     const current = this.rows.get(clientOrderId);
     this.events.push(["update", clientOrderId, patch.state ?? current?.state]);
-    if (!current) return { intent: null, applied: false };
+    if (!current) {
+      return { intent: null, applied: false, previous_filled_quantity: null, current_filled_quantity: null };
+    }
     // The monotonic-fill guard the real repository enforces.
     if (patch.filled_quantity !== undefined && patch.filled_quantity < current.filled_quantity) {
-      return { intent: clone(current), applied: false };
+      return {
+        intent: clone(current),
+        applied: false,
+        previous_filled_quantity: current.filled_quantity,
+        current_filled_quantity: current.filled_quantity,
+      };
     }
-    const next = { ...current, ...clone(patch) };
+    // The pre-image the real guarded write stamps, so the caller can attribute the exact
+    // transition instead of diffing against its own (possibly stale) snapshot.
+    const next = { ...current, ...clone(patch), previous_filled_quantity: current.filled_quantity };
     if (!next.audit.some((a) => a.audit_id === audit.audit_id)) next.audit = [...next.audit, clone(audit)];
     this.rows.set(clientOrderId, next);
-    return { intent: clone(next), applied: true };
+    return {
+      intent: clone(next),
+      applied: true,
+      previous_filled_quantity: current.filled_quantity,
+      current_filled_quantity: next.filled_quantity,
+    };
   }
   async loadNonterminal() {
     return [...this.rows.values()]

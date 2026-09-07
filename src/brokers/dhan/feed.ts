@@ -202,6 +202,10 @@ export class DhanFeed {
       this.connected = true;
       this.reconnectAttempts = 0;
       this.generation++;
+      // Retained normalization state belongs to the previous socket generation.
+      // A partial packet on this socket must never republish the old ladder.
+      this.state.clear();
+      this.lastTickAt = 0;
       // Re-subscribe everything: a new socket carries no prior subscriptions.
       this.subscribed.clear();
       if (this.wanted.size > 0) this.sendSubscribe([...this.wanted]);
@@ -229,6 +233,8 @@ export class DhanFeed {
       this.ws = null;
       this.connected = false;
       this.subscribed.clear();
+      this.state.clear();
+      this.lastTickAt = 0;
       this.opts.onConnection?.(false);
       // 1008/4401-style auth rejections will never succeed on retry, so surface
       // them as a lost session instead of reconnecting forever.
@@ -263,7 +269,10 @@ export class DhanFeed {
       if (token === null) continue;
       this.subscribed.add(token);
       const merged = this.merge(token, packet, now);
-      ticks.push(toTick(merged));
+      // Provenance is derived from THIS decoded packet, never from the merged
+      // state whose ladders intentionally remain available to UI consumers.
+      const depthUpdated = packet.bids !== undefined || packet.asks !== undefined;
+      ticks.push(toTick(merged, depthUpdated));
     }
     if (ticks.length === 0) return;
     // FIRST tick only. It is the single most valuable log line here (it proves the
@@ -463,7 +472,7 @@ export function toTick(state: {
   oi: number;
   bids: DepthLevel[];
   asks: DepthLevel[];
-}): Tick {
+}, depthUpdated = true): Tick {
   return {
     token: state.token,
     last_price: state.last_price,
@@ -473,6 +482,7 @@ export function toTick(state: {
     ask: state.asks[0]?.price ?? 0,
     bids: state.bids,
     asks: state.asks,
+    depth_updated: depthUpdated,
   };
 }
 

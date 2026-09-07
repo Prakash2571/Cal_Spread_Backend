@@ -11,7 +11,7 @@ BOX_EXECUTION_MODE=live
 BOX_LIVE_TRADING_ENABLED=true
 ```
 
-`BOX_EXECUTION_MODE` defaults to `paper_latency`; `BOX_LIVE_TRADING_ENABLED` defaults to `false`. Unknown execution modes fail during configuration instead of falling back to paper. Live startup also requires a ready Box Mongo connection, `KITE_API_KEY`, and a current restored Kite access-token session.
+`BOX_EXECUTION_MODE` defaults to `paper_latency`; `BOX_LIVE_TRADING_ENABLED` defaults to `false`. Unknown execution modes fail during configuration instead of falling back to paper. Live startup also requires a ready Box Mongo connection, `KITE_API_KEY`, and a current restored Kite access-token session. Paper profiles cannot reach broker mutations even if credentials are present: no live manager/adapter is constructed, and poison-adapter regressions fail on any accidental mutation.
 
 Every process start resets these in-memory runtime controls to `false`:
 
@@ -23,7 +23,11 @@ Scanner RUN/STOP is separate from these controls. STOP prevents discovery of new
 
 ## Source of truth and persistence
 
-Broker orders and broker positions are authoritative for live fills and exposure. Mongo stores the durable strategy/accounting projection and the append-only order-intent journal. A stable identity such as `BOX:<trade-id>:ENTRY:k1_ce:attempt-1` is persisted before submission. Ambiguous transport outcomes are reconciled by identity; they are never blindly resubmitted.
+Broker orders and broker positions are authoritative for live fills and exposure. Mongo stores the durable strategy/accounting projection and the append-only order-intent journal. A deterministic identity such as `BOX:<trade-id>:ENTRY:k1_ce:attempt-1` is persisted before submission. `CREATED -> SUBMITTING` is an expected-state compare-and-set: only the manager whose durable transition was applied may POST, while losers adopt or reconcile the existing intent. Ambiguous or working outcomes retain identity and are never blindly resubmitted.
+
+Residual reduction uses the same rule explicitly: **same logical submission means the same identity; a new flatten attempt for still-outstanding quantity means a new identity**. `ResidualLegExposure.flatten_attempt` advances only after a terminal broker result or an applied local `REJECTED` transition that proves no broker mutation occurred. Partial retries submit the exact durable remainder.
+
+Guarded order persistence reports the durable pre-write and post-write cumulative quantities. Position attribution uses that durable delta, never a caller's potentially stale snapshot. Broker cumulative quantity remains fill authority; an ACK or state label alone never creates exposure.
 
 Redis is a cache, **not** a write-ahead log. There is no filesystem WAL or broker-only recovery mode. During a total Mongo outage the service fails closed and cannot create a new durable exit or residual intent. If live boot fails because Mongo is unavailable, restore Mongo and restart the process before operating live Box execution. A mid-session persistence failure blocks new risk, trips the circuit breaker, and moves affected projections to recovery where applicable.
 
@@ -43,7 +47,9 @@ The system never treats arbitrary account positions as Box exposure. Cancel and 
 
 ## Order policy and deadlines
 
-All live entry, exit, and emergency-reduction orders are regular NRML DAY **LIMIT** orders. Market orders are not supported. Limits are bounded marketable prices derived from current depth and configured chase ticks; depth is a pre-check and limit-construction input, not fill authority. The full requested quantity must be executable within the bounded limit after the configured queue haircut.
+All live entry, exit, and emergency-reduction orders are regular NRML DAY **LIMIT** orders. Market orders are not supported. Limits are bounded marketable prices derived from current executable depth and configured chase ticks. The full requested quantity must be executable within the bounded limit after the configured queue haircut.
+
+Depth and fill have different authority. Authoritative depth permits construction and origination of a bounded LIMIT order; broker cumulative quantity alone proves a fill. The gateway checks executable depth at admission and stamps token, feed generation, quote version/time, and check time. The manager revalidates after durable intent classification and at dequeue. The adapter revalidates after pacing immediately before the external POST. A feed-generation change always refuses a new mutation; a newer book in the same generation is acceptable only if the immutable quantity still executes inside the immutable LIMIT. Existing non-`CREATED` intents are adopted/reconciled before feed validation so recovery is not blocked by a new-submission gate.
 
 Broker operations are paced by `BOX_LIVE_BROKER_MIN_INTERVAL_MS` (default 250 ms). Distinct deadlines apply:
 
@@ -63,6 +69,8 @@ The irreversible invariant is:
 
 > Once the broker/execution engine owns a fill, that filled quantity is irreversible state.
 
+The entry-size invariant is separately explicit: the candidate lot must be a positive safe integer, it must equal all four instruments' lot sizes, and every normal opened role must equal **exactly one lot**. Live risk ceilings are not a substitute for this invariant, and general multi-lot execution is not implemented. Legitimate remaining role quantities may be any safe integer from zero through one lot; a `35/75` partial remainder is valid and is never rounded back to a lot.
+
 Every trade persists exact outstanding quantity as `remaining_qty_by_role` for `k1_ce`, `k2_ce`, `k2_pe`, and `k1_pe`. An exit submits only the one to four roles whose remaining quantity is nonzero, and each submitted quantity equals that role's exact remainder. Broker-confirmed cumulative fill quantity is applied only to its role.
 
 Position states are:
@@ -72,13 +80,23 @@ Position states are:
 - `RECOVERY`: quantity is uncertain, an invariant was violated, persistence of a confirmed result failed, or reconciliation found an ownership mismatch.
 - `FLAT`: all four role quantities are zero.
 
-Over-close is never clamped to zero. A fill greater than the persisted role remainder preserves the prior quantity projection, records the invariant violation, enters `RECOVERY`, and blocks new entry. For a known partial close, retry uses only the exact remainder—for example, a 75-unit role with 40 confirmed closed retries 35, never 75. Manual and automatic close share the same execution engine and cumulative accounting path. `exit_attempts[]` is append-only; heavy audit data is omitted from bulk list/history responses.
+Over-close is never clamped to zero. Broker-confirmed safe-integer overfill is persisted as truth, records the invariant violation, enters `RECOVERY`, and blocks new entry. A malformed restored quantity also enters `RECOVERY`; compatibility fallback must not conceal malformed durable input. After explicit reconciliation, emergency reduction may submit the exact confirmed overfill quantity. For a known partial close, retry uses only the exact remainder—for example, a 75-unit role with 40 confirmed closed retries 35, never 75. Fractional, negative, non-finite, or otherwise invalid exit quantities fail before request construction. Manual and automatic close share the same execution engine and cumulative accounting path. `exit_attempts[]` is append-only; heavy audit data is omitted from bulk list/history responses.
 
 Normal automatic flattening is intentionally paused for an uncertain `RECOVERY` projection until reconciliation establishes broker truth. The explicit attributed flatten workflow may then resume exact reduction.
 
 ## Feed health and reconnect warm-up
 
-Live entry requires a healthy current feed. On feed loss the manager blocks entries and automatic exits. After reconnect it waits `BOX_LIVE_FEED_RECONNECT_WARMUP_MS` (default 5 seconds), and each requested candidate leg must receive at least one tick in the new feed generation. This prevents decisions from stale pre-reconnect books.
+Raw feed liveness and executable-book readiness are deliberately separate. Any valid tick may refresh raw connection liveness for analytics, but an option becomes execution-ready only from a packet that actually carried usable depth. Zerodha full packets set depth provenance; Dhan derives provenance from the current packet rather than a retained merged ladder. Non-finite or fractional depth fails closed, while a valid one-sided book may still authorize the corresponding exposure-reducing side.
+
+Every feed-generation reset invalidates stored executable books and readiness. After reconnect the manager waits `BOX_LIVE_FEED_RECONNECT_WARMUP_MS` (default 5 seconds), and every requested leg must receive authoritative usable depth in the new generation. An LTP-only tick cannot warm a leg. Queued requests carry an ephemeral checked-feed stamp and are revalidated at dequeue and immediately before POST, so a request cannot cross a reconnect generation using a stale book.
+
+## Reservation authority and concurrency
+
+Exact-contract reservations serialize boxes that share an option instrument, then force the waiter to re-evaluate. There is no global execution mutex or whole-underlying lock: unrelated contracts retain the configured execution concurrency. When the durable reservation tier is enabled and unavailable, live **entry** fails closed. Paper may continue only in explicitly reported `local_only` mode. Exposure-reducing exits use the local tier and residual flattening is not reservation-gated, so an authority outage does not prevent reducing owned exposure.
+
+## Technical failure taxonomy
+
+Internal execution failures use a fixed, bounded metric taxonomy: `reservation_error`, `reservation_authority_unavailable`, `execution_gateway_error`, `execution_simulator_error`, `execution_invariant_error`, `trade_persistence_error`, `position_book_error`, `charge_calculation_error`, `broker_state_error`, and `unknown_internal_error`. Exception text is bounded diagnostic context, never an unbounded label. Broker rejection, broker uncertainty, and proven local pre-submit refusal remain distinct outcomes.
 
 ## Runtime limits and circuit breaker
 
@@ -227,10 +245,7 @@ at all** — `abandon()` was instantaneous, so a paper order could never fill af
 requested. That flattered paper in the most dangerous direction, because a lost live race leaves
 real, irreversible exposure to unwind while paper reported a clean cancellation.
 
-Under `live_parity` the leg executor now models the two-phase cancel: the order enters
-`CANCEL_REQUESTED` and **remains eligible to fill from observed books** until a confirmation
-deadline drawn from measured cancel latency. The brief's arithmetic is pinned as a test and a
-golden fixture:
+Under `live_parity` the leg executor models the two-phase cancel only for an order that has actually arrived: the order enters `CANCEL_REQUESTED` and **remains eligible to fill from observed books** until a confirmation deadline drawn from measured cancel latency. A leg still in `pre_submission` or `in_transport`—including a sequential leg never submitted—cannot fill merely because an abort requested cancellation. Therefore every positive fill satisfies `first_fill_at >= arrival_at`, while the legitimate post-arrival cancel race remains modelled. The brief's arithmetic is pinned as a test and a golden fixture:
 
 ```
 75 requested

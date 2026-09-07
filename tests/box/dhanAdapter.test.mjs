@@ -27,6 +27,7 @@ import {
   BrokerAmbiguousSubmitError,
   BrokerOrderRejectedError,
   BrokerDisabledError,
+  BrokerPreSubmitRefusedError,
 } from "../../dist/box/brokerAdapter.js";
 
 /* ---------------------------- correlation identity ------------------------- */
@@ -282,6 +283,22 @@ function adapter(clientOverrides = {}, cfgOverrides = {}) {
   };
   return { a: new DhanBrokerAdapter(client, cfg), calls, client };
 }
+
+test("pre-POST feed refusal makes no Dhan mutation or correlation lookup", { timeout: 5000 }, async () => {
+  const { a, calls } = adapter();
+  const refusal = new BrokerPreSubmitRefusedError(
+    REQUEST.client_order_id,
+    "pre_post",
+    true,
+    "feed generation changed before broker POST",
+  );
+
+  const error = await a.submitOrder(REQUEST, () => { throw refusal; }).then(() => null, (reason) => reason);
+  assert.strictEqual(error, refusal);
+  assert.equal(error instanceof BrokerAmbiguousSubmitError, false);
+  assert.equal(calls.place, 0);
+  assert.equal(calls.byCorrelation, 0);
+});
 
 test("an AMBIGUOUS submission reconciles by correlation id and NEVER re-POSTs", { timeout: 5000 }, async () => {
   const { a, calls } = adapter();

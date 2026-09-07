@@ -549,6 +549,13 @@ const boxOrderIntentSchema = new mongoose.Schema(
       default: "CREATED",
     },
     filled_quantity: { type: Number, default: 0 },
+    /**
+     * Pre-image of `filled_quantity` for the most recent guarded update, stamped by that same
+     * atomic update. This is what makes position attribution authoritative: the delta comes from
+     * the durable transition the write established, never from a caller's stale snapshot. Absent
+     * on documents written before this field existed.
+     */
+    previous_filled_quantity: { type: Number, default: null },
     average_price: { type: Number, default: null },
     broker_tag: { type: String, default: null },
     reject_family: { type: String, default: null },
@@ -640,6 +647,21 @@ const boxExecutionAttemptSchema = new mongoose.Schema(
      * these charges were computed and discarded (paper) or never computed at all (live).
      */
     flatten_charges: { type: Number, default: 0 },
+    /** Last IST day receiving a flatten charge and that day's cumulative contribution. */
+    flatten_charge_day: { type: String, default: null },
+    flatten_charges_for_day: { type: Number, default: 0 },
+    /**
+     * One monotonic ownership boundary for residual quantity and its flatten charge.
+     * Optional/defaulted additions keep existing rows migration-free; repository CAS
+     * treats a physically absent legacy version as zero and an absent application set as empty.
+     */
+    projection_version: { type: Number, default: 0 },
+    residual_projection_identity: { type: String, default: null },
+    /**
+     * Bounded ring of recent residual-projection application ids. Older commands are still
+     * rejected by their stale expected version, so this never needs to grow with document age.
+     */
+    applied_flatten_applications: { type: [String], default: [] },
     gross_abort_pnl: { type: Number, default: null },
     net_abort_pnl: { type: Number, default: null },
     // Outstanding simulated exposure this attempt could not flatten. `resolved` is
@@ -655,6 +677,24 @@ boxExecutionAttemptSchema.index({ resolved_at: -1 });
 // Unresolved attempts (those still holding residual exposure), newest first — the
 // query startup reconciliation runs to resume flattening.
 boxExecutionAttemptSchema.index({ resolved: 1, resolved_at: -1 });
+// Attempts that paid a residual-flatten charge on one IST day, largest same-day debit first.
+// The daily-risk seed reconstructs that day's charge buckets from exactly this shape and BOUNDS
+// the read, so the index has to be able to serve the bound in the order that matters: the rows
+// that move the day's risk figure most. Additive and migration-free — an index only.
+boxExecutionAttemptSchema.index(
+  { flatten_charge_day: 1, flatten_charges_for_day: -1 },
+  { name: "box_execution_attempt_flatten_charge_day" },
+);
+// At most one direct crash-only recovery boundary may be unresolved at a time. This prevents
+// workers with slightly different reconstructed snapshots from minting competing recovery rows.
+boxExecutionAttemptSchema.index(
+  { candidate_key: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { candidate_key: "boot-recovery", resolved: false },
+    name: "box_single_unresolved_crash_recovery",
+  },
+);
 
 export interface BoxExecutionAttemptRecord extends IBoxExecutionAttempt {
   _id: mongoose.Types.ObjectId;
@@ -722,6 +762,8 @@ const boxDailyPnlSchema = new mongoose.Schema(
 // One document per (day, trade). The upsert key that makes re-draining idempotent:
 // a verify pass can safely re-write a row the 9 PM drain already wrote.
 boxDailyPnlSchema.index({ day: 1, trade_id: 1 }, { unique: true, name: "box_daily_pnl_day_trade" });
+// Cross-day deletion cleanup pages by trade without scanning the whole archive.
+boxDailyPnlSchema.index({ trade_id: 1, day: 1 }, { name: "box_daily_pnl_trade_day" });
 
 export interface BoxDailyPnlRecord extends IBoxDailyPnl {
   _id: mongoose.Types.ObjectId;
@@ -731,6 +773,98 @@ export interface BoxDailyPnlRecord extends IBoxDailyPnl {
 export const BoxDailyPnl = boxModel<IBoxDailyPnl>(
   "BoxDailyPnl",
   boxDailyPnlSchema as unknown as mongoose.Schema<IBoxDailyPnl>,
+);
+
+/**
+ * Durable deletion fence for reporting rows.
+ *
+ * Pending means only that a source delete was prepared; it does not invalidate a
+ * row while the source still exists. Completed fences are retained permanently
+ * so late writers cannot resurrect deleted P&L. This intentionally trades a
+ * compact document per deleted trade for cross-process deletion safety.
+ */
+export interface IBoxPnlDeletion {
+  _id: string;
+  status: "pending" | "complete";
+  candidate_days: string[];
+  attempts: number;
+  created_at: Date;
+  updated_at: Date;
+  completed_at: Date | null;
+  last_error: string | null;
+}
+
+const boxPnlDeletionSchema = new mongoose.Schema<IBoxPnlDeletion>(
+  {
+    _id: { type: String },
+    status: { type: String, enum: ["pending", "complete"], default: "pending" },
+    candidate_days: { type: [String], default: [] },
+    attempts: { type: Number, default: 0 },
+    created_at: { type: Date, default: () => new Date() },
+    updated_at: { type: Date, default: () => new Date() },
+    completed_at: { type: Date, default: null },
+    last_error: { type: String, default: null },
+  },
+  { collection: "box_pnl_deletions" },
+);
+
+// Startup repair pages only pending intents while completed fences accumulate.
+boxPnlDeletionSchema.index({ status: 1, _id: 1 }, { name: "box_pnl_deletions_status_id" });
+
+/** Durable per-trade reporting-cleanup intents and permanent deletion fences. */
+export const BoxPnlDeletion = boxModel<IBoxPnlDeletion>(
+  "BoxPnlDeletion",
+  boxPnlDeletionSchema,
+);
+
+/**
+ * Completion manifest for an exact durable day snapshot. A summary document by
+ * itself is not proof of completeness because an incremental drain can fail
+ * before a newly discovered row lands.
+ */
+export interface IBoxPnlDayState {
+  _id: string;
+  complete: boolean;
+  snapshot_version?: number;
+  row_count?: number;
+  content_sha256?: string;
+  needs_reproof?: boolean;
+  /** Read-only compatibility with pre-v2 state documents; never written again. */
+  expected_trade_ids?: string[];
+  updated_at: Date;
+}
+
+const boxPnlDayStateSchema = new mongoose.Schema<IBoxPnlDayState>(
+  {
+    _id: { type: String },
+    complete: { type: Boolean, default: false },
+    snapshot_version: { type: Number, default: null },
+    row_count: { type: Number, default: null },
+    content_sha256: { type: String, default: null },
+    needs_reproof: { type: Boolean, default: false },
+    // Kept in the additive schema only so old manifests can be recognized and
+    // compacted. New state is a constant-size count + SHA-256 proof.
+    expected_trade_ids: { type: [String], required: false, default: undefined },
+    updated_at: { type: Date, default: () => new Date() },
+  },
+  { collection: "box_pnl_day_states" },
+);
+
+// The five-minute repair pass keyset-pages both apparently complete v2 states
+// (to catch a row-write crash before post-invalidation) and explicit retries.
+boxPnlDayStateSchema.index(
+  { snapshot_version: 1, complete: 1, _id: 1 },
+  { name: "box_pnl_day_states_v2_complete_id" },
+);
+boxPnlDayStateSchema.index(
+  { snapshot_version: 1, needs_reproof: 1, _id: 1 },
+  { name: "box_pnl_day_states_v2_reproof_id" },
+);
+
+/** Durable proof that a day-bounded archive generation settled completely. */
+export const BoxPnlDayState = boxModel<IBoxPnlDayState>(
+  "BoxPnlDayState",
+  boxPnlDayStateSchema,
 );
 
 /* ------------------------------ box settings ------------------------------ */

@@ -137,12 +137,34 @@ export interface BrokerModifyRequest {
   quantity?: number;
 }
 
+/**
+ * One-shot local guard invoked after adapter pacing and immediately before the
+ * remote placement mutation. Throwing proves that no broker POST was attempted.
+ */
+export type BeforeBrokerPost = () => void;
+
+/**
+ * A current-feed authority check refused an order locally before broker mutation.
+ * The durable identity is terminally spent once OrderManager surfaces this error.
+ */
+export class BrokerPreSubmitRefusedError extends Error {
+  constructor(
+    readonly clientOrderId: string,
+    readonly stage: "dequeue" | "pre_post",
+    readonly durableIdentitySpent: boolean,
+    readonly reason: string,
+  ) {
+    super(`Local pre-submit feed refusal at ${stage}: ${reason}`);
+    this.name = "BrokerPreSubmitRefusedError";
+  }
+}
+
 /** Async broker boundary: all remote-capable reads are promises. */
 export interface BrokerAdapter {
   readonly mode: BrokerAdapterMode;
   /** Pure preparation hook (for example stable bounded broker tags); no transport calls. */
   prepareOrder?(req: BrokerOrderRequest): BrokerOrderRequest;
-  submitOrder(req: BrokerOrderRequest): Promise<BrokerOrder>;
+  submitOrder(req: BrokerOrderRequest, beforePost?: BeforeBrokerPost): Promise<BrokerOrder>;
   cancelOrder(clientOrderId: string): Promise<BrokerOrder | undefined>;
   modifyOrder?(clientOrderId: string, request: BrokerModifyRequest): Promise<BrokerOrder>;
   getOrder(clientOrderId: string): Promise<BrokerOrder | undefined>;

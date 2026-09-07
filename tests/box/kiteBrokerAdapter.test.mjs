@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   BrokerAmbiguousSubmitError,
   BrokerDisabledError,
+  BrokerPreSubmitRefusedError,
 } from "../../dist/box/brokerAdapter.js";
 import {
   KiteBrokerAdapter,
@@ -132,6 +133,22 @@ test("disabled KiteBrokerAdapter makes zero transport calls for every broker ope
   const health = await adapter.health();
   assert.equal(health.transport, "disabled");
   assert.deepEqual(transport.calls, [], "submit/cancel/modify/reads/margins/health never reach transport");
+});
+
+test("pre-POST feed refusal stays local and never becomes ambiguous", async () => {
+  const transport = scriptedTransport();
+  const adapter = new KiteBrokerAdapter(transport, adapterConfig(), fakeClock());
+  const refusal = new BrokerPreSubmitRefusedError(
+    request().client_order_id,
+    "pre_post",
+    true,
+    "feed generation changed before broker POST",
+  );
+
+  const error = await rejection(adapter.submitOrder(request(), () => { throw refusal; }));
+  assert.strictEqual(error, refusal);
+  assert.equal(error instanceof BrokerAmbiguousSubmitError, false);
+  assert.deepEqual(transport.calls, [], "neither placement nor tag reconciliation reached Kite");
 });
 
 test("Kite adapter enforces bounded LIMIT chase and modification count before transport", async () => {

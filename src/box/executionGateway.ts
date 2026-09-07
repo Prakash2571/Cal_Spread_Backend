@@ -1,6 +1,29 @@
 import type { BrokerOrder, BrokerOrderRequest } from "./brokerAdapter.js";
-import { BrokerAmbiguousSubmitError, boxClientOrderId } from "./brokerAdapter.js";
-import { OrderPersistenceAfterFillError, type BoxOrderManager } from "./orderManager.js";
+import {
+  BrokerAmbiguousSubmitError,
+  BrokerOrderRejectedError,
+  BrokerPreSubmitRefusedError,
+  boxClientOrderId,
+} from "./brokerAdapter.js";
+import {
+  OrderPersistenceAfterFillError,
+  type BoxOrderManager,
+  type CheckedFeedStamp,
+} from "./orderManager.js";
+import {
+  carryResidualForward,
+  classifyResidualFlattenErrorMessage,
+  classifyResidualOrder,
+  dispositionForFailure,
+  residualFailureIsInvariant,
+  residualFailurePhrase,
+  residualFlattenAttempt,
+  residualFlattenAttemptId,
+  FIRST_RESIDUAL_FLATTEN_ATTEMPT,
+  MAX_RESIDUAL_FLATTEN_ATTEMPT_PROBE,
+  type ResidualFlattenFailureKind,
+  type ResidualFlattenPass,
+} from "./residualFlatten.js";
 import type { BoxConfig } from "./config.js";
 import type {
   BoxEntryExecutionResult,
@@ -11,6 +34,7 @@ import type {
 import { entrySideFor, exitSideFor, round2 } from "./math.js";
 import { buildOrderPricing, touchPrice, walkDepth } from "./orderPricing.js";
 import { outstandingRoles, type BoxOpenPosition } from "./positions.js";
+import { singleLotCandidateViolation } from "./singleLotInvariant.js";
 import type { BoxQuoteStore } from "./quotes.js";
 import {
   BOX_LEG_ROLES,
@@ -22,6 +46,7 @@ import {
   type BoxLegEvaluation,
   type BoxLegRole,
   type BoxOptionInstrument,
+  type IBoxOrderIntent,
   type OrderSide,
   type PaperLegExecution,
   type PaperLeggingExecutionRecord,
@@ -42,6 +67,51 @@ export interface BoxExecutionGateway {
 }
 
 /**
+ * Re-check a gateway admission stamp against the newest book in the SAME socket
+ * generation. A newer book may proceed only when it still executes the immutable
+ * quantity within the immutable bounded LIMIT; generation changes always refuse.
+ */
+export function checkedFeedBlockReason(args: {
+  request: BrokerOrderRequest;
+  stamp: CheckedFeedStamp | undefined;
+  currentGeneration: number;
+  tokenCurrent: boolean;
+  quote: ReturnType<BoxQuoteStore["get"]>;
+  now: number;
+  quoteMaxAgeMs: number;
+  queueModel: BoxConfig["queueModel"];
+  queueLiquidityHaircutPct: number;
+}): string | null {
+  const { request, stamp, quote } = args;
+  if (!stamp) return "checked executable-feed evidence is missing";
+  if (stamp.token !== request.token) return "checked executable-feed token does not match request";
+  if (stamp.feed_generation !== args.currentGeneration) return "feed generation changed while order was queued";
+  if (!args.tokenCurrent) return "token has no executable book in the current feed generation";
+  if (!quote) return "current executable book is absent";
+  if (!Number.isSafeInteger(stamp.quote_version) || quote.version < stamp.quote_version || quote.at < stamp.quote_at) {
+    return "executable book identity regressed after bounded-depth admission";
+  }
+  const age = args.now - quote.at;
+  if (!Number.isFinite(stamp.checked_at) || stamp.checked_at < stamp.quote_at || stamp.checked_at > args.now ||
+      !Number.isFinite(age) || age < 0 || age > args.quoteMaxAgeMs) {
+    return "checked executable book is stale or has invalid timing";
+  }
+  const walk = walkDepth({
+    side: request.side,
+    levels: request.side === "BUY" ? quote.asks : quote.bids,
+    remainingQty: request.quantity,
+    limitPrice: request.pricing.limit_price,
+    queueModel: args.queueModel,
+    haircutPct: args.queueLiquidityHaircutPct,
+    at: quote.at,
+    quoteVersion: quote.version,
+  });
+  return walk.executable_within_limit >= request.quantity
+    ? null
+    : "current executable book no longer covers bounded order quantity";
+}
+
+/**
  * Central execution facade. Paper modes delegate byte-for-byte to the existing
  * deterministic simulator; live mode emits bounded LIMIT intents through the
  * durable BoxOrderManager and trusts broker cumulative fills only.
@@ -57,6 +127,8 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     /** Allocates the Mongo identity before any live intent is created. */
     allocateTradeId?: () => string;
     isTokenWarm?: (token: number) => boolean;
+    /** Current socket generation, captured with each checked executable book. */
+    feedGeneration?: () => number;
     now?: () => number;
     /**
      * Total charges (₹) for a set of orders, from the LOCAL fee calculator.
@@ -87,6 +159,20 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
   async simulateLeggingEntry(args: Parameters<BoxExecutionSimulator["simulateLeggingEntry"]>[0]): Promise<BoxLeggingResult> {
     if (this.mode !== "live") return this.deps.simulator.simulateLeggingEntry(args);
     const manager = this.requireManager();
+    const quantityViolation = singleLotCandidateViolation(args.candidate);
+    if (quantityViolation) {
+      manager.invariantViolation(`live entry ${args.candidate.key} violated single-lot invariant: ${quantityViolation}`);
+      return liveEntryFailure(
+        args.candidate,
+        args.detection.at,
+        this.now(),
+        [],
+        "insufficient_quantity",
+        `single-lot entry invariant refused execution: ${quantityViolation}`,
+        this.deps.cfg,
+        null,
+      );
+    }
     const attemptId = stableAttemptId(args.candidate.key, args.detection.at, "ENTRY");
     const tradeId = this.deps.allocateTradeId?.();
     if (!tradeId) {
@@ -95,6 +181,7 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     }
     const submittedAt = this.now();
     const requests: BrokerOrderRequest[] = [];
+    let checkedFeed = new Map<string, CheckedFeedStamp>();
     try {
       for (const role of BOX_LEG_ROLES) {
         const leg = args.detection.legs.find((item) => item.role === role);
@@ -111,12 +198,14 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           phase: "entry",
         }));
       }
-      this.precheck(requests);
+      checkedFeed = this.precheck(requests);
     } catch (error) {
       return liveEntryFailure(args.candidate, args.detection.at, submittedAt, [], "insufficient_quantity", errorMessage(error), this.deps.cfg, tradeId);
     }
 
-    const settled = await Promise.allSettled(requests.map((request) => manager.submit(request)));
+    const settled = await Promise.allSettled(
+      requests.map((request) => manager.submit(request, checkedFeed.get(request.client_order_id))),
+    );
     const orders = ordersFromSettled(settled);
     const uncertain = settled.some((item) => item.status === "rejected" &&
       (item.reason instanceof OrderPersistenceAfterFillError ||
@@ -185,15 +274,20 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       const record = liveRecord(args.detectedAt, this.now(), [], false, this.deps.cfg, undefined, args.position.id);
       return { ok: false, record, reason: "legging_incomplete", detail: "position already flat" };
     }
+    let checkedFeed: Map<string, CheckedFeedStamp>;
     try {
-      this.precheck(requests);
+      checkedFeed = this.precheck(requests);
     } catch (error) {
       const record = liveRecord(args.detectedAt, this.now(), [], false, this.deps.cfg, requests.length, args.position.id);
       return { ok: false, record, reason: "insufficient_quantity", detail: errorMessage(error) };
     }
-    const settled = await Promise.allSettled(requests.map((request) => manager.submit(request)));
+    const settled = await Promise.allSettled(
+      requests.map((request) => manager.submit(request, checkedFeed.get(request.client_order_id))),
+    );
     const orders = ordersFromSettled(settled);
-    const uncertain = settled.some((item) => item.status === "rejected") || orders.some((order) => order.state === "UNKNOWN" || order.state === "RECONCILIATION_REQUIRED");
+    const uncertain = settled.some((item) => item.status === "rejected" &&
+      !(item.reason instanceof BrokerPreSubmitRefusedError)) ||
+      orders.some((order) => order.state === "UNKNOWN" || order.state === "RECONCILIATION_REQUIRED");
     if (uncertain) manager.invariantViolation(`live exit ${attemptId} has uncertain broker terminal quantity`);
     const record = liveRecord(args.detectedAt, this.now(), orders, false, this.deps.cfg, requests.length, args.position.id);
     const legs = legsFromOrders(orders, args.position.legs, this.deps.quotes, this.now());
@@ -217,65 +311,125 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     return this.deps.simulator.estimateExecutableExit(position, now);
   }
 
+  /**
+   * LIVE RESIDUAL FLATTENING — a genuine retry loop.
+   *
+   * Every logically new attempt on still-outstanding quantity gets a NEW durable identity
+   * (`…:attempt-N`); a retry or reconciliation of the SAME broker submission keeps the old one.
+   * See `residualFlatten.ts` for the state machine and the crash-safety argument.
+   *
+   * Nothing here is allowed to swallow an error. Each leg's outcome is classified into a fixed
+   * disposition that decides ONE thing: may the next pass reuse this identity? A terminal
+   * durable outcome spends it only when the broker is terminal or a local guard proves no POST.
+   */
   async flattenResidual(args: Parameters<BoxExecutionSimulator["flattenResidual"]>[0]): ReturnType<BoxExecutionSimulator["flattenResidual"]> {
     if (this.mode !== "live") return this.deps.simulator.flattenResidual(args);
     const manager = this.requireManager();
-    const orders: BrokerOrder[] = [];
+    const passes: ResidualFlattenPass[] = [];
     for (const residual of args.residual) {
-      const quote = this.deps.quotes.get(residual.token);
-      const side: OrderSide = residual.side === "BUY" ? "SELL" : "BUY";
-      const reference = quote ? touchPrice(side, quote.bids, quote.asks) : null;
-      if (!reference) continue;
-      const inst: BoxOptionInstrument = {
-        token: residual.token,
-        tradingsymbol: residual.tradingsymbol,
-        exchange: residual.exchange ?? "NFO",
-        strike: 0,
-        instrument_type: residual.role.endsWith("_ce") ? "CE" : "PE",
-        expiry: "",
-        lot_size: residual.quantity,
-      };
-      try {
-        orders.push(await manager.submit(this.request({
-          role: residual.role,
-          inst,
-          side,
-          quantity: residual.quantity,
-          referencePrice: reference,
-          tradeId: args.keyPrefix,
-          attemptId: stableAttemptId(args.keyPrefix, residual.created_at, `RESIDUAL-${residual.role}`),
-          purpose: "EMERGENCY_RESIDUAL",
-          phase: "unwind",
-        })));
-      } catch (error) {
-        if (error instanceof OrderPersistenceAfterFillError) {
-          orders.push(error.order);
-          manager.invariantViolation(`residual ${args.keyPrefix} filled but its durable snapshot failed`);
-        } else if (/unknown|ambiguous|reconcil/i.test(errorMessage(error))) {
-          manager.invariantViolation(`residual ${args.keyPrefix} uncertain`);
-        }
-      }
+      passes.push(await this.flattenOneResidual(manager, args.keyPrefix, residual));
     }
+
+    const orders: BrokerOrder[] = [];
     const flattened: Partial<Record<BoxLegRole, number>> = {};
     const remaining: ResidualLegExposure[] = [];
-    for (const residual of args.residual) {
-      const order = orders.find((item) => item.role === residual.role);
-      const quantity = order?.filled_quantity ?? 0;
-      flattened[residual.role] = quantity;
-      if (quantity < residual.quantity) remaining.push({ ...residual, quantity: residual.quantity - quantity });
+    let flattenCharges = 0;
+    for (const pass of passes) {
+      // Attribute the order to the residual that produced it. Matching by role was wrong the
+      // moment two residual entries shared a role: the second silently inherited the first's
+      // fill and its own exposure vanished from the books.
+      if (pass.order) orders.push(pass.order);
+
+      const sameGeneration = pass.attempt === residualFlattenAttempt(pass.residual);
+      const rawFilledWatermark = sameGeneration ? pass.residual.flatten_accounted_filled : undefined;
+      const rawChargeWatermark = sameGeneration ? pass.residual.flatten_accounted_charges : undefined;
+      const legacyWatermarks = rawFilledWatermark === undefined && rawChargeWatermark === undefined;
+      const watermarksValid = legacyWatermarks || (
+        typeof rawFilledWatermark === "number" && Number.isFinite(rawFilledWatermark) && rawFilledWatermark >= 0 &&
+        typeof rawChargeWatermark === "number" && Number.isFinite(rawChargeWatermark) && rawChargeWatermark >= 0
+      );
+      let accountedFilled = watermarksValid && !legacyWatermarks ? rawFilledWatermark! : 0;
+      let accountedCharges = watermarksValid && !legacyWatermarks ? round2(rawChargeWatermark!) : 0;
+      let disposition = pass.disposition;
+      let fillDelta = 0;
+      let chargeDelta = 0;
+      // `undefined` means "this pass observed no broker order", so the residual keeps whatever it
+      // already carried — including ABSENT on a pre-watermark row, whose already-projected fill can
+      // only ever be derived from a durable intent snapshot.
+      let cumulativeFilled: number | undefined = watermarksValid && !legacyWatermarks ? accountedFilled : undefined;
+      let cumulativeCharges: number | undefined = watermarksValid && !legacyWatermarks ? accountedCharges : undefined;
+
+      if (!watermarksValid) {
+        manager.invariantViolation(
+          `residual ${args.keyPrefix} ${pass.residual.role} attempt-${pass.attempt} has inconsistent cumulative accounting watermarks`,
+        );
+        disposition = "adopt_attempt";
+        // Normalise the pair so the identity stops being ambiguous next pass instead of tripping the
+        // invariant forever: keep the highest readable fill watermark (never re-credit it) and read
+        // an unreadable one as zero, exactly as before this accounting existed.
+        cumulativeFilled = typeof rawFilledWatermark === "number" && Number.isFinite(rawFilledWatermark) &&
+          rawFilledWatermark > 0 ? rawFilledWatermark : 0;
+        cumulativeCharges = typeof rawChargeWatermark === "number" && Number.isFinite(rawChargeWatermark) &&
+          rawChargeWatermark > 0 ? round2(rawChargeWatermark) : 0;
+      } else if (pass.order) {
+        const brokerFilled = pass.order.filled_quantity;
+        if (legacyWatermarks) {
+          // A residual persisted before cumulative watermarks existed carries no accounting at all.
+          // Reading that as "nothing projected yet" replays the partial fill this identity ALREADY
+          // credited and re-bills its fee on the first post-upgrade terminal pass, understating the
+          // exposure that is still naked. `order.quantity` is immutable on the durable intent and
+          // equals the residual quantity at the moment this identity was created, so the difference
+          // is exactly what was already projected under it — and 0 for a genuinely fresh residual.
+          // Clamped: a snapshot whose quantity is somehow below the residual must never manufacture
+          // a negative watermark (which would re-credit even more than defaulting to zero).
+          accountedFilled = Math.max(0, pass.order.quantity - pass.residual.quantity);
+          accountedCharges = this.residualCumulativeCharges(pass.order, accountedFilled, 0);
+        }
+        const brokerCumulativeCharges = this.residualCumulativeCharges(pass.order, brokerFilled, accountedCharges);
+        // Only the FILL stream is a trustworthiness test. The charge figure is re-estimated from
+        // the current rate card on every pass rather than recorded, so it can legitimately fall
+        // (rate-card version change, corrected average price) while the fill is unchanged. Treating
+        // that as corruption forced `adopt_attempt` on every later pass, so the residual could
+        // never retire or flatten and every interval tripped the invariant/breaker — a permanently
+        // stranded naked leg. Real turnover is monotonic, so this branch catches nothing the fill
+        // check does not; a cheaper estimate is absorbed by the zero-clamp on `chargeDelta` below.
+        const regression = !Number.isFinite(brokerFilled) || brokerFilled < accountedFilled ||
+          brokerFilled < 0 || brokerFilled > pass.order.quantity;
+        const candidateFillDelta = regression ? 0 : brokerFilled - accountedFilled;
+        if (regression || candidateFillDelta > pass.residual.quantity) {
+          manager.invariantViolation(
+            `residual ${args.keyPrefix} ${pass.residual.role} attempt-${pass.attempt} cumulative accounting regressed or exceeded exposure ` +
+              `(fill ${accountedFilled} -> ${brokerFilled}, charge ${accountedCharges} -> ${brokerCumulativeCharges}, residual ${pass.residual.quantity})`,
+          );
+          // Quarantine this identity. Never turn a negative/regressed cumulative snapshot into a
+          // fill and never retire past an identity whose accounting cannot be trusted. The
+          // watermarks are still persisted so the quarantined identity stops being ambiguous.
+          disposition = "adopt_attempt";
+          cumulativeFilled = accountedFilled;
+          cumulativeCharges = accountedCharges;
+        } else {
+          fillDelta = candidateFillDelta;
+          chargeDelta = round2(Math.max(0, brokerCumulativeCharges - accountedCharges));
+          cumulativeFilled = brokerFilled;
+          // Keep the charge watermark monotonic: a cheaper re-estimate must not lower the bar and
+          // let the next pass bill the same turnover again when the estimate recovers.
+          cumulativeCharges = Math.max(accountedCharges, brokerCumulativeCharges);
+        }
+      }
+
+      flattened[pass.residual.role] = (flattened[pass.residual.role] ?? 0) + fillDelta;
+      flattenCharges = round2(flattenCharges + chargeDelta);
+      const outstanding = pass.residual.quantity - fillDelta;
+      if (outstanding > 0) {
+        remaining.push(carryResidualForward(
+          pass.residual,
+          outstanding,
+          pass.attempt,
+          disposition,
+          { cumulativeFilled, cumulativeCharges },
+        ));
+      }
     }
-    // Bill the flatten. Only FILLED quantity is chargeable, and only at the price the broker
-    // actually reported — an unfilled residual order costs nothing, and an order with no average
-    // price gives us nothing to charge against, so it is excluded rather than guessed at.
-    const chargeable = orders
-      .filter((order) => order.filled_quantity > 0 && order.average_price !== null)
-      .map((order) => ({
-        side: order.side,
-        tradingsymbol: order.tradingsymbol,
-        quantity: order.filled_quantity,
-        price: order.average_price as number,
-      }));
-    const flattenCharges = chargeable.length > 0 ? round2(this.deps.chargeTotal?.(chargeable) ?? 0) : 0;
 
     return {
       flattened_by_role: flattened,
@@ -283,6 +437,187 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       remaining,
       legs: orders.map((order) => paperLeg(order)),
     };
+  }
+
+  /**
+   * Cumulative charge for one cumulative filled quantity on one durable identity.
+   *
+   * The SAME estimator is used for a legacy-derived watermark and for the current snapshot, so a
+   * derived watermark and the figure it is compared against cannot disagree by construction — an
+   * unchanged cumulative fill therefore bills exactly zero. `fallback` is what an unpriceable or
+   * zero-fill snapshot means: no charge information, so the existing watermark stands.
+   */
+  private residualCumulativeCharges(order: BrokerOrder, filled: number, fallback: number): number {
+    if (!(filled > 0) || order.average_price === null) return fallback;
+    return round2(this.deps.chargeTotal?.([{
+      side: order.side,
+      tradingsymbol: order.tradingsymbol,
+      quantity: filled,
+      price: order.average_price,
+    }]) ?? 0);
+  }
+
+  /**
+   * One residual leg, one flatten attempt.
+   *
+   * The generation comes from the residual itself when it has one (the runtime loop persists it),
+   * and otherwise from the DURABLE intent journal — never from an in-memory counter, a clock or a
+   * random value. Crash-recovery exposure derived from the journal has no persisted generation,
+   * so the journal itself is probed for the first identity that is absent or still adoptable.
+   */
+  private async flattenOneResidual(
+    manager: BoxOrderManager,
+    keyPrefix: string,
+    residual: ResidualLegExposure,
+  ): Promise<ResidualFlattenPass> {
+    const base = stableAttemptId(keyPrefix, residual.created_at, `RESIDUAL-${residual.role}`);
+    const selected = await this.firstAdoptableResidualAttempt(
+      manager,
+      keyPrefix,
+      residual,
+      base,
+      residualFlattenAttempt(residual),
+    );
+    const attempt = selected.attempt;
+
+    const fail = (kind: ResidualFlattenFailureKind, detail: string, order: BrokerOrder | null = null): ResidualFlattenPass => {
+      if (residualFailureIsInvariant(kind)) {
+        manager.invariantViolation(
+          `residual ${keyPrefix} ${residual.role} attempt-${attempt} [${kind}]: ` +
+            `${residualFailurePhrase(kind)} — ${detail}`,
+        );
+      }
+      return { residual, attempt, order, disposition: dispositionForFailure(kind), failure: kind, detail };
+    };
+
+    if (selected.terminalIntent) {
+      const order = brokerOrderFromDurableIntent(selected.terminalIntent);
+      if (order.state === "REJECTED") {
+        return fail("broker_rejected", order.reject_reason ?? "durable broker rejection", order);
+      }
+      const disposition = classifyResidualOrder(order, residual.quantity);
+      return { residual, attempt, order, disposition, failure: null, detail: null };
+    }
+
+    const side: OrderSide = residual.side === "BUY" ? "SELL" : "BUY";
+    const quote = this.deps.quotes.get(residual.token);
+    const reference = quote ? touchPrice(side, quote.bids, quote.asks) : null;
+    const enforceCurrentGeneration = this.deps.isTokenWarm !== undefined;
+    if (!reference || (this.deps.isTokenWarm && !this.deps.isTokenWarm(residual.token)) ||
+        !quote || (enforceCurrentGeneration && this.now() - quote.at > this.deps.cfg.quoteMaxAgeMs)) {
+      // Nothing was sent, so the identity is still unused and MUST be reused next pass.
+      return fail("no_executable_book", `no current executable ${side} touch for ${residual.tradingsymbol}`);
+    }
+
+    const inst: BoxOptionInstrument = {
+      token: residual.token,
+      tradingsymbol: residual.tradingsymbol,
+      exchange: residual.exchange ?? "NFO",
+      strike: 0,
+      instrument_type: residual.role.endsWith("_ce") ? "CE" : "PE",
+      expiry: "",
+      lot_size: residual.quantity,
+    };
+
+    try {
+      const request = this.request({
+        role: residual.role,
+        inst,
+        side,
+        quantity: residual.quantity,
+        referencePrice: reference,
+        tradeId: keyPrefix,
+        attemptId: residualFlattenAttemptId(base, attempt),
+        purpose: "EMERGENCY_RESIDUAL",
+        phase: "unwind",
+      });
+      // Residual reduction bypasses entry discovery/warmup, but never bounded
+      // quantity, freshness, relevant-side depth, or generation checks.
+      let checkedFeed: Map<string, CheckedFeedStamp>;
+      try {
+        checkedFeed = this.precheck([request]);
+      } catch (error) {
+        return fail("no_executable_book", errorMessage(error));
+      }
+      const order = await manager.submit(request, checkedFeed.get(request.client_order_id));
+      const disposition = classifyResidualOrder(order, residual.quantity);
+      if (disposition === "adopt_attempt") {
+        // A working or unknown order still owns this identity. Keep it and reconcile.
+        return fail("broker_state_unknown", `order state ${order.state} is not terminal`, order);
+      }
+      return { residual, attempt, order, disposition, failure: null, detail: null };
+    } catch (error) {
+      // The broker owns a fill we could not record. Broker truth wins: carry the snapshot so the
+      // quantity is credited, and trip the invariant.
+      if (error instanceof OrderPersistenceAfterFillError) {
+        return fail("persistence_after_fill", errorMessage(error), error.order);
+      }
+      // A durable local refusal proves no broker POST and terminally spends this
+      // identity, so the still-outstanding quantity must advance to attempt N+1.
+      if (error instanceof BrokerPreSubmitRefusedError) {
+        return fail("local_pre_submit_refused", errorMessage(error));
+      }
+      // A KNOWN broker refusal. It is terminal broker truth, but policy retains this durable
+      // identity rather than manufacturing a fresh reduction order automatically.
+      if (error instanceof BrokerOrderRejectedError) {
+        return fail("broker_rejected", errorMessage(error), error.order);
+      }
+      // An ambiguous submission may or may not exist at the broker. NEVER resubmit it under a
+      // new identity; keep this one so the durable journal adopts whatever is really there.
+      if (error instanceof BrokerAmbiguousSubmitError) {
+        return fail("broker_state_unknown", errorMessage(error), error.order ?? null);
+      }
+      return fail(classifyResidualFlattenErrorMessage(errorMessage(error)), errorMessage(error));
+    }
+  }
+
+  /**
+   * First flatten generation whose durable intent is absent or still adoptable.
+   *
+   * Every residual is reconciled, including one that already persisted a generation. This repairs
+   * the crash window where a local no-POST refusal committed REJECTED but generation N+1 did not.
+   * Only an unambiguous structured local-no-POST rejection with zero fill and no broker order is
+   * advanced here. Broker rejection and every working/ambiguous state retain their identity.
+   */
+  private async firstAdoptableResidualAttempt(
+    manager: BoxOrderManager,
+    keyPrefix: string,
+    residual: ResidualLegExposure,
+    base: string,
+    firstAttempt = FIRST_RESIDUAL_FLATTEN_ATTEMPT,
+  ): Promise<{ attempt: number; terminalIntent: IBoxOrderIntent | null }> {
+    const probe = manager.findDurableIntent?.bind(manager);
+    if (!probe) return { attempt: firstAttempt, terminalIntent: null };
+    const lastAttempt = firstAttempt + MAX_RESIDUAL_FLATTEN_ATTEMPT_PROBE - 1;
+    for (let attempt = firstAttempt; attempt <= lastAttempt; attempt++) {
+      const clientOrderId = boxClientOrderId({
+        tradeId: keyPrefix,
+        purpose: "EMERGENCY_RESIDUAL",
+        role: residual.role,
+        attempt: residualFlattenAttemptId(base, attempt),
+      });
+      let existing: Awaited<ReturnType<NonNullable<BoxOrderManager["findDurableIntent"]>>>;
+      try {
+        existing = await probe(clientOrderId);
+      } catch {
+        // The journal is unreadable. Reusing the current identity is the safe answer: the upsert
+        // adopts an existing submission and only POSTs when the intent is still CREATED.
+        return { attempt, terminalIntent: null };
+      }
+      if (!existing) return { attempt, terminalIntent: null };
+      if (existing.state === "REJECTED") {
+        if (hasDurableLocalNoPostProvenance(existing)) continue;
+        return { attempt, terminalIntent: existing };
+      }
+      // COMPLETE/CANCELLED broker truth is projected directly from the durable snapshot before
+      // any later generation is allowed to POST. Working and ambiguous states retain the identity
+      // and flow through OrderManager reconciliation. Only proven local no-POST refusal is skipped.
+      if (existing.state === "COMPLETE" || existing.state === "CANCELLED") {
+        return { attempt, terminalIntent: existing };
+      }
+      return { attempt, terminalIntent: null };
+    }
+    return { attempt: lastAttempt + 1, terminalIntent: null };
   }
 
   invariantViolation(reason: string): void {
@@ -329,13 +664,20 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     };
   }
 
-  private precheck(requests: BrokerOrderRequest[]): void {
+  private precheck(requests: BrokerOrderRequest[]): Map<string, CheckedFeedStamp> {
+    const checked = new Map<string, CheckedFeedStamp>();
+    const checkedAt = this.now();
+    const feedGeneration = this.deps.feedGeneration?.() ?? 0;
     for (const request of requests) {
       if (this.mode === "live" && this.deps.isTokenWarm && !this.deps.isTokenWarm(request.token)) {
         throw new Error(`${request.tradingsymbol} has not received a WebSocket tick in the current feed generation.`);
       }
       const quote = this.deps.quotes.get(request.token);
       if (!quote) throw new Error(`${request.tradingsymbol} has no live depth.`);
+      const age = checkedAt - quote.at;
+      if (this.deps.isTokenWarm && (!Number.isFinite(age) || age < 0 || age > this.deps.cfg.quoteMaxAgeMs)) {
+        throw new Error(`${request.tradingsymbol} has no current executable depth.`);
+      }
       const walk = walkDepth({
         side: request.side,
         levels: request.side === "BUY" ? quote.asks : quote.bids,
@@ -349,7 +691,15 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       if (walk.executable_within_limit < request.quantity) {
         throw new Error(`${request.tradingsymbol} has ${walk.executable_within_limit} safe quantity within bounded limit; needs ${request.quantity}.`);
       }
+      checked.set(request.client_order_id, {
+        token: request.token,
+        feed_generation: feedGeneration,
+        quote_version: quote.version,
+        quote_at: quote.at,
+        checked_at: checkedAt,
+      });
     }
+    return checked;
   }
 
   private async unwindConfirmed(orders: BrokerOrder[], instruments: Record<BoxLegRole, BoxOptionInstrument>, tradeId: string, attemptId: string): Promise<BrokerOrder[]> {
@@ -365,7 +715,7 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
         continue;
       }
       try {
-        unwinds.push(await manager.submit(this.request({
+        const request = this.request({
           role: order.role,
           inst: instruments[order.role],
           side,
@@ -375,7 +725,9 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
           attemptId,
           purpose: "EMERGENCY_RESIDUAL",
           phase: "unwind",
-        })));
+        });
+        const checkedFeed = this.precheck([request]);
+        unwinds.push(await manager.submit(request, checkedFeed.get(request.client_order_id)));
       } catch (error) {
         if (error instanceof OrderPersistenceAfterFillError) {
           unwinds.push(error.order);
@@ -394,6 +746,54 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
   private now(): number {
     return this.deps.now?.() ?? Date.now();
   }
+}
+
+function brokerOrderFromDurableIntent(intent: IBoxOrderIntent): BrokerOrder {
+  return {
+    client_order_id: intent.client_order_id,
+    broker_order_id: intent.broker_order_id,
+    tag: intent.broker_tag,
+    role: intent.role,
+    trade_id: intent.trade_id,
+    attempt_id: intent.attempt_id,
+    purpose: intent.purpose,
+    phase: intent.phase,
+    exchange: intent.exchange,
+    tradingsymbol: intent.tradingsymbol,
+    token: intent.token,
+    side: intent.side,
+    quantity: intent.quantity,
+    pricing: {
+      order_type: "LIMIT",
+      reference_price: intent.reference_price,
+      tick_size: intent.tick_size,
+      max_chase_ticks: intent.max_chase_ticks,
+      limit_price: intent.limit_price,
+    },
+    limit_price: intent.limit_price,
+    state: intent.state,
+    filled_quantity: intent.filled_quantity,
+    pending_quantity: Math.max(0, intent.quantity - intent.filled_quantity),
+    average_price: intent.average_price,
+    fills: [],
+    reject_family: intent.reject_family as BrokerOrder["reject_family"],
+    reject_reason: intent.reject_reason,
+    created_at: intent.created_at.getTime(),
+    updated_at: intent.updated_at.getTime(),
+  };
+}
+
+export function hasDurableLocalNoPostProvenance(intent: IBoxOrderIntent): boolean {
+  if (intent.state !== "REJECTED" || intent.filled_quantity !== 0 || intent.broker_order_id !== null) {
+    return false;
+  }
+  return intent.audit.some((event) => {
+    const payload = event.payload;
+    return event.to_state === "REJECTED" &&
+      payload?.origin === "local_pre_submit_refusal" &&
+      payload.no_broker_post === true &&
+      (payload.stage === "dequeue" || payload.stage === "pre_post");
+  });
 }
 
 function stableAttemptId(scope: string, at: number, purpose: string): string {
@@ -527,6 +927,8 @@ function paperLeg(order: BrokerOrder): PaperLegExecution {
     cancel_confirmed_at: null,
     fill_qty_at_cancel_request: null,
     raced_fill_qty: 0,
+    // Live orders carry no simulated cancel stage: the broker, not the simulator, decided.
+    cancel_stage: null,
     // A live order is filled by the exchange, not by walking a book, so there is no
     // "executable within limit" observation to report. Left null rather than back-filled.
     executable_within_limit_at_arrival: null,

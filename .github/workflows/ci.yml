@@ -6,10 +6,9 @@ on:
     branches: [main]
   pull_request:
 
-# Read-only token. This workflow needs NO secrets: the Box tests are pure and
-# offline — no Zerodha credentials, no MongoDB, no Redis, no market access. Every
-# dependency the trading logic has (clock, sleep, quote store, charges, persistence)
-# is injected, so the suite runs deterministically against recorded fixtures.
+# Read-only token. This workflow needs no repository secrets: the fast Box job remains
+# fully offline, while the Mongo-backed job uses only its pinned local service container.
+# Broker credentials, Redis, and market access are never required.
 permissions:
   contents: read
 
@@ -56,4 +55,43 @@ jobs:
       #   build === typecheck === `tsc -b`, and test = build + node --test.
       # Steps run in order and fail fast, so a type error stops the job above.
       - name: Build + test
+        run: npm test
+
+
+  mongo-test:
+    name: Typecheck + Box tests (MongoDB)
+    runs-on: ubuntu-latest
+    services:
+      mongodb:
+        image: mongo:7.0.14
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      BOX_TEST_MONGODB_URI: mongodb://127.0.0.1:27017/calspread_box_ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install
+        run: |
+          npm ci || {
+            echo "::warning title=Lockfile out of sync::npm ci refused: package-lock.json does not match package.json. Falling back to 'npm install'. Please run 'npm install' locally and commit the regenerated package-lock.json."
+            npm install --no-audit --no-fund
+          }
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # The environment variable activates the production Mongo CAS, physical-legacy,
+      # aggregation-pipeline, and recovery-index tests that the offline job intentionally skips.
+      - name: Build + test with MongoDB
         run: npm test

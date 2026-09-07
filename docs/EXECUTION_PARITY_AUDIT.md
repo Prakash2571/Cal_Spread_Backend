@@ -252,10 +252,11 @@ it says no.
 `model.ts`, `repository.ts`, `routes.ts`, `boundedCache.ts`, `brokers/registry.ts`,
 `brokers/zerodha/liveAdapter.ts`.
 
-**Untouched, deliberately:** `math.ts`, `scanner.ts`, `charges.ts`, `localCharges.ts`,
-`positions.ts`, `positionMonitor.ts`, and every frontend file. Strategy mathematics, thresholds,
-direction logic, option selection, expiry logic and fee semantics are unchanged, proven by the
-pre-existing golden fixtures still passing byte-for-byte.
+**Untouched in this historical parity implementation:** `math.ts`, `scanner.ts`, `charges.ts`,
+`localCharges.ts`, `positions.ts`, `positionMonitor.ts`, and every frontend file. This statement is
+point-in-time only: the later safety follow-up in Part 4 changes some of those files to correct
+confirmed execution/accounting defects while preserving strategy mathematics, direction logic,
+option selection, expiry logic, LIMIT-only policy, and supported fee semantics.
 
 ## 2. Execution lifecycle, before vs after
 
@@ -549,3 +550,72 @@ A regression test (`tests/box/wiredNotInert.test.mjs`) now asserts that each wir
 production call site and produces non-empty output when fed, and that anything still inert remains
 labelled as such in the documentation. The specific failure mode it guards against is a module
 quietly reverting to scaffolding while the docs still claim it works.
+
+
+
+---
+
+# PART 4 — Execution-safety follow-up through `11243df`
+
+Parts 1–3 remain historical audits of the parity architecture at their stated commits. This part records the later live-money, accounting, feed-authority, and recovery hardening. It supersedes old test counts and any historical statement that the affected files were untouched.
+
+## Durable order identity, ownership, and attribution
+
+- **Residual identity (`a26ea08`, `11243df`).** A logical residual submission keeps the same durable identity while its result is ambiguous or working so restart reconciliation can adopt it. `ResidualLegExposure.flatten_attempt` advances only after a terminal broker outcome or an applied local `REJECTED` transition proving no broker mutation. A new flatten attempt for the still-outstanding exact remainder receives a new identity. Exceptions are classified rather than swallowed.
+- **Guarded fill attribution (`833873b`).** The persistence contract stamps and reports the durable pre-write cumulative quantity. Position attribution is `durable post - durable pre`, never `updated - stale caller snapshot`; accepted equal-quantity writes contribute zero.
+- **One POST owner (`426c906`).** `CREATED -> SUBMITTING` is an expected-state compare-and-set. Only the manager whose transition was applied may call the adapter. Losing managers adopt/reconcile the durable intent. A process-global lock was not introduced, so unrelated submissions retain their configured concurrency.
+- **No-POST provenance (`426c906`).** Feed loss immediately before mutation produces typed `BrokerPreSubmitRefusedError` only when the caller still owns the durable transition. A compare-and-set loser cannot claim a local refusal and must reconcile instead.
+
+## Arrival, feed, and LIMIT authority
+
+- **No pre-arrival fills (`6306b24`).** Paper legs in `pre_submission` or `in_transport` cannot fill during an abort. Only an order that arrived/rested can race cancellation, preserving the legitimate exchange cancel-vs-fill model. The invariant is `filled_quantity > 0 => first_fill_at >= arrival_at`.
+- **Executable depth, not LTP, grants authority (`426c906`).** `Tick.depth_updated` records packet provenance. Zerodha full packets and Dhan packets that actually carry depth may refresh executable books; a retained merged ladder does not make a later LTP-only packet authoritative. Raw ticks restore liveness only.
+- **Generation-bound checks (`426c906`).** Reconnect/reset invalidates executable books. Gateway admission stamps feed generation, quote version/time, token, and check time. The manager revalidates after durable classification, and adapters revalidate after pacing immediately before POST. A same-generation newer book is acceptable only when the immutable quantity remains executable inside the immutable LIMIT; a generation change refuses submission.
+- **Adoption before validation.** Existing non-`CREATED` intents are adopted/reconciled before checking current feed authority because recovery must not be blocked by the market-data condition that governs a new POST. New or still-`CREATED` submissions require current executable depth.
+
+Broker cumulative quantity remains the authority for fills. Market depth is the authority to originate the bounded LIMIT submission; it never fabricates a fill.
+
+## Quantity and accounting invariants
+
+- **Exact one lot (`d2d4263`).** Candidate lot size must be a positive safe integer and equal the lot size of all four contracts. A normal opened role quantity must equal exactly one lot. This is an explicit strategy invariant, not a side effect of live risk ceilings, and general multi-lot behavior was not implemented.
+- **Partial and overfill truth.** Remaining quantities may be any safe integer in `[0, lot]`; a legitimate `35/75` remainder is neither rounded nor rejected. Malformed restored projections enter `RECOVERY`. Broker-confirmed safe-integer overfills are persisted exactly and quarantined; an explicitly reconciled emergency reduction may submit that exact quantity.
+- **Partial-exit P&L (`1b59816`).** Closed quantities contribute frozen realised gross from their durable exit attempts; only outstanding quantities are marked. A quote move on a flat leg cannot move running P&L.
+- **Deletion resurrection protection (`3177fb6`).** Permanent Mongo deletion fences, actual Redis day membership, source/fence checks around writes, all-day eviction, fixed-size row-count/SHA-256 day proofs, and periodic reconciliation prevent a D1 trade deleted on D2 from reappearing through a D3 archiver/restart race.
+
+## Failure semantics and preserved safety boundaries
+
+Pipeline technical faults use the fixed bounded taxonomy:
+
+`reservation_error`, `reservation_authority_unavailable`, `execution_gateway_error`, `execution_simulator_error`, `execution_invariant_error`, `trade_persistence_error`, `position_book_error`, `charge_calculation_error`, `broker_state_error`, and `unknown_internal_error`.
+
+Exception text is bounded diagnostic context and never a metric label. Broker rejections and ambiguous broker states remain distinct from local technical faults and local pre-submit refusals.
+
+The follow-up preserves these boundaries:
+
+1. Paper modes never construct a mutation-capable broker path; poison-adapter tests enforce zero broker mutations.
+2. Live still requires both deployment gates and starts with runtime entry/order/flatten controls disarmed.
+3. Durable shared-contract reservations remain in place. Required authority loss blocks live **entry**; paper may continue only as labelled `local_only`.
+4. Exposure-reducing exits use the local reservation tier and residual flattening is ungated. An authority outage cannot turn a speculative-entry safety mechanism into a prohibition on reducing owned exposure.
+5. There is no global execution mutex, whole-underlying lock, fixed inter-trade sleep, or mandatory transaction. Exact-contract conflicts serialize while unrelated contracts retain concurrency.
+6. MARKET orders remain unrepresentable; feed stamps are ephemeral and are neither persisted as broker intent fields nor sent to brokers.
+
+## Schema and API compatibility
+
+Changes are additive and migration-free: optional residual `flatten_attempt`, optional order-intent `previous_filled_quantity`, packet/feed provenance in runtime tick objects, and permanent P&L deletion/day-state collections. Existing documents load through compatibility fallbacks; malformed durable quantities are not silently normalized. Compatible API and Mongo field meanings are preserved, and no frontend contract is intentionally changed.
+
+## STT audit outcome
+
+SELL-only STT and direction-aware entry/exit side reversal are correct. Current nearest-rupee rounding remains per executed sell order/leg. No independent real Zerodha or Dhan contract-note fixture in this repository proves a note-level aggregation boundary, so no rounding arithmetic or golden figure was changed. Broker evidence is required before changing stored charge semantics. Dhan rate provenance/reconciliation/runtime-switch consistency remains a separate operational evidence gap.
+
+## Adversarial evidence and remaining integration gaps
+
+The follow-up suites are organized by safety property rather than a stale aggregate count: `residualFlattenIdentity`, `fillAttribution`, `preArrivalFills`, `executionFaults`, `partialExitPnl`, `pnlArchive`, `depthReadiness`, `singleLotInvariant`, `executionCoordinator`, `concurrency`, `paperNeverReachesBroker`, and `orderManager`.
+
+Remaining gaps are explicit:
+
+- real Mongo fill-attribution integration requires `BOX_TEST_MONGODB_URI`;
+- no full service-backed Redis+Mongo D1/D2/D3 delete/archiver test exists;
+- reconnect queue behavior is covered across components, not by a real engine-to-manager socket reconnect;
+- outage reductions use coordinator/stub boundaries rather than a real broker;
+- paper poison coverage is gateway-focused rather than a complete engine lifecycle;
+- retail level-2 data still cannot prove true queue position, hidden liquidity, matching-engine order, or market impact.

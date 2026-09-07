@@ -22,7 +22,11 @@ Conventions:
 > | `ADMIN_SECRET`, `TOKEN_ROUTE_SECRET`, `INTERNAL_TOKEN_SECRET`, `DHAN_API_SECRET`, `KITE_API_SECRET` | credentials whose leak grants order placement. |
 >
 > Paper-safe default posture: `BOX_EXECUTION_MODE=paper_latency`,
-> `BOX_LIVE_TRADING_ENABLED=false`, `DHAN_LIVE_TRADING_ENABLED=false`.
+> `BOX_LIVE_TRADING_ENABLED=false`, `DHAN_LIVE_TRADING_ENABLED=false`. These are deployment
+> gates, not runtime arming: even a correctly gated live process starts with Box entry, live-order,
+> and emergency-flatten controls false. Conversely, paper profiles cannot mutate a broker merely
+> because credentials or live-capable broker integrations are configured; the mutation-capable
+> manager/adapter path is not constructed in paper mode.
 
 ---
 
@@ -176,6 +180,11 @@ Behaviour by conflict type:
   conflict metrics so netting can be justified against real observations later.
 - **Residual flattening** — never gated. It reduces exposure that already exists; queueing it
   behind a speculative entry would leave a naked leg open.
+- **Reservation-authority outage** — when the durable tier is enabled, its outage always blocks
+  live entry, regardless of whether durability was separately marked required for a legacy
+  single-process deployment. Paper may use only the labelled `local_only` tier. Exposure-reducing
+  exits use local coordination and residual flattening remains ungated; authority loss must not
+  prohibit reduction of already-owned exposure.
 - **Ambiguous/unknown terminal state, or residual exposure** — the reservation is HELD until its
   TTL, so a second box cannot assume there is no exposure on that contract.
 
@@ -267,6 +276,19 @@ cannot claim.
 Live-only limits (all under the `BOX_LIVE_*` prefix — order pacing, timeouts, and the
 risk caps below).
 
+### Non-configurable execution invariants
+
+These are safety contracts, not tuning knobs:
+
+- normal Box entry is exactly one positive safe-integer lot, and all four instruments must agree on that lot size; general multi-lot execution is unsupported;
+- partial role remainders remain exact safe integers in `[0, lot]`; malformed durable quantities or broker overfills enter `RECOVERY` rather than being normalized;
+- only the winner of the durable `CREATED -> SUBMITTING` compare-and-set may POST;
+- raw LTP restores liveness but never executable readiness; authoritative depth is checked at admission, dequeue, and immediately before POST and cannot cross a feed generation;
+- live orders are LIMIT-only; broker cumulative quantity, not ACK state or depth, proves fills;
+- paper paths cannot call broker mutation APIs, and live remains behind deployment gates plus reset-on-start runtime arming;
+- same logical residual submission keeps its identity, while a new terminally-authorized attempt for the outstanding remainder advances durable `flatten_attempt`;
+- unrelated instruments remain concurrent; no configuration introduces a global execution mutex.
+
 ## Box safety / risk (live)
 
 `BOX_LIVE_DAILY_LOSS_LIMIT`, `BOX_LIVE_CONSECUTIVE_FAILURE_LIMIT`, `BOX_LIVE_REJECT_LIMIT`,
@@ -288,6 +310,12 @@ risk caps below).
 > **Rate accuracy is P&L accuracy.** `BOX_STT_SELL_PCT` is the single largest cost in a
 > round trip; an understated value flatters every paper result. The shipped default
 > reflects the 1 Apr 2026 options-STT revision — verify against your account.
+>
+> STT is applied to executed SELL orders only, with entry/exit sides reversed by Box direction.
+> When `BOX_STT_ROUND_NEAREST_RUPEE=true`, the current implementation rounds each sell order/leg's
+> STT head. No independent Zerodha or Dhan contract-note fixture in this repository proves a
+> different note-level aggregation boundary, so arithmetic and historical figures are deliberately
+> unchanged pending broker evidence.
 
 Charge reconciliation: `BOX_RECONCILE_CHARGES`, `BOX_REQUIRE_PRICED_CHARGES`,
 `BOX_CHARGE_CACHE_TTL_MS`, `BOX_CHARGE_CONCURRENCY`, `BOX_CHARGE_RECONCILE_CONCURRENCY`,
@@ -299,3 +327,16 @@ Charge reconciliation: `BOX_RECONCILE_CHARGES`, `BOX_REQUIRE_PRICED_CHARGES`,
 `BOX_PNL_ARCHIVE_HOUR`, `BOX_PNL_ARCHIVE_DRAIN_DELAY_MS`, `BOX_PNL_VERIFY_HOURS`,
 `BOX_PNL_CACHE_ENABLED`, `BOX_PNL_CACHE_INTERVAL_MS`, `BOX_PNL_CACHE_TTL_SEC`,
 `BOX_CLOSED_CACHE_ENABLED`, `BOX_CLOSED_CACHE_TTL_SEC`, `BOX_METRICS_WINDOW`.
+
+Completed `box_pnl_deletions` fences are retained permanently by design. Each is a
+small, bounded document and prevents a delayed writer in another process from
+resurrecting a deleted trade's reporting row. Deletion evicts every Redis day membership and
+archived Mongo row associated with the trade, with source/fence checks before and after writes.
+Startup and periodic paged reconciliation repair late writers, legacy manifests, and interrupted
+cleanup. This safety reconciliation remains active even when the optional Redis P&L mirror is
+disabled.
+
+This is an explicit storage-for-safety tradeoff; pending candidate-day metadata is capped, and
+`box_pnl_day_states` uses a fixed-size survivor row count plus SHA-256 exact-day content proof
+rather than per-trade ID arrays. Historical cache miss/outage fails closed unless that complete
+durable proof exists.

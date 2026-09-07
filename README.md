@@ -159,10 +159,17 @@ analytics, schema and collections are untouched, and box positions live in their
 Paper execution remains the default. Live execution exists behind two independent deployment gates:
 `BOX_EXECUTION_MODE=live` **and** `BOX_LIVE_TRADING_ENABLED=true`. It also starts with all in-memory
 entry/order/flatten controls disarmed, requires a ready Mongo journal and current Kite session, and
-uses bounded LIMIT orders only. Unknown execution modes fail closed. Operators must read
+uses bounded LIMIT orders only. Unknown execution modes fail closed. Paper profiles do not construct
+the live manager or mutation-capable broker adapter, so credentials alone cannot let paper submit,
+modify, or cancel a broker order; a poison-adapter regression enforces this boundary. Operators must read
 [`src/box/LIVE_EXECUTION.md`](src/box/LIVE_EXECUTION.md) before enabling either gate; it documents
 reconciliation, exact partial-fill recovery, health blockers, full-admin controls, and incident
 operations.
+
+Live mutation ownership is durable: exactly one applied `CREATED -> SUBMITTING` compare-and-set
+winner may POST, while competing managers adopt/reconcile. Fill attribution uses persistence-
+reported durable pre/post cumulative quantities rather than stale caller snapshots. Technical
+failures use a fixed bounded taxonomy; exception messages remain diagnostics, not metric labels.
 
 > ### Paper execution — read this before trusting a number
 >
@@ -227,7 +234,10 @@ operations.
 > failure does not discard it: the fill is retained and re-persisted with bounded backoff, and the
 > engine reports `degraded` in `/api/box/status` until it succeeds. On startup the engine re-adopts
 > open positions **and** unresolved residual exposure, so an interrupted execution is resumed whether
-> or not RUN is pressed.
+> or not RUN is pressed. Residual order identity is durable: the same ambiguous/working logical
+> submission keeps the same identity for adoption; only a terminal broker result or a durably applied
+> local no-POST rejection advances `flatten_attempt`. A new attempt submits the exact still-outstanding
+> quantity under a new identity. Exceptions are classified and never silently swallowed.
 >
 > **Abort after a 4/4 fill.** A dislocation can decay *while the orders are in flight*. If all four
 > legs fill but the economics recomputed on the **executed** prices no longer clear the gate (say
@@ -274,12 +284,13 @@ operations.
 >   erases). No randomness anywhere. Distributions are kept strictly separate per broker,
 >   operation kind, marketable/passive profile and time-of-day bucket, and a bucket is only used
 >   once it has enough observations of its own.
-> - **ACK is not fill, and a cancel can be raced.** An acknowledgement — or an HTTP 200 — proves
->   an order exists, never that anything executed; only cumulative broker quantity does. And a
->   cancel is a *request*: paper now keeps a cancelling order eligible to fill until the
->   confirmation lands, sized from measured cancel latency. So `75` requested with `40` filled at
->   cancel time and `12` more filling in the window ends as **filled 52 / cancelled 23**, never
->   `filled 40`.
+> - **ACK is not fill, and only an arrived order can be raced by cancel.** An acknowledgement — or
+>   an HTTP 200 — proves an order exists, never that anything executed; only cumulative broker
+>   quantity does. A `pre_submission` or `in_transport` leg cannot fill because abort requested a
+>   cancel, so every positive paper fill has `first_fill_at >= arrival_at`. Once arrived, cancel is
+>   still only a *request*: paper keeps the order eligible to fill until confirmation. Thus `75`
+>   requested with `40` filled at cancel time and `12` more in the window ends as **filled 52 /
+>   cancelled 23**, never `filled 40`.
 > - **Live-equivalent concurrency cap.** Paper pipelines are capped at
 >   `BOX_PAPER_MAX_CONCURRENT_EXECUTIONS`, which **defaults to the live cap**
 >   (`BOX_LIVE_MAX_CONCURRENT_EXECUTIONS`, 1) so the recommended validation baseline matches a
@@ -374,31 +385,37 @@ concurrency-limited and cached, so Zerodha is never hammered.
 
 Guards on every automatic entry:
 
-- **Market open.** Outside NSE equity-derivatives hours nothing is entered at
-  all: there is no executable book, so a paper fill would be a fiction.
-- **One lot, always.** `quantity` is the contract's current `lot_size` from
-  instrument metadata. There is no multiplier and no custom size.
-- **One-lot touch liquidity.** Each leg needs `ask > 0 && askQty >= lotSize`
-  (BUY) or `bid > 0 && bidQty >= lotSize` (SELL), counting only what rests at
-  that **exact** best price. V1 does not walk deeper levels.
-- **Feed liveness.** The newest tick across the WHOLE universe must be within
-  `BOX_FEED_MAX_AGE_MS` (default 5s). This is the check that catches a silently
-  dropped connection, where every cached book still looks normal while being of
-  unknown age. When it trips, entries and automatic exits pause.
-- **Book trust window.** Each of the four books must have changed within
-  `BOX_QUOTE_MAX_AGE_MS` (default 15s). Note this is NOT a "price age" limit: a
-  depth feed only sends a message when the book *changes*, so silence on a quiet
-  strike is not staleness — an untouched book is still the current, executable
-  book. Illiquid F&O strikes are routinely quiet for seconds at a time, so a
-  sub-second limit here makes the scanner unable to trade anything but the most
-  active names without making it any safer.
-- **Revalidation.** Charge estimation is asynchronous, so after it returns the
-  four quotes are re-read and the freshness, liquidity and ₹1,200 spread tests
-  are re-applied to the **current** book. A decision is never executed on a
-  pre-API-call snapshot.
-- **One open box per exact strike pair**, enforced by a synchronous in-memory
-  reservation *and* a unique partial index on
-  `{underlying, expiry, lower_strike, upper_strike}` where `status: "open"`.
+- **Market open.** Outside NSE equity-derivatives hours nothing is entered; there is no executable
+  book, so a paper fill would be fiction.
+- **Exactly one lot.** The candidate lot must be a positive safe integer and equal the lot size on
+  all four instruments. Every normal opened role is exactly that one lot. Partial integer remainders
+  such as `35/75` remain valid; malformed restored quantities or broker overfills preserve broker
+  truth and enter `RECOVERY`. General multi-lot entry is unsupported.
+- **Bounded-LIMIT executable depth.** Detection uses side-correct touch economics. Legging and live
+  submission walk authoritative depth only as far as the immutable bounded LIMIT and require the
+  full requested quantity after the configured queue haircut. A valid one-sided book may authorize
+  the corresponding reducing side; non-finite or fractional depth fails closed.
+- **Raw liveness versus readiness.** A recent tick across the universe proves connection liveness,
+  but an LTP-only option tick does not create an executable book. Readiness requires packet-proven
+  usable depth. Every feed-generation reset invalidates books, and reconnect warm-up requires new-
+  generation depth for every requested leg.
+- **Book trust window.** Each executable book must remain inside `BOX_QUOTE_MAX_AGE_MS` (default
+  15s). Silence on an unchanged but current depth book is not itself a fabricated price update.
+- **Three submission checks.** The gateway validates/stamps depth at admission; the manager
+  revalidates after durable intent classification and at dequeue; the adapter revalidates after
+  pacing immediately before POST. A generation change always refuses the new mutation. A newer
+  same-generation book may pass only if quantity still executes inside the original LIMIT.
+- **Exclusive mutation ownership.** Only the winner of the durable `CREATED -> SUBMITTING`
+  compare-and-set may POST. Losing managers adopt/reconcile. Durable pre/post cumulative quantities,
+  not stale caller snapshots, drive fill attribution.
+- **One open box per exact strike pair**, enforced by synchronous reservation and a unique partial
+  index on `{underlying, expiry, lower_strike, upper_strike}` where `status: "open"`. Exact-contract
+  conflicts serialize while unrelated instruments retain concurrency.
+
+When the durable reservation tier is enabled but unavailable, live entry fails closed and paper may
+continue only as labelled `local_only`. Exposure-reducing exits use local coordination and residual
+flattening is never reservation-gated; losing shared authority cannot prevent reduction of already-
+owned exposure. No global execution mutex, whole-underlying lock, or fixed inter-trade sleep is used.
 
 ### When the market is closed
 
@@ -493,10 +510,12 @@ monitoring loop never depends on React being mounted.
 
 `/api/box/status` always reports a `day_pnl` block — the **running** net P&L of the day's box
 trades: the summed current net of every open position plus the realised net of every trade closed
-today, and their total. It is computed off the same touch-based metrics the monitor uses (no
-valuation model, nothing invented) and reads no database on a status call — the open side is
-in-memory and the closed side is a tally seeded from Mongo at boot and folded forward on each close.
-The Box page shows it as a compact strip above the execution-health panel.
+today, and their total. For a partially exited position, closed quantities contribute the realised
+gross frozen on their exit attempts while only remaining role quantities are marked at current
+executable quotes; movement in an already-flat leg cannot alter running P&L. Charges already paid
+and estimated charges on the remaining reduction are kept distinct. The calculation reads no
+database on a status call — the open side is in memory and the closed side is seeded from Mongo at
+boot and folded forward on each close. The Box page shows it above the execution-health panel.
 
 When `BOX_PNL_CACHE_ENABLED=true` **and** Upstash Redis is configured, that day P&L is also:
 
@@ -514,8 +533,11 @@ When `BOX_PNL_CACHE_ENABLED=true` **and** Upstash Redis is configured, that day 
   A process that comes up after the archive hour reconciles the day (and any still-pending earlier
   day) on boot.
 
-With `BOX_PNL_CACHE_ENABLED` unset the whole subsystem is inert: no Redis writes, no new collection,
-and the module behaves exactly as before.
+With `BOX_PNL_CACHE_ENABLED` unset, Redis mirroring and scheduled cache draining are disabled, but
+durable deletion safety is not inert. Permanent `box_pnl_deletions` fences, all-day eviction,
+source/fence checks, fixed-size row-count/SHA-256 day proofs, and startup/periodic paged
+reconciliation still prevent a deleted D1/D2 trade from being resurrected by a delayed D3 writer or
+legacy archive state.
 
 ### Performance
 
@@ -529,18 +551,19 @@ Kite WebSocket -> quote map -> affected candidates -> fast local calculation
 A `token -> candidates` index means a tick only recalculates the boxes that reference the token
 that moved (a strike is a leg of at most six of an underlying's 21 pairs), never a chain scan.
 MongoDB is never in the hot path — open positions are held in memory and written on entry, on exit
-and on a slow periodic snapshot. A charge call is only ever considered once a box's **gross** edge
-clears `₹1,200 + safety + a deliberate lower bound on charges`, and results are cached and
-de-duplicated, so the charge API can never become the bottleneck. The UI is a control surface: it
-receives a batched snapshot a couple of times a second and takes part in no decision.
+and on a slow periodic snapshot. A charge call is only considered once a box's **gross** edge clears
+the configured cheap prefilter allowance; final entry still uses the complete expected-net gate.
+Charge results are cached and de-duplicated, so that API cannot become the bottleneck. The UI is a
+control surface: it receives batched snapshots and takes part in no decision.
 
 The module reuses the **single** shared Kite WebSocket via the ticker hub rather than opening a
-second connection. **Executable option books are WebSocket-only**: REST depth is never admitted to
-the Box quote store, feed-health clock, entry path, automatic exit path, or manual-close path.
-Relevant WebSocket depth updates also re-evaluate affected open positions immediately; the
-one-second monitor is only a fallback watchdog. After any asynchronous charge lookup, all four
-books are captured again and that immutable final snapshot supplies the stored touch prices,
-touch quantities, and five-level depth.
+second connection. **Executable option books are WebSocket-depth-only**: REST depth and LTP-only
+packets are never admitted as execution authority. Raw ticks update connection liveness for
+analytics; packet-proven usable depth updates executable readiness. Relevant depth updates
+re-evaluate affected open positions immediately; the monitor is a fallback watchdog. Feed-generation
+resets invalidate every book, and admission/dequeue/pre-POST revalidation prevents queued work from
+crossing a reconnect. After asynchronous charge lookup, all four books are captured again and the
+immutable final snapshot supplies stored prices, quantities, and depth.
 
 Because Zerodha caps instruments per connection, `BOX_MAX_SUBSCRIBED_TOKENS`
 (default 2,200) bounds the live subscription; underlyings that do not fit are reported in
@@ -593,8 +616,7 @@ Every threshold is env-overridable; the defaults are the shipped specification.
 | `BOX_QUEUE_LIQUIDITY_HAIRCUT_PCT` | `30` | % of each displayed level assumed queued ahead of us (haircut model) |
 | `BOX_MAX_CROSS_LEG_EXCHANGE_DISPERSION_MS` | `250` | Reject a candidate whose four legs' exchange timestamps span more than this (0 disables) |
 | `BOX_EXIT_USE_REALISABLE` | `true` | Judge the auto-exit profit floor on realisable net (touch net − exit-slippage allowance) pre-execution; the final check uses the actual executed price |
-| `BOX_STT_ROUND_NEAREST_RUPEE` | `true` | Round the STT head to the nearest rupee, as the contract note does |
-| `BOX_IPFT_PER_CRORE` | `0` | NSE IPFT expressed as ₹ per crore of premium (folded into the exchange head) |
+| `BOX_STT_ROUND_NEAREST_RUPEE` | `true` | Round each executed SELL order/leg STT head to the nearest rupee. No independent broker fixture currently proves a different note-level aggregation boundary |
 | `BOX_ENABLE_SHORT_BOX` | `true` | Evaluate SHORT/reverse boxes as well as long boxes |
 | `BOX_EXPECTED_ENTRY_SLIPPAGE` / `BOX_EXPECTED_EXIT_SLIPPAGE` | `250` / `250` | Slippage allowances (₹) used before/for the un-measured side |
 | `BOX_RECONCILE_CHARGES` | `true` | Verify local charge maths against Zerodha asynchronously after a fill |
@@ -655,9 +677,12 @@ managed and exited on their own rules regardless of the new width. The active le
 
 ### Tests
 
-`npm test` builds and runs the box suite (`tests/box/`, Node's built-in runner, no extra
-dependency) — **118 deterministic tests**, no clock, network or database. Alongside the original
-math/scanner/monitor/serialize coverage it adds:
+`npm test` builds and runs the deterministic Box suite under `tests/box/` with Node's built-in
+runner. Do not use a hard-coded total here: safety coverage grows and CI is authoritative. Named
+regressions include residual retry identity, durable fill attribution, pre-arrival fill prohibition,
+fixed fault taxonomy, partial-exit P&L, cross-day deletion/archive safety, executable-depth readiness,
+submission ownership/concurrency, exact-one-lot enforcement, paper broker isolation, and reservation-
+authority outage reductions. The earlier strategy fixtures remain alongside these follow-ups:
 
 - **Direction** — long and short side maps, opposite edge signs on the same book, the short-box
   opportunity being "box above width", direction in the identity key, and old documents loading as
@@ -773,21 +798,26 @@ WebSocket level-2 data:
   (fine for coherence gating, too coarse for microsecond sequencing).
 - **Market impact** of our own order, and the reaction of other participants to it.
 
-Because of these, a `paper_legging` result is a *conservative, honest lower bound on execution
-quality given the data we can see* — useful for shadow-testing and calibration, **not** a promise of
-live fills. Never read "the tests pass" or "not degraded" as "production-ready".
+Because of these, a `paper_legging` result is an *observable deterministic approximation from the
+data we can see*, useful for shadow-testing and calibration but **not** a guaranteed lower bound or
+a promise of live fills. Queue haircuts can be conservative while unobserved liquidity withdrawal,
+latency, rejects, and market impact can still make live execution worse. Never read "the tests pass"
+or "not degraded" as "production-ready".
 
 **Partial exits are modelled exactly, not simplified.** Every open box carries per-role remaining
 quantity (`remaining_qty_by_role`). A `paper_legging` exit sizes each closing order from that exact
 outstanding quantity — so a role already flat is never re-closed and a partial close can never become
 reverse exposure. A partial exit decrements the per-role remaining, is persisted atomically before
 the execution is treated as clean (a crash cannot resurrect closed quantity), appends to an
-`exit_attempts` audit, and accumulates charges/realised-gross; the box is `closed` only once **every
-role is flat**. A partially-exited position is worked to flat (prioritising cleanup over convergence),
-and residual exposure from a failed unwind is flattened by a runtime loop that runs independently of
-RUN/STOP whenever the market is open and the feed is healthy. Manual and automatic closes share one
-code path and differ only in the exit reason; a manual close reports partial execution honestly
-rather than pretending nothing happened.
+`exit_attempts` audit, and accumulates charges/realised gross. Running P&L freezes realised gross for
+closed quantities and marks only each role's remainder, so later quote movement on a flat role has no
+effect. The box is `closed` only once **every role is flat**. A partially-exited position is worked to
+flat (prioritising cleanup over convergence), and residual exposure from a failed unwind is flattened
+by a runtime loop independent of RUN/STOP whenever executable authority is healthy. Every terminal
+flatten generation advances durable `flatten_attempt`; ambiguous work is adopted under the same
+identity instead of blindly retried. Manual and automatic closes share one path and differ only in
+the exit reason; a manual close reports partial execution honestly rather than pretending nothing
+happened.
 
 
 ---

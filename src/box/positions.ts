@@ -272,7 +272,13 @@ export function outstandingRoles(
 ): { role: BoxLegRole; quantity: number }[] {
   const out: { role: BoxLegRole; quantity: number }[] = [];
   for (const role of BOX_LEG_ROLES) {
-    const q = pos.remaining_qty_by_role[role] ?? 0;
+    const q = pos.remaining_qty_by_role[role];
+    if (!Number.isSafeInteger(q) || q < 0) {
+      throw new Error(`${role} outstanding quantity must be a non-negative safe integer`);
+    }
+    // Deliberately do not cap at one lot here. A broker-confirmed integer
+    // overfill is quarantined in RECOVERY, then an explicitly authorised
+    // emergency reduction must still be able to flatten the truthful quantity.
     if (q > 0) out.push({ role, quantity: q });
   }
   return out;

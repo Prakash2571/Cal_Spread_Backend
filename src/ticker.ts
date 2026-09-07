@@ -26,6 +26,13 @@ export interface Tick {
   bids?: DepthLevel[]; // up to 5 levels (full mode only)
   asks?: DepthLevel[];
   /**
+   * True only when THIS wire packet carried an authoritative executable depth
+   * snapshot. False means any ladders on the normalized tick are retained state
+   * for display/analytics only. Optional for legacy/custom producers; the Box
+   * store then infers authority only from explicitly supplied ladder properties.
+   */
+  depth_updated?: boolean;
+  /**
    * Exchange timestamp in epoch MILLISECONDS, present on "full" packets only.
    *
    * Kite sends it as a 32-bit Unix SECOND, so the resolution is one second — it
@@ -205,6 +212,7 @@ export function parseBinary(buf: ArrayBuffer): Tick[] {
       ask,
       bids,
       asks,
+      depth_updated: len >= 184,
       exchange_ts: exchangeTs,
     });
     offset += len;

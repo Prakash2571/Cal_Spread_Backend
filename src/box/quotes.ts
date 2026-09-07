@@ -24,7 +24,19 @@ export interface BoxTickInput {
   ask: number;
   bids?: { price: number; qty: number; orders: number }[];
   asks?: { price: number; qty: number; orders: number }[];
+  /** See Tick.depth_updated. False always fails closed for executable storage. */
+  depth_updated?: boolean;
   exchange_ts?: number;
+}
+
+export interface BoxQuoteDiagnostics {
+  authoritative_observations: number;
+  usable_book_updates: number;
+  depthless_ignored: number;
+  empty_invalidations: number;
+  malformed_levels_dropped: number;
+  generation_invalidations: number;
+  ready_books: number;
 }
 
 /** Notified after every accepted batch of WS depth packets. */
@@ -38,6 +50,13 @@ export class BoxQuoteStore {
   private nextVersion = 1;
   /** Execution simulators waiting for a post-arrival book. */
   private listeners = new Set<BoxQuoteListener>();
+  /** Fixed-cardinality counters only: no token-labelled or unbounded diagnostics. */
+  private authoritativeObservations = 0;
+  private usableBookUpdates = 0;
+  private depthlessIgnored = 0;
+  private emptyInvalidations = 0;
+  private malformedLevelsDropped = 0;
+  private generationInvalidations = 0;
 
   /** Number of tokens with a book. */
   get size(): number {
@@ -92,6 +111,18 @@ export class BoxQuoteStore {
     return this.listeners.size;
   }
 
+  diagnostics(): BoxQuoteDiagnostics {
+    return {
+      authoritative_observations: this.authoritativeObservations,
+      usable_book_updates: this.usableBookUpdates,
+      depthless_ignored: this.depthlessIgnored,
+      empty_invalidations: this.emptyInvalidations,
+      malformed_levels_dropped: this.malformedLevelsDropped,
+      generation_invalidations: this.generationInvalidations,
+      ready_books: this.quotes.size,
+    };
+  }
+
   /** True when a token has a book no older than maxAgeMs. */
   isFresh(token: number, maxAgeMs: number, now = Date.now()): boolean {
     const q = this.quotes.get(token);
@@ -102,69 +133,64 @@ export class BoxQuoteStore {
   /**
    * Apply a batch of live ticks.
    *
-   * Only ticks that actually carry depth update the book: a "full" packet
-   * without depth arrays would otherwise blank a good book and make a tradable
-   * leg look unquoted. `bid`/`ask` scalars are kept as a fallback for the touch.
+   * Explicit production provenance wins. Legacy/custom ticks with no marker are
+   * authoritative only when at least one ladder property was explicitly supplied;
+   * this preserves structural compatibility without letting an LTP-only shape warm
+   * execution readiness. Authoritative empty/fully-invalid books delete the prior
+   * book and still notify observers so pending execution paths can fail closed.
    */
   applyTicks(ticks: BoxTickInput[], at = Date.now()): number[] {
     const changed: number[] = [];
     for (const t of ticks) {
-      const bids = t.bids ?? [];
-      const asks = t.asks ?? [];
-      const hasDepth = bids.length > 0 || asks.length > 0;
-      const prev = this.quotes.get(t.token);
-      if (!hasDepth && prev) {
-        // Keep the existing book but do NOT refresh its timestamp: nothing new
-        // about the executable touch arrived, so it must keep ageing out.
+      const suppliedBids = Object.prototype.hasOwnProperty.call(t, "bids");
+      const suppliedAsks = Object.prototype.hasOwnProperty.call(t, "asks");
+      const authoritative = t.depth_updated === true ||
+        (t.depth_updated === undefined && (suppliedBids || suppliedAsks));
+      if (!authoritative) {
+        this.depthlessIgnored++;
         continue;
       }
-      // Clone the arrays: the evaluator and persisted fill must retain the exact
-      // WebSocket ladder from this packet even after a later packet replaces it.
-      const frozenBids = bids.map((l) => ({ ...l }));
-      const frozenAsks = asks.map((l) => ({ ...l }));
-      const bestBid = frozenBids.reduce(
-        (best, l) => (l.price > best ? l.price : best),
-        0,
-      );
-      const bestAsk = frozenAsks.reduce(
-        (best, l) => (l.price > 0 && (best === 0 || l.price < best) ? l.price : best),
-        0,
-      );
-      const bid = bestBid > 0 ? bestBid : (t.bid > 0 ? t.bid : 0);
-      const ask = bestAsk > 0 ? bestAsk : (t.ask > 0 ? t.ask : 0);
-      this.quotes.set(t.token, {
-        token: t.token,
-        bid,
-        bid_qty: frozenBids.reduce(
-          (qty, l) => qty + (l.price === bid && l.qty > 0 ? l.qty : 0),
-          0,
-        ),
-        ask,
-        ask_qty: frozenAsks.reduce(
-          (qty, l) => qty + (l.price === ask && l.qty > 0 ? l.qty : 0),
-          0,
-        ),
-        last: t.last_price,
-        bids: frozenBids,
-        asks: frozenAsks,
-        version: this.nextVersion++,
-        at,
-        // Preserve the EXCHANGE timestamp alongside the receive time when the feed
-        // supplied one. Receive time still drives freshness/feed-health; the
-        // exchange timestamp is what makes cross-leg temporal coherence meaningful.
-        exchange_at: typeof t.exchange_ts === "number" && t.exchange_ts > 0 ? t.exchange_ts : null,
-        source: "ws",
-      });
+
+      this.authoritativeObservations++;
+      const bids = this.sanitizeLevels(t.bids ?? [], "BUY");
+      const asks = this.sanitizeLevels(t.asks ?? [], "SELL");
       this.updates++;
       this.lastUpdate = at;
       changed.push(t.token);
+
+      if (bids.length === 0 && asks.length === 0) {
+        this.quotes.delete(t.token);
+        this.emptyInvalidations++;
+        // Consume a version for the invalidation event. A later usable snapshot
+        // can never share identity with a pre-invalidation book.
+        this.nextVersion++;
+        continue;
+      }
+
+      const bid = bids[0]?.price ?? 0;
+      const ask = asks[0]?.price ?? 0;
+      this.quotes.set(t.token, {
+        token: t.token,
+        bid,
+        bid_qty: bids.reduce((qty, l) => qty + (l.price === bid ? l.qty : 0), 0),
+        ask,
+        ask_qty: asks.reduce((qty, l) => qty + (l.price === ask ? l.qty : 0), 0),
+        last: Number.isFinite(t.last_price) ? t.last_price : 0,
+        bids,
+        asks,
+        version: this.nextVersion++,
+        at,
+        exchange_at: typeof t.exchange_ts === "number" &&
+          Number.isFinite(t.exchange_ts) && t.exchange_ts > 0 ? t.exchange_ts : null,
+        source: "ws",
+      });
+      this.usableBookUpdates++;
     }
     if (changed.length > 0 && this.listeners.size > 0) {
       for (const listener of this.listeners) {
         try {
           listener(changed, at);
         } catch (err) {
-          // A misbehaving observer must never break market-data intake.
           console.warn("[Box] quote listener failed:", err);
         }
       }
@@ -172,15 +198,43 @@ export class BoxQuoteStore {
     return changed;
   }
 
+  private sanitizeLevels(
+    levels: { price: number; qty: number; orders: number }[],
+    side: "BUY" | "SELL",
+  ): { price: number; qty: number; orders: number }[] {
+    const valid: { price: number; qty: number; orders: number }[] = [];
+    for (const level of levels) {
+      if (!Number.isFinite(level?.price) || level.price <= 0 ||
+          !Number.isFinite(level?.qty) || !Number.isSafeInteger(level.qty) || level.qty <= 0) {
+        this.malformedLevelsDropped++;
+        continue;
+      }
+      const orders = Number.isFinite(level.orders) && level.orders >= 0
+        ? Math.floor(level.orders)
+        : 0;
+      valid.push({ price: level.price, qty: level.qty, orders });
+    }
+    valid.sort((a, b) => side === "BUY" ? b.price - a.price : a.price - b.price);
+    // Both production feeds are five-level feeds. Keep the executable store bounded
+    // even when a custom producer supplies an unexpectedly large ladder.
+    return valid.slice(0, 5);
+  }
+
   /** Forget tokens that are no longer monitored, so the map cannot grow forever. */
   forget(tokens: Iterable<number>): void {
     for (const t of tokens) this.quotes.delete(t);
   }
 
-  /** Drop every book (e.g. when the Zerodha session dies). */
+  /** Drop every book without classifying why (shutdown/test compatibility). */
   clear(): void {
     this.quotes.clear();
     this.lastUpdate = null;
+  }
+
+  /** Drop every executable book at a socket-generation boundary. */
+  invalidateGeneration(): void {
+    this.generationInvalidations++;
+    this.clear();
   }
 
   /**
