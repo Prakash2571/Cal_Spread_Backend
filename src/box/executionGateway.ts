@@ -1,6 +1,20 @@
 import type { BrokerOrder, BrokerOrderRequest } from "./brokerAdapter.js";
-import { BrokerAmbiguousSubmitError, boxClientOrderId } from "./brokerAdapter.js";
+import { BrokerAmbiguousSubmitError, BrokerOrderRejectedError, boxClientOrderId } from "./brokerAdapter.js";
 import { OrderPersistenceAfterFillError, type BoxOrderManager } from "./orderManager.js";
+import {
+  carryResidualForward,
+  classifyResidualFlattenErrorMessage,
+  classifyResidualOrder,
+  dispositionForFailure,
+  residualFailureIsInvariant,
+  residualFailurePhrase,
+  residualFlattenAttempt,
+  residualFlattenAttemptId,
+  FIRST_RESIDUAL_FLATTEN_ATTEMPT,
+  MAX_RESIDUAL_FLATTEN_ATTEMPT_PROBE,
+  type ResidualFlattenFailureKind,
+  type ResidualFlattenPass,
+} from "./residualFlatten.js";
 import type { BoxConfig } from "./config.js";
 import type {
   BoxEntryExecutionResult,
@@ -22,6 +36,7 @@ import {
   type BoxLegEvaluation,
   type BoxLegRole,
   type BoxOptionInstrument,
+  type BoxOrderIntentState,
   type OrderSide,
   type PaperLegExecution,
   type PaperLeggingExecutionRecord,
@@ -217,52 +232,39 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     return this.deps.simulator.estimateExecutableExit(position, now);
   }
 
+  /**
+   * LIVE RESIDUAL FLATTENING — a genuine retry loop.
+   *
+   * Every logically new attempt on still-outstanding quantity gets a NEW durable identity
+   * (`…:attempt-N`); a retry or reconciliation of the SAME broker submission keeps the old one.
+   * See `residualFlatten.ts` for the state machine and the crash-safety argument.
+   *
+   * Nothing here is allowed to swallow an error. Each leg's outcome is classified into a fixed
+   * disposition that decides ONE thing: may the next pass reuse this identity? Only a terminal
+   * broker outcome (or a durable identity conflict, which is a bug) retires a generation.
+   */
   async flattenResidual(args: Parameters<BoxExecutionSimulator["flattenResidual"]>[0]): ReturnType<BoxExecutionSimulator["flattenResidual"]> {
     if (this.mode !== "live") return this.deps.simulator.flattenResidual(args);
     const manager = this.requireManager();
-    const orders: BrokerOrder[] = [];
+    const passes: ResidualFlattenPass[] = [];
     for (const residual of args.residual) {
-      const quote = this.deps.quotes.get(residual.token);
-      const side: OrderSide = residual.side === "BUY" ? "SELL" : "BUY";
-      const reference = quote ? touchPrice(side, quote.bids, quote.asks) : null;
-      if (!reference) continue;
-      const inst: BoxOptionInstrument = {
-        token: residual.token,
-        tradingsymbol: residual.tradingsymbol,
-        exchange: residual.exchange ?? "NFO",
-        strike: 0,
-        instrument_type: residual.role.endsWith("_ce") ? "CE" : "PE",
-        expiry: "",
-        lot_size: residual.quantity,
-      };
-      try {
-        orders.push(await manager.submit(this.request({
-          role: residual.role,
-          inst,
-          side,
-          quantity: residual.quantity,
-          referencePrice: reference,
-          tradeId: args.keyPrefix,
-          attemptId: stableAttemptId(args.keyPrefix, residual.created_at, `RESIDUAL-${residual.role}`),
-          purpose: "EMERGENCY_RESIDUAL",
-          phase: "unwind",
-        })));
-      } catch (error) {
-        if (error instanceof OrderPersistenceAfterFillError) {
-          orders.push(error.order);
-          manager.invariantViolation(`residual ${args.keyPrefix} filled but its durable snapshot failed`);
-        } else if (/unknown|ambiguous|reconcil/i.test(errorMessage(error))) {
-          manager.invariantViolation(`residual ${args.keyPrefix} uncertain`);
-        }
-      }
+      passes.push(await this.flattenOneResidual(manager, args.keyPrefix, residual));
     }
+
+    const orders: BrokerOrder[] = [];
     const flattened: Partial<Record<BoxLegRole, number>> = {};
     const remaining: ResidualLegExposure[] = [];
-    for (const residual of args.residual) {
-      const order = orders.find((item) => item.role === residual.role);
-      const quantity = order?.filled_quantity ?? 0;
-      flattened[residual.role] = quantity;
-      if (quantity < residual.quantity) remaining.push({ ...residual, quantity: residual.quantity - quantity });
+    for (const pass of passes) {
+      // Attribute the order to the residual that produced it. Matching by role was wrong the
+      // moment two residual entries shared a role: the second silently inherited the first's
+      // fill and its own exposure vanished from the books.
+      if (pass.order) orders.push(pass.order);
+      const filled = Math.max(0, Math.min(pass.residual.quantity, pass.order?.filled_quantity ?? 0));
+      flattened[pass.residual.role] = (flattened[pass.residual.role] ?? 0) + filled;
+      const outstanding = pass.residual.quantity - filled;
+      if (outstanding > 0) {
+        remaining.push(carryResidualForward(pass.residual, outstanding, pass.attempt, pass.disposition));
+      }
     }
     // Bill the flatten. Only FILLED quantity is chargeable, and only at the price the broker
     // actually reported — an unfilled residual order costs nothing, and an order with no average
@@ -283,6 +285,126 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       remaining,
       legs: orders.map((order) => paperLeg(order)),
     };
+  }
+
+  /**
+   * One residual leg, one flatten attempt.
+   *
+   * The generation comes from the residual itself when it has one (the runtime loop persists it),
+   * and otherwise from the DURABLE intent journal — never from an in-memory counter, a clock or a
+   * random value. Crash-recovery exposure derived from the journal has no persisted generation,
+   * so the journal itself is probed for the first identity that is absent or still adoptable.
+   */
+  private async flattenOneResidual(
+    manager: BoxOrderManager,
+    keyPrefix: string,
+    residual: ResidualLegExposure,
+  ): Promise<ResidualFlattenPass> {
+    const base = stableAttemptId(keyPrefix, residual.created_at, `RESIDUAL-${residual.role}`);
+    const attempt = residual.flatten_attempt === undefined
+      ? await this.firstAdoptableResidualAttempt(manager, keyPrefix, residual, base)
+      : residualFlattenAttempt(residual);
+
+    const fail = (kind: ResidualFlattenFailureKind, detail: string, order: BrokerOrder | null = null): ResidualFlattenPass => {
+      if (residualFailureIsInvariant(kind)) {
+        manager.invariantViolation(
+          `residual ${keyPrefix} ${residual.role} attempt-${attempt} [${kind}]: ` +
+            `${residualFailurePhrase(kind)} — ${detail}`,
+        );
+      }
+      return { residual, attempt, order, disposition: dispositionForFailure(kind), failure: kind, detail };
+    };
+
+    const quote = this.deps.quotes.get(residual.token);
+    const side: OrderSide = residual.side === "BUY" ? "SELL" : "BUY";
+    const reference = quote ? touchPrice(side, quote.bids, quote.asks) : null;
+    if (!reference) {
+      // Nothing was sent, so the identity is still unused and MUST be reused next pass.
+      return fail("no_executable_book", `no executable ${side} touch for ${residual.tradingsymbol}`);
+    }
+
+    const inst: BoxOptionInstrument = {
+      token: residual.token,
+      tradingsymbol: residual.tradingsymbol,
+      exchange: residual.exchange ?? "NFO",
+      strike: 0,
+      instrument_type: residual.role.endsWith("_ce") ? "CE" : "PE",
+      expiry: "",
+      lot_size: residual.quantity,
+    };
+
+    try {
+      const order = await manager.submit(this.request({
+        role: residual.role,
+        inst,
+        side,
+        quantity: residual.quantity,
+        referencePrice: reference,
+        tradeId: keyPrefix,
+        attemptId: residualFlattenAttemptId(base, attempt),
+        purpose: "EMERGENCY_RESIDUAL",
+        phase: "unwind",
+      }));
+      const disposition = classifyResidualOrder(order, residual.quantity);
+      if (disposition === "adopt_attempt") {
+        // A working or unknown order still owns this identity. Keep it and reconcile.
+        return fail("broker_state_unknown", `order state ${order.state} is not terminal`, order);
+      }
+      return { residual, attempt, order, disposition, failure: null, detail: null };
+    } catch (error) {
+      // The broker owns a fill we could not record. Broker truth wins: carry the snapshot so the
+      // quantity is credited, and trip the invariant.
+      if (error instanceof OrderPersistenceAfterFillError) {
+        return fail("persistence_after_fill", errorMessage(error), error.order);
+      }
+      // A KNOWN market refusal. Terminal, so the identity is spent — but it is not a fault.
+      if (error instanceof BrokerOrderRejectedError) {
+        return fail("broker_rejected", errorMessage(error), error.order);
+      }
+      // An ambiguous submission may or may not exist at the broker. NEVER resubmit it under a
+      // new identity; keep this one so the durable journal adopts whatever is really there.
+      if (error instanceof BrokerAmbiguousSubmitError) {
+        return fail("broker_state_unknown", errorMessage(error), error.order ?? null);
+      }
+      return fail(classifyResidualFlattenErrorMessage(errorMessage(error)), errorMessage(error));
+    }
+  }
+
+  /**
+   * First flatten generation whose durable intent is absent or still adoptable.
+   *
+   * Only used for residuals that carry no persisted generation (crash-recovery exposure derived
+   * from `attributedRecoveryExposure()`), so the ordinary runtime loop never pays for it. Bounded
+   * probe; if every probed generation is terminally spent the next one after the window is used,
+   * which is still a fresh identity rather than a reused one.
+   */
+  private async firstAdoptableResidualAttempt(
+    manager: BoxOrderManager,
+    keyPrefix: string,
+    residual: ResidualLegExposure,
+    base: string,
+  ): Promise<number> {
+    const probe = manager.findDurableIntent?.bind(manager);
+    if (!probe) return FIRST_RESIDUAL_FLATTEN_ATTEMPT;
+    for (let attempt = FIRST_RESIDUAL_FLATTEN_ATTEMPT; attempt <= MAX_RESIDUAL_FLATTEN_ATTEMPT_PROBE; attempt++) {
+      const clientOrderId = boxClientOrderId({
+        tradeId: keyPrefix,
+        purpose: "EMERGENCY_RESIDUAL",
+        role: residual.role,
+        attempt: residualFlattenAttemptId(base, attempt),
+      });
+      let existing: Awaited<ReturnType<NonNullable<BoxOrderManager["findDurableIntent"]>>>;
+      try {
+        existing = await probe(clientOrderId);
+      } catch {
+        // The journal is unreadable. Reusing the current identity is the safe answer: the upsert
+        // adopts an existing submission and only POSTs when the intent is still CREATED.
+        return attempt;
+      }
+      if (!existing) return attempt;
+      if (!TERMINAL_INTENT_STATES.has(existing.state)) return attempt;
+    }
+    return MAX_RESIDUAL_FLATTEN_ATTEMPT_PROBE + 1;
   }
 
   invariantViolation(reason: string): void {
@@ -395,6 +517,16 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     return this.deps.now?.() ?? Date.now();
   }
 }
+
+/**
+ * Durable intent states in which the broker can no longer add quantity to that order, so its
+ * identity is spent. Mirrors `isBrokerOrderTerminal`; kept as a set for probe lookups.
+ */
+const TERMINAL_INTENT_STATES: ReadonlySet<BoxOrderIntentState> = new Set<BoxOrderIntentState>([
+  "COMPLETE",
+  "CANCELLED",
+  "REJECTED",
+]);
 
 function stableAttemptId(scope: string, at: number, purpose: string): string {
   return `${purpose.toLowerCase()}-${stableHash(`${scope}:${at}:${purpose}`)}`;

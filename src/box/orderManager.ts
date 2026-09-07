@@ -381,6 +381,16 @@ export class BoxOrderManager {
     return out;
   }
 
+  /**
+   * Read one durable order intent by client id.
+   *
+   * Exposed so residual flattening can resolve its DURABLE attempt generation from the intent
+   * journal rather than from an in-memory counter. Read-only, and it never creates an intent.
+   */
+  findDurableIntent(clientOrderId: string): Promise<IBoxOrderIntent | null> {
+    return this.deps.persistence.findByClientId(clientOrderId);
+  }
+
   setFeedHealthy(healthy: boolean): void {
     const now = this.now();
     if (healthy && !this.feedHealthy) this.feedWarmUntil = now + this.deps.limits.feedReconnectWarmupMs;

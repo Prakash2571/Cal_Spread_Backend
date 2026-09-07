@@ -915,6 +915,23 @@ export interface ResidualLegExposure {
   /** Where this residual came from. */
   source: ResidualExposureSource;
   created_at: number;
+  /**
+   * DURABLE FLATTEN GENERATION — the attempt number the NEXT flatten submission must use.
+   *
+   * `created_at` is deliberately preserved when a shrunken residual is written back, so it
+   * cannot distinguish one flatten attempt from the next. Without a generation every pass
+   * regenerates the same `client_order_id`, and a live residual can therefore never be
+   * flattened a second time (see `residualFlatten.ts` for the full failure analysis).
+   *
+   * Persisted inside `BoxExecutionAttempt.residual_exposure` by the SAME write that persists
+   * the new remaining quantity, so advancing the generation and shrinking the exposure are one
+   * atomic durable transition.
+   *
+   * OPTIONAL FOR BACKWARDS COMPATIBILITY: rows written before this field existed read as
+   * attempt 1, which is the safe reading — attempt 1's durable intent is adopted rather than
+   * duplicated if it already exists.
+   */
+  flatten_attempt?: number;
 }
 
 /**
