@@ -1425,6 +1425,16 @@ export interface BoxScannerConfigSnapshot {
   live_max_modifications?: number;
   live_max_chase_ticks?: number;
   live_broker_min_interval_ms?: number;
+  /** Order-mutation pacing override (0 = derive from the broker's published limit). */
+  live_broker_order_min_interval_ms?: number;
+  /** How many ENTRY role submissions could be in transport at once (1..4). */
+  live_entry_submit_concurrency?: number;
+  /** The per-Box gross entry-order notional cap in force (₹). 0 = disabled. NOT margin. */
+  live_max_box_capital_rupees?: number;
+  /** Whether the underlying-level entry restriction was in force. */
+  one_active_box_per_underlying?: boolean;
+  /** The session cycle budget in force. 0 = unlimited. */
+  session_max_completed_trades?: number;
   /** Executable-order-pricing knobs a paper_legging fill was taken under. */
   leg_max_chase_ticks?: number;
   unwind_max_chase_ticks?: number;

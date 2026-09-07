@@ -14,7 +14,13 @@ import { CumulativeFillLedger } from "./orderLifecycle.js";
 import type { ExecutionTimingRecorder } from "./executionTiming.js";
 import { kindForPurpose } from "./executionTiming.js";
 import type { BrokerId } from "./latencyModel.js";
-import { BOX_ORDER_PRIORITY } from "./executionSchedulingPolicy.js";
+import {
+  admitBoxOperation,
+  BOX_ORDER_PRIORITY,
+  type BoxSchedulingOccupancy,
+  type BoxSchedulingSlot,
+  clampEntrySubmitConcurrency,
+} from "./executionSchedulingPolicy.js";
 import type {
   BoxOrderIntentAudit,
   BoxOrderIntentPatch,
@@ -170,6 +176,13 @@ export interface OrderManagerStatus {
 export interface OrderManagerLimits {
   maxOpenBoxes: number;
   maxConcurrentExecutions: number;
+  /**
+   * How many ENTRY role submissions of ONE Box pipeline may be in transport at once (1..4).
+   *
+   * See the BOX ENTRY BURST POLICY section of executionSchedulingPolicy.ts. `1` reproduces the
+   * pre-burst behaviour exactly.
+   */
+  entrySubmitConcurrency: number;
   maxResidualLegs: number;
   dailyLossLimit: number;
   rejectLimit: number;
@@ -184,6 +197,7 @@ export function orderManagerLimitsFromConfig(cfg: BoxConfig): OrderManagerLimits
   return {
     maxOpenBoxes: cfg.liveMaxOpenBoxes,
     maxConcurrentExecutions: cfg.liveMaxConcurrentExecutions,
+    entrySubmitConcurrency: cfg.liveEntrySubmitConcurrency,
     maxResidualLegs: cfg.liveMaxResidualLegs,
     dailyLossLimit: cfg.liveDailyLossLimit,
     rejectLimit: cfg.liveRejectLimit,
@@ -277,7 +291,25 @@ export class BoxOrderManager {
   private readonly knownIntents = new Map<string, IBoxOrderIntent>();
   private orphanOrders: BrokerOrder[] = [];
   private sequence = 0;
+  /**
+   * TOTAL in-flight operations. Retained as the reported number (`status().inFlight`) so every
+   * existing consumer — health, capacity checks, diagnostics — keeps its meaning.
+   */
   private inFlight = 0;
+  /** In-flight operations holding a BASE concurrency slot. */
+  private baseInFlight = 0;
+  /** In-flight ENTRY operations holding an entry-burst slot. */
+  private burstInFlight = 0;
+  /** In-flight operations whose purpose is not ENTRY. */
+  private nonEntryInFlight = 0;
+  /** The single Box pipeline owning every in-flight ENTRY operation, or null. */
+  private entryAttemptInFlight: string | null = null;
+  /** In-flight ENTRY operations, used to clear {@link entryAttemptInFlight} at zero. */
+  private entryInFlight = 0;
+  /** Peak simultaneous ENTRY submissions observed, for diagnostics. */
+  private peakEntryBurstWidth = 0;
+  /** How many times the entry burst granted an extra slot. Diagnostics only. */
+  private entryBurstGrants = 0;
   private rejects = 0;
   private consecutiveFailures = 0;
   private realisedPnlToday = 0;
@@ -887,14 +919,45 @@ export class BoxOrderManager {
     this.queue.sort((a, b) => queuePriority(a) - queuePriority(b) || a.sequence - b.sequence);
   }
 
+  /** The purpose an action is scheduled under. A bare cancel is a PROTECTIVE_CANCEL. */
+  private static purposeOf(action: QueueAction): BoxOrderPurpose {
+    return action.kind === "cancel" ? "PROTECTIVE_CANCEL" : action.request.purpose;
+  }
+
+  /** The Box pipeline an action belongs to. */
+  private static attemptOf(action: QueueAction): string {
+    return action.kind === "cancel" ? action.intent.attempt_id : action.request.attempt_id;
+  }
+
+  /** Current slot occupancy, in the shape the shared admission policy expects. */
+  private occupancy(): BoxSchedulingOccupancy {
+    return {
+      baseInFlight: this.baseInFlight,
+      burstInFlight: this.burstInFlight,
+      entryAttemptId: this.entryAttemptInFlight,
+      nonEntryInFlight: this.nonEntryInFlight,
+    };
+  }
+
   private pump(): void {
-    while (
-      !this.disposed &&
-      this.queue.length > 0 &&
-      this.inFlight < this.deps.limits.maxConcurrentExecutions
-    ) {
-      const action = this.queue.shift();
+    while (!this.disposed && this.queue.length > 0) {
+      // PEEK, never shift-then-requeue. The queue is priority-sorted, so if the head cannot be
+      // admitted we must STOP rather than look further down: admitting a lower-priority ENTRY
+      // ahead of a blocked EMERGENCY_RESIDUAL would invert BOX_ORDER_PRIORITY.
+      const action = this.queue[0];
       if (!action) return;
+      const verdict = admitBoxOperation({
+        request: {
+          purpose: BoxOrderManager.purposeOf(action),
+          attemptId: BoxOrderManager.attemptOf(action),
+        },
+        occupancy: this.occupancy(),
+        baseConcurrency: this.deps.limits.maxConcurrentExecutions,
+        entrySubmitConcurrency: clampEntrySubmitConcurrency(this.deps.limits.entrySubmitConcurrency),
+      });
+      if (!verdict.admit) return;
+      this.queue.shift();
+
       const blocked = this.queuedActionBlockReason(action);
       if (blocked) {
         if (action.kind === "submit") {
@@ -910,12 +973,12 @@ export class BoxOrderManager {
         action.kind === "submit" ? action.request.client_order_id : action.intent.client_order_id,
         "scheduler_dequeued",
       );
-      this.inFlight++;
+      this.occupySlot(action, verdict.slot);
       const execution = action.kind === "submit"
         ? this.execute(action)
         : this.executeCancel(action);
       void execution.finally(() => {
-        this.inFlight--;
+        this.releaseSlot(action, verdict.slot);
         if (action.kind === "submit") {
           const known = this.knownIntents.get(action.request.client_order_id);
           if (!known || !RECONCILE_STATES.has(known.state)) {
@@ -926,6 +989,59 @@ export class BoxOrderManager {
         this.pump();
       });
     }
+  }
+
+  /** Take a scheduling slot. Paired with {@link releaseSlot} in the execution's `finally`. */
+  private occupySlot(action: QueueAction, slot: BoxSchedulingSlot): void {
+    this.inFlight++;
+    if (slot === "base") this.baseInFlight++;
+    else {
+      this.burstInFlight++;
+      this.entryBurstGrants++;
+    }
+    if (BoxOrderManager.purposeOf(action) === "ENTRY") {
+      this.entryInFlight++;
+      this.entryAttemptInFlight = BoxOrderManager.attemptOf(action);
+      if (this.entryInFlight > this.peakEntryBurstWidth) this.peakEntryBurstWidth = this.entryInFlight;
+    } else {
+      this.nonEntryInFlight++;
+    }
+  }
+
+  /** Give a scheduling slot back. Clamped at zero so a double release cannot corrupt admission. */
+  private releaseSlot(action: QueueAction, slot: BoxSchedulingSlot): void {
+    this.inFlight = Math.max(0, this.inFlight - 1);
+    if (slot === "base") this.baseInFlight = Math.max(0, this.baseInFlight - 1);
+    else this.burstInFlight = Math.max(0, this.burstInFlight - 1);
+    if (BoxOrderManager.purposeOf(action) === "ENTRY") {
+      this.entryInFlight = Math.max(0, this.entryInFlight - 1);
+      // The pipeline owns the ENTRY slot set only while at least one of its legs is in flight.
+      // Clearing at zero is what lets the NEXT candidate start once this Box is fully settled.
+      if (this.entryInFlight === 0) this.entryAttemptInFlight = null;
+    } else {
+      this.nonEntryInFlight = Math.max(0, this.nonEntryInFlight - 1);
+    }
+  }
+
+  /** Entry-burst observations for diagnostics. Bounded, low-cardinality. */
+  entryBurstDiagnostics(): {
+    configured_entry_submit_concurrency: number;
+    base_concurrency: number;
+    peak_entry_submissions_in_flight: number;
+    burst_slot_grants: number;
+    base_in_flight: number;
+    burst_in_flight: number;
+    entry_attempt_in_flight: string | null;
+  } {
+    return {
+      configured_entry_submit_concurrency: clampEntrySubmitConcurrency(this.deps.limits.entrySubmitConcurrency),
+      base_concurrency: this.deps.limits.maxConcurrentExecutions,
+      peak_entry_submissions_in_flight: this.peakEntryBurstWidth,
+      burst_slot_grants: this.entryBurstGrants,
+      base_in_flight: this.baseInFlight,
+      burst_in_flight: this.burstInFlight,
+      entry_attempt_in_flight: this.entryAttemptInFlight,
+    };
   }
 
   /** Re-check mutable gates at the last safe point before any broker mutation. */

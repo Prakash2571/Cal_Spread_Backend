@@ -14,6 +14,10 @@
  *   strikes each side            3  (ATM ± 3 → at most 7 strikes → 21 pairs)
  */
 
+import {
+  ENTRY_SUBMIT_CONCURRENCY_MAX,
+  ENTRY_SUBMIT_CONCURRENCY_MIN,
+} from "./executionSchedulingPolicy.js";
 import type { BoxQueueModel, BoxScannerConfigSnapshot, ExecutionMode } from "./types.js";
 
 function num(name: string, fallback: number): number {
@@ -451,8 +455,65 @@ export interface BoxConfig {
   liveCancelTimeoutMs: number;
   liveMaxModifications: number;
   liveMaxChaseTicks: number;
-  /** Minimum interval between broker transport calls. */
+  /**
+   * Minimum interval between GENERAL broker transport calls: order-status polls, order
+   * lists, positions, margins and health.
+   *
+   * NOTE the narrowed meaning. This knob used to pace order placement too. Placement is now
+   * governed by {@link liveBrokerOrderMinIntervalMs}, because a poll cadence we chose and a
+   * rate limit the broker enforces are different things and should not share one number.
+   * Existing deployments see no change to polling behaviour.
+   */
   liveBrokerMinIntervalMs: number;
+  /**
+   * Minimum interval between ORDER MUTATIONS (place / modify / cancel), in ms.
+   *
+   * `0` (the default) means "derive from the broker's published limit" — see
+   * `brokerPacing.ts` for the per-broker profiles and their citations. A positive value is an
+   * operator override and is CLAMPED UP to the broker's hard floor: this is a real rate limit,
+   * so it can be relaxed towards the floor but never below it, and never to zero.
+   */
+  liveBrokerOrderMinIntervalMs: number;
+  /**
+   * How many Box ENTRY role submissions may be in transport simultaneously (1..4).
+   *
+   * Scoped to ONE Box pipeline (`attempt_id`) and to `purpose === "ENTRY"` only. See the BOX
+   * ENTRY BURST POLICY section of `executionSchedulingPolicy.ts` for why this is not a global
+   * concurrency increase and cannot be used to bypass contract reservations.
+   *
+   * Defaults to `1`, which is EXACTLY the pre-existing behaviour. Production deployments
+   * wanting the four-leg burst should set `4`.
+   */
+  liveEntrySubmitConcurrency: number;
+  /**
+   * Maximum gross entry-order notional (₹) permitted for ONE four-leg Box. `0` disables.
+   *
+   * This is `SUM(|limit_price x quantity|)` over the four bounded LIMIT requests. It is NOT
+   * broker margin — see `boxCapital.ts`, which explains at length why conflating the two would
+   * mislead an operator by roughly an order of magnitude.
+   */
+  liveMaxBoxCapitalRupees: number;
+
+  // ---- Strategy-level entry restrictions (apply to ENTRY only, never to reduction) ----
+  /**
+   * Permit at most one active Box per UNDERLYING, regardless of strike pair, expiry or
+   * direction. Defaults to `false` for backwards compatibility.
+   *
+   * An ADDITIONAL layer on top of the existing exact-contract reservations, never a
+   * replacement. See `underlyingLock.ts`.
+   */
+  oneActiveBoxPerUnderlying: boolean;
+  /**
+   * Maximum COMPLETE Box lifecycles (ENTRY → HOLD → EXIT → FLAT) an armed session may run.
+   * `0` = unlimited (default), `1` = one-shot, `N` = N cycles. See `tradingSession.ts`.
+   */
+  sessionMaxCompletedTrades: number;
+  /**
+   * Paper mirror of {@link liveMaxBoxCapitalRupees}, for `live_parity` validation. `0`
+   * disables. LIVE remains the authoritative safety gate; this exists so a paper run can
+   * exercise the same admission arithmetic.
+   */
+  paperMaxBoxCapitalRupees: number;
 
   // ---- paper_legging: four independent orders ----
   /** How the four legs are submitted: "parallel" (default) or "sequential". */
@@ -972,6 +1033,24 @@ export function loadBoxConfig(): BoxConfig {
     liveMaxModifications: clampInt("BOX_LIVE_MAX_MODIFICATIONS", 2, 0, 10),
     liveMaxChaseTicks: clampInt("BOX_LIVE_MAX_CHASE_TICKS", 2, 0, 20),
     liveBrokerMinIntervalMs: clampInt("BOX_LIVE_BROKER_MIN_INTERVAL_MS", 250, 50, 5_000),
+    // 0 = derive from the broker's published order-placement limit. A positive value is an
+    // operator override, clamped UP to the broker floor by resolveBrokerPacing().
+    liveBrokerOrderMinIntervalMs: clampInt("BOX_LIVE_BROKER_ORDER_MIN_INTERVAL_MS", 0, 0, 5_000),
+    // 1 = exactly the pre-existing serialised behaviour. Set 4 for the four-leg entry burst.
+    liveEntrySubmitConcurrency: clampInt(
+      "BOX_LIVE_ENTRY_SUBMIT_CONCURRENCY",
+      ENTRY_SUBMIT_CONCURRENCY_MIN,
+      ENTRY_SUBMIT_CONCURRENCY_MIN,
+      ENTRY_SUBMIT_CONCURRENCY_MAX,
+    ),
+    // 0 = disabled, so an existing deployment upgrading to this build is unaffected. The upper
+    // bound is deliberately generous (₹100 crore): this is a per-Box notional cap, and clamping
+    // it low would silently weaken an operator's intended limit.
+    liveMaxBoxCapitalRupees: clampInt("BOX_LIVE_MAX_BOX_CAPITAL_RUPEES", 0, 0, 1_000_000_000),
+
+    oneActiveBoxPerUnderlying: bool("BOX_ONE_ACTIVE_BOX_PER_UNDERLYING", false),
+    sessionMaxCompletedTrades: clampInt("BOX_SESSION_MAX_COMPLETED_TRADES", 0, 0, 10_000),
+    paperMaxBoxCapitalRupees: clampInt("BOX_PAPER_MAX_BOX_CAPITAL_RUPEES", 0, 0, 1_000_000_000),
 
     legExecutionMode:
       (process.env.BOX_LEG_EXECUTION_MODE?.trim().toLowerCase() === "sequential"
@@ -1128,6 +1207,13 @@ export function configSnapshot(cfg: BoxConfig): BoxScannerConfigSnapshot {
     live_max_modifications: cfg.liveMaxModifications,
     live_max_chase_ticks: cfg.liveMaxChaseTicks,
     live_broker_min_interval_ms: cfg.liveBrokerMinIntervalMs,
+    // Frozen onto the trade so an execution stays interpretable after these are retuned:
+    // "why were the legs 250ms apart?" must be answerable from the document alone.
+    live_broker_order_min_interval_ms: cfg.liveBrokerOrderMinIntervalMs,
+    live_entry_submit_concurrency: cfg.liveEntrySubmitConcurrency,
+    live_max_box_capital_rupees: cfg.liveMaxBoxCapitalRupees,
+    one_active_box_per_underlying: cfg.oneActiveBoxPerUnderlying,
+    session_max_completed_trades: cfg.sessionMaxCompletedTrades,
     // Executable-order-pricing knobs, frozen so a paper_legging fill stays
     // interpretable after the defaults are retuned.
     leg_max_chase_ticks: cfg.legMaxChaseTicks,

@@ -16,6 +16,13 @@ import {
   type BrokerPosition,
   type BrokerRejectFamily,
 } from "./brokerAdapter.js";
+import {
+  type BrokerPacingClass,
+  type EffectiveBrokerPacing,
+  resolveBrokerPacing,
+  TransportPacer,
+  type TransportPacerStats,
+} from "./brokerPacing.js";
 import type { BoxConfig } from "./config.js";
 import type { ExecutionTimingRecorder } from "./executionTiming.js";
 import type { ExecutionMode, IBoxOrderIntent, OrderSide } from "./types.js";
@@ -248,7 +255,19 @@ export interface KiteBrokerAdapterConfig {
   workingTimeoutMs: number;
   partialTimeoutMs: number;
   cancelTimeoutMs: number;
+  /**
+   * GENERAL transport pacing: order-status polls, order lists, positions, margins, health.
+   *
+   * This is also the poll cadence in `waitForResolution` / `confirmTerminalAfterCancel`, and
+   * its meaning is unchanged. ORDER MUTATIONS are paced separately — see {@link pacing}.
+   */
   brokerMinIntervalMs: number;
+  /**
+   * The resolved order-mutation vs general pacing. Optional so an existing test that builds a
+   * config literal keeps compiling; absent, it is derived from `brokerMinIntervalMs` and the
+   * broker's published order limit.
+   */
+  pacing?: EffectiveBrokerPacing;
   maxModifications: number;
   maxChaseTicks: number;
 }
@@ -262,6 +281,7 @@ export function kiteAdapterConfigFromBoxConfig(cfg: BoxConfig): KiteBrokerAdapte
     partialTimeoutMs: cfg.livePartialTimeoutMs,
     cancelTimeoutMs: cfg.liveCancelTimeoutMs,
     brokerMinIntervalMs: cfg.liveBrokerMinIntervalMs,
+    pacing: resolveBrokerPacing("zerodha", cfg.liveBrokerMinIntervalMs, cfg.liveBrokerOrderMinIntervalMs),
     maxModifications: cfg.liveMaxModifications,
     maxChaseTicks: cfg.liveMaxChaseTicks,
   };
@@ -277,8 +297,7 @@ export class KiteBrokerAdapter implements BrokerAdapter {
   private readonly orders = new Map<string, BrokerOrder>();
   private readonly clientByBroker = new Map<string, string>();
   private readonly modifications = new Map<string, number>();
-  private lastTransportAt = Number.NEGATIVE_INFINITY;
-  private transportTail: Promise<void> = Promise.resolve();
+  private readonly pacer: TransportPacer;
 
   constructor(
     private readonly transport: KiteBrokerTransport,
@@ -290,7 +309,23 @@ export class KiteBrokerAdapter implements BrokerAdapter {
       now: Date.now,
       wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     },
-  ) {}
+  ) {
+    this.pacer = new TransportPacer(
+      this.config.pacing ??
+        resolveBrokerPacing("zerodha", this.config.brokerMinIntervalMs, 0),
+      this.clock,
+    );
+  }
+
+  /** The pacing actually in force, for diagnostics. Never a configured-but-unused value. */
+  effectivePacing(): EffectiveBrokerPacing {
+    return this.pacer.effective();
+  }
+
+  /** Observed pacing cost, for diagnostics. */
+  pacingStats(): TransportPacerStats {
+    return this.pacer.stats();
+  }
 
   prepareOrder(req: BrokerOrderRequest): BrokerOrderRequest {
     return {
@@ -336,7 +371,7 @@ export class KiteBrokerAdapter implements BrokerAdapter {
           price: req.pricing.limit_price,
           tag: order.tag as string,
         });
-      });
+      }, "order_mutation");
       this.mark(req.client_order_id, "http_response");
     } catch (error) {
       if (error instanceof BrokerPreSubmitRefusedError) {
@@ -418,7 +453,7 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     // because the race starts the moment we commit to cancelling.
     this.mark(clientOrderId, "cancel_requested");
     await withDeadline(
-      this.call(() => this.transport.cancelOrder(order.broker_order_id as string)),
+      this.call(() => this.transport.cancelOrder(order.broker_order_id as string), "order_mutation"),
       this.config.cancelTimeoutMs,
       "Kite cancellation timed out; reconciliation is required.",
     ).catch((error) => {
@@ -459,7 +494,7 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     await this.call(() => this.transport.modifyOrder(order.broker_order_id as string, {
       price: request.limit_price,
       ...(request.quantity !== undefined ? { quantity: request.quantity } : {}),
-    }));
+    }), "order_mutation");
     this.modifications.set(clientOrderId, count + 1);
     order.limit_price = request.limit_price;
     order.pricing = { ...order.pricing, limit_price: request.limit_price };
@@ -692,7 +727,7 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     this.mark(order.client_order_id, "cancel_requested");
     try {
       await withDeadline(
-        this.call(() => this.transport.cancelOrder(order.broker_order_id as string)),
+        this.call(() => this.transport.cancelOrder(order.broker_order_id as string), "order_mutation"),
         this.config.cancelTimeoutMs,
         "Protective cancellation timed out.",
       );
@@ -773,16 +808,15 @@ export class KiteBrokerAdapter implements BrokerAdapter {
     if (!this.isEnabled()) throw new BrokerDisabledError();
   }
 
-  private call<T>(operation: () => Promise<T>): Promise<T> {
-    const run = this.transportTail.then(async () => {
-      const wait = this.config.brokerMinIntervalMs - (this.clock.now() - this.lastTransportAt);
-      if (wait > 0) await this.clock.wait(wait);
-      this.lastTransportAt = this.clock.now();
-      return operation();
-    });
-    // Keep the pacing chain alive after failures without hiding the caller's error.
-    this.transportTail = run.then(() => undefined, () => undefined);
-    return run;
+  /**
+   * Paced transport. Every broker touch goes through here.
+   *
+   * `klass` defaults to `"general"` so an unclassified call gets the SLOWER interval; only
+   * place / modify / cancel opt into the order-mutation rate. See `brokerPacing.ts` for why
+   * the two are separated and how the absolute floor still bounds total request rate.
+   */
+  private call<T>(operation: () => Promise<T>, klass: BrokerPacingClass = "general"): Promise<T> {
+    return this.pacer.run(operation, klass);
   }
 }
 

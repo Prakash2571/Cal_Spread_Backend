@@ -27,6 +27,13 @@
  */
 
 import {
+  type BrokerPacingClass,
+  type EffectiveBrokerPacing,
+  resolveBrokerPacing,
+  TransportPacer,
+  type TransportPacerStats,
+} from "./brokerPacing.js";
+import {
   assertBoundedLimit,
   BrokerAmbiguousSubmitError,
   BrokerDisabledError,
@@ -82,7 +89,18 @@ export interface DhanAdapterConfig {
   workingTimeoutMs: number;
   partialTimeoutMs: number;
   cancelTimeoutMs: number;
+  /**
+   * GENERAL transport pacing: order-status polls, order/position lists, funds, profile.
+   *
+   * Also the poll cadence in `waitForTerminal` / `protectiveCancelAndConfirm`. Unchanged in
+   * meaning. ORDER MUTATIONS are paced separately — see {@link pacing}.
+   */
   brokerMinIntervalMs: number;
+  /**
+   * Resolved order-mutation vs general pacing. Optional so existing config literals in tests
+   * keep compiling; absent, it is derived from `brokerMinIntervalMs` and Dhan's floor.
+   */
+  pacing?: EffectiveBrokerPacing;
   maxModifications: number;
   maxChaseTicks: number;
   dhanClientId: () => string;
@@ -117,6 +135,7 @@ export function dhanAdapterConfigFromBoxConfig(
     partialTimeoutMs: cfg.livePartialTimeoutMs,
     cancelTimeoutMs: cfg.liveCancelTimeoutMs,
     brokerMinIntervalMs: cfg.liveBrokerMinIntervalMs,
+    pacing: resolveBrokerPacing("dhan", cfg.liveBrokerMinIntervalMs, cfg.liveBrokerOrderMinIntervalMs),
     maxModifications: cfg.liveMaxModifications,
     maxChaseTicks: cfg.liveMaxChaseTicks,
     ...deps,
@@ -206,13 +225,27 @@ export class DhanBrokerAdapter implements BrokerAdapter {
   private readonly clientByBroker = new Map<string, string>();
   private readonly clientByCorrelation = new Map<string, string>();
   private readonly modifications = new Map<string, number>();
-  private transportTail: Promise<unknown> = Promise.resolve();
-  private lastTransportAt = 0;
+  private readonly pacer: TransportPacer;
 
   constructor(
     private readonly client: DhanClient,
     private readonly cfg: DhanAdapterConfig,
-  ) {}
+  ) {
+    this.pacer = new TransportPacer(
+      this.cfg.pacing ?? resolveBrokerPacing("dhan", this.cfg.brokerMinIntervalMs, 0),
+      { now: () => Date.now(), wait: (ms) => sleep(ms) },
+    );
+  }
+
+  /** The pacing actually in force, for diagnostics. */
+  effectivePacing(): EffectiveBrokerPacing {
+    return this.pacer.effective();
+  }
+
+  /** Observed pacing cost, for diagnostics. */
+  pacingStats(): TransportPacerStats {
+    return this.pacer.stats();
+  }
 
   /** The correlation id for a client order id (also usable by callers/tests). */
   correlationFor(clientOrderId: string): string {
@@ -253,17 +286,16 @@ export class DhanBrokerAdapter implements BrokerAdapter {
     }
   }
 
-  /** Serialized, self-paced transport (one broker call at a time). */
-  private async call<T>(op: () => Promise<T>): Promise<T> {
-    const run = async (): Promise<T> => {
-      const gap = this.cfg.brokerMinIntervalMs - (Date.now() - this.lastTransportAt);
-      if (gap > 0) await sleep(gap);
-      this.lastTransportAt = Date.now();
-      return op();
-    };
-    const scheduled = this.transportTail.then(run, run);
-    this.transportTail = scheduled.catch(() => undefined);
-    return scheduled;
+  /**
+   * Serialized, self-paced transport (one broker call at a time).
+   *
+   * `klass` defaults to `"general"`, so an unclassified call is paced by the SLOWER interval.
+   * Only place / modify / cancel opt into Dhan's order-mutation rate. Note Dhan additionally
+   * paces every HTTP call at `DHAN_MIN_INTERVAL_MS` inside src/brokers/dhan/http.ts, which is
+   * why the Dhan order floor in brokerPacing.ts matches that value rather than going lower.
+   */
+  private call<T>(op: () => Promise<T>, klass: BrokerPacingClass = "general"): Promise<T> {
+    return this.pacer.run(op, klass);
   }
 
   /** Attach the deterministic correlation id. Pure — no transport. */
@@ -322,7 +354,7 @@ export class DhanBrokerAdapter implements BrokerAdapter {
           quantity: req.quantity,
           price: req.pricing.limit_price,
         });
-      });
+      }, "order_mutation");
       this.mark(req.client_order_id, "http_response");
     } catch (err) {
       if (err instanceof BrokerPreSubmitRefusedError) {
@@ -474,7 +506,7 @@ export class DhanBrokerAdapter implements BrokerAdapter {
       // moment we commit to cancelling.
       this.mark(clientOrderId, "cancel_requested");
       try {
-        await this.call(() => this.client.cancelOrder(order.broker_order_id!));
+        await this.call(() => this.client.cancelOrder(order.broker_order_id!), "order_mutation");
         // Dhan accepted the cancel REQUEST. Not a cancellation: the loop below keeps confirming
         // precisely because the order may be filling right now.
         this.mark(clientOrderId, "cancel_acknowledged");
@@ -675,6 +707,7 @@ export class DhanBrokerAdapter implements BrokerAdapter {
         ...(request.quantity !== undefined ? { quantity: request.quantity } : {}),
         validity: "DAY",
       }),
+      "order_mutation",
     );
     known.pricing = { ...known.pricing, limit_price: request.limit_price };
     known.limit_price = request.limit_price;

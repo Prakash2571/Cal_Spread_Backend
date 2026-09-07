@@ -219,6 +219,11 @@ const scannerConfigSchema = new mongoose.Schema(
     live_max_modifications: { type: Number, default: null },
     live_max_chase_ticks: { type: Number, default: null },
     live_broker_min_interval_ms: { type: Number, default: null },
+    live_broker_order_min_interval_ms: { type: Number, default: null },
+    live_entry_submit_concurrency: { type: Number, default: null },
+    live_max_box_capital_rupees: { type: Number, default: null },
+    one_active_box_per_underlying: { type: Boolean, default: null },
+    session_max_completed_trades: { type: Number, default: null },
     // Executable-order-pricing knobs a paper_legging fill was taken under. All
     // optional/defaulted so trades written before they existed keep loading.
     leg_max_chase_ticks: { type: Number, default: null },
