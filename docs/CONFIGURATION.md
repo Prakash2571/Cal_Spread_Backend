@@ -299,3 +299,9 @@ Charge reconciliation: `BOX_RECONCILE_CHARGES`, `BOX_REQUIRE_PRICED_CHARGES`,
 `BOX_PNL_ARCHIVE_HOUR`, `BOX_PNL_ARCHIVE_DRAIN_DELAY_MS`, `BOX_PNL_VERIFY_HOURS`,
 `BOX_PNL_CACHE_ENABLED`, `BOX_PNL_CACHE_INTERVAL_MS`, `BOX_PNL_CACHE_TTL_SEC`,
 `BOX_CLOSED_CACHE_ENABLED`, `BOX_CLOSED_CACHE_TTL_SEC`, `BOX_METRICS_WINDOW`.
+
+Completed `box_pnl_deletions` fences are retained permanently by design. Each is a
+small, bounded document and prevents a delayed writer in another process from
+resurrecting a deleted trade's reporting row. This is an explicit storage-for-safety
+tradeoff; pending candidate-day metadata is capped, and `box_pnl_day_states` uses a
+fixed-size row count plus SHA-256 content proof rather than per-trade ID arrays.

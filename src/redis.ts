@@ -209,10 +209,12 @@ export async function del(...keys: string[]): Promise<void> {
  * Upstash returns HGETALL either as a flat [field, value, ...] array or as an
  * object depending on the deployment, so both shapes are accepted.
  */
-export async function hGetAllJson<T>(key: string): Promise<Map<string, T>> {
+export async function hGetAllJsonWithStatus<T>(
+  key: string,
+): Promise<{ available: boolean; values: Map<string, T> }> {
   const out = new Map<string, T>();
   const raw = await command(["HGETALL", KEY_PREFIX + key]);
-  if (!raw) return out;
+  if (raw === null) return { available: false, values: out };
   const put = (field: unknown, value: unknown) => {
     if (typeof field !== "string" || typeof value !== "string") return;
     const parsed = parseJson<T>(value);
@@ -223,7 +225,11 @@ export async function hGetAllJson<T>(key: string): Promise<Map<string, T>> {
   } else if (typeof raw === "object") {
     for (const [f, v] of Object.entries(raw as Record<string, unknown>)) put(f, v);
   }
-  return out;
+  return { available: true, values: out };
+}
+
+export async function hGetAllJson<T>(key: string): Promise<Map<string, T>> {
+  return (await hGetAllJsonWithStatus<T>(key)).values;
 }
 
 /**

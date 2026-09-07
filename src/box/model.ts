@@ -729,6 +729,8 @@ const boxDailyPnlSchema = new mongoose.Schema(
 // One document per (day, trade). The upsert key that makes re-draining idempotent:
 // a verify pass can safely re-write a row the 9 PM drain already wrote.
 boxDailyPnlSchema.index({ day: 1, trade_id: 1 }, { unique: true, name: "box_daily_pnl_day_trade" });
+// Cross-day deletion cleanup pages by trade without scanning the whole archive.
+boxDailyPnlSchema.index({ trade_id: 1, day: 1 }, { name: "box_daily_pnl_trade_day" });
 
 export interface BoxDailyPnlRecord extends IBoxDailyPnl {
   _id: mongoose.Types.ObjectId;
@@ -738,6 +740,98 @@ export interface BoxDailyPnlRecord extends IBoxDailyPnl {
 export const BoxDailyPnl = boxModel<IBoxDailyPnl>(
   "BoxDailyPnl",
   boxDailyPnlSchema as unknown as mongoose.Schema<IBoxDailyPnl>,
+);
+
+/**
+ * Durable deletion fence for reporting rows.
+ *
+ * Pending means only that a source delete was prepared; it does not invalidate a
+ * row while the source still exists. Completed fences are retained permanently
+ * so late writers cannot resurrect deleted P&L. This intentionally trades a
+ * compact document per deleted trade for cross-process deletion safety.
+ */
+export interface IBoxPnlDeletion {
+  _id: string;
+  status: "pending" | "complete";
+  candidate_days: string[];
+  attempts: number;
+  created_at: Date;
+  updated_at: Date;
+  completed_at: Date | null;
+  last_error: string | null;
+}
+
+const boxPnlDeletionSchema = new mongoose.Schema<IBoxPnlDeletion>(
+  {
+    _id: { type: String },
+    status: { type: String, enum: ["pending", "complete"], default: "pending" },
+    candidate_days: { type: [String], default: [] },
+    attempts: { type: Number, default: 0 },
+    created_at: { type: Date, default: () => new Date() },
+    updated_at: { type: Date, default: () => new Date() },
+    completed_at: { type: Date, default: null },
+    last_error: { type: String, default: null },
+  },
+  { collection: "box_pnl_deletions" },
+);
+
+// Startup repair pages only pending intents while completed fences accumulate.
+boxPnlDeletionSchema.index({ status: 1, _id: 1 }, { name: "box_pnl_deletions_status_id" });
+
+/** Durable per-trade reporting-cleanup intents and permanent deletion fences. */
+export const BoxPnlDeletion = boxModel<IBoxPnlDeletion>(
+  "BoxPnlDeletion",
+  boxPnlDeletionSchema,
+);
+
+/**
+ * Completion manifest for an exact durable day snapshot. A summary document by
+ * itself is not proof of completeness because an incremental drain can fail
+ * before a newly discovered row lands.
+ */
+export interface IBoxPnlDayState {
+  _id: string;
+  complete: boolean;
+  snapshot_version?: number;
+  row_count?: number;
+  content_sha256?: string;
+  needs_reproof?: boolean;
+  /** Read-only compatibility with pre-v2 state documents; never written again. */
+  expected_trade_ids?: string[];
+  updated_at: Date;
+}
+
+const boxPnlDayStateSchema = new mongoose.Schema<IBoxPnlDayState>(
+  {
+    _id: { type: String },
+    complete: { type: Boolean, default: false },
+    snapshot_version: { type: Number, default: null },
+    row_count: { type: Number, default: null },
+    content_sha256: { type: String, default: null },
+    needs_reproof: { type: Boolean, default: false },
+    // Kept in the additive schema only so old manifests can be recognized and
+    // compacted. New state is a constant-size count + SHA-256 proof.
+    expected_trade_ids: { type: [String], required: false, default: undefined },
+    updated_at: { type: Date, default: () => new Date() },
+  },
+  { collection: "box_pnl_day_states" },
+);
+
+// The five-minute repair pass keyset-pages both apparently complete v2 states
+// (to catch a row-write crash before post-invalidation) and explicit retries.
+boxPnlDayStateSchema.index(
+  { snapshot_version: 1, complete: 1, _id: 1 },
+  { name: "box_pnl_day_states_v2_complete_id" },
+);
+boxPnlDayStateSchema.index(
+  { snapshot_version: 1, needs_reproof: 1, _id: 1 },
+  { name: "box_pnl_day_states_v2_reproof_id" },
+);
+
+/** Durable proof that a day-bounded archive generation settled completely. */
+export const BoxPnlDayState = boxModel<IBoxPnlDayState>(
+  "BoxPnlDayState",
+  boxPnlDayStateSchema,
 );
 
 /* ------------------------------ box settings ------------------------------ */

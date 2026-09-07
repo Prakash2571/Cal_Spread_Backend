@@ -1,24 +1,4 @@
-/**
- * The nightly box-P&L archiver.
- *
- * WHAT IT DOES
- *   - While the day is live, mirrors the running net P&L of the day's box trades
- *     (open positions + trades closed today) to Redis on a slow cadence.
- *   - At a configured hour (default 21:00 IST) drains that day's cached P&L into
- *     the `box_daily_pnl` Mongo collection, STREAMED — one document at a time with
- *     a small delay — so the transfer never lands as a single bulk write.
- *   - At later hours (default 22:00 and 23:00 IST) re-checks the day and finishes
- *     anything the first drain missed. Every upsert is idempotent, so re-draining
- *     a row that already made it across is harmless.
- *
- * WHAT IT IS NOT
- *   Not the source of truth for a trade — that is always `box_trades`, written on
- *   entry and exit exactly as before. This is a reporting mirror + archive of the
- *   day's P&L view, gated behind BOX_PNL_CACHE_ENABLED and entirely inert when off.
- *
- * All I/O is injected so the orchestration can be unit-tested without Redis, Mongo
- * or a clock, and so this file never imports the engine (which would be circular).
- */
+/** Nightly Box P&L cache mirror and streamed durable archive. */
 
 import type { BoxConfig } from "./config.js";
 import type { BoxPnlCache } from "./pnlCache.js";
@@ -27,6 +7,7 @@ import {
   SUMMARY_FIELD,
   buildDaySnapshot,
   missingRowIds,
+  summarizeDayRows,
   type BoxDailyPnlRow,
   type BoxDailyPnlSummary,
   type ClosedPnlInput,
@@ -37,56 +18,60 @@ import {
 export interface BoxPnlArchiverDeps {
   cfg: BoxConfig;
   cache: BoxPnlCache;
-  /** Live open positions' P&L, from the engine (in-memory, cheap). */
   getOpenPnl: () => OpenPnlInput[];
-  /** Trades closed at or after `sinceMs` — the "closed today" set. */
   loadClosedSince: (sinceMs: number) => Promise<ClosedPnlInput[]>;
-  /** Upsert one archived row (per-trade or the summary). */
   upsert: (doc: IBoxDailyPnl) => Promise<void>;
-  /** Trade ids already archived for a day. */
-  loadPersistedIds: (day: string) => Promise<string[]>;
-  /** IST day key (YYYY-MM-DD), injected so the archiver keeps no clock of its own. */
+  filterExistingTradeIds: (ids: string[]) => Promise<string[]>;
+  /** Exact day-bounded durable representation. Errors must propagate. */
+  loadPersistedDay: (day: string) => Promise<IBoxDailyPnl[]>;
+  isPersistedDayComplete: (day: string, docs: IBoxDailyPnl[]) => Promise<boolean>;
+  markPersistedDayIncomplete: (day: string) => Promise<void>;
+  markPersistedDayComplete: (day: string, docs: IBoxDailyPnl[]) => Promise<void>;
+  deletePersistedRows: (day: string, tradeIds: string[]) => Promise<number>;
+  /** Finish pending deletion intents and remove source-less archive rows. */
+  reconcileDurableOrphans: () => Promise<number>;
   istDayKey: () => string;
-  /** A Date whose UTC fields read as IST (i.e. now shifted by +5:30). */
   istNow: () => Date;
-  /** True when the box Mongo connection is live. */
   isDbEnabled: () => boolean;
+  /** Deterministic scheduler seams; production uses the native timer and clock. */
+  setReconcileTimeout?: (callback: () => void, delayMs: number) => NodeJS.Timeout;
+  clearReconcileTimeout?: (timer: NodeJS.Timeout) => void;
+  reconcileNowMs?: () => number;
 }
+
+const FULL_RECONCILE_INTERVAL_MS = 5 * 60_000;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Real epoch ms of IST-midnight for a YYYY-MM-DD day key. */
 export function istDayStartMs(day: string): number {
   return new Date(`${day}T00:00:00.000+05:30`).getTime();
 }
 
-/** Flatten a snapshot into archive documents: one per row, then the summary. */
 export function snapshotToDocs(
   day: string,
   rows: BoxDailyPnlRow[],
   summary: BoxDailyPnlSummary | null,
 ): IBoxDailyPnl[] {
-  const docs: IBoxDailyPnl[] = rows.map((r) => ({
+  const docs: IBoxDailyPnl[] = rows.map((row) => ({
     day,
-    trade_id: r.trade_id,
-    underlying: r.underlying,
-    direction: r.direction,
-    lower_strike: r.lower_strike,
-    upper_strike: r.upper_strike,
-    expiry: r.expiry,
-    status: r.status,
-    gross_pnl: r.gross_pnl,
-    net_pnl: r.net_pnl,
-    realisable_net_pnl: r.realisable_net_pnl,
-    realised_net_pnl: r.realised_net_pnl,
-    opened_at: r.opened_at,
-    closed_at: r.closed_at,
-    updated_at: r.updated_at,
+    trade_id: row.trade_id,
+    underlying: row.underlying,
+    direction: row.direction,
+    lower_strike: row.lower_strike,
+    upper_strike: row.upper_strike,
+    expiry: row.expiry,
+    status: row.status,
+    gross_pnl: row.gross_pnl,
+    net_pnl: row.net_pnl,
+    realisable_net_pnl: row.realisable_net_pnl,
+    realised_net_pnl: row.realised_net_pnl,
+    opened_at: row.opened_at,
+    closed_at: row.closed_at,
+    updated_at: row.updated_at,
   }));
   if (summary) {
-    // The summary is written LAST so a part-way drain never looks complete.
     docs.push({
       day,
       trade_id: SUMMARY_FIELD,
@@ -98,69 +83,168 @@ export function snapshotToDocs(
   return docs;
 }
 
+function persistedRows(docs: IBoxDailyPnl[]): BoxDailyPnlRow[] {
+  return docs.flatMap((doc) =>
+    doc.trade_id !== SUMMARY_FIELD && (doc.status === "open" || doc.status === "closed")
+      ? [doc as BoxDailyPnlRow]
+      : [],
+  );
+}
+
 export class BoxPnlArchiver {
   private cacheTimer: NodeJS.Timeout | null = null;
   private schedulerTimer: NodeJS.Timeout | null = null;
+  private durableRetryTimer: NodeJS.Timeout | null = null;
+  private durableRetryDueAt: number | null = null;
+  private durableReconcileInFlight: Promise<void> | null = null;
+  private queuedReconcileDelayMs: number | null = null;
+  private started = false;
+  private stopped = false;
   private lastArchivedDay = "";
-  /** `${hour}:${day}` markers so each verify hour fires once per day. */
   private verifiedMarks = new Set<string>();
-  private draining = false;
+  private deletedTradeIds = new Set<string>();
+  private lifecycleTail: Promise<void> = Promise.resolve();
   private lastSummary: BoxDailyPnlSummary | null = null;
 
   constructor(private deps: BoxPnlArchiverDeps) {}
 
-  /** The most recent summary written to the cache (for the status view). */
+  /** Serialize snapshots and the complete collect→drain lifecycle in-process. */
+  private runLifecycle<T>(work: () => Promise<T>): Promise<T> {
+    const previous = this.lifecycleTail;
+    let release!: () => void;
+    this.lifecycleTail = new Promise<void>((resolve) => { release = resolve; });
+    return (async () => {
+      await previous;
+      try {
+        return await work();
+      } finally {
+        release();
+      }
+    })();
+  }
+
+  /**
+   * Install the local fast-path tombstone immediately, then run deletion cleanup
+   * between complete archive lifecycles. Durable fencing is enforced separately
+   * by the repository so this is not relied on across processes.
+   */
+  async withTradeDeletion<T>(tradeId: string, cleanup: () => Promise<T>): Promise<T> {
+    this.deletedTradeIds.add(tradeId);
+    try {
+      return await this.runLifecycle(cleanup);
+    } finally {
+      // The durable fence and source checks take over after local cleanup.
+      this.deletedTradeIds.delete(tradeId);
+    }
+  }
+
+  /** Compatibility helper for callers/tests that only need the local barrier. */
+  async tombstoneTrade(tradeId: string): Promise<void> {
+    await this.withTradeDeletion(tradeId, async () => undefined);
+  }
+
+  /** Schedule or accelerate one deduplicated bounded full reconciliation pass. */
+  requestFullReconcile(delayMs = 30_000): void {
+    if (this.stopped || !this.deps.isDbEnabled()) return;
+    const boundedDelay = Math.min(FULL_RECONCILE_INTERVAL_MS, Math.max(0, delayMs));
+    if (this.durableReconcileInFlight) {
+      this.queuedReconcileDelayMs = this.queuedReconcileDelayMs === null
+        ? boundedDelay
+        : Math.min(this.queuedReconcileDelayMs, boundedDelay);
+      return;
+    }
+
+    const now = this.deps.reconcileNowMs?.() ?? Date.now();
+    const dueAt = now + boundedDelay;
+    if (this.durableRetryTimer && this.durableRetryDueAt !== null) {
+      if (this.durableRetryDueAt <= dueAt) return;
+      (this.deps.clearReconcileTimeout ?? clearTimeout)(this.durableRetryTimer);
+    }
+    const schedule = this.deps.setReconcileTimeout ?? setTimeout;
+    this.durableRetryDueAt = dueAt;
+    this.durableRetryTimer = schedule(() => {
+      this.durableRetryTimer = null;
+      this.durableRetryDueAt = null;
+      if (this.stopped) return;
+      void this.reconcileOnStartup().catch((err) => {
+        console.warn("[BoxPnl] full reconciliation retry failed:", err);
+      });
+    }, boundedDelay);
+    this.durableRetryTimer.unref?.();
+  }
+
+  /** Compatibility name retained for the engine deletion path. */
+  requestDurableReconcile(delayMs = 30_000): void {
+    this.requestFullReconcile(delayMs);
+  }
+
   getLastSummary(): BoxDailyPnlSummary | null {
     return this.lastSummary;
   }
 
-  /** Start the cache-mirror timer and the archive/verify scheduler. */
   start(): void {
+    if (this.started) return;
+    this.started = true;
+    this.stopped = false;
+    // Durable deletion intents exist independently of Redis/cache enablement.
+    if (this.deps.isDbEnabled()) {
+      void this.reconcileOnStartup().catch((err) => {
+        console.warn("[BoxPnl] startup reconcile failed:", err);
+        this.requestFullReconcile();
+      });
+    }
     if (!this.deps.cfg.pnlCacheEnabled) return;
     if (!this.cacheTimer) {
       this.cacheTimer = setInterval(() => {
-        void this.writeCacheSnapshot().catch((e) =>
-          console.warn("[BoxPnl] cache write failed:", e),
+        void this.writeCacheSnapshot().catch((err) =>
+          console.warn("[BoxPnl] cache write failed:", err),
         );
       }, this.deps.cfg.pnlCacheIntervalMs);
       this.cacheTimer.unref?.();
     }
     if (!this.schedulerTimer) {
       this.schedulerTimer = setInterval(() => {
-        void this.tick().catch((e) => console.warn("[BoxPnl] scheduler tick failed:", e));
+        void this.tick().catch((err) => console.warn("[BoxPnl] scheduler tick failed:", err));
       }, 60_000);
       this.schedulerTimer.unref?.();
     }
-    // Cover a process that came up AFTER the archive hour: catch today (and any
-    // still-pending earlier day) up immediately.
-    void this.reconcileOnStartup().catch((e) =>
-      console.warn("[BoxPnl] startup reconcile failed:", e),
-    );
     console.log(
       `[BoxPnl] daily P&L cache enabled — mirroring every ${Math.round(
         this.deps.cfg.pnlCacheIntervalMs / 1000,
       )}s, archiving at ${this.deps.cfg.pnlArchiveHour}:00 IST, verifying at ` +
-        `${this.deps.cfg.pnlVerifyHours.map((h) => `${h}:00`).join(", ")} IST.`,
+        `${this.deps.cfg.pnlVerifyHours.map((hour) => `${hour}:00`).join(", ")} IST.`,
     );
   }
 
   stop(): void {
+    this.started = false;
+    this.stopped = true;
     if (this.cacheTimer) clearInterval(this.cacheTimer);
     if (this.schedulerTimer) clearInterval(this.schedulerTimer);
+    if (this.durableRetryTimer) {
+      (this.deps.clearReconcileTimeout ?? clearTimeout)(this.durableRetryTimer);
+    }
     this.cacheTimer = null;
     this.schedulerTimer = null;
+    this.durableRetryTimer = null;
+    this.durableRetryDueAt = null;
+    this.queuedReconcileDelayMs = null;
   }
 
-  /** Build today's snapshot and mirror it to Redis. Returns the summary. */
   async writeCacheSnapshot(): Promise<BoxDailyPnlSummary | null> {
-    if (!this.deps.cfg.pnlCacheEnabled) return null;
-    const snap = await this.buildSnapshot(this.deps.istDayKey());
-    this.lastSummary = snap.summary;
-    if (this.deps.cache.enabled()) await this.deps.cache.writeSnapshot(snap);
-    return snap.summary;
+    return this.runLifecycle(async () => {
+      if (!this.deps.cfg.pnlCacheEnabled) return null;
+      const day = this.deps.istDayKey();
+      const snap = await this.buildSnapshot(day);
+      const rows = snap.rows.filter((row) => !this.deletedTradeIds.has(row.trade_id));
+      const summary = summarizeDayRows({ day, rows, nowIso: new Date().toISOString() });
+      const safeSnap = { day, rows, summary };
+      this.lastSummary = summary;
+      if (this.deps.cache.enabled()) await this.deps.cache.writeSnapshot(safeSnap);
+      return summary;
+    });
   }
 
-  /** Build the day's snapshot from live open positions + trades closed that day. */
   async buildSnapshot(day: string): Promise<DaySnapshot> {
     const sinceMs = istDayStartMs(day);
     const open = this.deps.getOpenPnl();
@@ -168,95 +252,141 @@ export class BoxPnlArchiver {
     return buildDaySnapshot({ day, open, closed, nowIso: new Date().toISOString() });
   }
 
-  /**
-   * Resolve the rows to archive for a day: the cache is authoritative (that is
-   * what "transfer from cache to Mongo" means), but if the cache is empty or
-   * unreachable we fall back to a freshly built snapshot so the day is never lost.
-   */
-  private async collectDay(day: string): Promise<{ docs: IBoxDailyPnl[]; source: "cache" | "fresh" }> {
+  private async collectDay(day: string): Promise<{
+    docs: IBoxDailyPnl[];
+    source: "cache" | "fresh" | "durable";
+  }> {
     const cached = await this.deps.cache.readDay(day);
-    if (cached.rows.length > 0 || cached.summary) {
-      return { docs: snapshotToDocs(day, cached.rows, cached.summary), source: "cache" };
+    const cachePresent = cached.present ?? (cached.rows.length > 0 || cached.summary !== null);
+    if (cachePresent) {
+      const existingIds = new Set(
+        await this.deps.filterExistingTradeIds(cached.rows.map((row) => row.trade_id)),
+      );
+      const rows = cached.rows.filter(
+        (row) => existingIds.has(row.trade_id) && !this.deletedTradeIds.has(row.trade_id),
+      );
+      const summary = summarizeDayRows({ day, rows, nowIso: new Date().toISOString() });
+      return { docs: snapshotToDocs(day, rows, summary), source: "cache" };
     }
-    const snap = await this.buildSnapshot(day);
-    return { docs: snapshotToDocs(day, snap.rows, snap.summary), source: "fresh" };
-  }
 
-  /**
-   * Stream a set of archive documents into Mongo, one at a time with a delay.
-   * Breaks on the first error so the remaining docs are retried on the next pass;
-   * upserts are idempotent, so re-sending an already-written doc is safe.
-   * Returns how many were written before stopping.
-   */
-  private async drain(docs: IBoxDailyPnl[]): Promise<{ written: number; complete: boolean }> {
-    if (this.draining) return { written: 0, complete: false };
-    this.draining = true;
-    let written = 0;
-    try {
-      for (const doc of docs) {
-        try {
-          await this.deps.upsert(doc);
-          written++;
-        } catch (err) {
-          console.error(`[BoxPnl] archive upsert failed for ${doc.day}/${doc.trade_id}:`, err);
-          return { written, complete: false };
-        }
-        if (this.deps.cfg.pnlArchiveDrainDelayMs > 0) {
-          await delay(this.deps.cfg.pnlArchiveDrainDelayMs);
-        }
+    if (day !== this.deps.istDayKey()) {
+      // A historical miss/outage must never be synthesized from current-open plus
+      // every close since D1. Only a completed, exact-day durable snapshot is safe.
+      let durable = await this.deps.loadPersistedDay(day);
+      let complete = await this.deps.isPersistedDayComplete(day, durable);
+      if (complete) {
+        // Legacy migration and concurrent cleanup may have rewritten the day.
+        // Reload and revalidate so callers never drain the pre-migration snapshot.
+        durable = await this.deps.loadPersistedDay(day);
+        complete = await this.deps.isPersistedDayComplete(day, durable);
       }
-      return { written, complete: true };
-    } finally {
-      this.draining = false;
+      const candidates = persistedRows(durable);
+      if (!complete || !durable.some((doc) => doc.trade_id === SUMMARY_FIELD)) {
+        throw new Error(`historical Box P&L snapshot for ${day} is unavailable or incomplete`);
+      }
+      const existingIds = new Set(
+        await this.deps.filterExistingTradeIds(candidates.map((row) => row.trade_id)),
+      );
+      const rows = candidates.filter(
+        (row) => existingIds.has(row.trade_id) && !this.deletedTradeIds.has(row.trade_id),
+      );
+      const summary = summarizeDayRows({ day, rows, nowIso: new Date().toISOString() });
+      return { docs: snapshotToDocs(day, rows, summary), source: "durable" };
     }
+
+    const snap = await this.buildSnapshot(day);
+    const rows = snap.rows.filter((row) => !this.deletedTradeIds.has(row.trade_id));
+    const summary = summarizeDayRows({ day, rows, nowIso: new Date().toISOString() });
+    return { docs: snapshotToDocs(day, rows, summary), source: "fresh" };
   }
 
-  /** Drain the whole day (9 PM pass). */
+  private async drain(
+    docs: IBoxDailyPnl[],
+    fullDayDocs: IBoxDailyPnl[] = docs,
+  ): Promise<{ written: number; complete: boolean }> {
+    let written = 0;
+    for (const doc of docs) {
+      const deletedRow = doc.trade_id !== SUMMARY_FIELD && this.deletedTradeIds.has(doc.trade_id);
+      const staleSummary = doc.trade_id === SUMMARY_FIELD && fullDayDocs.some(
+        (row) => row.trade_id !== SUMMARY_FIELD && this.deletedTradeIds.has(row.trade_id),
+      );
+      if (deletedRow || staleSummary) continue;
+      try {
+        await this.deps.upsert(doc);
+        written++;
+      } catch (err) {
+        console.error(`[BoxPnl] archive upsert failed for ${doc.day}/${doc.trade_id}:`, err);
+        return { written, complete: false };
+      }
+      if (this.deps.cfg.pnlArchiveDrainDelayMs > 0) {
+        await delay(this.deps.cfg.pnlArchiveDrainDelayMs);
+      }
+    }
+    return { written, complete: true };
+  }
+
   async archiveDay(day: string): Promise<{ ok: boolean; written: number; total: number }> {
+    return this.runLifecycle(() => this.archiveDayUnlocked(day));
+  }
+
+  private async archiveDayUnlocked(
+    day: string,
+  ): Promise<{ ok: boolean; written: number; total: number }> {
     if (!this.deps.isDbEnabled()) {
       console.warn(`[BoxPnl] archive skipped for ${day}: box DB not connected.`);
       return { ok: false, written: 0, total: 0 };
     }
     const { docs, source } = await this.collectDay(day);
-    if (docs.length === 0) {
-      console.log(`[BoxPnl] nothing to archive for ${day}.`);
-      await this.deps.cache.markArchived(day, 0, new Date().toISOString());
-      return { ok: true, written: 0, total: 0 };
-    }
+    await this.deps.markPersistedDayIncomplete(day);
     console.log(`[BoxPnl] archiving ${docs.length} P&L row(s) for ${day} (from ${source}), streaming...`);
     const { written, complete } = await this.drain(docs);
     if (complete) {
+      await this.deps.markPersistedDayComplete(day, docs);
       await this.deps.cache.markArchived(day, docs.length, new Date().toISOString());
       console.log(`[BoxPnl] archived ${written}/${docs.length} P&L row(s) for ${day}.`);
     } else {
       console.warn(
-        `[BoxPnl] archive for ${day} incomplete (${written}/${docs.length}) — will finish on the next verify pass.`,
+        `[BoxPnl] archive for ${day} incomplete (${written}/${docs.length}) — will finish on verify.`,
       );
     }
     return { ok: complete, written, total: docs.length };
   }
 
-  /** Re-check a day and drain only what is still missing (10/11 PM passes). */
   async verifyDay(day: string): Promise<{ ok: boolean; written: number; missing: number }> {
-    if (!this.deps.isDbEnabled()) return { ok: false, written: 0, missing: 0 };
-    const { docs } = await this.collectDay(day);
-    if (docs.length === 0) return { ok: true, written: 0, missing: 0 };
-
-    const persisted = await this.deps.loadPersistedIds(day);
-    const missing = missingRowIds(docs.map((d) => d.trade_id), persisted);
-    if (missing.length === 0) {
-      await this.deps.cache.markArchived(day, docs.length, new Date().toISOString());
-      console.log(`[BoxPnl] verify ${day}: complete, ${docs.length} row(s) already archived.`);
-      return { ok: true, written: 0, missing: 0 };
-    }
-    console.warn(`[BoxPnl] verify ${day}: ${missing.length} row(s) missing — draining them now.`);
-    const missingSet = new Set(missing);
-    const { written, complete } = await this.drain(docs.filter((d) => missingSet.has(d.trade_id)));
-    if (complete) await this.deps.cache.markArchived(day, docs.length, new Date().toISOString());
-    return { ok: complete, written, missing: missing.length };
+    return this.runLifecycle(() => this.verifyDayUnlocked(day));
   }
 
-  /** The 60-second scheduler tick — fires the archive and verify passes by IST hour. */
+  private async verifyDayUnlocked(
+    day: string,
+  ): Promise<{ ok: boolean; written: number; missing: number }> {
+    if (!this.deps.isDbEnabled()) return { ok: false, written: 0, missing: 0 };
+    const { docs } = await this.collectDay(day);
+    const desiredRows = docs.filter((doc) => doc.trade_id !== SUMMARY_FIELD);
+    const desiredIds = desiredRows.map((doc) => doc.trade_id);
+    await this.deps.markPersistedDayIncomplete(day);
+    const persisted = await this.deps.loadPersistedDay(day);
+    const persistedIds = persisted
+      .map((doc) => doc.trade_id)
+      .filter((id) => id !== SUMMARY_FIELD);
+    const desiredSet = new Set(desiredIds);
+    const extras = persistedIds.filter((id) => !desiredSet.has(id));
+    if (extras.length > 0) await this.deps.deletePersistedRows(day, extras);
+
+    const missingRows = missingRowIds(desiredIds, persistedIds);
+    // Re-upsert every survivor, not just missing ids: otherwise an existing stale
+    // row would make the repository's survivor-derived summary stale as well.
+    const toWrite = [...desiredRows];
+    const summary = docs.find((doc) => doc.trade_id === SUMMARY_FIELD);
+    if (summary) toWrite.push(summary);
+
+    const { written, complete } = await this.drain(toWrite, docs);
+    if (complete) {
+      await this.deps.markPersistedDayComplete(day, docs);
+      await this.deps.cache.markArchived(day, docs.length, new Date().toISOString());
+    }
+    return { ok: complete, written, missing: missingRows.length + extras.length };
+  }
+
   private async tick(): Promise<void> {
     if (!this.deps.cfg.pnlCacheEnabled) return;
     const ist = this.deps.istNow();
@@ -264,47 +394,83 @@ export class BoxPnlArchiver {
     const mm = ist.getUTCMinutes();
     const day = this.deps.istDayKey();
 
-    if (hh === this.deps.cfg.pnlArchiveHour && mm <= 2) {
-      if (this.lastArchivedDay !== day) {
-        this.lastArchivedDay = day;
-        console.log(`[BoxPnl] triggering ${this.deps.cfg.pnlArchiveHour}:00 IST archive for ${day}.`);
-        await this.archiveDay(day);
-      }
+    if (hh === this.deps.cfg.pnlArchiveHour && mm <= 2 && this.lastArchivedDay !== day) {
+      this.lastArchivedDay = day;
+      await this.archiveDay(day);
     }
-
     if (this.deps.cfg.pnlVerifyHours.includes(hh) && mm <= 2) {
       const mark = `${hh}:${day}`;
       if (!this.verifiedMarks.has(mark)) {
         this.verifiedMarks.add(mark);
-        console.log(`[BoxPnl] triggering ${hh}:00 IST verify for ${day}.`);
         await this.verifyDay(day);
       }
     }
   }
 
-  /**
-   * On boot, if the process is starting AFTER the archive hour, make sure today
-   * is archived, and finish any earlier day the cache still lists as pending.
-   */
   async reconcileOnStartup(): Promise<void> {
-    if (!this.deps.cfg.pnlCacheEnabled || !this.deps.isDbEnabled()) return;
-    const day = this.deps.istDayKey();
-    const hh = this.deps.istNow().getUTCHours();
+    if (!this.deps.isDbEnabled() || this.stopped) return;
+    if (this.durableReconcileInFlight) return this.durableReconcileInFlight;
 
-    // Earlier pending days first (a process that was down overnight).
-    const pending = await this.deps.cache.pendingDays();
-    for (const entry of pending) {
-      if (entry.day < day) {
-        console.log(`[BoxPnl] startup: finishing pending archive for ${entry.day}.`);
-        await this.verifyDay(entry.day);
+    let needsRetry = true;
+    const run = (async () => {
+      needsRetry = await this.runReconcilePass();
+    })();
+    this.durableReconcileInFlight = run;
+    try {
+      await run;
+    } finally {
+      if (this.durableReconcileInFlight === run) this.durableReconcileInFlight = null;
+      if (!this.stopped) {
+        const queued = this.queuedReconcileDelayMs;
+        this.queuedReconcileDelayMs = null;
+        if (queued !== null || needsRetry || this.started) {
+          this.requestFullReconcile(
+            queued ?? (needsRetry ? 30_000 : FULL_RECONCILE_INTERVAL_MS),
+          );
+        }
+      }
+    }
+  }
+
+  private async runReconcilePass(): Promise<boolean> {
+    let needsRetry = false;
+    try {
+      const repaired = await this.deps.reconcileDurableOrphans();
+      if (repaired > 0) console.warn(`[BoxPnl] startup repaired ${repaired} durable item(s).`);
+    } catch (err) {
+      needsRetry = true;
+      console.warn("[BoxPnl] startup orphan reconciliation failed:", err);
+    }
+
+    if (this.deps.cfg.pnlCacheEnabled) {
+      const day = this.deps.istDayKey();
+      let pending: Awaited<ReturnType<BoxPnlCache["pendingDays"]>> = [];
+      try {
+        pending = await this.deps.cache.pendingDays();
+      } catch (err) {
+        needsRetry = true;
+        console.warn("[BoxPnl] could not list pending archive days:", err);
+      }
+      for (const entry of pending) {
+        if (entry.day >= day) continue;
+        try {
+          await this.verifyDay(entry.day);
+        } catch (err) {
+          needsRetry = true;
+          console.warn(`[BoxPnl] startup reconcile failed for historical day ${entry.day}:`, err);
+        }
+      }
+      if (this.deps.istNow().getUTCHours() >= this.deps.cfg.pnlArchiveHour) {
+        this.lastArchivedDay = day;
+        try {
+          await this.verifyDay(day);
+        } catch (err) {
+          needsRetry = true;
+          console.warn(`[BoxPnl] startup reconcile failed for current day ${day}:`, err);
+        }
       }
     }
 
-    // Today, only if we are already past the archive hour.
-    if (hh >= this.deps.cfg.pnlArchiveHour) {
-      console.log(`[BoxPnl] startup after archive hour — reconciling ${day}.`);
-      this.lastArchivedDay = day;
-      await this.verifyDay(day);
-    }
+    return needsRetry;
   }
 }

@@ -87,16 +87,22 @@ import {
   allocateBoxTradeId,
   applyBoxPartialExit,
   applyBoxReconciledProjection,
+  cancelBoxPnlDeletion,
   closeBoxTrade,
   deleteBoxDailyPnlForTrade,
+  deleteBoxDailyPnlRows,
   deleteBoxTrade,
+  filterExistingBoxTradeIds,
   findBoxTradeById,
   insertBoxExecutionAttempt,
   insertBoxTrade,
+  isBoxDailyPnlSnapshotComplete,
   isBoxDbEnabled,
   isValidBoxId,
-  loadBoxDailyPnlTradeIds,
+  loadBoxDailyPnlSnapshot,
   loadBoxMarginIntervalsSince,
+  markBoxDailyPnlComplete,
+  markBoxDailyPnlIncomplete,
   loadBoxExecutionAttempts,
   loadBoxLiveRiskSeed,
   loadBoxSettings,
@@ -106,6 +112,8 @@ import {
   markBoxTradeRecovery,
   loadBoxCalibrationSamples,
   persistBoxCalibrationSamples,
+  prepareBoxPnlDeletion,
+  reconcileBoxDailyPnlOrphans,
   resolveBoxExecutionAttempt,
   updateBoxExecutionAttemptResidual,
   saveBoxSettings,
@@ -735,7 +743,13 @@ export class BoxEngine {
       getOpenPnl: () => this.openPnlInputs(),
       loadClosedSince: (sinceMs) => this.closedPnlInputs(sinceMs),
       upsert: (doc) => upsertBoxDailyPnl(doc),
-      loadPersistedIds: (day) => loadBoxDailyPnlTradeIds(day),
+      filterExistingTradeIds: (ids) => filterExistingBoxTradeIds(ids),
+      loadPersistedDay: (day) => loadBoxDailyPnlSnapshot(day),
+      isPersistedDayComplete: (day, ids) => isBoxDailyPnlSnapshotComplete(day, ids),
+      markPersistedDayIncomplete: (day) => markBoxDailyPnlIncomplete(day),
+      markPersistedDayComplete: (day, ids) => markBoxDailyPnlComplete(day, ids),
+      deletePersistedRows: (day, ids) => deleteBoxDailyPnlRows(day, ids),
+      reconcileDurableOrphans: () => reconcileBoxDailyPnlOrphans(),
       istDayKey: () => this.deps.istDayKey(),
       // A Date whose UTC fields read as IST, matching the EOD scheduler's clock.
       istNow: () => new Date(Date.now() + 5.5 * 60 * 60 * 1000),
@@ -2864,40 +2878,75 @@ export class BoxEngine {
       };
     }
 
-    const deletedCount = await deleteBoxTrade(id);
+    // Install the durable archive fence BEFORE the irreversible source delete.
+    // If the guarded delete loses its race, remove the unused pending fence.
+    await prepareBoxPnlDeletion(id);
+    let deletedCount: number;
+    try {
+      deletedCount = await deleteBoxTrade(id);
+    } catch (deleteErr) {
+      // A transport error is ambiguous: Mongo may have committed the delete. A
+      // source re-read resolves it when possible; otherwise retain the intent and
+      // actively retry reconciliation in this process (startup retries too).
+      let sourceAfterError: BoxTradeRecord | null;
+      try {
+        sourceAfterError = await findBoxTradeById(id);
+      } catch (resolveErr) {
+        this.pnlArchiver.requestDurableReconcile();
+        console.warn(`[Box] could not resolve ambiguous deletion of ${id}:`, resolveErr);
+        throw deleteErr;
+      }
+      if (sourceAfterError) {
+        await cancelBoxPnlDeletion(id).catch((cancelErr) => {
+          console.warn(`[Box] failed to cancel unused P&L deletion fence for ${id}:`, cancelErr);
+          this.pnlArchiver.requestDurableReconcile();
+        });
+        throw deleteErr;
+      }
+      console.warn(`[Box] deletion of ${id} committed despite an ambiguous response; continuing cleanup.`);
+      deletedCount = 1;
+    }
     if (deletedCount === 0) {
-      // The guarded filter refused it or it vanished between the read and here.
+      await cancelBoxPnlDeletion(id).catch((cancelErr) => {
+        console.warn(`[Box] failed to cancel unused P&L deletion fence for ${id}:`, cancelErr);
+        this.pnlArchiver.requestDurableReconcile();
+      });
       return { ok: false, code: 409, error: "The trade could not be deleted." };
     }
 
-    /* ---- 1. in-memory position book, and everything keyed off it ---- */
-    if (position) {
-      this.positions.remove(id);          // also frees the byKey / reserved entry
-      this.syncManagerExposure();         // exposure counts the manager enforces
-      this.marginBackfillTries.delete(id);
-      this.marginInFlight.delete(id);
-      // Interrupt any retry/evaluation state the monitor still holds, or the next
-      // cycle would re-persist the trade we just removed.
-      const wasHeld = this.monitor.forgetPosition(id);
-      if (wasHeld) {
-        console.warn(`[Box] deletion of ${id} interrupted in-flight monitor work for that trade.`);
+    await this.pnlArchiver.withTradeDeletion(id, async () => {
+      /* ---- 1. in-memory position book, and everything keyed off it ---- */
+      if (position) {
+        this.positions.remove(id);          // also frees the byKey / reserved entry
+        this.syncManagerExposure();         // exposure counts the manager enforces
+        this.marginBackfillTries.delete(id);
+        this.marginInFlight.delete(id);
+        const wasHeld = this.monitor.forgetPosition(id);
+        if (wasHeld) {
+          console.warn(`[Box] deletion of ${id} interrupted in-flight monitor work for that trade.`);
+        }
+        if (!this.running) this.shrinkToOpenPositions();
+        else this.maybeReleaseFeed();
       }
-      // Release feed subscriptions this position was the last claimant of. With the
-      // scanner stopped this narrows the token set; with it running the scanner's
-      // own universe keeps whatever it still wants, so nothing it needs is dropped.
-      if (!this.running) this.shrinkToOpenPositions();
-      else this.maybeReleaseFeed();
-    }
 
-    /* ---- 2. Redis mirrors (the only paths that ever remove a trade) ---- */
-    const day = this.deps.istDayKey();
-    await this.closedCache.evictTrade(day, id).catch(() => false);
-    await this.pnlCache.evictTrade(day, id).catch(() => false);
+      /* ---- 2. Redis mirrors (membership is checked before invalidation) ---- */
+      const day = this.deps.istDayKey();
+      await this.closedCache.evictTrade(day, id).catch(() => false);
+      const pnlEviction = await this.pnlCache.evictTradeEverywhere(id).catch(() => ({
+        days: [],
+        attempted_days: 0,
+        completed: false,
+      }));
 
-    /* ---- 3. the P&L archive, so a regenerated day cannot resurrect it ---- */
-    await deleteBoxDailyPnlForTrade(id).catch((err) =>
-      console.warn(`[Box] failed to drop box_daily_pnl rows for deleted trade ${id}:`, err),
-    );
+      /* ---- 3. durable archive cleanup; failures remain pending for restart ---- */
+      await deleteBoxDailyPnlForTrade(id, pnlEviction.days).catch((err) => {
+        console.warn(
+          `[Box] box_daily_pnl cleanup for deleted trade ${id} is pending durable retry:`,
+          err,
+        );
+        this.pnlArchiver.requestDurableReconcile();
+      });
+    });
 
     /* ---- 4. RECOMPUTE every trade-derived figure from what remains ---- */
     await this.recomputeTradeDerivedStatistics();
