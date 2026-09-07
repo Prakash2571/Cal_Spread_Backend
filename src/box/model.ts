@@ -959,3 +959,60 @@ export const BoxCalibrationSample = boxModel<IBoxCalibrationSample>(
   "BoxCalibrationSample",
   boxCalibrationSampleSchema as unknown as mongoose.Schema<IBoxCalibrationSample>,
 );
+
+
+/**
+ * THE DURABLE TRADING-SESSION RECORD (collection: "box_trading_session").
+ *
+ * A SINGLE document, `_id: "current"`. There is exactly one armed session per deployment at a
+ * time, so a singleton row is the honest representation — a collection of many would invite the
+ * question "which one is in force?".
+ *
+ * WHY THIS IS NOT IN `box_settings`. That collection is deliberately `{_id, value: number}`, and
+ * a session needs strings and arrays of trade ids. More importantly it needs to be durable for a
+ * SAFETY reason rather than a convenience one: `BOX_SESSION_MAX_COMPLETED_TRADES=1` must not be
+ * resettable by restarting Node. If the counters lived in memory, "restart the process to get
+ * another trade" would make the whole control decorative.
+ *
+ * NO TTL INDEX, on purpose. A consumed one-shot session must stay consumed until an operator
+ * deliberately re-arms it. Expiring it on a timer would silently hand back a spent safety budget.
+ */
+const boxTradingSessionSchema = new mongoose.Schema<IBoxTradingSessionDoc>(
+  {
+    _id: { type: String, required: true },
+    session_id: { type: String, default: "" },
+    armed_at: { type: Date, default: null },
+    /** Admin ROLE label of whoever armed it. Never a token. */
+    armed_by: { type: String, default: null },
+    /** The limit SNAPSHOT taken at arm time, so a config change cannot widen it after the fact. */
+    max_completed_trades: { type: Number, default: 0 },
+    /** Trade ids that established a full four-leg Box. Append-only; a cycle is CONSUMED here. */
+    established_trade_ids: { type: [String], default: () => [] },
+    /** Trade ids from the above that later reached fully FLAT. A cycle is COMPLETED here. */
+    completed_trade_ids: { type: [String], default: () => [] },
+    /** Entry attempts that ended with no Box. Visibility only; gates nothing. */
+    aborted_attempts: { type: Number, default: 0 },
+    /** Monotonic count of explicit operator arms. Audit aid. */
+    arm_count: { type: Number, default: 0 },
+    updated_at: { type: Date, default: null },
+  },
+  { collection: "box_trading_session", versionKey: false },
+);
+
+export interface IBoxTradingSessionDoc {
+  _id: string;
+  session_id: string;
+  armed_at: Date | null;
+  armed_by: string | null;
+  max_completed_trades: number;
+  established_trade_ids: string[];
+  completed_trade_ids: string[];
+  aborted_attempts: number;
+  arm_count: number;
+  updated_at: Date | null;
+}
+
+export const BoxTradingSession = boxModel<IBoxTradingSessionDoc>(
+  "BoxTradingSession",
+  boxTradingSessionSchema,
+);

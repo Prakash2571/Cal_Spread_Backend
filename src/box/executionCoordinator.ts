@@ -252,6 +252,14 @@ export interface CoordinatorDeps {
    * survives a restart rather than depending on a lease that can expire.
    */
   activeUnderlyings?: () => ReadonlyMap<string, UnderlyingActivity>;
+  /**
+   * The armed trading session's ENTRY verdict (`BOX_SESSION_MAX_COMPLETED_TRADES`).
+   *
+   * SYNCHRONOUS, for the same reason as `activeUnderlyings`: it is consulted in a prologue that
+   * must not yield. ENTRY ONLY — a spent session budget must never reach an exit, a protective
+   * cancel, a residual flatten or a reconciliation-driven reduction.
+   */
+  sessionEntryGate?: () => { allowed: boolean; reason: string | null; detail: string | null };
   now?: () => number;
   /** Injected so tests can drive waiting deterministically. */
   sleep?: (ms: number) => Promise<void>;
@@ -361,6 +369,7 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     renewFailure: 0,
     uncertainHoldsAbandoned: 0,
     underlyingAlreadyActive: 0,
+    sessionLimitRefusals: 0,
     positionClaimsHeld: 0,
     positionClaimsReleased: 0,
     positionClaimFailures: 0,
@@ -707,6 +716,31 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
         incumbent,
       });
       return { ok: false, reason: "duplicate", detail: `identical opportunity already executing as ${incumbent}` };
+    }
+
+    // ── SESSION CYCLE BUDGET ───────────────────────────────────────────────────────────
+    //
+    // Checked first: it is the cheapest gate and the most decisive. With
+    // BOX_SESSION_MAX_COMPLETED_TRADES=1 the second candidate must be refused even while the
+    // first Box is still OPEN, i.e. before any cycle has COMPLETED — which is why the session
+    // counts cycles CONSUMED at establishment rather than only completed ones.
+    //
+    // Everything protective continues: this returns only from the ENTRY path.
+    const sessionGate = this.deps.sessionEntryGate?.();
+    if (sessionGate && !sessionGate.allowed) {
+      this.stats.sessionLimitRefusals++;
+      this.log({
+        execution: executionId,
+        broker,
+        underlying: candidate.underlying,
+        status: "suppressed_session_limit",
+        reason: sessionGate.reason ?? "session_limit_reached",
+      });
+      return {
+        ok: false,
+        reason: "session_limit_reached",
+        detail: sessionGate.detail ?? "the armed trading session has no cycles left",
+      };
     }
 
     // ── UNDERLYING LOCK, LAYER 1a: DURABLE POSITION OWNERSHIP ──────────────────────────

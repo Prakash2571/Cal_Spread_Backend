@@ -33,6 +33,7 @@ import {
   BoxPnlDayState,
   BoxPnlDeletion,
   BoxSetting,
+  BoxTradingSession,
   BoxTrade,
   BoxTradeEvent,
   isBoxEventLedgerEnabled,
@@ -42,6 +43,7 @@ import {
   type BoxTradeRecord,
   type IBoxDailyPnl,
   type IBoxSetting,
+  type IBoxTradingSessionDoc,
 } from "./model.js";
 import type {
   BoxChargeReconciliation,
@@ -59,6 +61,7 @@ import type {
   IBoxTrade,
   IBoxTradeEvent,
 } from "./types.js";
+import type { BoxSessionRecord } from "./tradingSession.js";
 
 /** Mongo duplicate-key error code. */
 const DUPLICATE_KEY = 11000;
@@ -2596,6 +2599,117 @@ export async function saveBoxSettings(entries: Map<string, number>): Promise<voi
     })),
     { ordered: false },
   );
+}
+
+/* --------------------------- durable trading session --------------------------- */
+
+/** The singleton document id. There is one armed session per deployment at a time. */
+const TRADING_SESSION_ID = "current";
+
+/**
+ * Coerce a persisted trade-id array into `string[]`, dropping anything that is not a string.
+ *
+ * Defensive rather than paranoid: these ids gate a SAFETY budget, and a single corrupt element
+ * must degrade to "that id is not counted" rather than throwing inside the boot path and taking
+ * session reconstruction down with it.
+ */
+function stringIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return (value as unknown[]).filter((id): id is string => typeof id === "string");
+}
+
+/**
+ * Load the durable trading-session record, or null when none has ever been armed.
+ *
+ * BEST-EFFORT READ, and the caller must treat a null differently from an unarmed session: a read
+ * failure is NOT evidence that no session is armed. `BoxEngine` therefore refuses live entry when
+ * the record could not be read, rather than assuming a clean slate — otherwise a transient Mongo
+ * error would hand back a spent one-shot budget.
+ */
+export async function loadBoxTradingSession(): Promise<
+  { ok: true; record: BoxSessionRecord | null } | { ok: false; error: string }
+> {
+  if (!isBoxDbEnabled()) {
+    return { ok: false, error: "Box persistence is not configured, so session state cannot be read." };
+  }
+  try {
+    const row = await BoxTradingSession.findById(TRADING_SESSION_ID).lean<IBoxTradingSessionDoc>();
+    if (!row) return { ok: true, record: null };
+    return {
+      ok: true,
+      record: {
+        session_id: typeof row.session_id === "string" ? row.session_id : "",
+        armed_at: row.armed_at ? row.armed_at.getTime() : null,
+        armed_by: row.armed_by ?? null,
+        max_completed_trades: Number.isFinite(row.max_completed_trades) ? row.max_completed_trades : 0,
+        // Defensive: a corrupt array must not throw here and take the boot path with it.
+        established_trade_ids: stringIds(row.established_trade_ids),
+        completed_trade_ids: stringIds(row.completed_trade_ids),
+        aborted_attempts: Number.isFinite(row.aborted_attempts) ? row.aborted_attempts : 0,
+        arm_count: Number.isFinite(row.arm_count) ? row.arm_count : 0,
+        updated_at: row.updated_at ? row.updated_at.getTime() : 0,
+      },
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Persist the trading-session record.
+ *
+ * THROWS on failure, deliberately. Every mutation here changes a safety budget — a cycle being
+ * consumed, a session being armed — and a silent write failure would leave the running counters
+ * and the durable ones disagreeing, so a restart would resurrect a budget that had been spent.
+ * The caller rolls its in-memory state back when this rejects.
+ */
+export async function saveBoxTradingSession(record: BoxSessionRecord): Promise<void> {
+  if (!isBoxDbEnabled()) {
+    throw new Error("Box persistence is not configured, so session state cannot be saved.");
+  }
+  await BoxTradingSession.updateOne(
+    { _id: TRADING_SESSION_ID },
+    {
+      $set: {
+        session_id: record.session_id,
+        armed_at: record.armed_at === null ? null : new Date(record.armed_at),
+        armed_by: record.armed_by,
+        max_completed_trades: record.max_completed_trades,
+        established_trade_ids: [...record.established_trade_ids],
+        completed_trade_ids: [...record.completed_trade_ids],
+        aborted_attempts: record.aborted_attempts,
+        arm_count: record.arm_count,
+        updated_at: new Date(record.updated_at),
+      },
+    },
+    { upsert: true },
+  );
+}
+
+/**
+ * Which of the given trade ids are durably FLAT (fully closed).
+ *
+ * Used at boot to close out session cycles that reached FLAT while the process was down. Reads
+ * the SAME authority the rest of the engine uses — a closed trade document with every role at
+ * zero — rather than inferring flatness from a heuristic.
+ */
+export async function loadFlatBoxTradeIds(tradeIds: readonly string[]): Promise<string[]> {
+  if (!isBoxDbEnabled() || tradeIds.length === 0) return [];
+  const ids: mongoose.Types.ObjectId[] = [];
+  for (const id of tradeIds) {
+    if (mongoose.isValidObjectId(id)) ids.push(new mongoose.Types.ObjectId(id));
+  }
+  if (ids.length === 0) return [];
+  try {
+    const rows = await BoxTrade.find(
+      { _id: { $in: ids }, status: "closed" },
+      { _id: 1 },
+    ).lean<{ _id: mongoose.Types.ObjectId }[]>();
+    return rows.map((row) => row._id.toString());
+  } catch (err) {
+    console.warn("[Box] failed to read flat trade ids for session reconciliation:", err);
+    return [];
+  }
 }
 
 /* ------------------- execution-latency calibration samples ------------------- */

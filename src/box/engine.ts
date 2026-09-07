@@ -40,6 +40,7 @@ import {
 import { BoxChargeEstimator, buildEntryChargeLegs, type BoxChargeLeg, type PriceChargeGroupsFn } from "./charges.js";
 import { BoxChargeReconciler } from "./chargeReconciler.js";
 import { activeUnderlyings, type UnderlyingActivity } from "./underlyingLock.js";
+import { BoxTradingSessionManager } from "./tradingSessionStore.js";
 import { BoxExecutionSimulator } from "./executionSimulator.js";
 import { createExecutionClock, type ExecutionClock } from "./executionClock.js";
 import { ExecutionEnvironmentMonitor } from "./executionEnvironment.js";
@@ -132,6 +133,8 @@ import {
   loadBoxExecutionAttempts,
   loadBoxLiveRiskSeed,
   loadBoxSettings,
+  loadBoxTradingSession,
+  loadFlatBoxTradeIds,
   loadBoxTradesClosedSince,
   loadOpenBoxTrades,
   loadUnresolvedBoxExecutionAttempts,
@@ -141,6 +144,7 @@ import {
   prepareBoxPnlDeletion,
   reconcileBoxDailyPnlOrphans,
   saveBoxSettings,
+  saveBoxTradingSession,
   serializeBoxTrade,
   setBoxChargeReconciliation,
   setBoxTradeMargin,
@@ -466,6 +470,14 @@ export class BoxEngine {
    * underlying lock's answer survives a restart.
    */
   private residualUnderlyingByAttempt = new Map<string, string>();
+  /**
+   * The armed trading session (`BOX_SESSION_MAX_COMPLETED_TRADES`).
+   *
+   * Durable, because a one-shot budget that a process restart could reset would be decorative.
+   * Until its state has been READ successfully it refuses entry — an unread session is not an
+   * unarmed one.
+   */
+  private readonly session: BoxTradingSessionManager;
   /** Durable projection version/content corresponding to each in-memory residual. */
   private residualProjectionVersion = new Map<string, number>();
   private residualProjectionIdentity = new Map<string, string>();
@@ -684,6 +696,18 @@ export class BoxEngine {
       }),
       skewGraceMs: this.cfg.reservationClockSkewGraceMs,
     });
+    // The durable trading session. Constructed here so the coordinator's entry gate can close
+    // over it; its state is READ later, during start(), once persistence is known to be up.
+    this.session = new BoxTradingSessionManager({
+      persistence: {
+        load: () => loadBoxTradingSession(),
+        save: (record) => saveBoxTradingSession(record),
+        flatTradeIds: (ids) => loadFlatBoxTradeIds(ids),
+      },
+      configuredMaxCompletedTrades: () => this.cfg.sessionMaxCompletedTrades,
+      log: (message) => console.warn(message),
+    });
+
     this.coordinator = new CoordinatedBoxExecutionGateway({
       inner: centralGateway,
       reservations: this.reservations.store,
@@ -699,6 +723,8 @@ export class BoxEngine {
       // LAYER 1a of the underlying lock. Synchronous and durable-state derived, so the lock
       // cannot be lost by a lease expiring while a position is still open.
       activeUnderlyings: () => this.activeUnderlyings(),
+      // The session cycle budget. ENTRY only; every reduction path bypasses it.
+      sessionEntryGate: () => this.session.evaluateEntry(this.recoveryActive()),
     });
     this.execution = this.coordinator;
 
@@ -970,6 +996,11 @@ export class BoxEngine {
       } catch (err) {
         console.warn("[Box] failed to re-claim underlying locks at startup:", err);
       }
+      // SESSION: read the durable record and close out cycles that reached FLAT while this
+      // process was down. Runs AFTER adoption so `flatTradeIds` is answered against the same
+      // durable trade documents the engine has just reconciled. A read failure leaves the session
+      // unreadable, which fails ENTRY closed while leaving every reduction path open.
+      await this.session.initialise();
       if (this.orderManager) {
         this.syncManagerExposure();
         const riskSeed = await loadBoxLiveRiskSeed(
@@ -2323,6 +2354,11 @@ export class BoxEngine {
       );
     }
 
+    // SESSION: an entry that ended with NO Box. Counted for visibility only — it consumes no
+    // cycle, because burning an operator's single permitted trade on an attempt that left no
+    // position would be indefensible.
+    void this.session.recordAborted();
+
     void appendBoxEvent({
       event: "EXECUTION_ABORTED",
       candidate_key: candidate.key,
@@ -2587,6 +2623,13 @@ export class BoxEngine {
     this.positions.add(position);
     this.syncManagerExposure();
 
+    // SESSION: a cycle is CONSUMED here, and only here.
+    //
+    // This is the successful-open path: a full four-leg Box now exists as a persisted position. A
+    // rejected, partially-filled-then-unwound or economics-aborted entry never reaches this line,
+    // which is exactly why such an attempt cannot burn the operator's permitted trade.
+    void this.session.recordEstablished(id);
+
     // A successfully opened box IS the 4/4 outcome. Observed here so measured outcome rates have a
     // numerator as well as a denominator — previously nothing ever recorded a success, so every
     // rate was permanently zero.
@@ -2809,6 +2852,10 @@ export class BoxEngine {
     // after a position is fully flat. `releaseUnderlyingForPosition` is reference-counted, so a
     // second Box on the same underlying keeps its own protection.
     void this.releaseUnderlyingClaim(position.underlying, position.id);
+    // SESSION: the cycle is COMPLETE. Recorded only after `closeBoxTrade` returned true, so the
+    // trade really is durably closed with every role at zero — the same authority boot
+    // reconciliation uses, which is what keeps the two consistent across a restart.
+    void this.session.recordCompleted(position.id);
 
     // Fold the realised result into the running day-P&L tally.
     this.rollClosedTodayDay();
@@ -3564,6 +3611,16 @@ export class BoxEngine {
       this.ensureResidualFlattenTimer();
     }
     this.orderManager?.setExposure({ residualLegs: this.residualLegCount() });
+  }
+
+  /**
+   * Whether exposure is currently quarantined pending reconciliation.
+   *
+   * Reads the SAME authority `getStatus()` reports (`live_manager.recoveryActive`), so the session
+   * gate and the operator's screen can never disagree about it.
+   */
+  private recoveryActive(): boolean {
+    return this.orderManager?.status().recoveryActive ?? false;
   }
 
   /**
