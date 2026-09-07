@@ -26,8 +26,9 @@
 
 import type { BrokerId } from "../brokers/types.js";
 import type { PaperLegCancelStage } from "./paperLegTimeline.js";
+import type { PartialExitMark } from "./partialExitPnl.js";
 
-export type { PaperLegCancelStage };
+export type { PaperLegCancelStage, PartialExitMark };
 
 /**
  * One order's charges, as billed by Zerodha's virtual contract note (or by the
@@ -1719,6 +1720,23 @@ export interface BoxExitMetrics {
   blocked_reason: BoxExitBlockedReason;
   /** The full structured decision this metrics object was derived from. */
   decision: BoxExitDecision;
+  /**
+   * Present ONLY when this position has already closed some quantity.
+   *
+   * When set, the P&L fields above (`gross_pnl_if_closed_now`, `current_net_pnl`,
+   * `realisable_net_pnl`, `estimated_exit_charges`, `total_round_trip_charges`) are the
+   * PARTIAL-AWARE figures: realised gross frozen on closed quantity plus a mark on the
+   * remaining quantity only, and exit charges = already paid + an estimate for what is left.
+   * `pos.quantity`/`pos.lot_size` are never decremented by a partial exit, so without this the
+   * mark re-valued already-flat legs at a full lot on every tick.
+   *
+   * The EDGE family (`entry_edge`, `remaining_edge`, `captured_edge`, `captured_pct`,
+   * `convergence_threshold`, `profit_capture_target`) and `decision` deliberately remain
+   * whole-box, full-lot reference figures: they describe a BOX, and a partially exited position
+   * is not one. That is why `evaluatePosition` sends a `PARTIALLY_EXITED` position straight to
+   * flattening and never consults `decision`. See `partialExitPnl.ts`.
+   */
+  partial_exit_mark?: PartialExitMark;
 }
 
 /**

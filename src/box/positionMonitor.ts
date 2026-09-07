@@ -26,6 +26,14 @@ import type { BoxConfig } from "./config.js";
 import type { BoxExecutionGateway } from "./executionGateway.js";
 import type { BoxMetrics } from "./metrics.js";
 import { ordersFromLegs } from "./localCharges.js";
+import {
+  isPartialBox,
+  markPartialExit,
+  openQuantityFraction,
+  realisedExitGross,
+  remainingByRoleOf,
+  remainingExitChargeOrders,
+} from "./partialExitPnl.js";
 import type { BoxChargeCalculatorLike } from "./brokerContext.js";
 import {
   computeExitMetrics,
@@ -261,6 +269,28 @@ export class BoxPositionMonitor {
     return this.deps.localCharges.legs(orders, "kite_estimate");
   }
 
+  /**
+   * Estimated exit charges for the quantity that is STILL OPEN.
+   *
+   * A partially exited box has already paid to close what it closed
+   * (`cumulative_exit_charges`, exact). Re-estimating a full four-leg exit on top of that
+   * double-counts the closed legs, which is half of the partial-exit accounting defect.
+   */
+  private remainingExitChargesEstimate(pos: BoxOpenPosition, legs: BoxLegEvaluation[]): number | null {
+    const orders = remainingExitChargeOrders(pos, legs);
+    if (orders === null) {
+      // A remaining leg cannot be priced. Returning null would drop this position out of the day
+      // total entirely (`?? 0` at the aggregation sites), which is a worse lie than an estimate,
+      // so fall back to the stored full-lot projection scaled by the fraction still open. It is an
+      // estimate of last resort — exactly what `estimated_exit_charges_total` already is.
+      const stored = pos.estimated_exit_charges_total;
+      if (stored === null) return null;
+      return round2(stored * openQuantityFraction(pos));
+    }
+    if (orders.length === 0) return 0;    // nothing left to close, so nothing left to pay
+    return round2(this.deps.localCharges.legs(orders, "kite_estimate").total);
+  }
+
   /** Recompute the exit arithmetic for one position (no side effects, no I/O). */
   measure(
     pos: BoxOpenPosition,
@@ -279,12 +309,16 @@ export class BoxPositionMonitor {
       captureDepth,
     });
 
+    const partial = isPartialBox(pos);
     const exitChargesTotal =
       exitChargesTotalOverride !== undefined
         ? exitChargesTotalOverride
-        : this.localExitChargesTotal(pos, legs);
+        : partial
+          // Already paid (exact) + estimated cost of closing only what is left.
+          ? this.addNullable(pos.cumulative_exit_charges, this.remainingExitChargesEstimate(pos, legs))
+          : this.localExitChargesTotal(pos, legs);
 
-    return computeExitMetrics({
+    const metrics = computeExitMetrics({
       boxWidth: pos.box_width,
       lotSize: pos.lot_size,
       entryBoxCostPerUnit: pos.entry_box_cost_per_unit,
@@ -304,6 +338,49 @@ export class BoxPositionMonitor {
       expirySafety: this.isInExpirySafetyWindow(pos),
       cfg: this.deps.cfg,
     });
+
+    // A WHOLE box keeps the pre-existing arithmetic byte-for-byte, including its rounding.
+    if (!partial) return metrics;
+
+    // PARTIALLY EXITED: re-mark only what is still open, and freeze what is already realised.
+    // `computeExitMetrics` above is quantity-blind by construction — its gross is
+    // `(exitCredit − entryDebit) × lotSize`, a whole-box identity that cannot express per-role
+    // quantities — so the P&L figures are replaced here rather than by trying to bend it.
+    const remainingByRole = remainingByRoleOf(pos);
+    const mark = markPartialExit({
+      direction,
+      remainingByRole,
+      entryPrices: pos.entry_prices,
+      legs,
+      realisedGross: realisedExitGross(pos),
+      // When a caller supplies the override (the FINAL close, which passes the exact cumulative
+      // figure) it is the whole exit-charge story and must not be added to again.
+      exitChargesIncurred: exitChargesTotalOverride !== undefined
+        ? 0
+        : pos.cumulative_exit_charges,
+      entryChargesTotal: pos.entry_charges_total,
+      estimatedRemainingExitCharges: exitChargesTotalOverride !== undefined
+        ? exitChargesTotalOverride
+        : this.remainingExitChargesEstimate(pos, legs),
+      executionCost: this.deps.cfg.expectedExitSlippage,
+    });
+
+    return {
+      ...metrics,
+      gross_pnl_if_closed_now: mark.gross,
+      estimated_exit_charges: mark.exit_charges_total,
+      total_round_trip_charges: mark.round_trip_charges,
+      current_net_pnl: mark.net,
+      realisable_net_pnl: mark.realisable_net,
+      // The breakdown, so the number is auditable rather than merely different.
+      partial_exit_mark: mark,
+    };
+  }
+
+  /** Sum two possibly-unknown charge figures without turning an unknown into a zero. */
+  private addNullable(a: number | null, b: number | null): number | null {
+    if (a === null || b === null) return null;
+    return round2(a + b);
   }
 
   private async retryPendingFinalPersists(): Promise<void> {
