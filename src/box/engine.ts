@@ -195,6 +195,7 @@ import {
   type BoxExitMetrics,
   type BoxExitReason,
   type BoxLegRole,
+  type BoxOrderIntentState,
   type BoxOpportunity,
   type BoxOptionInstrument,
   type BoxUnderlyingState,
@@ -746,6 +747,9 @@ export class BoxEngine {
         flatTradeIds: (ids) => loadFlatBoxTradeIds(ids),
       },
       configuredMaxCompletedTrades: () => this.cfg.sessionMaxCompletedTrades,
+      // Distinguishes "no Box database in this deployment" from "Mongo is down". The first must
+      // leave the session layer inert; the second must fail entry closed.
+      persistenceAvailable: () => isBoxDbEnabled(),
       log: (message) => console.warn(message),
     });
 
@@ -1029,6 +1033,10 @@ export class BoxEngine {
       } catch (err) {
         console.warn("[Box] failed to reconcile residual exposure:", err);
       }
+      // A consumption write that failed earlier keeps entry closed until it lands, so retry it on
+      // every reconciliation rather than waiting for someone to notice. Cheap no-op when nothing
+      // is pending.
+      void this.session.retryPendingWrite().catch(() => undefined);
       // Rebuild underlying-level protection from the state just adopted. Runs AFTER both
       // position adoption and residual reconciliation, so it sees every underlying that carries
       // exposure — a claim taken before residuals were loaded would miss some.
@@ -1478,6 +1486,9 @@ export class BoxEngine {
   async reconcileLive(): Promise<unknown> {
     if (!this.orderManager) throw new Error("Live order manager is unavailable.");
     this.syncManagerExposure();
+    // Flush any consumption write that failed earlier. Reconciliation is exactly the right place:
+    // it is the operation an operator runs when they suspect durable state has drifted.
+    await this.session.retryPendingWrite();
     return this.orderManager.reconcile();
   }
 
@@ -2672,7 +2683,12 @@ export class BoxEngine {
     // This is the successful-open path: a full four-leg Box now exists as a persisted position. A
     // rejected, partially-filled-then-unwound or economics-aborted entry never reaches this line,
     // which is exactly why such an attempt cannot burn the operator's permitted trade.
-    void this.session.recordEstablished(id);
+    //
+    // AWAITED, not fired and forgotten. Whether this write landed decides whether a one-shot budget
+    // was spent, so discarding its outcome would let a Mongo hiccup hand the budget back. The store
+    // retains the consumption in memory and closes entry when the write fails, so awaiting here
+    // costs a round trip and buys the guarantee.
+    await this.session.recordEstablished(id);
 
     // A successfully opened box IS the 4/4 outcome. Observed here so measured outcome rates have a
     // numerator as well as a denominator — previously nothing ever recorded a success, so every
@@ -2899,7 +2915,10 @@ export class BoxEngine {
     // SESSION: the cycle is COMPLETE. Recorded only after `closeBoxTrade` returned true, so the
     // trade really is durably closed with every role at zero — the same authority boot
     // reconciliation uses, which is what keeps the two consistent across a restart.
-    void this.session.recordCompleted(position.id);
+    //
+    // Failure here is benign in the safe direction: the cycle stays "in flight", which keeps entry
+    // closed and re-arming refused, and boot reconciliation closes it from durable trade state.
+    await this.session.recordCompleted(position.id);
 
     // Fold the realised result into the running day-P&L tally.
     this.rollClosedTodayDay();
@@ -3646,11 +3665,25 @@ export class BoxEngine {
     this.residualProjectionVersion.set(attemptId, projectionVersion);
     this.residualProjectionIdentity.set(attemptId, projectionIdentity);
     if (residual.length === 0) {
+      // RESOLVED. Drop the underlying hold this attempt owned, so the lock cannot outlive the
+      // exposure that justified it.
+      const resolved = this.residualUnderlyingByAttempt.get(attemptId);
       this.residualByAttempt.delete(attemptId);
       this.residualUnderlyingByAttempt.delete(attemptId);
+      if (resolved) {
+        void this.coordinator
+          .releaseUnderlyingForResidual(resolved, attemptId)
+          .catch(() => undefined);
+      }
     } else {
       this.residualByAttempt.set(attemptId, residual);
-      if (underlying) this.residualUnderlyingByAttempt.set(attemptId, underlying.trim().toUpperCase());
+      if (underlying) {
+        const symbol = underlying.trim().toUpperCase();
+        this.residualUnderlyingByAttempt.set(attemptId, symbol);
+        // Unresolved residual legs ARE exposure, so they hold the underlying in their own right —
+        // durably and cross-process, not merely via this process's in-memory view.
+        void this.coordinator.claimUnderlyingForResidual(symbol, attemptId).catch(() => undefined);
+      }
       this.ensureFeed(); // outstanding exposure needs live books to flatten
       this.ensureResidualFlattenTimer();
     }
@@ -3665,6 +3698,28 @@ export class BoxEngine {
    */
   private recoveryActive(): boolean {
     return this.orderManager?.status().recoveryActive ?? false;
+  }
+
+  /**
+   * Underlyings carrying an order whose broker state is not resolved.
+   *
+   * Built from the manager's orphan list — orders it saw at the broker but could not attribute to a
+   * known durable intent. Attribution is by tradingsymbol against the open-position book, which is
+   * the only mapping available without a database round trip on a synchronous path.
+   */
+  private unresolvedIntentUnderlyings(): { underlying: string; state: BoxOrderIntentState }[] {
+    const live = this.orderManager?.status() ?? null;
+    if (!live || live.orphanOrders.length === 0) return [];
+    const bySymbol = new Map<string, string>();
+    for (const position of this.positions.list()) {
+      for (const role of BOX_LEG_ROLES) {
+        bySymbol.set(position.legs[role].tradingsymbol, position.underlying);
+      }
+    }
+    return live.orphanOrders.map((order) => ({
+      underlying: bySymbol.get(order.tradingsymbol) ?? "__UNATTRIBUTED__",
+      state: "UNKNOWN" as BoxOrderIntentState,
+    }));
   }
 
   /**
@@ -3694,19 +3749,25 @@ export class BoxEngine {
    */
   private async reclaimUnderlyingsForOpenExposure(): Promise<void> {
     if (!this.cfg.oneActiveBoxPerUnderlying) return;
+    // EVERY open position gets its own holder, not one per underlying: with the restriction
+    // disabled-then-enabled, or across a config change, two Boxes can share an underlying, and the
+    // first to close must not drop the second's protection.
     const wanted = new Map<string, string>();
     for (const position of this.positions.list()) {
       if (position.position_state === "FLAT") continue;
-      if (!wanted.has(position.underlying)) wanted.set(position.underlying, position.id);
-    }
-    for (const [attemptId, legs] of this.residualByAttempt) {
-      if (legs.length === 0) continue;
-      const underlying = this.residualUnderlyingByAttempt.get(attemptId);
-      if (underlying && !wanted.has(underlying)) wanted.set(underlying, attemptId);
+      wanted.set(`${position.underlying}\u0000${position.id}`, position.id);
     }
     let claimed = 0;
-    for (const [underlying, tradeId] of wanted) {
+    for (const [composite, tradeId] of wanted) {
+      const underlying = composite.split("\u0000")[0] as string;
       if (await this.coordinator.claimUnderlyingForPosition(underlying, tradeId)) claimed++;
+    }
+    // Residual attempts hold the underlying under their OWN holder token, so a position closing
+    // does not drop protection that outstanding residual legs still need.
+    for (const [attemptId, legs] of this.residualByAttempt) {
+      if (legs.length === 0) continue;
+      const symbol = this.residualUnderlyingByAttempt.get(attemptId);
+      if (symbol) await this.coordinator.claimUnderlyingForResidual(symbol, attemptId);
     }
     if (wanted.size > 0) {
       console.warn(
@@ -3739,6 +3800,11 @@ export class BoxEngine {
         underlying: this.residualUnderlyingByAttempt.get(attemptId) ?? "__UNATTRIBUTED__",
         legs: legs.length,
       })),
+      // Orders whose broker state the manager could not attribute. Their underlying is resolved
+      // through the open-position book by tradingsymbol; anything unattributable is reported under
+      // a sentinel rather than dropped, because an order we cannot place is the LAST thing to treat
+      // as harmless.
+      intents: this.unresolvedIntentUnderlyings(),
     });
   }
 
@@ -4528,9 +4594,12 @@ export class BoxEngine {
 
       risk: {
         /** The per-Box GROSS ENTRY-ORDER NOTIONAL cap (₹). 0 = disabled. NOT broker margin. */
-        max_box_capital_rupees: this.cfg.executionMode === "live"
-          ? this.cfg.liveMaxBoxCapitalRupees
-          : this.cfg.paperMaxBoxCapitalRupees,
+        // The LIVE cap is the only ENFORCED one, so it is the only one reported as active.
+        // Reporting the paper mirror here made the UI badge a limit that never refuses anything.
+        max_box_capital_rupees: this.cfg.executionMode === "live" ? this.cfg.liveMaxBoxCapitalRupees : 0,
+        /** The paper mirror's configured value, reported separately and labelled as advisory. */
+        paper_max_box_capital_rupees: this.cfg.paperMaxBoxCapitalRupees,
+        max_box_capital_enforced: this.cfg.executionMode === "live" && this.cfg.liveMaxBoxCapitalRupees > 0,
         max_box_capital_metric: "gross_entry_order_notional_rupees",
         capital: this.centralGateway.capitalDiagnostics(),
         one_active_box_per_underlying: this.cfg.oneActiveBoxPerUnderlying,
@@ -4610,9 +4679,32 @@ export class BoxEngine {
           "environment change and a restart.",
       };
     }
+    if (profile === this.paperProfile) return { ok: true, profile };
     const from = currentSelection(this.cfg.executionMode, this.paperProfile);
     const to = currentSelection(this.cfg.executionMode, profile);
-    const verdict = evaluateModeTransition({ from, to, snapshot: this.modeTransitionSnapshot() });
+    // `currentSelection` collapses `standard` and `stress` onto the same selection, so a
+    // standard<->stress change would look like a no-op to `evaluateModeTransition` and skip the
+    // in-flight guard entirely. The real profile comparison above handles the genuine no-op; here
+    // we force the guard to run whenever the PROFILE differs, even if the selection does not.
+    const verdict = from === to
+      ? (transitionBlockers(this.modeTransitionSnapshot()).length > 0 ||
+          this.executionSim.activeCount > 0
+          ? ({
+              outcome: "refused",
+              from,
+              to,
+              blockers: [
+                ...transitionBlockers(this.modeTransitionSnapshot()),
+                ...(this.executionSim.activeCount > 0
+                  ? [{
+                      code: "paper_simulation_in_flight",
+                      detail: `${this.executionSim.activeCount} simulated execution(s) are in flight`,
+                    }]
+                  : []),
+              ],
+            } as const)
+          : ({ outcome: "allowed", from, to } as const))
+      : evaluateModeTransition({ from, to, snapshot: this.modeTransitionSnapshot() });
     if (verdict.outcome === "refused") {
       return {
         ok: false,

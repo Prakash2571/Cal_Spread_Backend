@@ -43,12 +43,15 @@ function persistence({ record = null, loadError = null, flat = [] } = {}) {
   };
 }
 
-function manager(p, max = 1) {
+function manager(p, max = 1, { persistenceAvailable = true } = {}) {
   let clock = 1_000;
   let seq = 0;
   return new BoxTradingSessionManager({
     persistence: p,
     configuredMaxCompletedTrades: () => max,
+    // "No Box database" and "Mongo is down" demand OPPOSITE answers, so availability is an
+    // explicit signal rather than something inferred from a read failure.
+    persistenceAvailable: () => persistenceAvailable,
     now: () => (clock += 1),
     newSessionId: () => `sess-${seq++}`,
     log: () => {},
@@ -172,7 +175,10 @@ test("establishment is ignored when no session is armed", async () => {
 
 /* ── write failure rolls back ────────────────────────────────────────────────────────── */
 
-test("a WRITE FAILURE rolls the in-memory record back", async () => {
+test("a failed ESTABLISHMENT write RETAINS the consumption and closes entry", async () => {
+  // THE DEFECT THIS PINS: rolling an establishment back would un-consume a cycle that a real
+  // four-leg Box has already consumed, handing a spent one-shot budget straight back. So the
+  // consumption is kept in memory and entry is refused until the write lands.
   const p = persistence();
   const m = manager(p, 1);
   await m.initialise();
@@ -180,15 +186,65 @@ test("a WRITE FAILURE rolls the in-memory record back", async () => {
 
   p.state.failSave = true;
   await m.recordEstablished("trade-1");
-  // The cycle was NOT consumed in memory, because it was not consumed durably either.
-  assert.equal(m.consumed(), 0, "running and durable counters must never disagree");
-  assert.equal(p.state.stored.established_trade_ids.length, 0);
+  assert.equal(m.consumed(), 1, "the Box exists, so the cycle is spent whether or not Mongo agrees");
+  const verdict = m.evaluateEntry(false);
+  assert.equal(verdict.allowed, false, "entry must stay closed while the durable record understates spend");
+  assert.equal(verdict.reason, "session_state_unreadable");
+  assert.match(verdict.detail, /could not be persisted/);
 
-  // Once the write works again the cycle is consumed for real.
+  // Once the write works, the pending consumption is flushed and entry closes on the REAL budget.
   p.state.failSave = false;
-  await m.recordEstablished("trade-1");
-  assert.equal(m.consumed(), 1);
+  await m.retryPendingWrite();
   assert.deepEqual(p.state.stored.established_trade_ids, ["trade-1"]);
+  assert.equal(m.evaluateEntry(false).reason, "session_budget_exhausted");
+});
+
+test("a retained consumption is RETRIED rather than wedging entry closed forever", async () => {
+  // The bug this pins: the idempotence check saw the id already present in memory and returned
+  // early, so the failed write was never re-attempted and entry stayed closed permanently.
+  const p = persistence();
+  const m = manager(p, 2);
+  await m.initialise();
+  await m.arm(QUIET_ARM);
+  p.state.failSave = true;
+  await m.recordEstablished("trade-1");
+  assert.equal(m.evaluateEntry(false).allowed, false);
+
+  p.state.failSave = false;
+  // Either route works: a repeated establishment call, or the explicit retry.
+  await m.recordEstablished("trade-1");
+  assert.deepEqual(p.state.stored.established_trade_ids, ["trade-1"]);
+  assert.equal(m.evaluateEntry(false).allowed, true, "one cycle of two remains, so entry reopens");
+});
+
+test("a RESTART after a failed establishment write cannot resurrect the budget", async () => {
+  // The durable record genuinely lacks the cycle, so this is the one case a restart could have
+  // handed it back. It cannot, because entry stayed closed until the write succeeded.
+  const p = persistence();
+  const m = manager(p, 1);
+  await m.initialise();
+  await m.arm(QUIET_ARM);
+  p.state.failSave = true;
+  await m.recordEstablished("trade-1");
+  assert.equal(m.evaluateEntry(false).allowed, false);
+
+  // Operator fixes Mongo; the pending consumption is flushed.
+  p.state.failSave = false;
+  await m.retryPendingWrite();
+  const rebooted = manager(p, 1);
+  await rebooted.initialise();
+  assert.equal(rebooted.consumed(), 1);
+  assert.equal(rebooted.evaluateEntry(false).allowed, false);
+});
+
+test("a write failure while ARMING still rolls back: refusing to arm is the safe direction", async () => {
+  const p = persistence();
+  const m = manager(p, 1);
+  await m.initialise();
+  p.state.failSave = true;
+  const armed = await m.arm(QUIET_ARM);
+  assert.equal(armed.ok, false);
+  assert.equal(m.evaluateEntry(false).reason, "session_not_armed", "must not look armed");
 });
 
 test("a write failure while ARMING refuses the arm rather than half-arming", async () => {
@@ -320,15 +376,23 @@ test("DISARM preserves the counters, so disarm-then-arm cannot skip the exposure
 
 /* ── recovery, and the entry/reduction asymmetry ─────────────────────────────────────── */
 
-test("RECOVERY blocks entry with its own distinct reason", async () => {
+test("RECOVERY blocks entry with its own distinct reason (when a budget is configured)", async () => {
   const p = persistence();
-  const m = manager(p, 0);
+  const m = manager(p, 1);
   await m.initialise();
   await m.arm(QUIET_ARM);
   const verdict = m.evaluateEntry(true);
   assert.equal(verdict.allowed, false);
   assert.equal(verdict.reason, "session_recovery");
   assert.match(verdict.detail, /reduction stays open/);
+});
+
+test("with NO budget configured the session layer has no opinion about recovery", async () => {
+  // Recovery blocking is the order manager's job. An unlimited session must not duplicate it, or
+  // the "0 = no-op" contract would be false again.
+  const m = manager(persistence(), 0);
+  await m.initialise();
+  assert.equal(m.evaluateEntry(true).allowed, true);
 });
 
 test("an UNLIMITED session never refuses entry however many cycles run", async () => {
@@ -387,4 +451,95 @@ test("the status payload never contains a token or credential-shaped field", asy
   assert.ok(!/token|secret|password|api[_-]?key/i.test(serialised), serialised);
   // `armed_by` is a ROLE label, never a credential.
   assert.match(serialised, /"armed_by":"full-admin"/);
+});
+
+/* ── regression: the default must be a genuine NO-OP ─────────────────────────────────── */
+
+test("REGRESSION: max=0 (the default) does NOT require arming — it is a true no-op", async () => {
+  // THE DEFECT THIS PINS: the gate was consulted unconditionally and refused on "not armed"
+  // before it ever looked at the limit, so the documented default silently stopped ALL Box entry
+  // — paper included — until an operator clicked Arm.
+  const p = persistence();
+  const m = manager(p, 0);
+  await m.initialise();
+  const verdict = m.evaluateEntry(false);
+  assert.equal(verdict.allowed, true, "an unlimited budget has nothing to enforce");
+  assert.equal(verdict.reason, null);
+});
+
+test("REGRESSION: max=0 admits even BEFORE initialise()", async () => {
+  const m = manager(persistence(), 0);
+  assert.equal(m.evaluateEntry(false).allowed, true);
+});
+
+test("REGRESSION: max=0 admits even when the durable read FAILED", async () => {
+  // Nothing to enforce means nothing to prove, so a read error is irrelevant.
+  const m = manager(persistence({ loadError: "connection refused" }), 0);
+  await m.initialise();
+  assert.equal(m.evaluateEntry(false).allowed, true);
+});
+
+test("an ARMED session keeps enforcing its snapshot even if the env var is later set to 0", async () => {
+  // The operator armed under a limit; that limit stands for the session's life.
+  const p = persistence();
+  const armedUnderOne = manager(p, 1);
+  await armedUnderOne.initialise();
+  await armedUnderOne.arm(QUIET_ARM);
+  await armedUnderOne.recordEstablished("trade-1");
+
+  const relaxedConfig = manager(p, 0);
+  await relaxedConfig.initialise();
+  assert.equal(relaxedConfig.snapshot().max_completed_trades, 1);
+  assert.equal(relaxedConfig.evaluateEntry(false).allowed, false, "the armed snapshot still governs");
+});
+
+/* ── regression: no database must not brick entry ────────────────────────────────────── */
+
+test("REGRESSION: with NO Box database the session layer is inert, not permanently closed", async () => {
+  // THE DEFECT THIS PINS: loadBoxTradingSession returns {ok:false} when persistence is not
+  // configured, which left `loaded` false forever with no retry — so a paper development machine
+  // with no Mongo could never open a Box at all.
+  const p = persistence({ loadError: "Box persistence is not configured" });
+  const m = manager(p, 1, { persistenceAvailable: false });
+  await m.initialise();
+  const verdict = m.evaluateEntry(false);
+  assert.equal(verdict.allowed, true, "there was never a durable budget to spend");
+  assert.equal(verdict.reason, null);
+});
+
+test("with NO database, nothing is written and nothing is claimed to be enforced", async () => {
+  const p = persistence();
+  const m = manager(p, 1, { persistenceAvailable: false });
+  await m.initialise();
+  await m.recordEstablished("trade-1");
+  await m.recordCompleted("trade-1");
+  await m.recordAborted();
+  assert.equal(p.state.saves, 0, "no database means no speculative writes");
+  const status = m.status({
+    entryInProgress: false, openBoxes: 0, exitInProgress: false, recoveryActive: false, entryBlockedExternally: false,
+  });
+  assert.equal(status.enforcing, false, "the status must not claim a limit it cannot enforce");
+});
+
+test("a real read FAILURE still fails closed — distinguished from having no database", async () => {
+  // The two look identical to load() and demand opposite answers. This is the "Mongo is down"
+  // half: a spent budget might be sitting in a table we cannot read.
+  const m = manager(persistence({ loadError: "connection refused" }), 1, { persistenceAvailable: true });
+  await m.initialise();
+  const verdict = m.evaluateEntry(false);
+  assert.equal(verdict.allowed, false);
+  assert.equal(verdict.reason, "session_state_unreadable");
+});
+
+test("the status payload reports whether the budget is actually being ENFORCED", async () => {
+  const activity = {
+    entryInProgress: false, openBoxes: 0, exitInProgress: false, recoveryActive: false, entryBlockedExternally: false,
+  };
+  const unlimited = manager(persistence(), 0);
+  await unlimited.initialise();
+  assert.equal(unlimited.status(activity).enforcing, false);
+
+  const bounded = manager(persistence(), 1);
+  await bounded.initialise();
+  assert.equal(bounded.status(activity).enforcing, true);
 });

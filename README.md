@@ -298,6 +298,34 @@ failures use a fixed bounded taxonomy; exception messages remain diagnostics, no
 >
 > It reuses the *identical* bounded-LIMIT pricing, the same queue haircut, the same timeout/unwind/
 > abort-after-fill policy and the same metrics as `paper_legging`.
+
+### Artificial PAPER latency is not real LIVE latency
+
+These two are constantly confused because they look identical in a latency chart, and
+conflating them is how a simulation delay ends up costing money on every real order. They are
+different things and live consults exactly one of them:
+
+| | Artificial PAPER latency | Real LIVE transport latency |
+| --- | --- | --- |
+| Settings | `BOX_SIMULATED_DECISION_MS`, `BOX_SIMULATED_LATENCY_MS`, recorded latency samples/distributions, paper POST→ACK and ACK→terminal models, the simulated cancel race, paper persistence simulation, the paper scheduler | `BOX_LIVE_BROKER_ORDER_MIN_INTERVAL_MS`, `BOX_LIVE_BROKER_MIN_INTERVAL_MS`, `DHAN_MIN_INTERVAL_MS`, plus durable Mongo writes, reservation acquisition, feed validation, the broker HTTP request, the ACK, working-order observation, cancel confirmation, reconciliation |
+| What it is | A **model** of elapsed time, so a simulated fill is not instantaneous | A **constraint**: a rate limit the broker enforces, and the time the network and exchange actually take |
+| Used by live? | **NEVER** | Always |
+| Can be zero? | Irrelevant — not on the live path | **No.** Clamped up to a per-broker floor |
+
+The live path is: candidate qualifies → safety/admission validation → durable intent
+transition → scheduler/rate-limit admission → **immediately call the broker** → wait only for
+real broker/network responses → process real broker state. No `sleep()` exists to make live
+resemble paper, and none was added.
+
+This is enforced rather than asserted. `tests/box/noArtificialLiveLatency.test.mjs` builds the
+live gateway with every paper timing construct replaced by a function that **throws**, audits
+the source so no live-path module even imports one or reads `BOX_SIMULATED_*`, and checks that
+the API reports `artificial_latency_applied_to_live: false`. It is mutation-tested: injecting a
+single `await simulator.simulatedLatency()` into the live entry path fails 5 of its tests.
+
+Optimising live speed here means removing *artificial* or *unnecessary* delay only. Broker
+pacing, durable persistence, reservation acquisition and cancellation confirmation all remain,
+because a slower correct exit beats an instant duplicate order.
 >
 > **Every figure states its own evidence.** A report says `measured: no` and `confidence: LOW`
 > whenever it is running on a configured constant rather than observations, and a stale sample set
@@ -585,10 +613,16 @@ Every threshold is env-overridable; the defaults are the shipped specification.
 | `BOX_LIVE_MAX_OPEN_BOXES` | `1` | Live maximum open Box projections |
 | `BOX_LIVE_MAX_CONCURRENT_EXECUTIONS` | `1` | Live broker-operation concurrency; role orders queue by safety priority |
 | `BOX_LIVE_MAX_RESIDUAL_LEGS` | `1` | Live residual-leg circuit-breaker limit |
+| `BOX_LIVE_ENTRY_SUBMIT_CONCURRENCY` | `1` | How many ENTRY legs of ONE Box may be in transport at once (1–4). `1` = the pre-existing serialised behaviour; `4` recommended for production. ENTRY-only and scoped to one `attempt_id`, and burst slots are invisible to emergency/cancel/exit admission, so it cannot bypass reservations or delay protective work |
+| `BOX_LIVE_BROKER_ORDER_MIN_INTERVAL_MS` | `0` | ORDER-MUTATION pacing (place/modify/cancel). `0` derives from the broker's published limit (Zerodha 110 ms, floor 100 ms; Dhan 120 ms, floor 120 ms). An override is **clamped up** to the floor — this is a real rate limit and can never be disabled. Distinct from `BOX_LIVE_BROKER_MIN_INTERVAL_MS`, which keeps its existing meaning for polls and reads |
+| `BOX_LIVE_MAX_BOX_CAPITAL_RUPEES` | `0` (off) | Maximum `gross_entry_order_notional_rupees` = `SUM(\|limit_price × quantity\|)` over the four bounded LIMIT entry legs. **NOT broker margin** — a hedged Box blocks far less, and can be a net credit. Refused before any broker submission as `box_capital_limit`; compared in integer paise so exactly-at-cap is admitted and one paisa over is not. Exits unaffected |
+| `BOX_PAPER_MAX_BOX_CAPITAL_RUPEES` | `0` (off) | Paper mirror of the above, for `live_parity` validation. LIVE remains the authoritative gate |
+| `BOX_ONE_ACTIVE_BOX_PER_UNDERLYING` | `false` | Permit at most one active Box per underlying, regardless of strike pair, expiry or direction. **Additional** to the existing exact-contract reservations, never a replacement. Refusals report `underlying_already_active`, never `contract_reserved`. ENTRY-only |
+| `BOX_SESSION_MAX_COMPLETED_TRADES` | `0` (unlimited) | Complete Box lifecycles (`ENTRY → HOLD → EXIT → FLAT`) an armed session may run. `1` = one-shot. Durable, so a restart cannot hand back a spent budget; unreadable state fails ENTRY closed. Reaching the limit disables **new entry only** — monitoring, exit, residual flattening and reconciliation continue |
 | `BOX_LIVE_RECONCILE_INTERVAL_MS` | `60000` | Low-frequency broker order/position reconciliation cadence |
 | `BOX_LIVE_FEED_RECONNECT_WARMUP_MS` | `5000` | Quiet period after reconnect, in addition to current-generation leg ticks |
-| `BOX_SIMULATED_LATENCY_MS` | `250` | Simulated order-send → exchange arrival delay |
-| `BOX_SIMULATED_DECISION_MS` | `40` | Simulated internal decision time before an order is "sent" |
+| `BOX_SIMULATED_LATENCY_MS` | `250` | **PAPER ONLY.** Simulated order-send → exchange arrival delay. Never consulted on the live path — see the latency note below |
+| `BOX_SIMULATED_DECISION_MS` | `40` | **PAPER ONLY.** Simulated internal decision time before an order is "sent". Never consulted on the live path |
 | `BOX_EXECUTION_MAX_WAIT_MS` | `1500` | Bound on how long the simulator waits to reach the arrival instant |
 | `BOX_PAPER_EXECUTION_PROFILE` | `standard` | `standard` (unchanged paper), `live_parity` (evidence-driven: shared-liquidity ledger + measured latency + live concurrency cap + cancel-vs-fill race on top of `paper_legging`), or `stress` (fault injection for resilience testing — refuses to start with live execution, and is never live parity) |
 | `BOX_PAPER_MAX_CONCURRENT_EXECUTIONS` | live cap (`1`) | Concurrent paper pipelines under `live_parity`; defaults to `BOX_LIVE_MAX_CONCURRENT_EXECUTIONS` |
@@ -749,6 +783,12 @@ Box arbitrage (paper, admin-only — full admin or trade access):
 | `POST /api/box/trades/:id/close` | Manual close at the executable touch (409 if not fillable) |
 | `GET /api/box/events` | The append-only decision ledger |
 | `GET /api/box/stream` | SSE: scanner state, opportunities, entries, position updates, exits |
+| `GET /api/box/execution-control` | Execution mode, deployment live capability, arming state, session budget, risk limits and the **effective** broker pacing. No secrets |
+| `POST /api/box/execution-mode/preview` | What a requested mode change *would* do, without doing it — including `restart_required` and the exact env vars |
+| `POST /api/box/execution-mode/paper-profile` | FULL ADMIN — switch between paper profiles at runtime. LIVE is unreachable here at any privilege level |
+| `POST /api/box/session/arm` | FULL ADMIN — arm a trading session (optional `max_completed_trades`, snapshotted) |
+| `POST /api/box/session/disarm` | FULL ADMIN — stop new entry; counters are preserved |
+| `POST /api/box/controls/:control` | FULL ADMIN — arm `box_entry_enabled`, `box_live_order_enabled` or `box_emergency_flatten` **independently** |
 
 Sensitive routes are rate-limited (the verify routes more aggressively than the rest).
 

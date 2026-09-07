@@ -300,6 +300,210 @@ These are safety contracts, not tuning knobs:
 `BOX_LIVE_BROKER_MIN_INTERVAL_MS`, `BOX_LIVE_HTTP_TIMEOUT_MS`,
 `BOX_LIVE_FEED_RECONNECT_WARMUP_MS`, `BOX_LIVE_MAX_CHASE_TICKS`.
 
+### Transport pacing: real rate limits, not simulated latency
+
+This distinction is the single most important one in this section, because the two
+kinds of delay look identical in a latency chart and are completely different things.
+
+| | Artificial PAPER latency | Real LIVE transport latency |
+|---|---|---|
+| Settings | `BOX_SIMULATED_DECISION_MS`, `BOX_SIMULATED_LATENCY_MS`, recorded latency samples, paper ACK→terminal and cancel-race models, the paper scheduler | `BOX_LIVE_BROKER_MIN_INTERVAL_MS`, `BOX_LIVE_BROKER_ORDER_MIN_INTERVAL_MS`, `DHAN_MIN_INTERVAL_MS` |
+| What it is | A **model** of how long things take, so a simulated fill is not instantaneous | A **rate limit** the broker enforces, plus the time the network and the exchange actually take |
+| Consulted in live? | **NEVER.** No live-path module imports a paper timing module or reads either `BOX_SIMULATED_*` knob | Always |
+| Can it be zero? | Irrelevant — it is not on the live path | **No.** Clamped up to a per-broker floor |
+
+`tests/box/noArtificialLiveLatency.test.mjs` enforces the third row three ways: poison
+dependencies that throw if live touches a paper construct, a source audit that no
+live-path module even references them, and a declared
+`artificial_latency_applied_to_live: false` in the API.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `BOX_LIVE_BROKER_MIN_INTERVAL_MS` | `250` | GENERAL pacing: order-status polls, order/position lists, funds, margins, health. Also the poll cadence while a working order resolves. Meaning **unchanged** by this feature. |
+| `BOX_LIVE_BROKER_ORDER_MIN_INTERVAL_MS` | `0` | ORDER-MUTATION pacing (place / modify / cancel). `0` derives it from the broker's published limit. A positive value is an operator override, **clamped up** to the broker floor. |
+
+Per-broker profiles live in `src/box/brokerPacing.ts`:
+
+| Broker | Default | Hard floor | Why |
+|---|---|---|---|
+| Zerodha | 110 ms | 100 ms | Kite Connect permits 10 order requests/second (100 ms). The default adds 10% headroom because the limiter runs on the broker's clock, and a rejected request still consumes the daily order-request budget. |
+| Dhan | 120 ms | 120 ms | Dhan permits more than 10/s, but `src/brokers/dhan/http.ts` already paces every HTTP call at `DHAN_MIN_INTERVAL_MS` (default 120 ms), so a smaller Box-level value would be absorbed by the lower layer and misreported. |
+
+An unrecognised broker id falls back to the **strictest** known profile, because an
+unknown broker is exactly the case where its limits are least certain.
+
+Splitting one bucket into two raises the achievable *total* request rate, so a third
+absolute-floor watermark bounds every transport call at the order interval — total
+transport stays at 1/order-interval (10/s for Zerodha, its published ceiling). The
+effective values in force are reported by `GET /api/box/execution-control` under
+`execution.effective_broker_order_min_interval_ms`, read from the adapter itself
+rather than re-derived from config.
+
+### Four-leg entry burst
+
+| Setting | Default | Range |
+|---|---|---|
+| `BOX_LIVE_ENTRY_SUBMIT_CONCURRENCY` | `1` | 1–4 |
+
+A live concurrency slot is held for an order's **entire lifecycle** — submit through
+terminal polling — so with `BOX_LIVE_MAX_CONCURRENT_EXECUTIONS=1` leg 2 is not even
+persisted until leg 1 fully resolves. First-to-last submit is therefore bounded below
+by three complete order lifecycles, and the Box is **unhedged** for that whole window.
+
+This knob bounds how many of one Box's four ENTRY legs may be in transport together.
+What makes it safe rather than merely faster:
+
+- `ENTRY` purpose only, scoped to a single `attempt_id`, so two overlapping candidate
+  Boxes can never use it to bypass contract reservations. The one-pipeline-at-a-time
+  check covers base slots too, so a second candidate cannot take a freed base slot
+  while the first still holds burst slots.
+- Burst slots are **invisible** to emergency, cancel and exit admission, which count
+  base occupancy only. An entry burst therefore cannot delay protective work, and when
+  the base slot frees the priority queue hands it to queued
+  `EMERGENCY_RESIDUAL`/`PROTECTIVE_CANCEL`/`EXIT` ahead of any remaining `ENTRY`.
+- Rate limiting is unaffected: the adapter pacer still spaces the four placements.
+
+`1` reproduces the pre-burst behaviour exactly; `4` is the recommended production value.
+
+### Maximum ₹ per Box — an admission metric, not broker margin
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `BOX_LIVE_MAX_BOX_CAPITAL_RUPEES` | `0` (disabled) | Maximum `gross_entry_order_notional_rupees` for one four-leg Box |
+| `BOX_PAPER_MAX_BOX_CAPITAL_RUPEES` | `0` (disabled) | Paper mirror, for `live_parity` validation. LIVE remains the authoritative gate |
+
+The metric is:
+
+```
+gross_entry_order_notional_rupees = SUM( |limit_price x quantity| )   over the four ENTRY legs
+```
+
+computed from the **actual immutable bounded LIMIT order requests** that would be
+transmitted — never an LTP, never a mid. A LIMIT order cannot fill worse than its
+limit and the Box never uses MARKET orders, so this is the largest rupee amount those
+four orders can transact.
+
+**It is NOT broker margin.** A four-leg Box is hedged, so its real margin requirement
+is typically a small fraction of gross option notional and can even be a net credit.
+An operator who read "margin" and set a matching cap would be off by roughly an order
+of magnitude. Where a reliable broker margin estimate exists it is exposed separately
+as `broker_estimated_margin_rupees` and is **never** substituted for the admission
+metric: one is an observable property of our own bounded orders, the other is a remote
+estimate that can fail, lag or be denied.
+
+Why gross notional is nonetheless the right gate: it is deterministic, computable
+offline from data already held, monotone in quantity and price, and conservative (it
+always over-states the economic risk of a hedged Box). It needs no broker round trip,
+so it can be evaluated at the last safe moment before submission — which a remote
+margin call cannot.
+
+Checked three times: advisory at candidate qualification (visibility only);
+authoritatively at `pre_submit`, from the immutable requests and before the first
+`manager.submit`; and re-verified at `dequeue`, catching a tightened cap or a rebuilt
+request set. Comparisons run in **integer paise**, so exactly at the cap is admitted
+and one paisa over is refused. Fails closed twice: a metric with fewer than four
+priced legs is refused when a cap is configured, and an ENTRY that reaches the queue
+with no capital stamp is refused. Refusal reason: `box_capital_limit`. **Exits are
+never gated by it.**
+
+### One active Box per underlying
+
+| Setting | Default |
+|---|---|
+| `BOX_ONE_ACTIVE_BOX_PER_UNDERLYING` | `false` |
+
+When enabled, a second Box may not enter on an underlying that is already active,
+**regardless of strike pair, expiry or direction**: `RELIANCE 2500/2600` active blocks
+`RELIANCE 2550/2650` even though they share zero option contracts.
+
+Concurrent same-underlying Boxes are not an execution-safety problem; they are an
+accounting problem. Two Boxes on one underlying can hold opposite option roles that
+economically offset each other, so the broker's net position per contract no longer
+decomposes cleanly into "Box A's exposure" and "Box B's exposure" — which makes
+reconciliation, partial-exit accounting and residual attribution materially harder at
+exactly the moment they matter most.
+
+This is **additive**. The existing exact-contract reservations are untouched, and with
+the flag off behaviour is bit-for-bit unchanged (reservation test MP5, "same
+underlying, different strikes stay concurrent", still passes). Refusals are reported as
+`underlying_already_active` — **never** as `contract_reserved`, because the two Boxes
+need not share any option and the remedy is different.
+
+Implemented in three layers, because neither a lock nor durable state alone suffices:
+
+| Layer | What | Why it is needed |
+|---|---|---|
+| 1a | Durable-state check: open/partial/RECOVERY positions, unresolved residual legs, unresolved intents | Survives a restart — reconstructed from Mongo at boot, with no expiry |
+| 1b | Entry-pipeline lease, in the **same** reservation document as the four contract keys | Cross-process safety, claimed atomically by the same unique multikey index, inheriting fencing, generation, TTL and the renewal heartbeat |
+| 1c | Durable open-position claim | A clean settle releases the entry lease, and Layer 1a reads this process's in-memory book which a **sibling process cannot see**. A successful entry therefore *converts* its lease into a position claim rather than releasing it — a transfer, so there is no instant to race through |
+
+The claim is renewed by the existing heartbeat (deliberately unbounded, since an open
+Box may be held for hours), re-established at boot from adopted state, reference-counted
+by trade id, cleared on a broker switch, and **released when the Box is fully FLAT** — so
+the setting cannot silently become "one Box per underlying per process lifetime".
+
+ENTRY only: `refsForExit` never adds the underlying key, so an exit cannot even block
+its own retry.
+
+### Session cycle budget (one-shot trading)
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `BOX_SESSION_MAX_COMPLETED_TRADES` | `0` | `0` unlimited, `1` one-shot, `N` cycles |
+
+A cycle is one **COMPLETE lifecycle**: `ENTRY → HOLD/MONITOR → EXIT → FLAT`. It is not
+"one broker order", and reaching the limit does **not** stop the engine — monitoring,
+auto-exit, partial-exit cleanup, residual flattening, reconciliation and recovery all
+continue. Only NEW ENTRY is disabled.
+
+Two counters, because one cannot express one-shot:
+
+- **CONSUMED** — a full four-leg Box was established. This is what gates new entry, so
+  with `max=1` the second candidate is refused *while the first Box is still open*, when
+  nothing has yet completed. A single completed-counter would read `0` and admit it.
+- **COMPLETED** — that Box later reached fully FLAT. This is what makes the session
+  report `COMPLETED`.
+
+A rejected, partially-filled-then-unwound or `abort_after_fill` entry establishes no Box
+and therefore consumes nothing; those are counted separately as aborted attempts.
+
+Durable in collection `box_trading_session` (a singleton document, **no TTL index** — a
+consumed one-shot session stays consumed until an operator re-arms). Failure policy:
+
+- a **write** failure rolls the in-memory record back, so running and durable counters
+  can never disagree. A Mongo outage makes the counter refuse to move, which for a
+  safety budget is the correct direction to fail.
+- a **read** failure fails ENTRY closed with `session_state_unreadable`. An unread
+  session is *not* an unarmed session; assuming a clean slate on a transient error is
+  exactly how "restart to get another trade" would work. Exit, residual flattening and
+  reconciliation are unaffected.
+- cycles that reached FLAT during downtime are reconciled at boot from the same durable
+  authority the engine uses for flatness, so a completion cannot be lost either.
+
+Sessions are armed through `POST /api/box/session/arm` (full admin). Arming resets the
+counters, making it the most attractive bypass, so it is refused four ways: an open Box,
+an unresolved residual leg, active recovery, and the session's own record of a
+consumed-but-unfinished cycle. Disarm **preserves** the counters, so disarm-then-arm
+cannot skip that guard. The limit is snapshotted at arm time, so changing the env var
+and restarting cannot retroactively widen a session already armed.
+
+### How the limits interact
+
+| Combination | Result |
+|---|---|
+| `MAX_OPEN_BOXES=3`, `ONE_ACTIVE_BOX_PER_UNDERLYING=true` | RELIANCE + TCS + INFY allowed; two RELIANCE Boxes refused |
+| `SESSION_MAX_COMPLETED_TRADES=1` | One complete lifecycle only, regardless of `MAX_OPEN_BOXES` |
+| Any entry gate closed | Exits, protective cancels, emergency residual flattening and reconciliation-driven reduction all still run |
+
+### Exit immunity
+
+Every gate above is an **ENTRY** gate. None may prevent reduction of exposure already
+owned — the worst case of refusing an entry is a missed opportunity, while the worst
+case of refusing a reduction is an open position nobody can close. Enforced by
+`tests/box/exitImmunity.test.mjs`, including the combined case where the ₹ cap is
+exceeded *and* the session is spent *and* the underlying is active *and* max-open-boxes
+is reached: a valid attributed exit and an emergency residual flatten both still run.
+
 ## Box charges
 
 `BOX_BROKERAGE_PER_ORDER`, `BOX_BROKERAGE_MAX_PCT`, `BOX_STT_SELL_PCT`,

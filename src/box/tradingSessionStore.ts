@@ -51,6 +51,17 @@ export interface TradingSessionManagerDeps {
   readonly persistence: TradingSessionPersistence;
   /** The configured cycle budget, used when an operator arms without specifying one. */
   readonly configuredMaxCompletedTrades: () => number;
+  /**
+   * Whether durable Box persistence exists at all.
+   *
+   * WHY THIS IS SEPARATE FROM A READ FAILURE. "Mongo is down" and "this deployment has no Box
+   * database" look identical to `load()` but demand opposite answers. A transient outage must fail
+   * ENTRY CLOSED, because a spent one-shot budget might be sitting in a table we cannot read. A
+   * deployment with no database never had a budget to spend, and failing closed there would mean a
+   * paper development machine could never open a Box — which is precisely the case the reservation
+   * layer goes out of its way to keep working.
+   */
+  readonly persistenceAvailable: () => boolean;
   readonly now?: () => number;
   readonly newSessionId?: () => string;
   readonly log?: (message: string) => void;
@@ -69,6 +80,14 @@ export class BoxTradingSessionManager {
    */
   private loaded = false;
   private loadError: string | null = null;
+  /**
+   * True when a CONSUMPTION could not be persisted.
+   *
+   * Entry stays closed while set: the in-memory record knows a cycle was spent but the durable one
+   * does not, so a restart would resurrect the budget. Refusing until the write lands is the only
+   * answer that cannot lose a spent cycle.
+   */
+  private writeFailed = false;
 
   constructor(private readonly deps: TradingSessionManagerDeps) {
     this.record = idleSessionRecord(this.now());
@@ -113,6 +132,17 @@ export class BoxTradingSessionManager {
    * monitor, reconcile and flatten real exposure).
    */
   async initialise(): Promise<void> {
+    if (!this.deps.persistenceAvailable()) {
+      // No Box database. There is no durable budget and never was one, so the session layer stays
+      // inert rather than failing entry closed forever.
+      this.loaded = false;
+      this.loadError = null;
+      this.deps.log?.(
+        "[Box] no Box database is configured, so the trading-session cycle budget is inert. " +
+          "BOX_SESSION_MAX_COMPLETED_TRADES cannot be enforced without durable persistence.",
+      );
+      return;
+    }
     const loaded = await this.deps.persistence.load();
     if (!loaded.ok) {
       this.loaded = false;
@@ -135,7 +165,7 @@ export class BoxTradingSessionManager {
     const flat = await this.deps.persistence.flatTradeIds(outstanding);
     if (flat.length === 0) return;
     const next = reconcileCompletions(this.record, flat, this.now());
-    await this.commit(next, "reconcile boot completions");
+    await this.commit(next, "reconcile boot completions", true);
     this.deps.log?.(
       `[Box] session reconciliation closed ${flat.length} cycle(s) that reached FLAT while the ` +
         "process was down.",
@@ -150,20 +180,53 @@ export class BoxTradingSessionManager {
    * in step; the cost is that a Mongo outage makes the counter refuse to move, which for a safety
    * budget is the correct direction to fail.
    */
-  private async commit(next: BoxSessionRecord, what: string): Promise<boolean> {
+  private async commit(
+    next: BoxSessionRecord,
+    what: string,
+    /**
+     * Whether a failed write may roll the in-memory record BACK.
+     *
+     * ROLLBACK IS ONLY SAFE FOR A BUDGET-GRANTING MUTATION. Rolling back an ARM leaves the session
+     * unarmed, which refuses entry — the safe direction. Rolling back an ESTABLISHMENT un-consumes
+     * a cycle that a real four-leg Box has already consumed, which HANDS THE ONE-SHOT BUDGET BACK
+     * and permits a second Box. So a consumption is retained in memory even when its write failed,
+     * and the persistence-unhealthy flag below then refuses entry until it lands.
+     */
+    rollbackOnFailure: boolean,
+  ): Promise<boolean> {
     const previous = this.record;
     this.record = next;
     try {
       await this.deps.persistence.save(next);
+      this.writeFailed = false;
       return true;
     } catch (error) {
-      this.record = previous;
+      if (rollbackOnFailure) this.record = previous;
+      else this.writeFailed = true;
       this.deps.log?.(
         `[Box] failed to persist the trading session (${what}): ` +
-          `${error instanceof Error ? error.message : String(error)}. In-memory state rolled back.`,
+          `${error instanceof Error ? error.message : String(error)}. ` +
+          (rollbackOnFailure
+            ? "In-memory state rolled back."
+            : "In-memory consumption RETAINED and entry closed, so a spent cycle cannot be handed back."),
       );
       return false;
     }
+  }
+
+  /**
+   * Is the cycle budget feature configured at all?
+   *
+   * `BOX_SESSION_MAX_COMPLETED_TRADES=0` means UNLIMITED, and the documented default. An unlimited
+   * budget has nothing to enforce, so the whole session layer — including the arm requirement —
+   * must be inert. Getting this wrong turned the default into "no Box may ever enter until an
+   * operator clicks Arm", which is a silent full stop rather than a no-op.
+   */
+  private enforcing(): boolean {
+    if (this.deps.configuredMaxCompletedTrades() > 0) return true;
+    // An ARMED session with a positive snapshot still enforces, even if the env var was later
+    // changed to 0: the operator armed under a limit and that limit stands for the session.
+    return isArmed(this.record) && this.record.max_completed_trades > 0;
   }
 
   /**
@@ -177,6 +240,16 @@ export class BoxTradingSessionManager {
     reason: SessionEntryRefusal | null;
     detail: string | null;
   } {
+    // NOT CONFIGURED ⇒ NO OPINION. This is what makes the default a true no-op: an existing
+    // deployment upgrading to this build sees no change in entry behaviour whatsoever.
+    if (!this.enforcing()) return { allowed: true, reason: null, detail: null };
+
+    // NO DATABASE ⇒ nothing could ever have been persisted, so there is no budget to have spent.
+    // Distinguished from a read FAILURE, which fails closed below.
+    if (!this.deps.persistenceAvailable()) {
+      return { allowed: true, reason: null, detail: null };
+    }
+
     if (!this.loaded) {
       return {
         allowed: false,
@@ -185,6 +258,16 @@ export class BoxTradingSessionManager {
           `durable trading-session state could not be read (${this.loadError ?? "unknown error"}); ` +
           "entry is refused because an unread session cannot be proven to have budget left. " +
           "Exit, residual flattening and reconciliation are unaffected.",
+      };
+    }
+    if (this.writeFailed) {
+      return {
+        allowed: false,
+        reason: "session_state_unreadable",
+        detail:
+          "a consumed Box cycle could not be persisted, so the durable session record understates " +
+          "what has been spent. Entry stays closed until the write succeeds, because a restart " +
+          "would otherwise hand the spent cycle back. Exit and residual flattening are unaffected.",
       };
     }
     return evaluateSessionEntry({ record: this.record, recoveryActive });
@@ -217,7 +300,7 @@ export class BoxTradingSessionManager {
       previous: this.record,
       now: this.now(),
     });
-    if (!(await this.commit(next, "arm"))) {
+    if (!(await this.commit(next, "arm", true))) {
       return { ok: false, reason: "the session could not be persisted, so arming was refused" };
     }
     return { ok: true, record: this.record };
@@ -226,7 +309,7 @@ export class BoxTradingSessionManager {
   /** Disarm. Counters are preserved, so disarm-then-arm cannot skip the exposure guard. */
   async disarm(): Promise<boolean> {
     if (!this.loaded) return false;
-    return this.commit(disarmSession(this.record, this.now()), "disarm");
+    return this.commit(disarmSession(this.record, this.now()), "disarm", true);
   }
 
   /**
@@ -236,32 +319,56 @@ export class BoxTradingSessionManager {
    * partially-filled or economics-aborted entry never established a Box and must not burn a cycle.
    */
   async recordEstablished(tradeId: string): Promise<void> {
-    if (!this.loaded || !isArmed(this.record)) return;
+    if (!this.deps.persistenceAvailable() || !this.loaded || !isArmed(this.record)) return;
     const next = recordEstablishedBox(this.record, tradeId, this.now());
-    if (next === this.record) return; // idempotent: already counted
-    await this.commit(next, `establish ${tradeId}`);
+    // Already counted IN MEMORY. Normally idempotent — but when a previous write failed, the
+    // in-memory record is ahead of the durable one and entry is closed until it catches up, so
+    // this call is the RETRY. Returning early here would have wedged entry closed permanently.
+    if (next === this.record && !this.writeFailed) return;
+    // NO ROLLBACK: the Box exists, so the cycle is spent whether or not Mongo agrees yet.
+    await this.commit(next, `establish ${tradeId}`, false);
+  }
+
+  /**
+   * Re-attempt a consumption write that previously failed.
+   *
+   * Called from the engine's periodic reconciliation, so a transient Mongo outage self-heals
+   * instead of leaving entry closed until someone notices. Idempotent and cheap when nothing is
+   * pending.
+   */
+  async retryPendingWrite(): Promise<void> {
+    if (!this.writeFailed || !this.deps.persistenceAvailable()) return;
+    await this.commit(this.record, "retry pending consumption", false);
   }
 
   /** Record that an established Box reached fully FLAT. COMPLETES a cycle. */
   async recordCompleted(tradeId: string): Promise<void> {
-    if (!this.loaded) return;
+    if (!this.deps.persistenceAvailable() || !this.loaded) return;
     const next = recordCompletedBox(this.record, tradeId, this.now());
     if (next === this.record) return;
-    await this.commit(next, `complete ${tradeId}`);
+    await this.commit(next, `complete ${tradeId}`, true);
   }
 
   /** Record an entry attempt that ended with no Box. Visibility only; consumes nothing. */
   async recordAborted(): Promise<void> {
-    if (!this.loaded || !isArmed(this.record)) return;
-    await this.commit(recordAbortedAttempt(this.record, this.now()), "aborted attempt");
+    if (!this.deps.persistenceAvailable() || !this.loaded || !isArmed(this.record)) return;
+    await this.commit(recordAbortedAttempt(this.record, this.now()), "aborted attempt", true);
   }
 
   /** The status projection, including the load-failure block reason. */
-  status(activity: BoxSessionActivity): ReturnType<typeof sessionStatus> & { readable: boolean } {
+  status(activity: BoxSessionActivity): ReturnType<typeof sessionStatus> & {
+    readable: boolean;
+    enforcing: boolean;
+    write_failed: boolean;
+  } {
     const verdict = this.evaluateEntry(activity.recoveryActive);
     return {
       ...sessionStatus(this.record, activity, verdict.reason),
       readable: this.loaded,
+      /** False ⇒ the cycle budget is not being enforced (unlimited, or no durable persistence). */
+      enforcing: this.enforcing() && this.deps.persistenceAvailable(),
+      /** True ⇒ a consumption could not be persisted and entry is closed until it lands. */
+      write_failed: this.writeFailed,
     };
   }
 

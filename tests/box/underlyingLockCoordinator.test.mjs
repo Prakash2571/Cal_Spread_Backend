@@ -297,7 +297,12 @@ test("a FULLY FLAT RELIANCE Box does NOT block: the lock is not permanent", asyn
 
 /* ── LAYER 1b: the entry-pipeline lease ─────────────────────────────────────────────── */
 
-test("the underlying key is claimed ATOMICALLY with the four contract keys, in one document", async () => {
+test("the underlying is held SEPARATELY from the four contract keys, never mixed into that lease", async () => {
+  // THE DEFECT THIS PINS. An earlier version appended the underlying key to the contract key set so
+  // all five were claimed atomically. Because the claim must OUTLIVE the entry to protect an open
+  // Box, and a reservation conflict is side-agnostic, the Box's own EXIT then collided with its own
+  // claim on those four contracts and was deferred forever — auto-exit, manual close and operator
+  // emergency flatten alike, recoverable only by restarting the process.
   const gateway = controllableGateway();
   const { coordinator, reservations } = await ready({ gateway });
   const candidate = boxFor({ k1: 2500, k2: 2600 });
@@ -307,18 +312,55 @@ test("the underlying key is claimed ATOMICALLY with the four contract keys, in o
   await flush();
 
   const held = reservations.activeKeys(NOW);
-  assert.equal(held.length, 5, "four contracts plus the underlying");
-  const underlyingKeys = held.filter(isUnderlyingReservationKey);
-  assert.deepEqual(underlyingKeys, [underlyingReservationKey("zerodha", "RELIANCE")]);
-  // And the four contract keys are still exactly the contracts.
-  const contractKeys = held.filter((k) => !isUnderlyingReservationKey(k)).sort();
+  // Both are held during the pipeline, but as TWO separate leases.
   assert.deepEqual(
-    contractKeys,
+    held.filter(isUnderlyingReservationKey),
+    [underlyingReservationKey("zerodha", "RELIANCE")],
+  );
+  assert.deepEqual(
+    held.filter((k) => !isUnderlyingReservationKey(k)).sort(),
     BOX_LEG_ROLES.map((role) => instrumentKey("zerodha", candidate.legs[role])).sort(),
   );
 
-  gateway.finish(0);
+  gateway.finish(0, { ok: true, legging: { trade_id: "trade-1", residual_exposure: [] } });
   await pending;
+  await flush();
+
+  // AFTER the entry settles: the contract keys are RELEASED, and only the underlying is retained.
+  const after = reservations.activeKeys(NOW);
+  assert.deepEqual(
+    after,
+    [underlyingReservationKey("zerodha", "RELIANCE")],
+    "an open Box must keep ONLY its underlying, never the contracts its own exit needs",
+  );
+});
+
+test("REGRESSION: the Box's OWN EXIT is not blocked by its own open-position claim", async () => {
+  // The exact deadlock. Enter, establish, then exit the same Box on the same contracts.
+  const gateway = controllableGateway();
+  const { coordinator } = await ready({ gateway });
+  const candidate = boxFor({ k1: 2500, k2: 2600 });
+
+  const entry = coordinator.simulateLeggingEntry({
+    candidate, detection: detectionFor(candidate), stillWanted: () => true, qualify: () => ({ qualifies: true }),
+  });
+  await flush();
+  gateway.finish(0, { ok: true, legging: { trade_id: "trade-1", residual_exposure: [] } });
+  assert.equal((await entry).ok, true);
+  await flush();
+  assert.deepEqual(coordinator.claimedUnderlyings(), ["RELIANCE"], "the claim is held");
+
+  const exit = await coordinator.simulateLeggingExit({
+    position: {
+      id: "trade-1",
+      underlying: candidate.underlying,
+      legs: candidate.legs,
+      direction: "LONG_BOX",
+      remaining_qty_by_role: FOUR_LOTS,
+    },
+    detectedAt: NOW,
+  });
+  assert.equal(exit.ok, true, "the Box's own exit must never be blocked by its own underlying claim");
 });
 
 test("a second in-flight RELIANCE entry is refused by the LEASE, with no durable position yet", async () => {
@@ -435,7 +477,7 @@ test("a FAILED entry releases the underlying: a refusal must not consume the loc
   assert.equal(reservations.activeKeys(NOW).filter(isUnderlyingReservationKey).length, 0);
 });
 
-test("the claim is reference-counted, so one trade's release cannot drop another's protection", async () => {
+test("the claim is reference-counted by HOLDER, so one release cannot drop another's protection", async () => {
   const gateway = controllableGateway();
   const { coordinator } = await ready({ gateway });
   await coordinator.claimUnderlyingForPosition("RELIANCE", "trade-1");
@@ -447,6 +489,56 @@ test("the claim is reference-counted, so one trade's release cannot drop another
 
   await coordinator.releaseUnderlyingForPosition("RELIANCE", "trade-2");
   assert.deepEqual(coordinator.claimedUnderlyings(), []);
+});
+
+test("a RESIDUAL holder keeps the underlying even after the position's own hold is released", async () => {
+  // Unresolved residual legs ARE exposure and hold the underlying in their own right, so a position
+  // closing cannot drop protection the residual still needs.
+  const gateway = controllableGateway();
+  const { coordinator } = await ready({ gateway });
+  await coordinator.claimUnderlyingForPosition("RELIANCE", "trade-1");
+  await coordinator.claimUnderlyingForResidual("RELIANCE", "attempt-9");
+
+  await coordinator.releaseUnderlyingForPosition("RELIANCE", "trade-1");
+  assert.deepEqual(coordinator.claimedUnderlyings(), ["RELIANCE"], "the residual still holds it");
+
+  await coordinator.releaseUnderlyingForResidual("RELIANCE", "attempt-9");
+  assert.deepEqual(coordinator.claimedUnderlyings(), []);
+});
+
+test("REGRESSION: a PAPER entry with no trade id does not lock the underlying forever", async () => {
+  // THE DEFECT THIS PINS. The claim used to be keyed `trade_id ?? executionId`, and the paper
+  // simulator never sets `trade_id` — so the claim was registered under an internal execution id
+  // while the engine released by the trade document's `_id`. The delete matched nothing and the
+  // symbol stayed locked for the life of the process.
+  const gateway = controllableGateway();
+  const { coordinator } = await ready({ gateway });
+  const candidate = boxFor({ k1: 2500, k2: 2600 });
+  const entry = coordinator.simulateLeggingEntry({
+    candidate, detection: detectionFor(candidate), stillWanted: () => true, qualify: () => ({ qualifies: true }),
+  });
+  await flush();
+  // Paper's record carries NO trade_id.
+  gateway.finish(0, { ok: true, legging: { residual_exposure: [] } });
+  await entry;
+  await flush();
+
+  assert.deepEqual(
+    coordinator.claimedUnderlyings(),
+    [],
+    "with no trade id to hand the hold to, the pipeline hold is released rather than orphaned",
+  );
+  // And the underlying is genuinely re-enterable.
+  const second = coordinator.simulateLeggingEntry({
+    candidate: boxFor({ k1: 2550, k2: 2650 }),
+    detection: detectionFor(boxFor({ k1: 2550, k2: 2650 })),
+    stillWanted: () => true,
+    qualify: () => ({ qualifies: true }),
+  });
+  await flush();
+  assert.equal(gateway.started.length, 2, "the underlying must not be locked by a paper entry");
+  gateway.finish(1, { ok: true, legging: { residual_exposure: [] } });
+  await second;
 });
 
 test("RESTART: an underlying claim is re-established from adopted durable state", async () => {
@@ -527,6 +619,7 @@ test("an UNCERTAIN settle RETAINS the underlying lease rather than releasing it"
     reservations.activeKeys(NOW).some(isUnderlyingReservationKey),
     "unresolved exposure must keep the underlying held",
   );
+  assert.deepEqual(coordinator.claimedUnderlyings(), ["RELIANCE"]);
 });
 
 /* ── cross-process ──────────────────────────────────────────────────────────────────── */

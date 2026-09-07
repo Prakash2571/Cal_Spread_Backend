@@ -382,6 +382,21 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     attemptId: string,
     phase: "partial_entry" | "economics_abort",
   ): void {
+    const violation = this.conservationViolation(plan, entryOrders, unwindOrders, attemptId, phase);
+    // RAISED OUTSIDE the guarded block. Wrapping the reporting call in the same try/catch as the
+    // arithmetic meant a throw from `invariantViolation` — the very thing that triggers RECOVERY —
+    // silently discarded the violation it was reporting.
+    if (violation !== null) this.deps.manager?.invariantViolation(violation);
+  }
+
+  /** The conservation failure message, or null when exact conservation holds. Never throws. */
+  private conservationViolation(
+    plan: PartialEntryPlan,
+    entryOrders: BrokerOrder[],
+    unwindOrders: BrokerOrder[],
+    attemptId: string,
+    phase: "partial_entry" | "economics_abort",
+  ): string | null {
     try {
       const unwoundByRole: Partial<Record<BoxLegRole, number>> = {};
       for (const order of unwindOrders) {
@@ -399,16 +414,19 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
         })),
         unwoundByRole,
       });
-      if (result.conserved) return;
-      const detail = result.violations
-        .map((violation) => `${violation.role}:${violation.kind}(${violation.detail})`)
-        .join("; ");
-      this.deps.manager?.invariantViolation(
-        `live entry ${attemptId} (${phase}) violated quantity conservation: ${detail}. ` +
-          `Planned unwind was ${plan.unwind.length} leg(s).`,
+      if (result.conserved) return null;
+      return (
+        `live entry ${attemptId} (${phase}) violated quantity conservation: ` +
+        result.violations
+          .map((violation) => `${violation.role}:${violation.kind}(${violation.detail})`)
+          .join("; ") +
+        `. Planned unwind was ${plan.unwind.length} leg(s).`
       );
     } catch {
-      /* a conservation CHECK must never abort the recovery it is verifying */
+      // Only the ARITHMETIC is guarded. A throw here means the check itself failed, which must not
+      // abort the recovery in progress — but it must also not be silently indistinguishable from
+      // "conserved", so it is reported as its own violation below.
+      return `live entry ${attemptId} (${phase}) quantity-conservation check itself failed`;
     }
   }
 
@@ -853,34 +871,6 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       candidateKey: candidate.key,
       at: this.now(),
       stage,
-    });
-  }
-
-  /**
-   * ADVISORY capital metric for a candidate, for UI visibility during qualification.
-   *
-   * Uses the same arithmetic as the gate but is explicitly NOT the gate: it is computed from
-   * detection reference prices rather than from built order requests, so it is an estimate.
-   * Nothing may be admitted on the strength of this number — {@link evaluateEntryCapital} at
-   * `pre_submit` is the only decision that counts.
-   */
-  quoteCandidateCapital(candidate: BoxCandidate, legs: readonly BoxLegEvaluation[]): BoxCapitalReport | null {
-    const priced = legs.filter((leg) => leg.price !== null);
-    if (priced.length !== BOX_LEG_ROLES.length) return null;
-    const pseudo = priced.map((leg) => ({
-      role: leg.role,
-      side: leg.side,
-      tradingsymbol: leg.tradingsymbol,
-      quantity: candidate.lot_size,
-      pricing: { limit_price: leg.price as number },
-    }));
-    return evaluateBoxCapitalAdmission({
-      metrics: grossEntryOrderNotional(pseudo, BOX_LEG_ROLES.length),
-      limitRupees: this.capitalLimitRupees(),
-      broker: this.deps.broker?.() ?? "unknown",
-      candidateKey: candidate.key,
-      at: this.now(),
-      stage: "qualification",
     });
   }
 

@@ -79,7 +79,6 @@ import {
 } from "./instrumentKey.js";
 import {
   evaluateUnderlyingAdmission,
-  isUnderlyingReservationKey,
   underlyingLegRef,
   UNDERLYING_ALREADY_ACTIVE_REASON,
   type UnderlyingActivity,
@@ -295,15 +294,32 @@ interface UncertainHold {
   reason: string;
 }
 
-/** A durable reservation held for as long as a Box remains open on an underlying. */
+/**
+ * A durable reservation on ONE underlying key, held for as long as anything depends on it.
+ *
+ * REFERENCE-COUNTED BY HOLDER, not by trade id alone. There are three kinds of holder and they
+ * have different lifetimes, which is why a single id was not enough:
+ *
+ *   `pipeline:<executionId>`  an entry pipeline is running. Added before the contract lease is
+ *                             taken, removed when the pipeline settles.
+ *   `trade:<tradeId>`         an established Box is open. Added on a successful entry, removed
+ *                             when the engine reports it FLAT (or the record is deleted).
+ *   `residual:<attemptId>`    unresolved residual legs exist. Added when residual exposure is
+ *                             registered, removed when it resolves.
+ *
+ * The claim is released only when EVERY holder is gone. That is what makes both failure modes
+ * impossible: it cannot be lost while a Box is open (the `trade:` holder is added before the
+ * `pipeline:` holder is removed), and it cannot be retained after the Box is flat (the last
+ * holder leaving releases it).
+ */
 interface PositionUnderlyingClaim {
   readonly owner: string;
   lease: ReservationLease;
   context: ReservationContext;
   readonly keys: string[];
   readonly underlying: string;
-  /** Trade ids relying on this claim. The claim is released when this empties. */
-  readonly tradeIds: Set<string>;
+  /** Holder tokens, e.g. `trade:665f…`. Released when this empties. */
+  readonly holders: Set<string>;
   claimedAt: number;
   ownershipLost: boolean;
 }
@@ -477,22 +493,19 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
         ...args,
         stillWanted: this.ownershipGuard(gate.executionId, args.stillWanted),
       });
-      // A SUCCESSFUL entry converts its lease into a durable open-position claim rather than
-      // releasing it. Done BEFORE `settle`, and by transfer rather than release-then-reacquire,
-      // so there is no instant at which the underlying is unprotected.
-      if (result.ok === true && this.deps.cfg.oneActiveBoxPerUnderlying) {
-        const converted = this.convertLeaseToPositionClaim(
-          gate.executionId,
-          args.candidate.underlying,
-          result.legging?.trade_id ?? null,
-        );
-        if (converted) {
-          this.abandon(gate.executionId);
-          if (gate.opportunityId !== null) this.activeOpportunities.delete(gate.opportunityId);
-          return result;
-        }
-      }
-      await this.settle(gate.executionId, gate.opportunityId, uncertaintyOf(result));
+      // Promote the underlying's PIPELINE hold to a TRADE hold before the pipeline hold is
+      // dropped, so an open Box is never momentarily unprotected. Deliberately independent of the
+      // contract lease's fate: even if that lease's ownership was lost mid-flight, an established
+      // Box still gets its underlying protection.
+      const uncertainty = uncertaintyOf(result);
+      await this.settleUnderlyingHold({
+        executionId: gate.executionId,
+        underlying: gate.underlying,
+        tradeId: result.ok === true ? (result.legging?.trade_id ?? null) : null,
+        established: result.ok === true,
+        retainForUncertainty: uncertainty === "uncertain",
+      });
+      await this.settle(gate.executionId, gate.opportunityId, uncertainty);
       return result;
     } catch (error) {
       // An exception leaves broker state genuinely unknown. Hold the reservation
@@ -520,7 +533,16 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
         ...args,
         stillWanted: this.ownershipGuard(gate.executionId, args.stillWanted),
       });
-      // The atomic entry path reports no residual, so a plain failure is clean.
+      // The atomic entry path reports no residual, so a plain failure is clean. It also has no
+      // trade id to promote a hold to, so the pipeline hold is simply released and Layer 1a's
+      // durable-state check takes over for whatever position was opened.
+      await this.settleUnderlyingHold({
+        executionId: gate.executionId,
+        underlying: gate.underlying,
+        tradeId: null,
+        established: false,
+        retainForUncertainty: false,
+      });
       await this.settle(gate.executionId, gate.opportunityId, "clean");
       return result;
     } catch (error) {
@@ -655,7 +677,7 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     candidate: BoxCandidate,
     detection: BoxEvaluation,
   ): Promise<
-    | { ok: true; executionId: string; keys: string[]; opportunityId: string }
+    | { ok: true; executionId: string; keys: string[]; opportunityId: string; underlying: string }
     | { ok: false; reason: BoxExecutionFailureReason; detail: string }
   > {
     const broker = this.deps.broker();
@@ -736,10 +758,15 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
         status: "suppressed_session_limit",
         reason: sessionGate.reason ?? "session_limit_reached",
       });
+      // `session_limit_reached` is the only BoxExecutionFailureReason for this layer, so the
+      // specific cause travels in the DETAIL and in the log's `reason` field. Flattening the
+      // detail too would tell an operator whose database blipped that they were out of budget.
       return {
         ok: false,
         reason: "session_limit_reached",
-        detail: sessionGate.detail ?? "the armed trading session has no cycles left",
+        detail:
+          sessionGate.detail ??
+          `${sessionGate.reason ?? "session_limit_reached"}: the armed trading session refused entry`,
       };
     }
 
@@ -774,6 +801,42 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       }
     }
 
+    // ── UNDERLYING LOCK, LAYER 1b: ENTRY PIPELINE OWNERSHIP ────────────────────────────
+    //
+    // Acquired here: after the durable-state check, BEFORE the contract lease, and holding ONLY
+    // the underlying key. Always first, so there is no lock-ordering cycle. This is a cross-process
+    // CAS, so it also closes the same-tick race the in-process Layer 1a check cannot see.
+    //
+    // ENTRY ONLY. `refsForExit` never takes it, so an exit can never be blocked by it.
+    if (this.deps.cfg.oneActiveBoxPerUnderlying) {
+      const held = await this.holdUnderlying(
+        candidate.underlying,
+        CoordinatedBoxExecutionGateway.pipelineHolder(executionId),
+        // EXCLUSIVE: a second entry pipeline may not join an underlying that is already held.
+        true,
+      );
+      if (!held) {
+        this.abandonAndReleaseHold(executionId);
+        this.stats.underlyingAlreadyActive++;
+        this.log({
+          execution: executionId,
+          broker,
+          underlying: candidate.underlying,
+          status: "suppressed_underlying_active",
+          reason: UNDERLYING_ALREADY_ACTIVE_REASON,
+        });
+        return {
+          ok: false,
+          reason: UNDERLYING_ALREADY_ACTIVE_REASON,
+          detail:
+            `${candidate.underlying} is already held by another Box or entry pipeline; ` +
+            "BOX_ONE_ACTIVE_BOX_PER_UNDERLYING is enabled, so a second Box on this underlying may " +
+            "not enter regardless of strike pair, expiry or direction. This is NOT a contract " +
+            "reservation conflict — the two Boxes need not share any option.",
+        };
+      }
+    }
+
     const refs = this.refsForEntry(candidate);
     const keys = keysOf(refs);
 
@@ -804,45 +867,20 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     } catch (error) {
       // A store that throws must not leave the claim behind, or this opportunity would
       // be suppressed as a duplicate of itself forever.
-      this.abandon(executionId);
+      this.abandonAndReleaseHold(executionId);
       throw error;
     }
 
     if (attempt.kind === "unavailable") {
       const fallback = await this.handleUnavailable(executionId, refs, candidate, context, attempt);
       if (!fallback.ok) {
-        this.abandon(executionId);
+        this.abandonAndReleaseHold(executionId);
         return fallback;
       }
       attempt = fallback.attempt;
     }
 
     if (attempt.kind === "conflict") {
-      // A conflict on the UNDERLYING key is a different fact from a conflict on a contract, and
-      // must be reported as such. Waiting would be pointless too: the incumbent holds the
-      // underlying for its whole entry pipeline, not for a moment of book contention.
-      const underlyingConflict = attempt.conflicts.find((c) => isUnderlyingReservationKey(c.key));
-      if (underlyingConflict) {
-        this.abandon(executionId);
-        this.stats.underlyingAlreadyActive++;
-        this.log({
-          execution: executionId,
-          broker,
-          underlying: candidate.underlying,
-          status: "suppressed_underlying_active",
-          reason: UNDERLYING_ALREADY_ACTIVE_REASON,
-          incumbent: underlyingConflict.heldBy,
-        });
-        return {
-          ok: false,
-          reason: UNDERLYING_ALREADY_ACTIVE_REASON,
-          detail:
-            `${candidate.underlying} is already held by entry pipeline ${underlyingConflict.heldBy}; ` +
-            "BOX_ONE_ACTIVE_BOX_PER_UNDERLYING is enabled, so a second Box on this underlying may not " +
-            "enter regardless of strike pair, expiry or direction. This is NOT a contract reservation " +
-            "conflict — the two Boxes need not share any option.",
-        };
-      }
       waited = true;
       this.stats.reservationConflicts++;
       const described = attempt.conflicts.map((c) => c.kind).join(",");
@@ -864,14 +902,14 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       if (attempt.kind === "unavailable") {
         const fallback = await this.handleUnavailable(executionId, refs, candidate, context, attempt);
         if (!fallback.ok) {
-          this.abandon(executionId);
+          this.abandonAndReleaseHold(executionId);
           return fallback;
         }
         attempt = fallback.attempt;
       }
 
       if (attempt.kind !== "acquired") {
-        this.abandon(executionId);
+        this.abandonAndReleaseHold(executionId);
         this.stats.expiredWhileWaiting++;
         this.waitSamples.add(this.now() - waitStarted);
         this.log({
@@ -897,7 +935,7 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       const verdict = this.revalidate(candidate, detection);
       if (!verdict.ok) {
         this.stats.revalidationRejected++;
-        this.abandon(executionId);
+        this.abandonAndReleaseHold(executionId);
         await this.releaseLease(executionId, attempt.lease);
         this.log({
           execution: executionId,
@@ -931,7 +969,7 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     // through the conflict branch and reached the submit path with no lease at all. It
     // fails closed like every other unresolved acquisition.
     if (attempt.kind !== "acquired") {
-      this.abandon(executionId);
+      this.abandonAndReleaseHold(executionId);
       this.stats.failedClosed++;
       const detail =
         attempt.kind === "unavailable"
@@ -950,7 +988,7 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     // PRE-SUBMIT OWNERSHIP CHECK. The last thing before the order path.
     const permitted = await this.confirmBeforeSubmit(executionId, keys, context, attempt.lease, waited);
     if (!permitted.ok) {
-      this.abandon(executionId);
+      this.abandonAndReleaseHold(executionId);
       await this.releaseLease(executionId, attempt.lease);
       this.log({
         execution: executionId,
@@ -966,7 +1004,7 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
     // The claim becomes a LEASED execution. Nothing was registered twice: `claim()`
     // already created the record; this only attaches the granted reservation.
     this.grant(executionId, keys, attempt.lease);
-    return { ok: true, executionId, keys, opportunityId };
+    return { ok: true, executionId, keys, opportunityId, underlying: candidate.underlying };
   }
 
   /* ------------------------------------------------------------------ *
@@ -1015,6 +1053,40 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
    * Every failure path after `claim()` must call this, or the opportunity would be
    * suppressed as a duplicate of itself and the underlying's budget slot would leak.
    */
+  /**
+   * Release the entry-pipeline hold on an underlying, if this execution took one.
+   *
+   * Called from `abandon`, which every failure path inside `coordinateEntry` already invokes — so a
+   * new early-return added later cannot leak the hold. Fire-and-forget because `abandon` is
+   * synchronous by design (it runs inside the non-yielding prologue), and a failed release only ever
+   * over-restricts.
+   */
+  private releasePipelineHold(executionId: string, underlying: string | undefined): void {
+    if (!this.deps.cfg.oneActiveBoxPerUnderlying || !underlying) return;
+    void this.dropUnderlyingHolder(
+      underlying,
+      CoordinatedBoxExecutionGateway.pipelineHolder(executionId),
+    ).catch(() => undefined);
+  }
+
+  /**
+   * Abandon an execution AND release its underlying pipeline hold.
+   *
+   * For `coordinateEntry`'s failure paths only. Every early return there already calls this, which
+   * is why the release lives here rather than being repeated at each one — a new early return added
+   * later cannot leak the hold.
+   *
+   * NOT used by `settle`/`holdOnUncertainty`: by then the hold's fate has already been decided by
+   * `settleUnderlyingHold` (promoted to a trade hold, retained for uncertainty, or dropped), and
+   * releasing again here would undo that decision. That mistake dropped the hold on exactly the
+   * ambiguous outcomes it exists to cover.
+   */
+  private abandonAndReleaseHold(executionId: string): void {
+    const exec = this.active.get(executionId);
+    this.releasePipelineHold(executionId, exec?.underlying);
+    this.abandon(executionId);
+  }
+
   private abandon(executionId: string): void {
     const exec = this.active.get(executionId);
     if (exec === undefined) return;
@@ -1255,19 +1327,18 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       (role: BoxLegRole): OrderSide => entrySideFor(role, direction),
       BOX_LEG_ROLES,
     );
-    // ── UNDERLYING LOCK, LAYER 1b: ENTRY PIPELINE OWNERSHIP ────────────────────────────
+    // NOTE the underlying key is deliberately NOT added here.
     //
-    // The underlying key joins the SAME key set as the four contracts, so it is claimed
-    // ATOMICALLY with them by the same unique multikey index — all five or none. It therefore
-    // inherits the fencing token, broker-generation filter, deployment namespace, TTL, crash
-    // recovery and renewal heartbeat without a line of new infrastructure.
+    // An earlier version appended it to this key set so all five were claimed atomically. That
+    // was a serious bug: the claim outlives the entry (it must, to protect an OPEN Box), and a
+    // reservation conflict is side-agnostic, so the Box's OWN EXIT then collided with its own
+    // claim on the four contracts and was deferred forever — auto-exit, manual close and
+    // operator emergency flatten alike, with only a restart to clear it.
     //
-    // ENTRY ONLY. `refsForExit` deliberately does not add it: an exit reduces exposure we
-    // already own, and an entry restriction must never be able to block that.
-    if (this.deps.cfg.oneActiveBoxPerUnderlying) {
-      // BOX_LEG_ROLES[0] is a label for logs only; the reservation tiers compare keys.
-      refs.push(underlyingLegRef(this.deps.broker(), candidate.underlying, BOX_LEG_ROLES[0] as BoxLegRole));
-    }
+    // The underlying lock is therefore acquired SEPARATELY, holds ONLY the underlying key, and
+    // is reference-counted by holder (see `holdUnderlying`). Losing atomicity between the two
+    // acquisitions is harmless: they protect different things, the underlying is always taken
+    // FIRST so there is no lock-ordering cycle, and each is individually CAS-exclusive.
     return refs;
   }
 
@@ -1349,77 +1420,46 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
   }
 
   /**
-   * Hand a successful entry's lease over to the position-claim registry.
+   * Acquire (or join) the durable claim on one underlying, for a named holder.
    *
-   * A TRANSFER, not a release plus an acquire: the same owner id keeps the same durable row, so
-   * no other worker can slip between the two operations. Returns false when there is nothing to
-   * transfer, in which case the caller settles normally.
+   * Holds ONLY the underlying key, so it can never conflict with the four contract keys an exit
+   * needs. Idempotent per holder. Returns false when the claim is held by ANOTHER process or the
+   * authority is unreachable, which the caller treats as `underlying_already_active` on entry and
+   * as a degraded-protection note on the boot path.
+   *
+   * Never throws: a failure to take a lock must not be able to abort adopting real exposure.
    */
-  private convertLeaseToPositionClaim(
-    executionId: string,
+  private async holdUnderlying(
     underlying: string,
-    tradeId: string | null,
-  ): boolean {
-    const exec = this.active.get(executionId);
-    if (!exec || exec.lease === null || exec.ownershipLost) return false;
-    const claimKey = this.positionClaimKey(underlying);
-    const existing = this.positionClaims.get(claimKey);
-    if (existing) {
-      // Already claimed for this underlying (a second trade, or a re-entry after a config
-      // change). Add the trade and release this execution's now-redundant lease normally.
-      if (tradeId) existing.tradeIds.add(tradeId);
-      return false;
-    }
-    this.positionClaims.set(claimKey, {
-      owner: executionId,
-      lease: exec.lease,
-      context: exec.context,
-      keys: exec.keys,
-      underlying: underlying.trim().toUpperCase(),
-      // A successful entry with no trade id would otherwise be unreleasable. Fall back to the
-      // execution id so the claim still has an owner the engine can clear.
-      tradeIds: new Set([tradeId ?? executionId]),
-      claimedAt: this.now(),
-      ownershipLost: false,
-    });
-    this.stats.positionClaimsHeld++;
-    this.ensureHeartbeat();
-    this.log({
-      execution: executionId,
-      broker: exec.context.broker,
-      underlying,
-      status: "underlying_claim_held",
-      tradeId: tradeId ?? "-",
-    });
-    return true;
-  }
-
-  /**
-   * Claim an underlying for an already-open Box.
-   *
-   * Called by the engine at BOOT for every adopted position and unresolved residual attempt,
-   * which is what makes the lock survive a restart: after a reboot every lease has expired, so
-   * the protection is re-established from durable Mongo state rather than assumed.
-   *
-   * Idempotent per (underlying, tradeId). A failure to acquire is reported but never throws:
-   * refusing to adopt a position because a lock could not be taken would strand real exposure.
-   */
-  async claimUnderlyingForPosition(underlying: string, tradeId: string): Promise<boolean> {
+    holder: string,
+    /**
+     * Whether an EXISTING claim must be refused rather than joined.
+     *
+     * TRUE for an entry pipeline, and this is the whole restriction: joining would admit a second
+     * Box on an underlying that already has one, which is precisely what the setting forbids. An
+     * earlier version joined unconditionally and therefore did not restrict anything for the
+     * in-flight case.
+     *
+     * FALSE for the boot re-claim, a trade hold and a residual hold. Those are not new exposure —
+     * they are additional dependents on protection that must already exist, and refusing them would
+     * mean an adopted position or an unresolved residual leg silently lost its lock.
+     */
+    exclusive: boolean,
+  ): Promise<boolean> {
     if (!this.deps.cfg.oneActiveBoxPerUnderlying) return false;
     const claimKey = this.positionClaimKey(underlying);
     const existing = this.positionClaims.get(claimKey);
     if (existing) {
-      existing.tradeIds.add(tradeId);
+      if (exclusive) return false;
+      existing.holders.add(holder);
       return true;
     }
-    const owner = this.mintId("position");
+    const owner = this.mintId("underlying");
     const context = this.context();
     const refs = [underlyingLegRef(this.deps.broker(), underlying, BOX_LEG_ROLES[0] as BoxLegRole)];
     try {
       const attempt = await this.acquire(owner, refs, context);
       if (attempt.kind !== "acquired") {
-        // Another process already protects this underlying, or the authority is down. Either way
-        // Layer 1a still blocks locally, so this is a degraded-protection note, not a failure.
         this.stats.positionClaimFailures++;
         this.log({
           execution: owner,
@@ -1436,7 +1476,7 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
         context,
         keys: attempt.lease.keys as string[],
         underlying: underlying.trim().toUpperCase(),
-        tradeIds: new Set([tradeId]),
+        holders: new Set([holder]),
         claimedAt: this.now(),
         ownershipLost: false,
       });
@@ -1450,18 +1490,17 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
   }
 
   /**
-   * Drop a trade's reliance on an underlying claim, releasing it when the last one goes.
+   * Drop one holder, releasing the claim when the last one goes.
    *
-   * Called by the engine when a Box becomes fully FLAT and its residual exposure is resolved.
    * Releasing here — rather than letting a TTL lapse — is what stops the lock being incorrectly
-   * retained after the position is flat.
+   * retained after a position is flat.
    */
-  async releaseUnderlyingForPosition(underlying: string, tradeId: string): Promise<void> {
+  private async dropUnderlyingHolder(underlying: string, holder: string): Promise<void> {
     const claimKey = this.positionClaimKey(underlying);
     const claim = this.positionClaims.get(claimKey);
     if (!claim) return;
-    claim.tradeIds.delete(tradeId);
-    if (claim.tradeIds.size > 0) return;
+    claim.holders.delete(holder);
+    if (claim.holders.size > 0) return;
     this.positionClaims.delete(claimKey);
     this.stats.positionClaimsReleased++;
     await this.releaseLease(claim.owner, claim.lease);
@@ -1471,8 +1510,99 @@ export class CoordinatedBoxExecutionGateway implements BoxExecutionGateway {
       broker: claim.context.broker,
       underlying,
       status: "underlying_claim_released",
-      tradeId,
+      holder,
     });
+  }
+
+  /** Holder token for an entry pipeline. */
+  private static pipelineHolder(executionId: string): string {
+    return `pipeline:${executionId}`;
+  }
+
+  /** Holder token for an established Box. */
+  private static tradeHolder(tradeId: string): string {
+    return `trade:${tradeId}`;
+  }
+
+  /**
+   * Promote a settled entry pipeline's hold to a TRADE hold, or release it.
+   *
+   * ORDER MATTERS AND IS THE WHOLE POINT: the `trade:` holder is added BEFORE the `pipeline:`
+   * holder is removed, so there is no instant at which the claim has zero holders while a Box is
+   * open. That is what closes the "lock lost while the position remains open" hole, including the
+   * case where the entry lease's ownership was lost mid-flight — this path does not depend on that
+   * lease at all.
+   *
+   * `retainForUncertainty` keeps the pipeline hold when the outcome was ambiguous: exposure may
+   * exist under a trade id we do not yet know, so releasing would assume there is none.
+   */
+  private async settleUnderlyingHold(args: {
+    readonly executionId: string;
+    readonly underlying: string;
+    readonly tradeId: string | null;
+    readonly established: boolean;
+    readonly retainForUncertainty: boolean;
+  }): Promise<void> {
+    if (!this.deps.cfg.oneActiveBoxPerUnderlying) return;
+    const pipeline = CoordinatedBoxExecutionGateway.pipelineHolder(args.executionId);
+    if (args.established && args.tradeId) {
+      const claimKey = this.positionClaimKey(args.underlying);
+      const claim = this.positionClaims.get(claimKey);
+      if (claim) claim.holders.add(CoordinatedBoxExecutionGateway.tradeHolder(args.tradeId));
+      else {
+        // The hold was somehow lost while the entry succeeded. Re-acquire under the trade rather
+        // than leaving an open Box unprotected across processes.
+        await this.holdUnderlying(
+          args.underlying,
+          CoordinatedBoxExecutionGateway.tradeHolder(args.tradeId),
+          false,
+        );
+      }
+      this.log({
+        execution: args.executionId,
+        broker: this.deps.broker(),
+        underlying: args.underlying,
+        status: "underlying_claim_held",
+        tradeId: args.tradeId,
+      });
+    } else if (args.retainForUncertainty) {
+      // Ambiguous outcome: keep the pipeline hold. It is renewed by the heartbeat and cleared by
+      // reconciliation or by the engine registering residual exposure under its own holder.
+      this.log({
+        execution: args.executionId,
+        broker: this.deps.broker(),
+        underlying: args.underlying,
+        status: "underlying_claim_retained_uncertain",
+      });
+      return;
+    }
+    await this.dropUnderlyingHolder(args.underlying, pipeline);
+  }
+
+  /**
+   * Claim an underlying for an already-open Box or an unresolved residual attempt.
+   *
+   * Called by the engine at BOOT for every adopted position and residual, which is what makes the
+   * lock survive a restart: after a reboot every lease has expired, so protection is rebuilt from
+   * durable Mongo state rather than assumed to have persisted.
+   */
+  async claimUnderlyingForPosition(underlying: string, tradeId: string): Promise<boolean> {
+    return this.holdUnderlying(underlying, CoordinatedBoxExecutionGateway.tradeHolder(tradeId), false);
+  }
+
+  /** Release a trade's hold. Called when a Box becomes fully FLAT, or its record is deleted. */
+  async releaseUnderlyingForPosition(underlying: string, tradeId: string): Promise<void> {
+    await this.dropUnderlyingHolder(underlying, CoordinatedBoxExecutionGateway.tradeHolder(tradeId));
+  }
+
+  /** Claim an underlying on behalf of unresolved RESIDUAL legs. */
+  async claimUnderlyingForResidual(underlying: string, attemptId: string): Promise<boolean> {
+    return this.holdUnderlying(underlying, `residual:${attemptId}`, false);
+  }
+
+  /** Release a residual attempt's hold once its exposure is resolved. */
+  async releaseUnderlyingForResidual(underlying: string, attemptId: string): Promise<void> {
+    await this.dropUnderlyingHolder(underlying, `residual:${attemptId}`);
   }
 
   /** Underlyings this process currently protects on behalf of an open Box. Diagnostics. */

@@ -51,7 +51,65 @@ All live entry, exit, and emergency-reduction orders are regular NRML DAY **LIMI
 
 Depth and fill have different authority. Authoritative depth permits construction and origination of a bounded LIMIT order; broker cumulative quantity alone proves a fill. The gateway checks executable depth at admission and stamps token, feed generation, quote version/time, and check time. The manager revalidates after durable intent classification and at dequeue. The adapter revalidates after pacing immediately before the external POST. A feed-generation change always refuses a new mutation; a newer book in the same generation is acceptable only if the immutable quantity still executes inside the immutable LIMIT. Existing non-`CREATED` intents are adopted/reconciled before feed validation so recovery is not blocked by a new-submission gate.
 
-Broker operations are paced by `BOX_LIVE_BROKER_MIN_INTERVAL_MS` (default 250 ms). Distinct deadlines apply:
+### Pacing: real broker rate limits, never simulated latency
+
+**NO ARTIFICIAL SIMULATION LATENCY IS APPLIED TO LIVE EXECUTION. REAL SAFETY AND
+RATE-LIMIT LATENCY REMAINS.** These are different things that look identical in a latency
+chart, so the distinction is stated here rather than left implicit:
+
+| | Artificial PAPER latency | Real LIVE transport latency |
+|---|---|---|
+| What | `BOX_SIMULATED_DECISION_MS`, `BOX_SIMULATED_LATENCY_MS`, recorded latency samples and distributions, paper POST→ACK and ACK→terminal models, the simulated cancel race, paper persistence simulation, the paper scheduler | Broker rate-limit pacing, durable Mongo writes, reservation acquisition, feed validation, the broker HTTP request, the broker ACK, working-order observation, cancellation confirmation, reconciliation, recovery |
+| Purpose | A *model*, so a simulated fill is not instantaneous | A *constraint*, imposed by the broker, the network and our own durability requirements |
+| On the live path? | **NEVER** | Always |
+
+The live path is exactly: candidate qualifies → safety/admission validation → durable
+intent transition → scheduler/rate-limit admission → **immediately call the broker** →
+wait only for real broker/network responses → process real broker state. No `sleep()` was
+added to make live resemble paper.
+
+This is enforced, not merely asserted. `tests/box/noArtificialLiveLatency.test.mjs`:
+
+1. builds the live gateway with every paper timing construct replaced by a function that
+   **throws**, and runs entry, partial entry with unwind, economics abort and residual
+   flattening without touching one;
+2. audits the source so no live-path module even *imports* a paper timing module or reads
+   `BOX_SIMULATED_*` (the simulator has 8 such references; the six live-path modules have 0);
+3. asserts the API reports `artificial_latency_applied_to_live: false`.
+
+The suite is mutation-tested: injecting a single `await simulator.simulatedLatency()` into
+the live entry path fails 5 of its tests.
+
+Two pacing buckets, because a broker rate limit and a poll cadence we chose ourselves are
+not the same constraint:
+
+| Setting | Default | Governs |
+|---|---|---|
+| `BOX_LIVE_BROKER_MIN_INTERVAL_MS` | 250 ms | GENERAL: order-status polls, order/position lists, funds, margins, health. Also the poll cadence while a working order resolves. **Unchanged.** |
+| `BOX_LIVE_BROKER_ORDER_MIN_INTERVAL_MS` | 0 → per-broker | ORDER MUTATION: place / modify / cancel. `0` derives from the broker's published limit; a positive override is **clamped up** to the broker floor. |
+
+Per-broker floors (`src/box/brokerPacing.ts`): Zerodha 110 ms default / **100 ms floor**
+(Kite Connect permits 10 order requests/second; the 10% headroom exists because the
+limiter runs on the broker's clock and a rejected request still consumes the daily
+order-request budget). Dhan 120 ms default / **120 ms floor**, matching the
+`DHAN_MIN_INTERVAL_MS` pacing its own HTTP layer already imposes, so a smaller Box-level
+value would be absorbed below and misreported here. An unrecognised broker falls back to
+the strictest known profile.
+
+`BOX_LIVE_BROKER_ORDER_MIN_INTERVAL_MS` **cannot be used to disable pacing.** `0`,
+negative, `NaN` and any below-floor value all resolve to at least the broker floor.
+Cancellation is deliberately in the faster bucket: a protective cancel is the operation
+least worth slowing down.
+
+Splitting one bucket into two would otherwise raise the achievable *total* request rate,
+so a third absolute-floor watermark bounds every transport call at the order interval —
+total transport stays at 1/order-interval (10/s for Zerodha, its published ceiling).
+
+The effective values in force are reported by `GET /api/box/execution-control` under
+`execution.effective_broker_order_min_interval_ms`, read **from the adapter** rather than
+re-derived from config, and tagged `pacing_source_of_truth`.
+
+Distinct deadlines apply:
 
 - HTTP request: `BOX_LIVE_HTTP_TIMEOUT_MS=5000`
 - broker acknowledgement: `BOX_LIVE_ACK_TIMEOUT_MS=3000`
@@ -62,6 +120,50 @@ Broker operations are paced by `BOX_LIVE_BROKER_MIN_INTERVAL_MS` (default 250 ms
 A working or partial timeout triggers protective cancellation followed by terminal cumulative-quantity confirmation. If terminal quantity cannot be established, the order becomes `RECONCILIATION_REQUIRED`; no blind retry is allowed. The configured modification/chase bounds are safety ceilings; the current manager does not actively modify working orders.
 
 The central priority is emergency residual reduction, protective cancellation, exit, then entry. `BOX_LIVE_MAX_CONCURRENT_EXECUTIONS` defaults to 1, so multi-role work is queued and serialized rather than rejected.
+
+### The four-leg entry burst
+
+A concurrency slot is held for an order's **entire lifecycle** — submit through terminal
+polling — so at `BOX_LIVE_MAX_CONCURRENT_EXECUTIONS=1` leg 2 is not even persisted, let
+alone transmitted, until leg 1 has fully resolved. First-to-last submit is therefore
+bounded below by three complete order lifecycles, and between leg 1 filling and leg 4
+reaching the broker the position is **UNHEDGED**. Shrinking that window is the most
+valuable latency improvement available, and unlike removing a gate it costs nothing.
+
+`BOX_LIVE_ENTRY_SUBMIT_CONCURRENCY` (1–4, default 1) bounds how many ENTRY role
+submissions of ONE Box pipeline may be in transport at once. It is not a global
+concurrency increase:
+
+- `ENTRY` purpose only, and all slots must belong to the same `attempt_id`, so two
+  overlapping candidate Boxes can never use it to bypass contract reservations. The
+  one-pipeline-at-a-time check covers **base** slots too, closing the window where a
+  second candidate could take a freed base slot while the first still held burst slots.
+- Burst slots are **invisible** to emergency, cancel and exit admission, which count base
+  occupancy only. An entry burst therefore cannot delay protective work, and when the base
+  slot frees, the priority queue hands it to a queued `EMERGENCY_RESIDUAL` /
+  `PROTECTIVE_CANCEL` / `EXIT` ahead of any remaining `ENTRY`. This is strictly better
+  than the pre-burst behaviour, where all four entry legs contended for the same single
+  slot protective work needed.
+- `pump()` peeks the priority-sorted head and stops when it cannot be admitted, rather
+  than looking further down the queue — admitting a lower-priority `ENTRY` ahead of a
+  blocked `EMERGENCY_RESIDUAL` would invert `BOX_ORDER_PRIORITY`.
+- Rate limiting is unaffected: lifecycle concurrency and wire pacing are different
+  mechanisms, and the adapter pacer still spaces the four placements.
+
+`1` reproduces the pre-burst behaviour exactly. `4` is the recommended production value.
+
+### Entry telemetry
+
+Already-recorded raw stages (`executionTiming.ts`) cover `detected`, `qualified`,
+`scheduler_enqueued`, `scheduler_dequeued`, `intent_persisted`, `transport_started`,
+`http_request_started`, `http_response`, `broker_order_id`, `acknowledged`, `first_fill`,
+`last_fill`, `full_fill`, `cancel_requested`, `cancel_acknowledged`, `terminal`,
+`reconciled`. Box-level spans (`brokerTimingStore.ts`) cover
+`detection_to_first_submit_ms`, `detection_to_last_submit_ms`, `detection_to_first_fill_ms`,
+`detection_to_all_four_filled_ms`, `first_fill_to_last_fill_ms`,
+`unhedged_exposure_duration_ms` and `unwind_duration_ms`. Exchange timestamps are never
+fabricated when the broker does not supply them: `monoSpan()` returns `null` rather than a
+guess.
 
 ## Exact quantity and position state
 
