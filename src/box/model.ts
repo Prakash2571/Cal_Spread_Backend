@@ -647,6 +647,21 @@ const boxExecutionAttemptSchema = new mongoose.Schema(
      * these charges were computed and discarded (paper) or never computed at all (live).
      */
     flatten_charges: { type: Number, default: 0 },
+    /** Last IST day receiving a flatten charge and that day's cumulative contribution. */
+    flatten_charge_day: { type: String, default: null },
+    flatten_charges_for_day: { type: Number, default: 0 },
+    /**
+     * One monotonic ownership boundary for residual quantity and its flatten charge.
+     * Optional/defaulted additions keep existing rows migration-free; repository CAS
+     * treats a physically absent legacy version as zero and an absent application set as empty.
+     */
+    projection_version: { type: Number, default: 0 },
+    residual_projection_identity: { type: String, default: null },
+    /**
+     * Bounded ring of recent residual-projection application ids. Older commands are still
+     * rejected by their stale expected version, so this never needs to grow with document age.
+     */
+    applied_flatten_applications: { type: [String], default: [] },
     gross_abort_pnl: { type: Number, default: null },
     net_abort_pnl: { type: Number, default: null },
     // Outstanding simulated exposure this attempt could not flatten. `resolved` is
@@ -662,6 +677,24 @@ boxExecutionAttemptSchema.index({ resolved_at: -1 });
 // Unresolved attempts (those still holding residual exposure), newest first — the
 // query startup reconciliation runs to resume flattening.
 boxExecutionAttemptSchema.index({ resolved: 1, resolved_at: -1 });
+// Attempts that paid a residual-flatten charge on one IST day, largest same-day debit first.
+// The daily-risk seed reconstructs that day's charge buckets from exactly this shape and BOUNDS
+// the read, so the index has to be able to serve the bound in the order that matters: the rows
+// that move the day's risk figure most. Additive and migration-free — an index only.
+boxExecutionAttemptSchema.index(
+  { flatten_charge_day: 1, flatten_charges_for_day: -1 },
+  { name: "box_execution_attempt_flatten_charge_day" },
+);
+// At most one direct crash-only recovery boundary may be unresolved at a time. This prevents
+// workers with slightly different reconstructed snapshots from minting competing recovery rows.
+boxExecutionAttemptSchema.index(
+  { candidate_key: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { candidate_key: "boot-recovery", resolved: false },
+    name: "box_single_unresolved_crash_recovery",
+  },
+);
 
 export interface BoxExecutionAttemptRecord extends IBoxExecutionAttempt {
   _id: mongoose.Types.ObjectId;

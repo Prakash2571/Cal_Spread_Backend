@@ -33,10 +33,10 @@
  *                              per `client_order_id`) decides what that means: a `CREATED`
  *                              intent is submitted (no POST had happened), anything later is
  *                              adopted through `adapter.getOrder`. Never a duplicate order.
- *   crash after that write  -> the previous generation reached a TERMINAL durable outcome before
- *                              we advanced: either a terminal broker result or a local refusal
- *                              whose audit proves no POST. Its identity is spent and the new one
- *                              is genuinely new.
+ *   crash after that write  -> the previous generation reached an outcome that explicitly permits
+ *                              advancement: COMPLETE/CANCELLED broker truth left a remainder, or
+ *                              a local refusal proved no POST. Broker-origin REJECTED deliberately
+ *                              retains its identity for operator/reconciliation policy.
  *
  * The generation is therefore never a loose in-memory counter, never `Date.now()` and never
  * random: each attempt is represented explicitly by its own row in `box_order_intents`.
@@ -66,10 +66,9 @@ export type ResidualFlattenDisposition =
   /** Nothing is left. The residual is gone. */
   | "flattened"
   /**
-   * This identity reached a TERMINAL durable outcome: either a terminal broker
-   * result or a local pre-POST refusal that proves no broker mutation occurred,
-   * and quantity remains. The identity is SPENT: the remainder needs a NEW generation, otherwise
-   * the durable intent's immutable `quantity` blocks it forever.
+   * This identity reached an outcome that permits a NEW generation: COMPLETE/CANCELLED broker
+   * truth left quantity, or a local pre-POST refusal proves no broker mutation occurred. A
+   * broker-origin REJECTED does not enter this state; its identity is retained deliberately.
    */
   | "retire_attempt"
   /**
@@ -155,32 +154,56 @@ export function residualFlattenAttemptId(base: string, attempt: number): string 
  * ONLY `retire_attempt` advances. Everything else keeps the identity so the durable journal can
  * adopt whatever the broker actually has.
  */
+export interface ResidualFlattenAccounting {
+  /**
+   * Broker cumulative quantity safely observed for `attempt`, or `undefined` when this pass saw no
+   * broker order at all (no executable book, a gate refusal) and therefore observed nothing.
+   */
+  readonly cumulativeFilled: number | undefined;
+  /** Cumulative charge safely observed for `attempt`, `undefined` under the same rule. */
+  readonly cumulativeCharges: number | undefined;
+}
+
 export function carryResidualForward(
   residual: ResidualLegExposure,
   quantity: number,
   attempt: number,
   disposition: ResidualFlattenDisposition,
+  accounting?: ResidualFlattenAccounting,
 ): ResidualLegExposure {
-  return {
-    ...residual,
-    quantity,
-    flatten_attempt: disposition === "retire_attempt" ? attempt + 1 : attempt,
-  };
+  const retires = disposition === "retire_attempt";
+  const nextAttempt = retires ? attempt + 1 : attempt;
+  // A new durable order identity owns a fresh cumulative broker stream. Adopt/reuse retains the
+  // exact watermarks so a terminal replay after restart contributes only its positive delta.
+  //
+  // A pass that observed no broker order at all contributes no watermark, so the residual's own
+  // value is preserved — including ABSENT on a pre-watermark legacy row. Writing zero there would
+  // destroy the only remaining evidence of what that identity already projected (the immutable
+  // quantity on its durable intent), and the next terminal pass would re-credit and re-bill it.
+  const accountedFilled = retires ? 0 : accounting?.cumulativeFilled ?? residual.flatten_accounted_filled;
+  const accountedCharges = retires ? 0 : accounting?.cumulativeCharges ?? residual.flatten_accounted_charges;
+  const next: ResidualLegExposure = { ...residual, quantity, flatten_attempt: nextAttempt };
+  if (accountedFilled === undefined) delete next.flatten_accounted_filled;
+  else next.flatten_accounted_filled = accountedFilled;
+  if (accountedCharges === undefined) delete next.flatten_accounted_charges;
+  else next.flatten_accounted_charges = accountedCharges;
+  return next;
 }
 
 /**
  * Classify a broker order returned by a residual submission.
  *
- * Terminal is the ONLY state that spends an identity, because it is the only state in which the
- * broker can no longer add quantity to that order. A working or unknown order must keep its
- * identity: issuing a second reduction while the first may still fill is how a flatten becomes
- * an over-reduction.
+ * Terminal COMPLETE/CANCELLED is the only broker truth that retires an identity when quantity
+ * remains. REJECTED is terminal at the broker but intentionally retained until an explicit
+ * operator/reconciliation policy authorises a new order. Working/unknown outcomes likewise keep
+ * their identity so a second reduction cannot race a fill.
  */
 export function classifyResidualOrder(
   order: BrokerOrder,
   requested: number,
 ): ResidualFlattenDisposition {
   if (!isBrokerOrderTerminal(order.state)) return "adopt_attempt";
+  if (order.state === "REJECTED") return "adopt_attempt";
   return order.filled_quantity >= requested ? "flattened" : "retire_attempt";
 }
 
@@ -214,10 +237,12 @@ export function dispositionForFailure(kind: ResidualFlattenFailureKind): Residua
       // Nothing reached the broker. The identity is untouched and must be reused.
       return "reuse_attempt";
     case "local_pre_submit_refused":
-    case "broker_rejected":
-      // A durable terminal outcome spends the identity. For a local refusal the
-      // audit proves no broker POST; for a broker rejection the broker is terminal.
+      // The applied structured audit proves the broker was never called, so a new identity is safe.
       return "retire_attempt";
+    case "broker_rejected":
+      // Broker-origin rejection is terminal but not permission to manufacture another order.
+      // Retain the durable identity until an operator/reconciliation policy says otherwise.
+      return "adopt_attempt";
     case "identity_conflict":
       // A stale immutable snapshot must never be able to strand exposure. Retire past it.
       return "retire_attempt";

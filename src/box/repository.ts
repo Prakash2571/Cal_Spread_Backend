@@ -11,6 +11,12 @@ import mongoose from "mongoose";
 import { isBoxConnectionReady } from "../db.js";
 import { LEGACY_BROKER, type BrokerId } from "../brokers/types.js";
 import {
+  MAX_FLATTEN_APPLICATION_IDS,
+  residualProjectionIdentity,
+  type BoxExecutionAttemptProjectionCommand,
+  type BoxExecutionAttemptProjectionResult,
+} from "./executionAttemptProjection.js";
+import {
   BoxPnlDayProofBuilder,
   SUMMARY_FIELD,
   boxPnlDayProofsEqual,
@@ -56,6 +62,222 @@ import type {
 
 /** Mongo duplicate-key error code. */
 const DUPLICATE_KEY = 11000;
+
+export const BOX_RECOVERY_UNIQUE_INDEX = "box_single_unresolved_crash_recovery";
+export const BOX_RECOVERY_KEY = "boot-recovery";
+
+interface BoxExecutionAttemptIndexDescription {
+  name?: string;
+  unique?: boolean;
+  key?: Record<string, unknown>;
+  partialFilterExpression?: Record<string, unknown>;
+}
+
+interface RawBoxExecutionAttemptCollection {
+  find(
+    filter: Record<string, unknown>,
+    options: { projection: Record<string, number> },
+  ): { toArray(): Promise<Array<{ _id: unknown }>> };
+  createIndexes(specs: Record<string, unknown>[]): Promise<unknown>;
+  indexes(): Promise<BoxExecutionAttemptIndexDescription[]>;
+}
+
+/** How long a failed re-verification waits before the next readiness request may retry. */
+export const BOX_RECOVERY_REVERIFY_BACKOFF_MS = 30_000;
+
+function rawBoxExecutionAttemptCollection(): RawBoxExecutionAttemptCollection {
+  return BoxExecutionAttempt.collection as unknown as RawBoxExecutionAttemptCollection;
+}
+
+function exactRecord(
+  actual: Record<string, unknown> | undefined,
+  expected: Record<string, unknown>,
+): boolean {
+  if (!actual) return false;
+  const actualKeys = Object.keys(actual);
+  const expectedKeys = Object.keys(expected);
+  return actualKeys.length === expectedKeys.length &&
+    expectedKeys.every((key) => Object.prototype.hasOwnProperty.call(actual, key) &&
+      actual[key] === expected[key]);
+}
+
+/**
+ * Pure validation used by startup and offline tests. Any duplicate unresolved recovery rows or
+ * drift in the safety-critical index is an operator-repair condition, never something to guess
+ * through by selecting one row.
+ */
+export function boxRecoveryPersistenceValidationError(
+  indexes: readonly BoxExecutionAttemptIndexDescription[],
+  unresolvedRecoveryIds: readonly string[],
+): string | null {
+  if (unresolvedRecoveryIds.length > 1) {
+    return `duplicate unresolved ${BOX_RECOVERY_KEY} rows: ${unresolvedRecoveryIds.join(", ")}`;
+  }
+  const index = indexes.find((candidate) => candidate.name === BOX_RECOVERY_UNIQUE_INDEX);
+  if (!index) return `missing ${BOX_RECOVERY_UNIQUE_INDEX} index`;
+  if (index.unique !== true) return `${BOX_RECOVERY_UNIQUE_INDEX} is not unique`;
+  if (!exactRecord(index.key, { candidate_key: 1 })) {
+    return `${BOX_RECOVERY_UNIQUE_INDEX} has incompatible keys`;
+  }
+  if (!exactRecord(index.partialFilterExpression, {
+    candidate_key: BOX_RECOVERY_KEY,
+    resolved: false,
+  })) {
+    return `${BOX_RECOVERY_UNIQUE_INDEX} has an incompatible partial filter`;
+  }
+  return null;
+}
+
+/**
+ * Readiness gate for the crash-recovery uniqueness boundary.
+ *
+ * The boundary is only trustworthy while the connection that verified it is still up, so a lost
+ * connection invalidates the verification. The bit used to be ONE-SHOT — cleared on every
+ * disconnect and set only by `boot()`, which cannot run twice — so a single routine reconnect
+ * quarantined crash-only recovery for the rest of the process: `loadUnresolvedBoxExecutionAttempts`
+ * permanently excluded `boot-recovery` rows, `ensureBoxRecoveryExecutionAttempt` permanently threw,
+ * and (with such exposure attributed) live entry stayed closed until an operator restarted.
+ *
+ * The rules this gate encodes:
+ *  - fail closed: never ready until a verification completed on the CURRENT connection;
+ *  - self-heal: a readiness request on a restored connection starts exactly one re-verification;
+ *  - never spam: at most one attempt in flight, and at most one attempt per backoff window;
+ *  - never establish the safety-critical index as a side effect of a readiness probe in a process
+ *    that never established it explicitly at boot.
+ *
+ * Extracted as a class so the reconnect path is exercised offline, with no Mongo, by driving an
+ * instance whose connection/establisher/clock are doubles.
+ */
+export class BoxRecoveryPersistenceGate {
+  private verified = false;
+  private establishedOnce = false;
+  private inFlight: Promise<void> | null = null;
+  private nextAttemptAtMs = 0;
+
+  constructor(private readonly deps: {
+    isConnected: () => boolean;
+    establish: () => Promise<void>;
+    now?: () => number;
+    reverifyBackoffMs?: number;
+  }) {}
+
+  /** Ready only while connected and explicitly verified since the last observed disconnect. */
+  isReady(): boolean {
+    if (!this.deps.isConnected()) {
+      this.verified = false;
+      return false;
+    }
+    if (!this.verified) this.requestReverification();
+    return this.verified;
+  }
+
+  /**
+   * Establish and verify now, propagating any failure. This is the explicit boot path: the caller
+   * decides what an unverifiable boundary means for the process.
+   */
+  async establishNow(): Promise<void> {
+    await this.verifyOnce();
+  }
+
+  /** The verification currently in flight, if any. Never rejects — readiness is read via `isReady`. */
+  pendingVerification(): Promise<void> {
+    return (this.inFlight ?? Promise.resolve()).catch(() => undefined);
+  }
+
+  private verifyOnce(): Promise<void> {
+    this.verified = false;
+    // A synchronous throw must never escape into the caller: `isReady()` is consulted on the live
+    // exposure paths, and its contract is "false", not "explode".
+    let started: Promise<void>;
+    try {
+      started = this.deps.establish();
+    } catch (error) {
+      started = Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+    const attempt = started.then(() => {
+      this.verified = true;
+      this.establishedOnce = true;
+    });
+    // Track the attempt so a concurrent readiness probe cannot start a second one, and release the
+    // slot however it settles.
+    const tracked: Promise<void> = attempt.finally(() => {
+      if (this.inFlight === tracked) this.inFlight = null;
+    });
+    this.inFlight = tracked;
+    return tracked;
+  }
+
+  private requestReverification(): void {
+    if (!this.establishedOnce || this.inFlight) return;
+    const now = this.deps.now?.() ?? Date.now();
+    if (now < this.nextAttemptAtMs) return;
+    this.nextAttemptAtMs = now + (this.deps.reverifyBackoffMs ?? BOX_RECOVERY_REVERIFY_BACKOFF_MS);
+    // Deliberately not awaited: the probe is synchronous and stays fail-closed until this
+    // completes. A failure is logged and retried no sooner than the backoff window.
+    void this.verifyOnce().catch((error) => {
+      console.warn(
+        "[Box] crash-recovery persistence could not be re-verified after a Box connection change; " +
+          `crash-only recovery stays quarantined: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+  }
+}
+
+const boxRecoveryPersistenceGate = new BoxRecoveryPersistenceGate({
+  isConnected: () => isBoxConnectionReady(),
+  establish: () => establishBoxExecutionAttemptPersistence(),
+});
+
+/** Ready only while connected and explicitly verified since the last observed disconnect. */
+export function isBoxRecoveryPersistenceReady(): boolean {
+  return boxRecoveryPersistenceGate.isReady();
+}
+
+/**
+ * Establish and verify the single-unresolved crash-recovery boundary before any worker can adopt
+ * or create one. Existing duplicates are quarantined for operator repair; incompatible indexes
+ * are surfaced and never dropped or silently rebuilt.
+ */
+export async function initialiseBoxExecutionAttemptPersistence(): Promise<void> {
+  await boxRecoveryPersistenceGate.establishNow();
+}
+
+/** The Mongo round trip itself. Readiness bookkeeping belongs to the gate above. */
+async function establishBoxExecutionAttemptPersistence(): Promise<void> {
+  if (!isBoxConnectionReady()) throw new Error("box MongoDB connection is not ready");
+
+  const collection = rawBoxExecutionAttemptCollection();
+  // Use the native collection so this preflight does not depend on Mongoose's background
+  // auto-index lifecycle. Duplicate detection must happen before our explicit createIndexes call.
+  const unresolved = await collection.find({
+    candidate_key: BOX_RECOVERY_KEY,
+    resolved: false,
+  }, { projection: { _id: 1 } }).toArray();
+  const unresolvedIds = unresolved.map((row) => String(row._id));
+  if (unresolvedIds.length > 1) {
+    throw new Error(
+      `cannot initialise Box crash recovery: duplicate unresolved rows require quarantine/repair (${unresolvedIds.join(", ")})`,
+    );
+  }
+
+  try {
+    await collection.createIndexes([{
+      key: { candidate_key: 1 },
+      name: BOX_RECOVERY_UNIQUE_INDEX,
+      unique: true,
+      partialFilterExpression: { candidate_key: BOX_RECOVERY_KEY, resolved: false },
+    }]);
+  } catch (error) {
+    throw new Error(
+      `failed to establish ${BOX_RECOVERY_UNIQUE_INDEX}; an incompatible index or duplicate ` +
+        `recovery row may exist: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  const indexes = await collection.indexes();
+  const validationError = boxRecoveryPersistenceValidationError(indexes, unresolvedIds);
+  if (validationError) throw new Error(`Box crash-recovery persistence is unsafe: ${validationError}`);
+}
 
 export function isDuplicateKeyError(err: unknown): boolean {
   return (
@@ -1486,7 +1708,12 @@ export async function loadUnresolvedBoxExecutionAttempts(
 ): Promise<BoxExecutionAttemptRecord[]> {
   if (!isBoxDbEnabled()) return [];
   try {
-    return await BoxExecutionAttempt.find({ resolved: false })
+    // Crash-only rows are quarantined unless this process has explicitly established and verified
+    // their uniqueness boundary. Ordinary residual attempts remain safe to adopt and work.
+    const filter = isBoxRecoveryPersistenceReady()
+      ? { resolved: false }
+      : { resolved: false, candidate_key: { $ne: BOX_RECOVERY_KEY } };
+    return await BoxExecutionAttempt.find(filter)
       .sort({ resolved_at: -1 })
       .limit(limit)
       .lean<BoxExecutionAttemptRecord[]>();
@@ -1495,97 +1722,413 @@ export async function loadUnresolvedBoxExecutionAttempts(
   }
 }
 
-/** Mark an execution attempt's residual exposure as flattened (best-effort). */
-export async function resolveBoxExecutionAttempt(
-  id: string,
-  /** Charges incurred by the final flatten pass (a delta). Applied atomically with resolution. */
-  flattenChargeDelta?: number,
-): Promise<boolean> {
-  if (!isBoxDbEnabled() || !isValidBoxId(id)) return false;
-  const update: Record<string, unknown> = { $set: { resolved: true, residual_exposure: [] } };
-  if (flattenChargeDelta !== undefined && flattenChargeDelta > 0) {
-    update.$inc = { flatten_charges: round2Repo(flattenChargeDelta) };
+function validatedRecoveryExecutionAttempt(
+  row: BoxExecutionAttemptRecord | null,
+): BoxExecutionAttemptRecord | null {
+  if (!row) return null;
+  const residual = row.residual_exposure;
+  const version = row.projection_version;
+  const charges = row.flatten_charges ?? 0;
+  if (row.candidate_key !== BOX_RECOVERY_KEY || row.resolved !== false ||
+      !Array.isArray(residual) || residual.length === 0 ||
+      !Number.isSafeInteger(version) || (version ?? -1) < 0 ||
+      !Number.isFinite(charges) || charges < 0 ||
+      row.residual_projection_identity !== residualProjectionIdentity(residual)) {
+    throw new Error(
+      `unresolved ${BOX_RECOVERY_KEY} row ${row._id.toString()} has an incompatible projection; ` +
+        "direct crash recovery is quarantined",
+    );
   }
-  const result = await BoxExecutionAttempt.updateOne({ _id: id }, update);
-  return (result.matchedCount ?? 0) > 0;
+  return row;
 }
 
 /**
- * Persist the STILL-OUTSTANDING residual after a partial flatten, idempotently.
- *
- * When `residual` is empty the attempt is resolved; otherwise the remaining
- * exposure is written back so a later flatten (or a restart) works only what is
- * left — never the quantity already flattened.
+ * Create or adopt the deterministic ledger row used by direct crash-only recovery.
+ * The fixed ObjectId makes retries and workers converge on one accounting boundary.
  */
-export async function updateBoxExecutionAttemptResidual(
-  id: string,
-  residual: unknown[],
-  /**
-   * Charges incurred by THIS flatten pass (a delta, not a running total).
-   *
-   * Applied with `$inc` in the SAME update as the residual projection, so the cost and the quantity
-   * it paid for are recorded atomically: a pass can never leave one written without the other, and
-   * retrying an unacknowledged update cannot double-charge because it applied wholly or not at all.
-   */
-  flattenChargeDelta?: number,
-): Promise<boolean> {
-  if (!isBoxDbEnabled() || !isValidBoxId(id)) return false;
-  const resolved = residual.length === 0;
-  const update: Record<string, unknown> = {
-    $set: { residual_exposure: resolved ? [] : residual, resolved },
-  };
-  if (flattenChargeDelta !== undefined && flattenChargeDelta > 0) {
-    update.$inc = { flatten_charges: round2Repo(flattenChargeDelta) };
+export async function ensureBoxRecoveryExecutionAttempt(args: {
+  id: string;
+  recoveryKey: string;
+  residual: IBoxExecutionAttempt["residual_exposure"];
+  executionMode: ExecutionMode;
+  broker: BrokerId;
+  at: Date;
+}): Promise<BoxExecutionAttemptRecord | null> {
+  if (!isBoxDbEnabled() || !isValidBoxId(args.id)) return null;
+  if (args.recoveryKey !== BOX_RECOVERY_KEY || !isBoxRecoveryPersistenceReady()) {
+    throw new Error(
+      "direct crash recovery is quarantined until its unique persistence index is verified",
+    );
   }
-  const result = await BoxExecutionAttempt.updateOne({ _id: id }, update);
-  return (result.matchedCount ?? 0) > 0;
+  const existing = await BoxExecutionAttempt.findOne({
+    candidate_key: args.recoveryKey,
+    resolved: false,
+  }).sort({ resolved_at: 1 }).lean<BoxExecutionAttemptRecord>();
+  if (existing) return validatedRecoveryExecutionAttempt(existing);
+  const residual = args.residual ?? [];
+  try {
+    const created = await BoxExecutionAttempt.findOneAndUpdate(
+      { _id: args.id },
+    {
+      $setOnInsert: {
+        candidate_key: args.recoveryKey,
+        direction: "LONG_BOX",
+        underlying: "CRASH_RECOVERY",
+        name: "Crash-only attributed recovery",
+        is_index: false,
+        expiry: "",
+        lower_strike: 0,
+        upper_strike: 0,
+        lot_size: 0,
+        quantity: residual.reduce((sum, leg) => sum + leg.quantity, 0),
+        execution_mode: args.executionMode,
+        broker: args.broker,
+        leg_execution_mode: null,
+        detected_at: args.at,
+        resolved_at: args.at,
+        detected_gross_edge: null,
+        expected_net_profit: null,
+        filled_leg_count: 0,
+        failed_legs: [],
+        failure_reason: "unwind_failed",
+        failure_detail: "durable accounting boundary for crash-only attributed flatten",
+        legging: null,
+        partial_entry_charges: null,
+        unwind_charges: null,
+        flatten_charges: 0,
+        flatten_charge_day: null,
+        flatten_charges_for_day: 0,
+        projection_version: 0,
+        residual_projection_identity: residualProjectionIdentity(residual),
+        applied_flatten_applications: [],
+        gross_abort_pnl: null,
+        net_abort_pnl: null,
+        residual_exposure: residual,
+        resolved: residual.length === 0,
+      },
+    },
+      { upsert: true, new: true, setDefaultsOnInsert: true },
+    ).lean<BoxExecutionAttemptRecord>();
+    return validatedRecoveryExecutionAttempt(created);
+  } catch (error) {
+    if (!isDuplicateKeyError(error)) throw error;
+    // Another snapshot won the single-unresolved-recovery index between our read and upsert.
+    const winner = await BoxExecutionAttempt.findOne({
+      candidate_key: args.recoveryKey,
+      resolved: false,
+    }).lean<BoxExecutionAttemptRecord>();
+    return validatedRecoveryExecutionAttempt(winner);
+  }
+}
+
+function projectionResult(
+  status: BoxExecutionAttemptProjectionResult["status"],
+  row: BoxExecutionAttemptRecord | null,
+): BoxExecutionAttemptProjectionResult {
+  if (!row) {
+    return {
+      status,
+      projection_version: null,
+      projection_identity: null,
+      residual_exposure: null,
+      flatten_charges: null,
+      flatten_charge_day: null,
+      flatten_charges_for_day: null,
+    };
+  }
+  const residual = Array.isArray(row.residual_exposure) ? row.residual_exposure : [];
+  return {
+    status,
+    projection_version: Number.isSafeInteger(row.projection_version) &&
+      (row.projection_version ?? -1) >= 0 ? row.projection_version! : 0,
+    projection_identity: row.residual_projection_identity ?? residualProjectionIdentity(residual),
+    residual_exposure: residual,
+    flatten_charges: Math.round(Math.max(0, row.flatten_charges ?? 0) * 100) / 100,
+    flatten_charge_day: row.flatten_charge_day ?? null,
+    flatten_charges_for_day: Math.round(Math.max(0, row.flatten_charges_for_day ?? 0) * 100) / 100,
+  };
+}
+
+/**
+ * Atomically own one residual/charge projection transition.
+ *
+ * Exactly one writer can match the expected version/content and application id. Replaying an
+ * acknowledged-or-not command returns `already_applied`; a different winner returns `stale` with
+ * its authoritative projection, so callers can adopt rather than regress it. Missing legacy
+ * version/application fields are treated as version 0/an empty set without a migration.
+ */
+export async function applyBoxExecutionAttemptProjection(
+  id: string,
+  command: BoxExecutionAttemptProjectionCommand,
+): Promise<BoxExecutionAttemptProjectionResult> {
+  if (!isBoxDbEnabled() || !isValidBoxId(id)) return projectionResult("not_found", null);
+  const versionGuard: Record<string, unknown>[] = [{ projection_version: command.expected_version }];
+  const identityGuard: Record<string, unknown>[] = [
+    { residual_projection_identity: command.expected_projection_identity },
+  ];
+  if (command.expected_version === 0) {
+    versionGuard.push({ projection_version: { $exists: false } }, { projection_version: null });
+    identityGuard.push({
+      residual_projection_identity: null,
+      residual_exposure: command.expected_residual_exposure,
+    });
+  }
+  const row = await BoxExecutionAttempt.findOneAndUpdate(
+    {
+      _id: id,
+      applied_flatten_applications: { $ne: command.application_id },
+      $and: [{ $or: versionGuard }, { $or: identityGuard }],
+    },
+    [{
+      $set: {
+        residual_exposure: { $literal: command.residual_exposure },
+        resolved: command.residual_exposure.length === 0,
+        projection_version: { $add: [{ $ifNull: ["$projection_version", 0] }, 1] },
+        residual_projection_identity: command.next_projection_identity,
+        applied_flatten_applications: {
+          $slice: [
+            {
+              $concatArrays: [
+                { $ifNull: ["$applied_flatten_applications", []] },
+                [{ $literal: command.application_id }],
+              ],
+            },
+            -MAX_FLATTEN_APPLICATION_IDS,
+          ],
+        },
+        flatten_charges: {
+          $round: [
+            { $add: [{ $ifNull: ["$flatten_charges", 0] }, command.flatten_charge_delta] },
+            2,
+          ],
+        },
+        flatten_charge_day: command.flatten_charge_delta > 0
+          ? command.flatten_charge_day
+          : { $ifNull: ["$flatten_charge_day", null] },
+        flatten_charges_for_day: command.flatten_charge_delta > 0
+          ? {
+              $round: [
+                {
+                  $add: [
+                    {
+                      $cond: [
+                        { $eq: ["$flatten_charge_day", command.flatten_charge_day] },
+                        { $ifNull: ["$flatten_charges_for_day", 0] },
+                        0,
+                      ],
+                    },
+                    command.flatten_charge_delta,
+                  ],
+                },
+                2,
+              ],
+            }
+          : { $ifNull: ["$flatten_charges_for_day", 0] },
+      },
+    }] as unknown as Record<string, unknown>,
+    { new: true },
+  ).lean<BoxExecutionAttemptRecord>();
+  if (row) return projectionResult("applied", row);
+
+  const current = await BoxExecutionAttempt.findById(id).lean<BoxExecutionAttemptRecord>();
+  if (!current) return projectionResult("not_found", null);
+  const applied = current.applied_flatten_applications ?? [];
+  return projectionResult(
+    applied.includes(command.application_id) ? "already_applied" : "stale",
+    current,
+  );
 }
 
 function round2Repo(v: number): number {
   return Math.round(v * 100) / 100;
 }
 
-export async function loadBoxLiveRiskSeed(sinceMs: number): Promise<{
+/** Pure daily attribution rule shared by the Mongo seed and offline rollover tests. */
+export function boxExecutionAttemptDailyRiskContribution(
+  attempt: {
+    resolved_at?: Date | null;
+    net_abort_pnl?: number | null;
+    flatten_charges?: number | null;
+    flatten_charge_day?: string | null;
+    flatten_charges_for_day?: number | null;
+  },
+  sinceMs: number,
+  tradingDay: string,
+): number {
+  const resolvedToday = attempt.resolved_at instanceof Date &&
+    attempt.resolved_at.getTime() >= sinceMs;
+  const abort = resolvedToday ? (attempt.net_abort_pnl ?? 0) : 0;
+  const flattenToday = attempt.flatten_charge_day === tradingDay
+    ? Math.max(0, attempt.flatten_charges_for_day ?? 0)
+    : resolvedToday && !attempt.flatten_charge_day
+      ? Math.max(0, attempt.flatten_charges ?? 0)
+      : 0;
+  return round2Repo(abort - flattenToday);
+}
+
+/** The one attempt shape the daily-risk seed reads. */
+interface BoxDailyRiskSeedAttemptRow {
+  _id: unknown;
+  resolved_at?: Date | null;
+  resolved?: boolean;
+  net_abort_pnl?: number | null;
+  flatten_charges?: number | null;
+  flatten_charge_day?: string | null;
+  flatten_charges_for_day?: number | null;
+}
+
+const BOX_DAILY_RISK_SEED_SELECT = {
+  resolved_at: 1,
+  resolved: 1,
+  net_abort_pnl: 1,
+  flatten_charges: 1,
+  flatten_charge_day: 1,
+  flatten_charges_for_day: 1,
+} as const;
+
+/**
+ * Per-contribution bound on the daily-risk seed, matching `loadUnresolvedBoxExecutionAttempts`'s
+ * 200-row bound so the seed cannot read more attempts than startup reconciliation can work.
+ *
+ * WHY THREE BOUNDED READS RATHER THAN ONE BOUNDED `$or`
+ * The seed used to be a single unbounded `$or`, so it scanned the whole attempt collection as
+ * stranded unresolved rows accumulated. Simply bounding that `$or` would have been the UNSAFE
+ * bound: the planner's row order is not the risk order, so a truncated page can silently drop
+ * today's largest charge rows in favour of ancient unresolved ones — and a dropped charge makes
+ * the day look CHEAPER than it was, which loosens the daily-loss gate instead of tightening it.
+ *
+ * So each contribution is read and bounded on its own index, in the order that matters:
+ *   today's charge buckets -> largest same-day debit first (they move the gate the most)
+ *   today's resolutions    -> newest first, on {resolved_at: -1}
+ *   still-unresolved rows  -> newest first, on {resolved: 1, resolved_at: -1}, i.e. exactly the
+ *                             page startup reconciliation adopts and can therefore charge again
+ * The worst case of truncation is omitting the smallest same-day debits, the oldest of today's
+ * resolutions, and baselines for rows this process will not be working anyway.
+ */
+const BOX_DAILY_RISK_SEED_LIMIT = 200;
+
+export async function loadBoxLiveRiskSeed(sinceMs: number, tradingDayArg?: string): Promise<{
   realisedPnl: number;
   rejects: number;
   consecutiveFailures: number;
+  /** Full cumulative watermarks for unresolved attempts included in this day-risk reconstruction. */
+  flattenChargeBaselines: Record<string, number>;
+  /** Authoritative requested-day charge buckets for every attempt represented by this seed. */
+  flattenChargeBaselinesForDay: Record<string, number>;
+  /**
+   * True when an attempt read filled its page, so this reconstruction may be MISSING loss rows.
+   *
+   * The bound exists to stop a seed load scanning the whole collection, but a page boundary is not
+   * evidence of completeness: `resolved_at` order is not risk order, so a dropped row silently
+   * removes its `net_abort_pnl` loss and makes the day look cheaper than it was. A risk seed that
+   * errs generous is the one direction it must never err in, so incompleteness is REPORTED and the
+   * consumer keeps entry closed rather than treating a truncated page as authoritative.
+   */
+  incomplete: boolean;
 }> {
   if (!isBoxDbEnabled()) {
     throw new Error("Box persistence is unavailable while loading the live daily-risk seed.");
   }
-  const [trades, attempts, rejectedCount, recentIntents] = await Promise.all([
+  // Additive compatibility for the original one-argument API. `sinceMs` denotes the start (or a
+  // point within) the requested IST day, so shifting its timestamp produces that day key.
+  const tradingDay = tradingDayArg ??
+    new Date(sinceMs + 5.5 * 60 * 60 * 1_000).toISOString().slice(0, 10);
+  const [trades, chargedToday, resolvedToday, stillUnresolved, rejectedCount, recentIntents] = await Promise.all([
     BoxTrade.find({ closed_at: { $gte: new Date(sinceMs) } })
       .select({ realised_net_pnl: 1, net_pnl: 1 })
       .lean<Array<{ realised_net_pnl?: number | null; net_pnl?: number | null }>>(),
+    BoxExecutionAttempt.find({ flatten_charge_day: tradingDay })
+      .select(BOX_DAILY_RISK_SEED_SELECT)
+      .sort({ flatten_charges_for_day: -1 })
+      .limit(BOX_DAILY_RISK_SEED_LIMIT)
+      .lean<BoxDailyRiskSeedAttemptRow[]>(),
     BoxExecutionAttempt.find({ resolved_at: { $gte: new Date(sinceMs) } })
-      .select({ net_abort_pnl: 1, flatten_charges: 1 })
-      .lean<Array<{ net_abort_pnl?: number | null; flatten_charges?: number | null }>>(),
-    BoxOrderIntent.countDocuments({ state: "REJECTED", updated_at: { $gte: new Date(sinceMs) } }),
+      .select(BOX_DAILY_RISK_SEED_SELECT)
+      .sort({ resolved_at: -1 })
+      .limit(BOX_DAILY_RISK_SEED_LIMIT)
+      .lean<BoxDailyRiskSeedAttemptRow[]>(),
+    BoxExecutionAttempt.find({ resolved: false })
+      .select(BOX_DAILY_RISK_SEED_SELECT)
+      .sort({ resolved_at: -1 })
+      .limit(BOX_DAILY_RISK_SEED_LIMIT)
+      .lean<BoxDailyRiskSeedAttemptRow[]>(),
+    BoxOrderIntent.countDocuments({
+      state: "REJECTED",
+      updated_at: { $gte: new Date(sinceMs) },
+      $nor: [{
+        filled_quantity: 0,
+        broker_order_id: null,
+        audit: {
+          $elemMatch: {
+            to_state: "REJECTED",
+            "payload.origin": "local_pre_submit_refusal",
+            "payload.no_broker_post": true,
+          },
+        },
+      }],
+    }),
     BoxOrderIntent.find({ updated_at: { $gte: new Date(sinceMs) } })
-      .select({ state: 1 })
+      .select({ state: 1, filled_quantity: 1, broker_order_id: 1, audit: 1 })
       .sort({ updated_at: -1 })
-      .lean<Array<{ state: BoxOrderIntentState }>>(),
+      .lean<Array<Pick<IBoxOrderIntent, "state" | "filled_quantity" | "broker_order_id" | "audit">>>(),
   ]);
+  // One row can satisfy more than one contribution (a row charged today is usually also
+  // unresolved), and every downstream reducer must see it EXACTLY once or the day is
+  // double-charged. De-duplicate on `_id`, which is the attempt identity the seed keys by.
+  const attemptsById = new Map<string, BoxDailyRiskSeedAttemptRow>();
+  for (const row of [...chargedToday, ...resolvedToday, ...stillUnresolved]) {
+    attemptsById.set(String(row._id), row);
+  }
+  const attempts = [...attemptsById.values()];
   const tradePnl = trades.reduce((sum, trade) => sum + (trade.realised_net_pnl ?? trade.net_pnl ?? 0), 0);
-  // `net_abort_pnl` deliberately EXCLUDES the cost of flattening residual exposure, which is
-  // accumulated separately in `flatten_charges`. In-session the engine charges those against the
-  // daily loss limit as they are paid (`noteFlattenCharges` → `recordRealisedPnl(-charges)`), so
-  // omitting them here made the restart seed strictly more optimistic than the live counter it
-  // replaces: after a restart the day looked BETTER by the whole sum of flatten charges, and live
-  // entry could stay enabled with the true realised loss already past the limit. A risk seed that
-  // errs generous is the one direction it must never err in.
+  // `net_abort_pnl` deliberately EXCLUDES residual-flatten charges. Abort P&L belongs to the
+  // attempt's resolution day, while flatten fees belong to the IST day on which each projection
+  // paid them. The last-day bucket makes an old carryover attempt visible to today's restart seed
+  // without charging its prior-day cumulative history again. Physically legacy rows have no day
+  // bucket; when they resolved today their cumulative charge remains the additive-compatible
+  // fallback used before this metadata existed.
   const abortPnl = attempts.reduce(
-    (sum, attempt) => sum + (attempt.net_abort_pnl ?? 0) - Math.max(0, attempt.flatten_charges ?? 0),
+    (sum, attempt) => sum + boxExecutionAttemptDailyRiskContribution(attempt, sinceMs, tradingDay),
     0,
   );
+  const flattenChargeBaselines: Record<string, number> = {};
+  const flattenChargeBaselinesForDay: Record<string, number> = {};
+  for (const attempt of attempts) {
+    const attemptId = String(attempt._id);
+    if (attempt.flatten_charge_day === tradingDay) {
+      flattenChargeBaselinesForDay[attemptId] = round2Repo(
+        Math.max(0, attempt.flatten_charges_for_day ?? 0),
+      );
+    }
+    if (attempt.resolved !== false) continue;
+    flattenChargeBaselines[attemptId] = round2Repo(
+      Math.max(0, attempt.flatten_charges ?? 0),
+    );
+  }
   let consecutiveFailures = 0;
   for (const intent of recentIntents) {
     if (intent.state === "COMPLETE") break;
+    const localNoPost = intent.state === "REJECTED" && intent.filled_quantity === 0 &&
+      intent.broker_order_id === null && intent.audit.some((event) =>
+        event.to_state === "REJECTED" &&
+        event.payload?.origin === "local_pre_submit_refusal" &&
+        event.payload.no_broker_post === true);
+    if (localNoPost) continue;
     if (intent.state === "REJECTED" || intent.state === "UNKNOWN" || intent.state === "RECONCILIATION_REQUIRED") {
       consecutiveFailures++;
     }
   }
-  return { realisedPnl: tradePnl + abortPnl, rejects: rejectedCount, consecutiveFailures };
+  return {
+    realisedPnl: tradePnl + abortPnl,
+    rejects: rejectedCount,
+    consecutiveFailures,
+    flattenChargeBaselines,
+    flattenChargeBaselinesForDay,
+    // A full page means "there may be more", never "that was all of it".
+    incomplete: chargedToday.length >= BOX_DAILY_RISK_SEED_LIMIT ||
+      resolvedToday.length >= BOX_DAILY_RISK_SEED_LIMIT ||
+      stillUnresolved.length >= BOX_DAILY_RISK_SEED_LIMIT,
+  };
 }
 
 /* ----------------------------- daily P&L archive -------------------------- */

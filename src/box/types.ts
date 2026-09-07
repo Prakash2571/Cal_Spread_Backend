@@ -949,6 +949,17 @@ export interface ResidualLegExposure {
    * duplicated if it already exists.
    */
   flatten_attempt?: number;
+  /**
+   * Broker cumulative fill already represented by this residual projection for
+   * `flatten_attempt`. Optional legacy rows start at zero.
+   */
+  flatten_accounted_filled?: number;
+  /**
+   * Cumulative charge estimate already represented for the same durable flatten
+   * identity. Stored beside quantity so replay after a crash can bill only the
+   * incremental cumulative charge.
+   */
+  flatten_accounted_charges?: number;
 }
 
 /**
@@ -1231,6 +1242,15 @@ export interface IBoxExecutionAttempt {
    * flattening is the later (possibly multi-pass) work of clearing what the unwind could not.
    */
   flatten_charges?: number | null;
+  /** IST day receiving the most recent flatten charge and the amount attributed to that day. */
+  flatten_charge_day?: string | null;
+  flatten_charges_for_day?: number | null;
+  /** Monotonic residual/charge projection version. Missing legacy rows are version 0. */
+  projection_version?: number | null;
+  /** Stable content identity of `residual_exposure`; optional for migration-free legacy reads. */
+  residual_projection_identity?: string | null;
+  /** Bounded ring of recent residual-projection application ids. */
+  applied_flatten_applications?: string[] | null;
   gross_abort_pnl: number | null;
   net_abort_pnl: number | null;
   /**

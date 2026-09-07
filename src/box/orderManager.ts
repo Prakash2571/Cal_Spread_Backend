@@ -97,6 +97,40 @@ export interface OrderManagerHealth {
   circuit: "closed" | "open";
 }
 
+export interface DailyRiskSeed {
+  realisedPnl: number;
+  rejects: number;
+  consecutiveFailures: number;
+  /** Authoritative charge total for this seed's trading day, keyed by execution attempt. */
+  flattenChargeBaselinesForDay?: Record<string, number>;
+  /**
+   * The loader could not prove it read every contributing row. An understated loss must never
+   * present itself as an authoritative seed, so this keeps `daily_risk_seed` unhealthy — and
+   * therefore entry closed — while still installing the counters for observability.
+   */
+  incomplete?: boolean;
+}
+
+/** Generation captured immediately before an asynchronous daily-risk load begins. */
+export interface DailyRiskSeedToken {
+  readonly tradingDay: string;
+  readonly mutationGeneration: number;
+  /** Unique loader/token generation; late completions are accepted only while this is active. */
+  readonly loadGeneration: number;
+}
+
+export interface DailyRiskSeedTimer {
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+interface FlattenChargeMutation {
+  readonly generation: number;
+  readonly attemptId: string;
+  readonly previousChargesForDay: number;
+  readonly chargesForDay: number;
+}
+
 export interface OrderManagerStatus {
   controls: OrderManagerControls;
   health: OrderManagerHealth;
@@ -108,7 +142,15 @@ export interface OrderManagerStatus {
   unknownOrders: number;
   recoveryActive: boolean;
   safeAttributedReductionReady: boolean;
+  /** Matching crash-only exposure exists but its unique durable recovery boundary is unavailable. */
+  crashRecoveryEntryQuarantined: boolean;
   tradingDay: string;
+  riskBookkeeping: {
+    activeSeedTokens: number;
+    activeLoadGeneration: number | null;
+    retainedMutationCount: number;
+    retainedMutationDayBuckets: number;
+  };
   rejects: number;
   consecutiveFailures: number;
   realisedPnlToday: number;
@@ -257,7 +299,23 @@ export class BoxOrderManager {
   private breakerReason: string | null = null;
   private breakerAt: number | null = null;
   private reconcilePromise: Promise<OrderManagerReconcileReport> | null = null;
-  private dailyRiskSeedPromise: Promise<void> | null = null;
+  private dailyRiskLoadGeneration = 0;
+  private activeDailyRiskLoad: {
+    generation: number;
+    day: string;
+    token: DailyRiskSeedToken;
+    timeout: unknown;
+  } | null = null;
+  private readonly activeDailyRiskSeedTokens = new Map<number, DailyRiskSeedToken>();
+  private crashOnlyAttributedExposure = false;
+  /**
+   * Local flatten observations are generation-stamped per day. A seed loader captures the
+   * generation before issuing any query, then installation merges only ranges absent from the
+   * loader's authoritative per-attempt day buckets. This is the serialization boundary between
+   * Mongo reconstruction and in-process risk mutation.
+   */
+  private flattenChargeMutationGeneration = 0;
+  private readonly flattenChargeMutationsByDay = new Map<string, FlattenChargeMutation[]>();
   private reconcileTimer: NodeJS.Timeout | null = null;
   private disposed = false;
   private lastReconciledAt: number | null = null;
@@ -274,7 +332,13 @@ export class BoxOrderManager {
       istDayKey?: (at: number) => string;
       onPersistenceLossAfterFill?: (order: BrokerOrder, error: unknown) => void;
       onReconciliationIssue?: (report: OrderManagerReconcileReport) => void | Promise<void>;
-      loadDailyRiskSeed?: (tradingDay: string) => Promise<{ realisedPnl: number; rejects: number; consecutiveFailures: number }>;
+      loadDailyRiskSeed?: (tradingDay: string) => Promise<DailyRiskSeed>;
+      /** Logical cancellation bound for a seed query that the database driver cannot abort. */
+      dailyRiskSeedTimeoutMs?: number;
+      /** Injectable deterministic timer used by seed timeout tests. */
+      dailyRiskSeedTimer?: DailyRiskSeedTimer;
+      /** Process/connection/index-scoped readiness; read at every entry decision. */
+      isCrashRecoveryPersistenceReady?: () => boolean;
       onCircuitTrip?: (reason: string) => void;
       /**
        * LIVE TIMING INSTRUMENTATION (Phase 2). Optional and FAIL-OPEN: when absent the manager
@@ -340,6 +404,76 @@ export class BoxOrderManager {
     this.controls = { ...this.controls, ...patch };
   }
 
+  /** Capture and register the local mutation boundary immediately before a daily-risk load starts. */
+  beginDailyRiskSeed(tradingDay: string): DailyRiskSeedToken {
+    const token: DailyRiskSeedToken = {
+      tradingDay,
+      mutationGeneration: this.flattenChargeMutationGeneration,
+      loadGeneration: ++this.dailyRiskLoadGeneration,
+    };
+    this.activeDailyRiskSeedTokens.set(token.loadGeneration, token);
+    return token;
+  }
+
+  /**
+   * Release a daily-risk seed token whose load will never install anything.
+   *
+   * `seedLimits` settles the token on the installing path; every other exit needs this one, or the
+   * token stays "active" forever and `compactFlattenChargeMutations` must retain the whole day's
+   * merge journal — the unbounded growth the generation bound exists to close, re-opened once per
+   * failed boot. Idempotent (an already-settled token is not registered) and it never discards a
+   * merge a genuinely active loader still needs: compaction keeps the suffix above the oldest
+   * REMAINING active generation for the day.
+   */
+  abandonDailyRiskSeed(token: DailyRiskSeedToken): void {
+    if (!this.activeDailyRiskSeedTokens.has(token.loadGeneration)) return;
+    this.settleDailyRiskSeedToken(token);
+  }
+
+  /**
+   * Reconciliation/engine seam for crash-only exposure not represented by projected trades.
+   * Entry reads persistence readiness dynamically; ordinary exits never consult this flag.
+   */
+  setCrashOnlyAttributedExposure(exists: boolean): void {
+    this.crashOnlyAttributedExposure = exists;
+  }
+
+  /**
+   * Record one authoritative per-attempt/day bucket advance. Lifetime bookkeeping lives in the
+   * engine; this manager owns only the trading-day debit and the seed-install merge journal.
+   */
+  recordFlattenCharge(args: {
+    attemptId: string;
+    chargeDay: string;
+    previousChargesForDay: number;
+    chargesForDay: number;
+  }): void {
+    if (!args.chargeDay || !Number.isFinite(args.previousChargesForDay) ||
+        !Number.isFinite(args.chargesForDay)) return;
+    const previous = Math.round(Math.max(0, args.previousChargesForDay) * 100) / 100;
+    const current = Math.round(Math.max(0, args.chargesForDay) * 100) / 100;
+    if (current <= previous || args.chargeDay !== this.tradingDay) return;
+    const generation = ++this.flattenChargeMutationGeneration;
+    const activeLoaderCanNeedMutation = [...this.activeDailyRiskSeedTokens.values()].some(
+      (token) => token.tradingDay === args.chargeDay && token.mutationGeneration < generation,
+    );
+    if (activeLoaderCanNeedMutation) {
+      const mutation: FlattenChargeMutation = {
+        generation,
+        attemptId: args.attemptId,
+        previousChargesForDay: previous,
+        chargesForDay: current,
+      };
+      const mutations = this.flattenChargeMutationsByDay.get(args.chargeDay) ?? [];
+      mutations.push(mutation);
+      this.flattenChargeMutationsByDay.set(args.chargeDay, mutations);
+    }
+    if (args.chargeDay === this.tradingDay) {
+      this.realisedPnlToday = Math.round((this.realisedPnlToday - (current - previous)) * 100) / 100;
+      this.evaluateLimits();
+    }
+  }
+
   /** Seed durable/reconciled counters before entry is allowed. */
   seedLimits(args: {
     tradingDay: string;
@@ -348,14 +482,33 @@ export class BoxOrderManager {
     consecutiveFailures?: number;
     openBoxes?: number;
     residualLegs?: number;
+    seedToken?: DailyRiskSeedToken | undefined;
+    flattenChargeBaselinesForDay?: Record<string, number> | undefined;
+    /** The reconstruction may be missing loss rows; see `DailyRiskSeed.incomplete`. */
+    incomplete?: boolean | undefined;
   }): void {
+    if (args.seedToken && !this.activeDailyRiskSeedTokens.has(args.seedToken.loadGeneration)) {
+      // Timed-out/rolled-over loader completion. Its scalar and baselines are no longer allowed to
+      // mutate current risk, and its mutation range has already been compacted.
+      return;
+    }
     this.tradingDay = args.tradingDay;
-    this.realisedPnlToday = Number.isFinite(args.realisedPnlToday) ? args.realisedPnlToday! : 0;
+    const seedPnl = Number.isFinite(args.realisedPnlToday) ? args.realisedPnlToday! : 0;
+    this.realisedPnlToday = this.mergePostLoadFlattenCharges(
+      args.tradingDay,
+      seedPnl,
+      args.seedToken,
+      args.flattenChargeBaselinesForDay,
+    );
     this.rejects = Math.max(0, Math.floor(args.rejects ?? 0));
     this.consecutiveFailures = Math.max(0, Math.floor(args.consecutiveFailures ?? 0));
     this.openBoxes = Math.max(0, Math.floor(args.openBoxes ?? 0));
     this.residualLegs = Math.max(0, Math.floor(args.residualLegs ?? 0));
-    this.health.daily_risk_seed = "healthy";
+    // A truncated reconstruction can only understate a loss, which would LOOSEN the daily-loss
+    // gate. Counters are still installed so an operator can see them, but the seed is not called
+    // healthy, and `canEnter()` already treats anything other than healthy as closed.
+    this.health.daily_risk_seed = args.incomplete === true ? "failed" : "healthy";
+    if (args.seedToken) this.settleDailyRiskSeedToken(args.seedToken);
     this.evaluateLimits();
   }
 
@@ -457,6 +610,7 @@ export class BoxOrderManager {
         this.health.broker_orders_api !== "healthy" ||
         this.health.broker_positions_api !== "healthy") return false;
     if (this.unknownOrders > 0 || this.recoveryActive) return false;
+    if (this.isCrashRecoveryEntryQuarantined()) return false;
     if (!this.feedHealthy || this.now() < this.feedWarmUntil) return false;
     if (this.openBoxes >= this.deps.limits.maxOpenBoxes) return false;
     if (this.residualLegs > this.deps.limits.maxResidualLegs) return false;
@@ -682,7 +836,15 @@ export class BoxOrderManager {
       unknownOrders: this.unknownOrders,
       recoveryActive: this.recoveryActive,
       safeAttributedReductionReady: this.safeAttributedReductionReady,
+      crashRecoveryEntryQuarantined: this.isCrashRecoveryEntryQuarantined(),
       tradingDay: this.tradingDay,
+      riskBookkeeping: {
+        activeSeedTokens: this.activeDailyRiskSeedTokens.size,
+        activeLoadGeneration: this.activeDailyRiskLoad?.generation ?? null,
+        retainedMutationCount: [...this.flattenChargeMutationsByDay.values()]
+          .reduce((sum, mutations) => sum + mutations.length, 0),
+        retainedMutationDayBuckets: this.flattenChargeMutationsByDay.size,
+      },
       rejects: this.rejects,
       consecutiveFailures: this.consecutiveFailures,
       realisedPnlToday: this.realisedPnlToday,
@@ -698,6 +860,12 @@ export class BoxOrderManager {
     this.disposed = true;
     if (this.reconcileTimer) clearInterval(this.reconcileTimer);
     this.reconcileTimer = null;
+    if (this.activeDailyRiskLoad) {
+      this.seedTimer().clearTimeout(this.activeDailyRiskLoad.timeout);
+      this.activeDailyRiskLoad = null;
+    }
+    this.activeDailyRiskSeedTokens.clear();
+    this.flattenChargeMutationsByDay.clear();
     for (const action of this.queue.splice(0)) {
       if (action.kind === "submit") {
         this.activeClientIds.delete(action.request.client_order_id);
@@ -967,6 +1135,12 @@ export class BoxOrderManager {
       null,
       `local pre-submit refusal; no broker POST attempted (${refusal.stage}): ${refusal.reason}`,
       [intent.state],
+      {
+        origin: "local_pre_submit_refusal",
+        no_broker_post: true,
+        stage: refusal.stage,
+        reason: refusal.reason,
+      },
     );
     // Provenance matters: an already-REJECTED fresh row may be a real broker
     // rejection written by another actor. Only THIS applied CAS proves no POST.
@@ -1313,6 +1487,7 @@ export class BoxOrderManager {
     brokerOrderId: string | null,
     message: string,
     expectedStates?: readonly BoxOrderIntentState[],
+    payload?: Record<string, unknown> | null,
   ): Promise<OrderIntentUpdateResult & { intent: IBoxOrderIntent }> {
     const at = this.now();
     const result = await this.deps.persistence.update(
@@ -1325,7 +1500,7 @@ export class BoxOrderManager {
           ? new Date(at)
           : null,
       },
-      auditFor(intent, state, brokerOrderId, message, null, at),
+      auditFor(intent, state, brokerOrderId, message, null, at, payload),
       expectedStates,
     );
     const updated = result.intent;
@@ -1432,10 +1607,68 @@ export class BoxOrderManager {
     }
   }
 
+  private mergePostLoadFlattenCharges(
+    day: string,
+    seedPnl: number,
+    token: DailyRiskSeedToken | undefined,
+    baselines: Record<string, number> | undefined,
+  ): number {
+    if (!token || token.tradingDay !== day) return seedPnl;
+    let unseededCharges = 0;
+    for (const mutation of this.flattenChargeMutationsByDay.get(day) ?? []) {
+      if (mutation.generation <= token.mutationGeneration) continue;
+      const seedBaselineValue = baselines?.[mutation.attemptId];
+      const seedBaseline = Number.isFinite(seedBaselineValue)
+        ? Math.round(Math.max(0, seedBaselineValue!) * 100) / 100
+        : 0;
+      // A loader may have observed none, part, or all of this local range. Add exactly the suffix
+      // above both the mutation's prior watermark and the authoritative seed bucket.
+      const representedThrough = Math.max(mutation.previousChargesForDay, seedBaseline);
+      if (mutation.chargesForDay > representedThrough) {
+        unseededCharges += mutation.chargesForDay - representedThrough;
+      }
+    }
+    return Math.round((seedPnl - unseededCharges) * 100) / 100;
+  }
+
+  private settleDailyRiskSeedToken(token: DailyRiskSeedToken): void {
+    this.activeDailyRiskSeedTokens.delete(token.loadGeneration);
+    this.compactFlattenChargeMutations(token.tradingDay);
+  }
+
+  /** Retain exactly the mutation suffix an active loader can still need. */
+  private compactFlattenChargeMutations(day: string): void {
+    const active = [...this.activeDailyRiskSeedTokens.values()]
+      .filter((token) => token.tradingDay === day);
+    if (active.length === 0) {
+      this.flattenChargeMutationsByDay.delete(day);
+      return;
+    }
+    const oldestBoundary = Math.min(...active.map((token) => token.mutationGeneration));
+    const retained = (this.flattenChargeMutationsByDay.get(day) ?? [])
+      .filter((mutation) => mutation.generation > oldestBoundary);
+    if (retained.length === 0) this.flattenChargeMutationsByDay.delete(day);
+    else this.flattenChargeMutationsByDay.set(day, retained);
+  }
+
   private rollTradingDay(): void {
     const next = this.dayKey();
     if (next === this.tradingDay) return;
     this.tradingDay = next;
+    // No prior-day loader may pin memory or occupy the one current-day slot. Logical cancellation
+    // is enough even when the database operation itself cannot be aborted: generation checks make
+    // every eventual completion inert.
+    if (this.activeDailyRiskLoad && this.activeDailyRiskLoad.day !== next) {
+      this.seedTimer().clearTimeout(this.activeDailyRiskLoad.timeout);
+      this.settleDailyRiskSeedToken(this.activeDailyRiskLoad.token);
+      this.activeDailyRiskLoad = null;
+    }
+    for (const token of [...this.activeDailyRiskSeedTokens.values()]) {
+      if (token.tradingDay !== next) this.settleDailyRiskSeedToken(token);
+    }
+    for (const day of [...this.flattenChargeMutationsByDay.keys()]) {
+      if (day !== next) this.flattenChargeMutationsByDay.delete(day);
+    }
     // Never reopen on a process-local zero at midnight. Entry remains blocked
     // until the new IST day's durable closes, aborts, and rejects are reloaded.
     this.realisedPnlToday = 0;
@@ -1448,33 +1681,81 @@ export class BoxOrderManager {
   }
 
   private refreshDailyRiskSeed(): void {
-    if (this.dailyRiskSeedPromise || this.disposed) return;
+    if (this.activeDailyRiskLoad || this.disposed) return;
     const day = this.tradingDay;
     const loader = this.deps.loadDailyRiskSeed;
     if (!loader) {
       this.health.daily_risk_seed = "failed";
       return;
     }
+    const token = this.beginDailyRiskSeed(day);
+    const generation = token.loadGeneration;
     this.health.daily_risk_seed = "seeding";
-    this.dailyRiskSeedPromise = loader(day)
+    const timeout = this.seedTimer().setTimeout(() => {
+      const active = this.activeDailyRiskLoad;
+      if (!active || active.generation !== generation) return;
+      this.activeDailyRiskLoad = null;
+      this.settleDailyRiskSeedToken(token);
+      if (day === this.tradingDay) this.health.daily_risk_seed = "failed";
+      // Release the slot and immediately request the newest day. The timed-out promise may settle
+      // later, but it no longer owns a generation and therefore cannot install anything.
+      if (!this.disposed) {
+        this.rollTradingDay();
+        this.refreshDailyRiskSeed();
+      }
+    }, Math.max(1, this.deps.dailyRiskSeedTimeoutMs ?? 30_000));
+    this.activeDailyRiskLoad = { generation, day, token, timeout };
+
+    void Promise.resolve()
+      .then(() => loader(day))
       .then((seed) => {
-        // Ignore a slow prior-day response that crossed another IST rollover.
-        if (day !== this.tradingDay) return;
-        this.realisedPnlToday = Number.isFinite(seed.realisedPnl) ? seed.realisedPnl : 0;
-        this.rejects = Math.max(0, Math.floor(seed.rejects));
-        this.consecutiveFailures = Math.max(0, Math.floor(seed.consecutiveFailures));
-        this.health.daily_risk_seed = "healthy";
-        this.evaluateLimits();
-        // Reconciliation owns the final entry-ready flag. Defer so this promise is
-        // cleared before reconcile can request another seed.
-        setTimeout(() => void this.reconcile().catch(() => undefined), 0).unref?.();
+        const active = this.activeDailyRiskLoad;
+        if (!active || active.generation !== generation || day !== this.tradingDay ||
+            !this.activeDailyRiskSeedTokens.has(token.loadGeneration)) return;
+        this.seedTimer().clearTimeout(active.timeout);
+        this.activeDailyRiskLoad = null;
+        this.seedLimits({
+          tradingDay: day,
+          realisedPnlToday: Number.isFinite(seed.realisedPnl) ? seed.realisedPnl : 0,
+          rejects: seed.rejects,
+          consecutiveFailures: seed.consecutiveFailures,
+          seedToken: token,
+          flattenChargeBaselinesForDay: seed.flattenChargeBaselinesForDay,
+          incomplete: seed.incomplete,
+        });
+        // Reconciliation owns the final entry-ready flag. Defer so the load slot is visibly free.
+        const deferred = setTimeout(() => void this.reconcile().catch(() => undefined), 0);
+        deferred.unref?.();
       })
       .catch(() => {
+        const active = this.activeDailyRiskLoad;
+        if (!active || active.generation !== generation) return;
+        this.seedTimer().clearTimeout(active.timeout);
+        this.activeDailyRiskLoad = null;
+        this.settleDailyRiskSeedToken(token);
         if (day === this.tradingDay) this.health.daily_risk_seed = "failed";
-      })
-      .finally(() => {
-        this.dailyRiskSeedPromise = null;
       });
+  }
+
+  private seedTimer(): DailyRiskSeedTimer {
+    if (this.deps.dailyRiskSeedTimer) return this.deps.dailyRiskSeedTimer;
+    return {
+      setTimeout: (callback, delayMs) => {
+        const handle = setTimeout(callback, delayMs);
+        handle.unref?.();
+        return handle;
+      },
+      clearTimeout: (handle) => clearTimeout(handle as NodeJS.Timeout),
+    };
+  }
+
+  private isCrashRecoveryEntryQuarantined(): boolean {
+    if (!this.crashOnlyAttributedExposure) return false;
+    try {
+      return !(this.deps.isCrashRecoveryPersistenceReady?.() ?? false);
+    } catch {
+      return true;
+    }
   }
 
   private dayKey(): string {
@@ -1600,6 +1881,7 @@ function auditFor(
   message: string,
   fillIdentity: string | null,
   now: number,
+  payload: Record<string, unknown> | null = null,
 ): BoxOrderIntentAudit {
   return {
     audit_id: `${intent.client_order_id}:${intent.state}->${state}:${brokerOrderId ?? "none"}:${fillIdentity ?? "none"}`,
@@ -1609,6 +1891,7 @@ function auditFor(
     broker_order_id: brokerOrderId,
     message,
     fill_identity: fillIdentity,
+    payload,
   };
 }
 

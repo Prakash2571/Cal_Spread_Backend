@@ -201,6 +201,7 @@ async function build({
   invariants = [],
   generation = { value: 0 },
   beforePost,
+  chargeTotal = () => 20,
 } = {}) {
   const adapter = adapterFor(script, { beforePost });
   let now = 10_000;
@@ -240,7 +241,7 @@ async function build({
     quotes,
     manager,
     feedGeneration: () => generation.value,
-    chargeTotal: () => 20,
+    chargeTotal,
   });
 
   return { manager, gateway, adapter, journal, quotes, invariants };
@@ -610,9 +611,72 @@ test("R17: an applied local pre-POST refusal spends exactly one generation and r
   assert.equal(second.remaining.length, 0);
 });
 
-/* ══════════════════ NEGATIVE CONTROL ══════════════════ */
+test("R17b: restart repairs a crash-stranded persisted generation after durable local refusal", async () => {
+  const generation = { value: 1 };
+  let refuseOnce = true;
+  const beforeCrash = await build({
+    generation,
+    beforePost: async () => {
+      if (refuseOnce) {
+        refuseOnce = false;
+        generation.value = 2;
+      }
+    },
+    script: ({ req }) => ({ state: "COMPLETE", filled: req.quantity }),
+    held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 75 }],
+  });
+  const stalePersistedResidual = residual("k1_ce", { flatten_attempt: 1 });
+  const refused = await beforeCrash.gateway.flattenResidual({
+    residual: [stalePersistedResidual],
+    keyPrefix: "att-crash-local-refusal",
+  });
+  assert.equal(refused.remaining[0].flatten_attempt, 2, "the in-memory result advanced before the crash");
+  const rejected = [...beforeCrash.journal.rows.values()].find((intent) => intent.state === "REJECTED");
+  assert.equal(rejected.filled_quantity, 0);
+  assert.equal(rejected.broker_order_id, null);
+  assert.equal(rejected.audit.at(-1).payload.no_broker_post, true);
 
-test("NEGATIVE CONTROL: with the OLD write-back (generation never advances) the second POST disappears again", async () => {
+  // CRASH: generation-2 was never projected. Restart receives the old generation-1 residual.
+  const afterRestart = await build({
+    generation,
+    journal: beforeCrash.journal,
+    script: ({ req }) => ({ state: "COMPLETE", filled: req.quantity }),
+    held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 75 }],
+  });
+  const repaired = await afterRestart.gateway.flattenResidual({
+    residual: [stalePersistedResidual],
+    keyPrefix: "att-crash-local-refusal",
+  });
+
+  assert.equal(afterRestart.adapter.submits.length, 1, "restart reaches a fresh broker identity");
+  assert.match(afterRestart.adapter.submits[0].id, /attempt-2$/);
+  assert.equal(repaired.remaining.length, 0);
+  assert.equal(repaired.flattened_by_role.k1_ce, 75);
+});
+
+test("R17c: broker-origin REJECTED never advances to a fresh residual identity", async () => {
+  const b = await build({
+    script: () => ({ state: "REJECTED", filled: 0 }),
+    held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 75 }],
+  });
+  const persisted = residual("k1_ce", { flatten_attempt: 1 });
+  const first = await b.gateway.flattenResidual({ residual: [persisted], keyPrefix: "att-broker-reject" });
+  const second = await b.gateway.flattenResidual({ residual: first.remaining, keyPrefix: "att-broker-reject" });
+
+  assert.equal(b.adapter.submits.length, 1, "a broker rejection is not retried under a new identity");
+  assert.equal(first.remaining[0].flatten_attempt, 1);
+  assert.equal(second.remaining[0].flatten_attempt, 1);
+  const intent = [...b.journal.rows.values()].find((row) => row.state === "REJECTED");
+  assert.ok(intent.broker_order_id, "broker-origin rejection retains broker identity");
+  assert.equal(
+    intent.audit.some((event) => event.payload?.origin === "local_pre_submit_refusal"),
+    false,
+  );
+});
+
+/* ══════════════════ stale projection self-repair ══════════════════ */
+
+test("terminal broker truth is projected before a stale residual can use the next generation", async () => {
   const b = await build({
     script: ({ generation, req }) => generation === 1
       ? { state: "CANCELLED", filled: 0 }
@@ -620,19 +684,356 @@ test("NEGATIVE CONTROL: with the OLD write-back (generation never advances) the 
     held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 75 }],
   });
 
-  // This is precisely the pre-fix projection: carry the shrunken residual forward but PIN the
-  // generation, so the identity regenerates byte-identically on every pass exactly as the old
-  // `stableAttemptId(keyPrefix, residual.created_at, role)` did.
-  const { remaining } = await loop(b.gateway, [residual("k1_ce")], 3, {
-    writeBack: (r) => ({ ...r, flatten_attempt: 1 }),
+  const stale = residual("k1_ce", { flatten_attempt: 1 });
+  const first = await b.gateway.flattenResidual({ residual: [stale], keyPrefix: "att-terminal-repair" });
+  assert.equal(first.remaining[0].flatten_attempt, 2);
+  assert.equal(b.adapter.submits.length, 1);
+
+  // CRASH before generation 2 is projected: restart/another worker still holds generation 1.
+  const repaired = await b.gateway.flattenResidual({ residual: [stale], keyPrefix: "att-terminal-repair" });
+  assert.equal(b.adapter.submits.length, 1, "stale work adopts attempt 1; it cannot POST attempt 2 yet");
+  assert.equal(repaired.remaining[0].flatten_attempt, 2, "adopted terminal truth repairs the projection");
+
+  const completed = await b.gateway.flattenResidual({
+    residual: repaired.remaining,
+    keyPrefix: "att-terminal-repair",
+  });
+  assert.equal(b.adapter.submits.length, 2);
+  assert.match(b.adapter.submits[1].id, /attempt-2$/);
+  assert.equal(completed.remaining.length, 0);
+});
+
+test("a COMPLETE fill is adopted after crash-before-projection without a second POST", async () => {
+  const b = await build({
+    script: ({ req }) => ({ state: "COMPLETE", filled: req.quantity }),
+    held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 75 }],
+  });
+  const stale = residual("k1_ce", { flatten_attempt: 1 });
+  const beforeCrash = await b.gateway.flattenResidual({ residual: [stale], keyPrefix: "att-complete-repair" });
+  assert.equal(beforeCrash.remaining.length, 0);
+  assert.equal(b.adapter.submits.length, 1);
+
+  const afterCrash = await b.gateway.flattenResidual({ residual: [stale], keyPrefix: "att-complete-repair" });
+  assert.equal(b.adapter.submits.length, 1, "terminal attempt 1 is adopted rather than skipping to attempt 2");
+  assert.equal(afterCrash.flattened_by_role.k1_ce, 75);
+  assert.equal(afterCrash.remaining.length, 0);
+});
+
+test("terminal replay applies only cumulative fill/charge above the persisted generation watermark", async () => {
+  const b = await build({
+    script: () => ({ state: "UNKNOWN", filled: 20 }),
+    chargeTotal: (orders) => orders.reduce((sum, order) => sum + order.quantity * 0.5, 0),
+    held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 75 }],
+  });
+  const projected = await b.gateway.flattenResidual({
+    residual: [residual("k1_ce")],
+    keyPrefix: "att-cumulative-terminal-same",
+  });
+  assert.equal(projected.flattened_by_role.k1_ce, 20);
+  assert.equal(projected.flatten_charges, 10);
+  assert.equal(projected.remaining[0].quantity, 55);
+  assert.equal(projected.remaining[0].flatten_accounted_filled, 20);
+  assert.equal(projected.remaining[0].flatten_accounted_charges, 10);
+
+  const intent = [...b.journal.rows.values()][0];
+  b.journal.rows.set(intent.client_order_id, {
+    ...intent,
+    state: "CANCELLED",
+    filled_quantity: 20,
+    average_price: 99.9,
+    terminal_at: new Date(3_000),
+    updated_at: new Date(3_000),
+  });
+  const replay = await b.gateway.flattenResidual({
+    residual: projected.remaining,
+    keyPrefix: "att-cumulative-terminal-same",
+  });
+  assert.equal(replay.flattened_by_role.k1_ce, 0, "unchanged broker cumulative fill is not replayed");
+  assert.equal(replay.flatten_charges, 0, "unchanged cumulative fee is not replayed");
+  assert.equal(replay.remaining[0].quantity, 55);
+  assert.equal(replay.remaining[0].flatten_attempt, 2);
+  assert.equal(replay.remaining[0].flatten_accounted_filled, 0, "a retired identity resets fill accounting");
+  assert.equal(replay.remaining[0].flatten_accounted_charges, 0, "a retired identity resets fee accounting");
+
+  // After restart, generation 2 owns a fresh cumulative stream and applies its full 55 once.
+  const restarted = await build({
+    journal: b.journal,
+    script: ({ req }) => ({ state: "COMPLETE", filled: req.quantity }),
+    chargeTotal: (orders) => orders.reduce((sum, order) => sum + order.quantity * 0.5, 0),
+    held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 55 }],
+  });
+  const completed = await restarted.gateway.flattenResidual({
+    residual: replay.remaining,
+    keyPrefix: "att-cumulative-terminal-same",
+  });
+  assert.match(restarted.adapter.submits.at(-1).id, /attempt-2$/);
+  assert.equal(completed.flattened_by_role.k1_ce, 55);
+  assert.equal(completed.flatten_charges, 27.5);
+  assert.equal(completed.remaining.length, 0);
+});
+
+test("terminal replay applies only the later positive cumulative suffix", async () => {
+  const b = await build({
+    script: () => ({ state: "UNKNOWN", filled: 20 }),
+    chargeTotal: (orders) => orders.reduce((sum, order) => sum + order.quantity * 0.5, 0),
+    held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 75 }],
+  });
+  const projected = await b.gateway.flattenResidual({
+    residual: [residual("k1_ce")],
+    keyPrefix: "att-cumulative-terminal-growth",
+  });
+  const intent = [...b.journal.rows.values()][0];
+  b.journal.rows.set(intent.client_order_id, {
+    ...intent,
+    state: "CANCELLED",
+    filled_quantity: 35,
+    average_price: 99.9,
+    terminal_at: new Date(3_000),
+    updated_at: new Date(3_000),
   });
 
-  assert.equal(
-    b.adapter.submits.length,
-    1,
-    "PROOF OF CAUSALITY: without the durable generation the residual is submitted once and never again",
-  );
-  assert.equal(remaining.length, 1, "and the naked exposure survives every later pass");
-  assert.equal(remaining[0].quantity, 75);
-  // ...whereas the same script WITH the generation flattens it (asserted in R1/R2 above).
+  const replay = await b.gateway.flattenResidual({
+    residual: projected.remaining,
+    keyPrefix: "att-cumulative-terminal-growth",
+  });
+  assert.equal(replay.flattened_by_role.k1_ce, 15);
+  assert.equal(replay.flatten_charges, 7.5);
+  assert.equal(replay.remaining[0].quantity, 40);
+  assert.equal(replay.remaining[0].flatten_attempt, 2);
+});
+
+test("cumulative regression quarantines the identity and never produces negative fill", async () => {
+  const b = await build({
+    script: () => ({ state: "UNKNOWN", filled: 20 }),
+    chargeTotal: (orders) => orders.reduce((sum, order) => sum + order.quantity * 0.5, 0),
+    held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 75 }],
+  });
+  const projected = await b.gateway.flattenResidual({
+    residual: [residual("k1_ce")],
+    keyPrefix: "att-cumulative-regression",
+  });
+  const intent = [...b.journal.rows.values()][0];
+  b.journal.rows.set(intent.client_order_id, {
+    ...intent,
+    state: "CANCELLED",
+    filled_quantity: 10,
+    average_price: 99.9,
+    terminal_at: new Date(3_000),
+    updated_at: new Date(3_000),
+  });
+
+  const replay = await b.gateway.flattenResidual({
+    residual: projected.remaining,
+    keyPrefix: "att-cumulative-regression",
+  });
+  assert.equal(replay.flattened_by_role.k1_ce, 0);
+  assert.equal(replay.flatten_charges, 0);
+  assert.equal(replay.remaining[0].quantity, 55);
+  assert.equal(replay.remaining[0].flatten_attempt, 1, "corrupt terminal accounting cannot retire past the identity");
+  assert.ok(b.invariants.some((message) => /cumulative accounting regressed/.test(message)));
+});
+
+
+/* ══════════ pre-watermark (legacy) residuals must not be re-credited ══════════
+ *
+ * Cumulative watermarks are new. A residual persisted by the PREVIOUS version has none, and
+ * reading that as "this identity has projected nothing yet" replays the partial fill it already
+ * credited and re-bills its fee on the first post-upgrade terminal pass — understating exposure
+ * that is still naked. `order.quantity` is immutable on the durable intent and equals the residual
+ * quantity when that identity was created, so the difference is exactly what it already projected.
+ */
+
+/** A terminal durable intent for `attempt`, sized to `intentQuantity`, with `filled` cumulative. */
+async function terminalIntentJournal({ attempt = 1, intentQuantity = 75, filled, keyPrefix }) {
+  const { intent } = await identityFor(attempt, residual("k1_ce", { quantity: intentQuantity }), keyPrefix);
+  return new Journal([{
+    ...intent,
+    state: "CANCELLED",
+    filled_quantity: filled,
+    average_price: 99.9,
+    terminal_at: new Date(3_000),
+    updated_at: new Date(3_000),
+  }]);
+}
+
+test("a watermark-less residual derives its accounted fill from the durable intent instead of re-crediting it", async () => {
+  const keyPrefix = "att-legacy-watermarks";
+  // Pre-upgrade state: generation 1 was sized 75, filled 20, and that 20 was ALREADY projected and
+  // charged — the old code recorded it only by shrinking the residual to 55.
+  const journal = await terminalIntentJournal({ filled: 20, keyPrefix });
+  const b = await build({
+    journal,
+    script: ({ req }) => ({ state: "COMPLETE", filled: req.quantity }),
+    chargeTotal: (orders) => orders.reduce((sum, order) => sum + order.quantity * 0.5, 0),
+    held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 55 }],
+  });
+  const legacy = residual("k1_ce", { quantity: 55, flatten_attempt: 1 });
+  assert.equal("flatten_accounted_filled" in legacy, false, "the legacy row has no watermarks at all");
+  assert.equal("flatten_accounted_charges" in legacy, false);
+
+  const replay = await b.gateway.flattenResidual({ residual: [legacy], keyPrefix });
+
+  assert.equal(b.adapter.submits.length, 0, "terminal durable truth is replayed, never resubmitted");
+  // Defaulting the watermark to 0 credited 20 lots a second time, billed the 20-lot fee again and
+  // projected 35 — leaving 20 units naked and invisible.
+  assert.equal(replay.flattened_by_role.k1_ce, 0, "the already-projected fill is not credited twice");
+  assert.equal(replay.flatten_charges, 0, "and its fee is not billed twice");
+  assert.equal(replay.remaining[0].quantity, 55, "all 55 units are still outstanding and still worked");
+  assert.equal(replay.remaining[0].flatten_attempt, 2, "the spent identity retires normally");
+  assert.equal(replay.remaining[0].flatten_accounted_filled, 0, "generation 2 owns a fresh stream");
+  assert.equal(replay.remaining[0].flatten_accounted_charges, 0);
+  assert.equal(b.invariants.length, 0, "an upgraded legacy row is not an accounting violation");
+
+  // The exposure is still flattenable: generation 2 reduces the true 55 units exactly once.
+  const completed = await b.gateway.flattenResidual({ residual: replay.remaining, keyPrefix });
+  assert.match(b.adapter.submits.at(-1).id, /attempt-2$/);
+  assert.equal(b.adapter.submits.at(-1).quantity, 55);
+  assert.equal(completed.flattened_by_role.k1_ce, 55);
+  assert.equal(completed.flatten_charges, 27.5);
+  assert.equal(completed.remaining.length, 0);
+});
+
+test("a watermark-less residual with a zero-fill durable intent still applies its whole terminal fill", async () => {
+  // The other half of the derivation: a genuinely FRESH legacy residual (nothing ever projected)
+  // must derive a zero watermark, so its terminal fill is applied in full exactly once.
+  const keyPrefix = "att-legacy-fresh";
+  const journal = await terminalIntentJournal({ filled: 30, intentQuantity: 75, keyPrefix });
+  const b = await build({
+    journal,
+    script: ({ req }) => ({ state: "COMPLETE", filled: req.quantity }),
+    chargeTotal: (orders) => orders.reduce((sum, order) => sum + order.quantity * 0.5, 0),
+    held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 75 }],
+  });
+
+  const replay = await b.gateway.flattenResidual({
+    residual: [residual("k1_ce", { quantity: 75, flatten_attempt: 1 })],
+    keyPrefix,
+  });
+  assert.equal(replay.flattened_by_role.k1_ce, 30, "nothing was projected under this identity yet");
+  assert.equal(replay.flatten_charges, 15);
+  assert.equal(replay.remaining[0].quantity, 45);
+  assert.equal(replay.remaining[0].flatten_attempt, 2);
+  assert.equal(b.invariants.length, 0);
+});
+
+test("a pass with no broker order leaves a legacy residual's watermarks derivable", async () => {
+  // A legacy row whose first post-upgrade pass finds no executable book must not have zeros written
+  // over its absent watermarks: the durable intent is the only remaining evidence of what it
+  // already projected, and the pass after that would re-credit the whole fill.
+  const keyPrefix = "att-legacy-no-book";
+  const journal = await terminalIntentJournal({ filled: 20, keyPrefix });
+  const b = await build({
+    journal,
+    script: ({ req }) => ({ state: "COMPLETE", filled: req.quantity }),
+    chargeTotal: (orders) => orders.reduce((sum, order) => sum + order.quantity * 0.5, 0),
+    held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 55 }],
+  });
+  // No book for a residual whose durable intent is still WORKING, so nothing is submitted or read.
+  const working = new Journal([...b.journal.rows.values()].map((row) => ({ ...row, state: "UNKNOWN" })));
+  const noBook = await build({
+    journal: working,
+    script: ({ req }) => ({ state: "COMPLETE", filled: req.quantity }),
+    chargeTotal: (orders) => orders.reduce((sum, order) => sum + order.quantity * 0.5, 0),
+    held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 55 }],
+  });
+  noBook.quotes.applyTicks([], 1_000);
+  const legacy = residual("k1_ce", { quantity: 55, flatten_attempt: 1 });
+  const refused = await noBook.gateway.flattenResidual({
+    residual: [{ ...legacy, token: 12345, tradingsymbol: "SYM-unquoted" }],
+    keyPrefix,
+  });
+  assert.equal(noBook.adapter.submits.length, 0);
+  assert.equal(refused.remaining[0].flatten_accounted_filled, undefined,
+    "an unobserved pass writes no watermark over an absent one");
+  assert.equal(refused.remaining[0].flatten_accounted_charges, undefined);
+
+  // So the NEXT pass still derives the already-projected 20 from the durable intent.
+  const replay = await b.gateway.flattenResidual({ residual: [legacy], keyPrefix });
+  assert.equal(replay.flattened_by_role.k1_ce, 0);
+  assert.equal(replay.flatten_charges, 0);
+  assert.equal(replay.remaining[0].quantity, 55);
+});
+
+/* ══════════ a cheaper re-estimated charge is not corruption ══════════ */
+
+test("a lower re-estimated cumulative charge still retires and flattens the residual, and bills no negative fee", async () => {
+  // The cumulative charge is RE-ESTIMATED from the current rate card on every pass, so it can fall
+  // while the fill is unchanged (rate-card version change, corrected average price). Folding that
+  // into the accounting-regression guard forced `adopt_attempt` forever: the identity never
+  // retired, the quantity never shrank, and every interval tripped the invariant and the breaker,
+  // stranding a naked leg for good.
+  const keyPrefix = "att-charge-only-regression";
+  const rate = { perUnit: 0.25 };
+  const journal = await terminalIntentJournal({ filled: 20, keyPrefix });
+  const b = await build({
+    journal,
+    script: ({ req }) => ({ state: "COMPLETE", filled: req.quantity }),
+    chargeTotal: (orders) => orders.reduce((sum, order) => sum + order.quantity * rate.perUnit, 0),
+    held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 55 }],
+  });
+  // 20 lots were charged 10 when the rate card was 0.5/unit; today the same fill estimates 5.
+  const carried = residual("k1_ce", {
+    quantity: 55,
+    flatten_attempt: 1,
+    flatten_accounted_filled: 20,
+    flatten_accounted_charges: 10,
+  });
+
+  const replay = await b.gateway.flattenResidual({ residual: [carried], keyPrefix });
+  assert.equal(replay.flattened_by_role.k1_ce, 0, "an unchanged cumulative fill is not replayed");
+  assert.equal(replay.flatten_charges, 0, "a cheaper estimate bills nothing, never a negative fee");
+  assert.equal(replay.remaining[0].quantity, 55);
+  assert.equal(replay.remaining[0].flatten_attempt, 2, "the identity retires, so the exposure can be worked");
+  assert.equal(b.invariants.length, 0, "a re-estimated charge is not accounting corruption");
+
+  // Retirement is what makes the leg reachable at all: prove it actually flattens.
+  const completed = await b.gateway.flattenResidual({ residual: replay.remaining, keyPrefix });
+  assert.match(b.adapter.submits.at(-1).id, /attempt-2$/);
+  assert.equal(completed.flattened_by_role.k1_ce, 55);
+  assert.equal(completed.flatten_charges, 13.75);
+  assert.equal(completed.remaining.length, 0);
+  assert.equal(b.invariants.length, 0);
+});
+
+test("the charge watermark stays monotonic across a cheaper then recovered rate card", async () => {
+  // A cheaper estimate must not LOWER the watermark either: the next pass would then bill the same
+  // turnover again once the estimate recovers.
+  const keyPrefix = "att-charge-monotonic";
+  const rate = { perUnit: 0.25 };
+  const journal = await terminalIntentJournal({ filled: 20, keyPrefix });
+  // Broker-origin rejection RETAINS its identity by policy, so the watermarks are carried across
+  // passes rather than reset — the case in which a falling estimate could actually lower the bar.
+  const retained = new Journal([...journal.rows.values()].map((row) => ({
+    ...row,
+    state: "REJECTED",
+    filled_quantity: 20,
+    average_price: 99.9,
+    reject_reason: "broker rejected the balance",
+  })));
+  const b = await build({
+    journal: retained,
+    script: ({ req }) => ({ state: "COMPLETE", filled: req.quantity }),
+    chargeTotal: (orders) => orders.reduce((sum, order) => sum + order.quantity * rate.perUnit, 0),
+    held: [{ exchange: "NFO", tradingsymbol: "SYM-k1_ce", net_quantity: 55 }],
+  });
+  const carried = residual("k1_ce", {
+    quantity: 55,
+    flatten_attempt: 1,
+    flatten_accounted_filled: 20,
+    flatten_accounted_charges: 10,
+  });
+
+  const cheaper = await b.gateway.flattenResidual({ residual: [carried], keyPrefix });
+  assert.equal(b.adapter.submits.length, 0, "a retained broker rejection never manufactures a new POST");
+  assert.equal(cheaper.flatten_charges, 0);
+  assert.equal(cheaper.remaining[0].flatten_attempt, 1, "broker-origin rejection keeps the identity");
+  assert.equal(cheaper.remaining[0].flatten_accounted_charges, 10,
+    "the watermark never falls to the cheaper estimate");
+
+  // Rate card recovers: the SAME 20 lots must still bill nothing.
+  rate.perUnit = 0.5;
+  const recovered = await b.gateway.flattenResidual({ residual: cheaper.remaining, keyPrefix });
+  assert.equal(recovered.flatten_charges, 0, "already-billed turnover is never billed again");
+  assert.equal(recovered.remaining[0].flatten_accounted_charges, 10);
+  assert.equal(b.invariants.length, 0);
 });
