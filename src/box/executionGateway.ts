@@ -659,6 +659,8 @@ function paperLeg(order: BrokerOrder): PaperLegExecution {
     cancel_confirmed_at: null,
     fill_qty_at_cancel_request: null,
     raced_fill_qty: 0,
+    // Live orders carry no simulated cancel stage: the broker, not the simulator, decided.
+    cancel_stage: null,
     // A live order is filled by the exchange, not by walking a book, so there is no
     // "executable within limit" observation to report. Left null rather than back-filled.
     executable_within_limit_at_arrival: null,

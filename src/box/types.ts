@@ -25,6 +25,9 @@
  */
 
 import type { BrokerId } from "../brokers/types.js";
+import type { PaperLegCancelStage } from "./paperLegTimeline.js";
+
+export type { PaperLegCancelStage };
 
 /**
  * One order's charges, as billed by Zerodha's virtual contract note (or by the
@@ -841,6 +844,19 @@ export interface PaperLegExecution {
   fill_qty_at_cancel_request: number | null;
   /** Quantity that filled AFTER the cancel was requested. The race, quantified. */
   raced_fill_qty: number;
+  /**
+   * WHERE the order was when a cancel was requested — null when none ever was.
+   *
+   * Only `at_exchange` may participate in the cancel-vs-fill race. A cancel issued while the
+   * order was still in transport (`in_transport`) or before it was ever submitted
+   * (`pre_submission`) removes an order that was never resting on the book, so it cannot fill:
+   * previously the abort path made every unresolved leg `CANCEL_REQUESTED` regardless of
+   * arrival, which let a leg in flight produce `fill_at < arrival_at`.
+   *
+   * See `paperLegTimeline.ts`. Recorded so parity statistics can separate "cancelled in
+   * transport" from "cancelled while working", which are different market events.
+   */
+  cancel_stage: PaperLegCancelStage | null;
   /**
    * Executable quantity WITHIN THE LIMIT on the first book this order was offered, before any of it
    * was consumed (queue haircut applied, concurrent reservations subtracted).
