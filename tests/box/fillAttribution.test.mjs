@@ -36,7 +36,7 @@
  * BOX_TEST_MONGODB_URI is set.
  */
 
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 
 import { BoxOrderManager } from "../../dist/box/orderManager.js";
@@ -521,4 +521,18 @@ test("A11b (real Mongo): the pre-image is stamped by the same atomic write, so a
   assert.equal(replay.current_filled_quantity, 40);
 
   await model.BoxOrderIntent.deleteMany({});
+});
+
+
+/**
+ * Release the Mongo socket the A11 block opened.
+ *
+ * The connection is a live handle, so leaving it open keeps the test runner alive after the last
+ * assertion and a MongoDB-enabled CI job hangs instead of reporting. A no-op when the suite ran
+ * offline and never connected.
+ */
+after(async () => {
+  if (!URI) return;
+  const { boxConnection } = await import("../../dist/db.js");
+  await boxConnection?.close();
 });

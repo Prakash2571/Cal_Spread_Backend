@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
@@ -964,4 +964,18 @@ test("real Mongo: the bounded daily-risk seed is indexed and counts an overlappi
   } finally {
     await model.BoxExecutionAttempt.deleteMany({ candidate_key: key });
   }
+});
+
+
+/**
+ * Release the Mongo socket this file opened.
+ *
+ * An open connection is a live handle, so without this the runner sits on a drained event loop
+ * after the last assertion and the CI job hangs until its wall-clock limit rather than reporting
+ * the result it already has. Offline runs never connect, so this is a no-op there.
+ */
+after(async () => {
+  if (!URI) return;
+  const { boxConnection } = await import("../../dist/db.js");
+  await boxConnection?.close();
 });
