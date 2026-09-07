@@ -233,8 +233,12 @@ export function deriveSessionState(record: BoxSessionRecord, activity: BoxSessio
   if (activity.exitInProgress) return "EXIT_IN_PROGRESS";
   if (activity.openBoxes > 0) return "POSITION_OPEN";
   if (activity.entryInProgress) return "ENTRY_IN_PROGRESS";
-  if (isBudgetExhausted(record) && completedCycles(record) >= consumedCycles(record)) return "COMPLETED";
-  if (activity.entryBlockedExternally) return "BLOCKED";
+  const exhausted = isBudgetExhausted(record);
+  if (exhausted && completedCycles(record) >= consumedCycles(record)) return "COMPLETED";
+  // BLOCKED covers the session's OWN exhausted budget as well as an external gate. Reporting
+  // ARMED here would be actively misleading: `evaluateSessionEntry` refuses entry, so a screen
+  // saying "ARMED" would tell an operator the session was ready to trade when it was not.
+  if (exhausted || activity.entryBlockedExternally) return "BLOCKED";
   return "ARMED";
 }
 
