@@ -3022,6 +3022,13 @@ export class BoxEngine {
   ): Promise<void> {
     if (this.marginInFlight.has(id)) return;
     this.marginInFlight.add(id);
+    // Entry prices, when the position is already in the book — which it is on both
+    // callers: entry captures margin only after the fill is recorded, and the backfill
+    // sweep works from live positions. Kite derives a MARKET leg's price from the LTP
+    // itself, but Dhan's calculator margins against the price it is handed, so passing
+    // the real figures is what makes the two brokers' margins comparable.
+    const entryPrices = this.positions.get(id)?.entry_prices ?? null;
+
     // The sides depend on the direction: a short box blocks a different basket
     // margin from a long box on the same strikes.
     const orders = BOX_LEG_ROLES.map((role) => ({
@@ -3033,6 +3040,7 @@ export class BoxEngine {
       order_type: "MARKET",
       quantity: lotSize,
       price: 0,
+      reference_price: entryPrices?.[role] ?? null,
     }));
 
     // Retry a few times: the margin API can transiently 5xx or rate-limit, and a
@@ -3051,6 +3059,17 @@ export class BoxEngine {
             throw new Error(`basket margin returned a non-numeric total`);
           }
           const margin = Math.max(0, Math.round(res.total));
+          // Say so when the figure is NOT a netted basket number. Only `res.total` is
+          // persisted, so once stored an inflated per-leg sum is indistinguishable from
+          // a real basket margin — and it is plausible enough to go unnoticed, which is
+          // precisely how it went unnoticed before.
+          if (res.source === "dhan_per_leg_fallback") {
+            console.warn(
+              `[Box] margin for ${key} is a PER-LEG SUM (₹${margin}), not a netted basket ` +
+                "figure: Dhan's multi-order calculator did not answer, so this OVER-STATES " +
+                "a hedged box. See the [Dhan] warning above for the cause.",
+            );
+          }
           const pos = this.positions.get(id);
           if (pos) pos.margin = margin;
           await setBoxTradeMargin(id, margin);

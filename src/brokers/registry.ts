@@ -41,7 +41,12 @@ import type {
 } from "../box/brokerContext.js";
 import { BROKER_IDS, type BrokerHealthState, type BrokerId, type BrokerSessionState } from "./types.js";
 import { createZerodhaLiveAdapter } from "./zerodha/liveAdapter.js";
-import { DhanClient, extractIpv4Addresses, normalizeDhanMultiMargin } from "./dhan/client.js";
+import {
+  DhanClient,
+  describeDhanMarginPayload,
+  extractIpv4Addresses,
+  normalizeDhanMultiMargin,
+} from "./dhan/client.js";
 import { SubscriptionCoordinator } from "./subscriptions.js";
 import { InstrumentProvider } from "./instrumentProvider.js";
 import { QuoteProvider } from "./quoteProvider.js";
@@ -184,6 +189,28 @@ function emptyLaneStats(lane: MarketDataLane, wanted: number, generation: number
     reconnects: 0,
     generation,
   };
+}
+
+/**
+ * The per-unit price to quote a leg at in Dhan's margin calculator.
+ *
+ * Dhan's calculator has no `order_type`, so it cannot resolve a MARKET order's price
+ * from the LTP the way Kite's basket endpoint does — whatever is in this field IS the
+ * price it margins against. The engine therefore passes the real per-leg price as
+ * `reference_price` while leaving `price` at 0 for Kite's benefit.
+ *
+ * The final 0.05 is a liveness guard, not an estimate: Dhan rejects a zero-priced leg,
+ * and a rejected basket call degrades to the per-leg sum, so a nominal price yields a
+ * hedge-aware figure that is merely missing its premium component rather than an
+ * over-statement several times too large.
+ */
+function pickLegPrice(order: BoxMarginOrder): number {
+  for (const candidate of [order.reference_price, order.price]) {
+    if (typeof candidate === "number" && Number.isFinite(candidate) && candidate > 0) {
+      return candidate;
+    }
+  }
+  return 0.05;
 }
 
 export class ActiveBrokerManager {
@@ -1109,7 +1136,22 @@ export class ActiveBrokerManager {
       broker: this.active,
       basketMargin: async (orders) => {
         if (this.active === "zerodha") {
-          const res = await this.deps.kite.getBasketMargin(orders);
+          // Mapped field-by-field rather than passed through. `BoxMarginOrder` carries
+          // a Dhan-only pricing hint (`reference_price`), and Kite's basket endpoint is
+          // the one margin path that currently works — forwarding an unknown field to it
+          // is a risk with no upside.
+          const res = await this.deps.kite.getBasketMargin(
+            orders.map((o) => ({
+              exchange: o.exchange,
+              tradingsymbol: o.tradingsymbol,
+              transaction_type: o.transaction_type,
+              variety: o.variety,
+              product: o.product,
+              order_type: o.order_type,
+              quantity: o.quantity,
+              price: o.price,
+            })),
+          );
           this.lastMarginSource = "kite_basket";
           return { ...res, source: "kite_basket" as const };
         }
@@ -1166,7 +1208,13 @@ export class ActiveBrokerManager {
         // margined differently AND auto-squared-off.
         productType: "MARGIN",
         securityId: String(inst.dhan_security_id),
-        price: order.price > 0 ? order.price : 0.05,
+        // Dhan prices each leg from THIS field; unlike Kite's basket endpoint there is
+        // no `order_type`, so a MARKET order's price is not resolved server-side from
+        // the LTP. Prefer the real per-leg price the caller supplies, fall back to the
+        // order price, and only then to a nominal non-zero value — Dhan rejects a zero
+        // price outright, so the last resort exists to keep the basket call alive rather
+        // than to be accurate.
+        price: pickLegPrice(order),
       });
     }
     if (legs.length === 0) {
@@ -1178,7 +1226,15 @@ export class ActiveBrokerManager {
     // ---- preferred path: one hedge-aware multi-order request ----
     if (allResolved) {
       try {
-        const raw = await this.dhanClient.calculateMultiMargin(legs);
+        const raw = await this.dhanClient.calculateMultiMargin(legs, {
+          // The figure must describe THIS basket. Netting against held positions would
+          // make the entry-time figure differ from the backfill figure for the same box,
+          // and for an already-open box the incremental requirement can collapse toward
+          // zero — which `normalizeDhanMultiMargin` rejects, pushing us straight back
+          // into the inflated per-leg sum.
+          includePosition: false,
+          includeOrder: false,
+        });
         const normalized = normalizeDhanMultiMargin(raw);
         if (normalized) {
           this.lastMarginSource = "dhan_multi";
@@ -1192,11 +1248,20 @@ export class ActiveBrokerManager {
             exposure: normalized.exposure,
           };
         }
+        // Name the fields Dhan actually returned. The previous log said only that the
+        // fallback had fired, which made a renamed field indistinguishable from an
+        // outage — and the resulting over-statement looks plausible, so nothing else
+        // draws attention to it.
         console.warn(
-          "[Dhan] multi-order margin returned no readable total — falling back to the per-leg sum.",
+          "[Dhan] multi-order margin returned no readable total — falling back to the " +
+            `per-leg sum, which OVER-STATES a hedged box. Response fields: ${describeDhanMarginPayload(raw)}`,
         );
       } catch (err) {
-        console.warn("[Dhan] multi-order margin failed — falling back to the per-leg sum:", err);
+        console.warn(
+          "[Dhan] multi-order margin failed — falling back to the per-leg sum, which " +
+            "OVER-STATES a hedged box:",
+          err,
+        );
       }
     } else {
       console.warn(

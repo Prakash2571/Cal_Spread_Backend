@@ -18,7 +18,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { ActiveBrokerManager } from "../../dist/brokers/registry.js";
-import { extractIpv4Addresses, normalizeDhanMultiMargin } from "../../dist/brokers/dhan/client.js";
+import {
+  DhanClient,
+  describeDhanMarginPayload,
+  extractIpv4Addresses,
+  normalizeDhanMultiMargin,
+} from "../../dist/brokers/dhan/client.js";
 
 /* ------------------------- multi-margin normalization ---------------------- */
 
@@ -63,6 +68,92 @@ test("a zero or negative total is NOT a credible four-leg requirement", () => {
   // Accepting 0 here would silently mark a real box as margin-free.
   assert.equal(normalizeDhanMultiMargin({ totalMargin: 0 }), null);
   assert.equal(normalizeDhanMultiMargin({ totalMargin: -5 }), null);
+});
+
+/* ------------------------------ the wire contract -------------------------- */
+
+/**
+ * A DhanClient over a RECORDING transport, so the request body itself is observable.
+ *
+ * The manager-level tests further down stub `calculateMultiMargin` wholesale, and that
+ * is exactly how a wrong body shape survived them: the preference logic was proven
+ * correct while the request it actually sent was being rejected by Dhan every time, so
+ * every real box silently fell through to the inflated per-leg sum. These tests assert
+ * the field names on the wire, which is the only place that failure was visible.
+ */
+function recordingClient(response = { totalMargin: 41_250 }) {
+  const sent = [];
+  const http = {
+    read: async (opts) => {
+      sent.push(opts);
+      return response;
+    },
+  };
+  return { client: new DhanClient(http, () => "CLIENT7"), sent };
+}
+
+const ONE_LEG = {
+  exchangeSegment: "NSE_FNO",
+  transactionType: "BUY",
+  quantity: 275,
+  productType: "MARGIN",
+  securityId: "45000",
+  price: 50,
+};
+
+test("the multi-margin request sends its legs under `scripList`", async () => {
+  const { client, sent } = recordingClient();
+  await client.calculateMultiMargin([ONE_LEG]);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].method, "POST");
+  assert.equal(sent[0].path, "/margincalculator/multi");
+  assert.deepEqual(sent[0].body.scripList, [ONE_LEG]);
+  assert.equal(sent[0].body.orders, undefined, "`orders` is not a field Dhan accepts here");
+});
+
+test("dhanClientId is sent ONCE at the top level, never repeated per leg", async () => {
+  const { client, sent } = recordingClient();
+  await client.calculateMultiMargin([ONE_LEG]);
+  assert.equal(sent[0].body.dhanClientId, "CLIENT7");
+  for (const leg of sent[0].body.scripList) {
+    assert.equal(leg.dhanClientId, undefined);
+  }
+});
+
+test("the netting flags are always explicit, and default to false", async () => {
+  // Explicit rather than omitted: the figure must describe THIS basket, so that it is
+  // reproducible whether it is computed at entry or on a later backfill sweep.
+  const { client, sent } = recordingClient();
+  await client.calculateMultiMargin([ONE_LEG]);
+  assert.equal(sent[0].body.includePosition, false);
+  assert.equal(sent[0].body.includeOrder, false);
+
+  const { client: c2, sent: s2 } = recordingClient();
+  await c2.calculateMultiMargin([ONE_LEG], { includePosition: true });
+  assert.equal(s2[0].body.includePosition, true);
+  assert.equal(s2[0].body.includeOrder, false);
+});
+
+test("the body carries exactly Dhan's four fields and nothing more", async () => {
+  const { client, sent } = recordingClient();
+  await client.calculateMultiMargin([ONE_LEG]);
+  assert.deepEqual(Object.keys(sent[0].body).sort(), [
+    "dhanClientId",
+    "includeOrder",
+    "includePosition",
+    "scripList",
+  ]);
+});
+
+test("an unreadable payload is described by FIELD NAME, never by value", async () => {
+  // Account balances travel in this payload, so the diagnostic names keys only. Without
+  // it, a renamed field is indistinguishable from a transient outage in the logs.
+  assert.equal(
+    describeDhanMarginPayload({ data: { errorType: "x", errorMessage: "y" } }),
+    "errorType, errorMessage",
+  );
+  assert.equal(describeDhanMarginPayload({}), "<no fields>");
+  assert.equal(describeDhanMarginPayload(null), "null");
 });
 
 /* ---------------------------- the basket margin ---------------------------- */
@@ -169,6 +260,25 @@ test("the MARGIN (carry-forward) product is used, never INTRADAY", async () => {
   assert.ok(calls.multiLegs.every((l) => l.productType === "MARGIN"));
   assert.ok(calls.multiLegs.every((l) => l.exchangeSegment === "NSE_FNO"));
   assert.ok(calls.multiLegs.every((l) => l.quantity === 275));
+  assert.ok(calls.multiLegs.every((l) => l.price > 0));
+});
+
+test("the REAL per-leg price is preferred over the order price", async () => {
+  // Dhan's calculator has no `order_type`, so it margins against whatever price it is
+  // handed — a MARKET leg's price is not resolved server-side from the LTP the way
+  // Kite's basket endpoint does it.
+  const { m, calls } = marginManager();
+  activateDhan(m);
+  await m.margins().basketMargin(BOX_ORDERS.map((o) => ({ ...o, price: 0, reference_price: 12.5 })));
+  assert.ok(calls.multiLegs.every((l) => l.price === 12.5));
+});
+
+test("a zero-priced leg is never sent, because Dhan rejects one", async () => {
+  // A rejected basket call degrades to the per-leg sum, so the nominal price keeps the
+  // hedge-aware path alive rather than pretending to be accurate.
+  const { m, calls } = marginManager();
+  activateDhan(m);
+  await m.margins().basketMargin(BOX_ORDERS.map((o) => ({ ...o, price: 0, reference_price: null })));
   assert.ok(calls.multiLegs.every((l) => l.price > 0));
 });
 

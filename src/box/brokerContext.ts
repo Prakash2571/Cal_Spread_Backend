@@ -76,6 +76,16 @@ export interface BoxMarginOrder {
   order_type: string;
   quantity: number;
   price: number;
+  /**
+   * Real per-unit price of this leg, when the caller knows it.
+   *
+   * Exists because the brokers differ: Kite's basket endpoint takes an `order_type` and
+   * resolves a MARKET leg's price from the LTP itself, so `price` is conventionally 0
+   * there. Dhan's calculator has no `order_type` and margins against whatever price it
+   * is given, so a leg quoted at 0 (or at a nominal placeholder) loses its premium
+   * component. Kite ignores this field; Dhan prefers it.
+   */
+  reference_price?: number | null;
 }
 
 /**
