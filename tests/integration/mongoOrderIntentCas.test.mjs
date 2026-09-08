@@ -192,7 +192,7 @@ test("real Mongo: the pre-image is captured by the same atomic write", async (t)
   const { repo, model } = await mongo();
   await clean(model);
 
-  const doc = intentDoc({ state: "WORKING", filled_quantity: 25 });
+  const doc = intentDoc({ state: "PARTIALLY_FILLED", filled_quantity: 25 });
   await repo.createBoxOrderIntent(doc);
 
   // The aggregation `$set` evaluates every expression against the INPUT document, so
@@ -202,7 +202,7 @@ test("real Mongo: the pre-image is captured by the same atomic write", async (t)
   const result = await repo.updateBoxOrderIntent(
     doc.client_order_id,
     { filled_quantity: 60 },
-    audit("preimage-1", "WORKING", "WORKING", "cumulative fill advanced"),
+    audit("preimage-1", "PARTIALLY_FILLED", "PARTIALLY_FILLED", "cumulative fill advanced"),
   );
 
   assert.equal(result.applied, true);
@@ -216,15 +216,15 @@ test("real Mongo: concurrent cumulative-fill writes report deltas that sum exact
   const { repo, model } = await mongo();
   await clean(model);
 
-  const doc = intentDoc({ state: "WORKING", filled_quantity: 0 });
+  const doc = intentDoc({ state: "OPEN", filled_quantity: 0 });
   await repo.createBoxOrderIntent(doc);
 
   // Two observers apply cumulative snapshots 40 and 75 in an arbitrary order. The monotonic
   // `$lte` guard means a regressing snapshot is refused, and the applied deltas must sum to 75
   // exactly — never double-count, never lose a fill.
   const [a, b] = await Promise.all([
-    repo.updateBoxOrderIntent(doc.client_order_id, { filled_quantity: 40 }, audit("f-40", "WORKING", "WORKING", "poll 40")),
-    repo.updateBoxOrderIntent(doc.client_order_id, { filled_quantity: 75 }, audit("f-75", "WORKING", "WORKING", "poll 75")),
+    repo.updateBoxOrderIntent(doc.client_order_id, { filled_quantity: 40 }, audit("f-40", "OPEN", "PARTIALLY_FILLED", "poll 40")),
+    repo.updateBoxOrderIntent(doc.client_order_id, { filled_quantity: 75 }, audit("f-75", "OPEN", "PARTIALLY_FILLED", "poll 75")),
   ]);
 
   const deltas = [a, b]
@@ -241,18 +241,50 @@ test("real Mongo: a regressing cumulative quantity is refused", async (t) => {
   const { repo, model } = await mongo();
   await clean(model);
 
-  const doc = intentDoc({ state: "WORKING", filled_quantity: 75 });
+  const doc = intentDoc({ state: "PARTIALLY_FILLED", filled_quantity: 75 });
   await repo.createBoxOrderIntent(doc);
 
   const result = await repo.updateBoxOrderIntent(
     doc.client_order_id,
     { filled_quantity: 40 },
-    audit("regress-1", "WORKING", "WORKING", "out-of-order poll"),
+    audit("regress-1", "PARTIALLY_FILLED", "PARTIALLY_FILLED", "out-of-order poll"),
   );
 
   assert.equal(result.applied, false);
   const stored = await model.BoxOrderIntent.findOne({ client_order_id: doc.client_order_id }).lean();
   assert.equal(stored.filled_quantity, 75);
+  await clean(model);
+});
+
+test("real Mongo: the predecessor guard refuses an illegal state transition", async (t) => {
+  if (skip) return t.skip(skip);
+  const { repo, model } = await mongo();
+  await clean(model);
+
+  // `updateBoxOrderIntent` derives a predecessor guard from the TARGET state, independently of any
+  // `expectedStates` the caller passes. A CREATED row cannot jump straight to COMPLETE: an order
+  // that was never transmitted cannot have filled.
+  const doc = intentDoc({ state: "CREATED" });
+  await repo.createBoxOrderIntent(doc);
+  const illegal = await repo.updateBoxOrderIntent(
+    doc.client_order_id,
+    { state: "COMPLETE", filled_quantity: 75 },
+    audit("illegal-1", "CREATED", "COMPLETE", "never-submitted order claims a fill"),
+  );
+  assert.equal(illegal.applied, false, "CREATED -> COMPLETE must be refused");
+
+  const stored = await model.BoxOrderIntent.findOne({ client_order_id: doc.client_order_id }).lean();
+  assert.equal(stored.state, "CREATED");
+  assert.equal(stored.filled_quantity, 0, "a refused transition cannot leak a fill");
+
+  // An unknown target state has no predecessor list at all, so it must also be refused rather than
+  // matching everything. This is the guard that caught "WORKING" — a state this system never had.
+  const bogus = await repo.updateBoxOrderIntent(
+    doc.client_order_id,
+    { state: "WORKING" },
+    audit("illegal-2", "CREATED", "WORKING", "invented state"),
+  );
+  assert.equal(bogus.applied, false, "an unknown target state must never be accepted");
   await clean(model);
 });
 
@@ -269,8 +301,8 @@ test("real Mongo: a conflicting broker order id fences the transition out", asyn
   // First writer binds the durable identity to broker order B-1.
   const bound = await repo.updateBoxOrderIntent(
     doc.client_order_id,
-    { state: "WORKING", broker_order_id: "B-1" },
-    audit("fence-1", "SUBMITTING", "WORKING", "acknowledged as B-1"),
+    { state: "ACKNOWLEDGED", broker_order_id: "B-1" },
+    audit("fence-1", "SUBMITTING", "ACKNOWLEDGED", "acknowledged as B-1"),
   );
   assert.equal(bound.applied, true);
 
@@ -279,20 +311,20 @@ test("real Mongo: a conflicting broker order id fences the transition out", asyn
   const conflicting = await repo.updateBoxOrderIntent(
     doc.client_order_id,
     { state: "COMPLETE", broker_order_id: "B-2", filled_quantity: 75 },
-    audit("fence-2", "WORKING", "COMPLETE", "stale writer claims B-2"),
+    audit("fence-2", "ACKNOWLEDGED", "COMPLETE", "stale writer claims B-2"),
   );
   assert.equal(conflicting.applied, false, "a broker-identity mismatch must reject the transition");
 
   const stored = await model.BoxOrderIntent.findOne({ client_order_id: doc.client_order_id }).lean();
   assert.equal(stored.broker_order_id, "B-1");
-  assert.equal(stored.state, "WORKING");
+  assert.equal(stored.state, "ACKNOWLEDGED");
   assert.equal(stored.filled_quantity, 0, "the refused write must not have leaked a fill");
 
   // The SAME broker id remains free to advance — fencing rejects impostors, not the real owner.
   const same = await repo.updateBoxOrderIntent(
     doc.client_order_id,
     { state: "COMPLETE", broker_order_id: "B-1", filled_quantity: 75 },
-    audit("fence-3", "WORKING", "COMPLETE", "B-1 completed"),
+    audit("fence-3", "ACKNOWLEDGED", "COMPLETE", "B-1 completed"),
   );
   assert.equal(same.applied, true);
   await clean(model);
@@ -305,10 +337,10 @@ test("real Mongo: replaying an identical audited transition stays idempotent", a
   const { repo, model } = await mongo();
   await clean(model);
 
-  const doc = intentDoc({ state: "WORKING", filled_quantity: 75 });
+  const doc = intentDoc({ state: "PARTIALLY_FILLED", filled_quantity: 75 });
   await repo.createBoxOrderIntent(doc);
 
-  const entry = audit("dup-1", "WORKING", "COMPLETE", "terminal snapshot");
+  const entry = audit("dup-1", "PARTIALLY_FILLED", "COMPLETE", "terminal snapshot");
   const first = await repo.updateBoxOrderIntent(doc.client_order_id, { state: "COMPLETE", filled_quantity: 75 }, entry);
   // A retry after a network wobble replays the same audit id. The `$concatArrays` guard must append
   // it exactly once, and the cumulative quantity must not advance a second time.
@@ -503,12 +535,12 @@ test("real Mongo: a restarted process reloads durable state and adopts, without 
   await clean(model);
 
   // Leave a WORKING leg behind, exactly as an abrupt restart would.
-  const doc = intentDoc({ state: "WORKING", filled_quantity: 25, broker_order_id: "B-restart-1" });
+  const doc = intentDoc({ state: "OPEN", filled_quantity: 0, broker_order_id: "B-restart-1" });
   await repo.createBoxOrderIntent(doc);
   await repo.updateBoxOrderIntent(
     doc.client_order_id,
-    { state: "WORKING", broker_order_id: "B-restart-1", filled_quantity: 25 },
-    audit("restart-seed", "SUBMITTING", "WORKING", "working before restart"),
+    { state: "PARTIALLY_FILLED", broker_order_id: "B-restart-1", filled_quantity: 25 },
+    audit("restart-seed", "OPEN", "PARTIALLY_FILLED", "partially filled before restart"),
   );
 
   // A fresh process loads the durable journal.
@@ -527,7 +559,7 @@ test("real Mongo: a restarted process reloads durable state and adopts, without 
   const advanced = await repo.updateBoxOrderIntent(
     doc.client_order_id,
     { state: "COMPLETE", broker_order_id: "B-restart-1", filled_quantity: 75 },
-    audit("restart-finish", "WORKING", "COMPLETE", "reconciled to terminal after restart"),
+    audit("restart-finish", "PARTIALLY_FILLED", "COMPLETE", "reconciled to terminal after restart"),
   );
   assert.equal(advanced.applied, true);
   assert.equal(advanced.previous_filled_quantity, 25);
@@ -541,12 +573,12 @@ test("real Mongo: terminal rows leave the nonterminal working set", async (t) =>
   const { model, repo } = await mongo();
   await clean(model);
 
-  const doc = intentDoc({ state: "WORKING" });
+  const doc = intentDoc({ state: "OPEN" });
   await repo.createBoxOrderIntent(doc);
   await repo.updateBoxOrderIntent(
     doc.client_order_id,
     { state: "CANCELLED", terminal_at: new Date() },
-    audit("terminal-1", "WORKING", "CANCELLED", "cancellation confirmed terminal"),
+    audit("terminal-1", "OPEN", "CANCELLED", "cancellation confirmed terminal"),
   );
 
   const nonterminal = await repo.loadNonterminalBoxOrderIntents();
