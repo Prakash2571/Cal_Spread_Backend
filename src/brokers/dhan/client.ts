@@ -167,6 +167,34 @@ export interface DhanMarginRequestLeg {
   triggerPrice?: number;
 }
 
+/**
+ * One leg of the MULTI-order margin request.
+ *
+ * Carries NO `dhanClientId`. On this endpoint the client id belongs at the TOP level
+ * of the body; repeating it inside each leg is not part of the contract.
+ */
+export type DhanMultiMarginLeg = Omit<DhanMarginRequestLeg, "dhanClientId">;
+
+/**
+ * The wire body of `POST /margincalculator/multi`.
+ *
+ * The leg array MUST be named `scripList`. This is the single detail that silently
+ * disabled hedge-aware margining: a body sent as `{ orders: [...] }` is rejected by
+ * Dhan, the caller then falls back to summing four standalone legs, and the dashboard
+ * reports several times the real basket requirement — an over-statement that looks
+ * plausible rather than like a failure. Modelled as a type so the field names are
+ * checked by the compiler instead of remembered.
+ */
+export interface DhanMultiMarginRequest {
+  dhanClientId: string;
+  /** Net the basket against positions already held. */
+  includePosition: boolean;
+  /** Net the basket against orders still pending. */
+  includeOrder: boolean;
+  /** The legs. Dhan's field name for them is `scripList`, not `orders`. */
+  scripList: DhanMultiMarginLeg[];
+}
+
 export interface DhanMarginResponse {
   totalMargin: number;
   spanMargin: number;
@@ -259,6 +287,25 @@ export function normalizeDhanMultiMargin(
     availableBalance: pickNumber(body, "availableBalance", "available_balance"),
     insufficientBalance: pickNumber(body, "insufficientBalance", "insufficient_balance"),
   };
+}
+
+/**
+ * Describe a margin payload's top-level fields, for the log line emitted when no total
+ * could be read.
+ *
+ * Exists because the previous failure was INVISIBLE: the fallback logged only that it
+ * had happened, never what Dhan actually returned, so a renamed or restructured field
+ * looked identical to a transient outage. Naming the keys turns the next such drift
+ * into a one-line diagnosis. Values are deliberately NOT logged — this payload carries
+ * account balances.
+ */
+export function describeDhanMarginPayload(res: unknown): string {
+  if (res === null || res === undefined) return String(res);
+  if (typeof res !== "object") return `<${typeof res}>`;
+  const body = ((res as { data?: unknown }).data ?? res) as Record<string, unknown>;
+  if (typeof body !== "object" || body === null) return "<non-object data>";
+  const keys = Object.keys(body);
+  return keys.length > 0 ? keys.join(", ") : "<no fields>";
 }
 
 /* --------------------------------- quotes --------------------------------- */
@@ -508,15 +555,30 @@ export class DhanClient {
    * All four intended orders are sent together, each carrying its real BUY/SELL
    * direction — sending them as four buys (or omitting direction) would defeat the
    * hedge recognition this call exists for.
+   *
+   * The body shape is load-bearing: the legs go under `scripList` with `dhanClientId`
+   * at the TOP level only. Sending them as `orders`, or repeating the client id per
+   * leg, makes Dhan reject the request; the caller then silently falls back to the
+   * per-leg sum, which is exactly the several-fold over-statement this endpoint exists
+   * to avoid. See `DhanMultiMarginRequest`.
    */
   calculateMultiMargin(
-    legs: Omit<DhanMarginRequestLeg, "dhanClientId">[],
+    legs: DhanMultiMarginLeg[],
+    opts: { includePosition?: boolean; includeOrder?: boolean } = {},
   ): Promise<DhanMultiMarginResponse> {
-    const dhanClientId = this.clientId();
+    const body: DhanMultiMarginRequest = {
+      dhanClientId: this.clientId(),
+      // Default FALSE for both: the figure must describe the basket itself, so that it
+      // is reproducible whether it is computed at entry or on a later backfill sweep,
+      // and independent of whatever else the account happens to be holding.
+      includePosition: opts.includePosition ?? false,
+      includeOrder: opts.includeOrder ?? false,
+      scripList: legs,
+    };
     return this.http.read<DhanMultiMarginResponse>({
       method: "POST",
       path: "/margincalculator/multi",
-      body: { dhanClientId, orders: legs.map((leg) => ({ ...leg, dhanClientId })) },
+      body,
     });
   }
 
