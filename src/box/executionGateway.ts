@@ -17,6 +17,8 @@ import {
   grossEntryOrderNotional,
   type BoxCapitalReport,
 } from "./boxCapital.js";
+import { entrySubmissionOrder } from "./entrySubmissionOrder.js";
+import { evaluateLiveEntryGuard, stillWantedSafely } from "./liveEntryGuard.js";
 import {
   OrderPersistenceAfterFillError,
   type BoxOrderManager,
@@ -196,17 +198,35 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       manager.invariantViolation(`live entry ${attemptId} has no preallocated durable trade identity`);
       return liveEntryFailure(args.candidate, args.detection.at, this.now(), [], "legging_incomplete", "durable trade identity allocation failed; entry blocked", this.deps.cfg, null);
     }
+    // ── CHECKPOINT 1 of 5: BEFORE BUILDING ANYTHING ──────────────────────────────────────
+    //
+    // `args.stillWanted` is the predicate the COORDINATOR composed: the caller's own condition
+    // folded together with "do we still hold the reservation lease" (see
+    // executionCoordinator.ownershipGuard). Until this fix the live path never called it — only
+    // the paper simulator did — so a Box whose lease had been lost still POSTed all four legs.
+    //
+    // Cheapest possible refusal: no requests, no durable rows, no exposure.
     const submittedAt = this.now();
+    const wantedAtBuild = this.entryGuardRefusal(args.stillWanted, "pre_build");
+    if (wantedAtBuild) return this.refusedBeforeSubmit(args, submittedAt, tradeId, wantedAtBuild);
+
     const requests: BrokerOrderRequest[] = [];
     let checkedFeed = new Map<string, CheckedFeedStamp>();
+    // HEDGE-FIRST TRANSPORT ORDER (see entrySubmissionOrder.ts). Requests are built — and
+    // therefore enqueued, and therefore POSTed — BUY hedges first. Under the canonical role order
+    // a SHORT_BOX sent its naked SELL first and hedged it second; this makes that impossible.
+    // Role identities, sides, quantities and the four-leg economics are untouched: only the
+    // sequence changes, and every downstream figure is keyed by role, never by position.
+    const submissionOrder = entrySubmissionOrder(args.candidate.direction);
+    const hedgeCount = submissionOrder.filter((slot) => slot.hedge).length;
     try {
-      for (const role of BOX_LEG_ROLES) {
-        const leg = args.detection.legs.find((item) => item.role === role);
-        if (!leg || leg.price === null) throw new Error(`No executable reference price for ${role}.`);
+      for (const slot of submissionOrder) {
+        const leg = args.detection.legs.find((item) => item.role === slot.role);
+        if (!leg || leg.price === null) throw new Error(`No executable reference price for ${slot.role}.`);
         requests.push(this.request({
-          role,
-          inst: args.candidate.legs[role],
-          side: entrySideFor(role, args.candidate.direction),
+          role: slot.role,
+          inst: args.candidate.legs[slot.role],
+          side: entrySideFor(slot.role, args.candidate.direction),
           quantity: args.candidate.lot_size,
           referencePrice: leg.price,
           tradeId,
@@ -257,10 +277,30 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
       checked_at: capital.at,
     };
 
+    // ── CHECKPOINT 2 of 5: IMMEDIATELY BEFORE ENQUEUE ────────────────────────────────────
+    // Everything above — building four requests, the depth precheck, the capital evaluation — took
+    // real time. Still nothing has been transmitted, so this remains a free refusal.
+    const wantedAtEnqueue = this.entryGuardRefusal(args.stillWanted, "pre_enqueue");
+    if (wantedAtEnqueue) return this.refusedBeforeSubmit(args, submittedAt, tradeId, wantedAtEnqueue);
+
+    // The guard travels WITH each leg, alongside its hedge-first rank, so the manager can
+    // re-evaluate it at dequeue, after durable persistence, and at the final pre-POST boundary.
+    // It is passed for ENTRY legs ONLY; exits and reductions never receive one and so can never be
+    // refused by it.
+    const rankByRole = new Map(submissionOrder.map((slot) => [slot.role, slot]));
     const settled = await Promise.allSettled(
-      requests.map((request) => manager.submit(request, checkedFeed.get(request.client_order_id), capitalStamp)),
+      requests.map((request) => {
+        const slot = rankByRole.get(request.role);
+        return manager.submit(request, checkedFeed.get(request.client_order_id), capitalStamp, {
+          stillWanted: () => (args.stillWanted ? args.stillWanted() : true),
+          transportRank: slot?.rank ?? 0,
+          hedge: slot?.hedge ?? false,
+          hedgeCount,
+        });
+      }),
     );
-    const orders = ordersFromSettled(settled);
+    // Canonical role order for OUTPUT/accounting; the POSTs above were hedge-first.
+    const orders = canonicalRoleOrder(ordersFromSettled(settled));
     const uncertain = settled.some((item) => item.status === "rejected" &&
       (item.reason instanceof OrderPersistenceAfterFillError ||
         /unknown|ambiguous|reconcil/i.test(errorMessage(item.reason)))) ||
@@ -360,6 +400,59 @@ export class CentralBoxExecutionGateway implements BoxExecutionGateway {
     const opened = liveRecord(args.detection.at, submittedAt, orders, true, this.deps.cfg, undefined, tradeId);
     opened.outcome_class = "OPENED";
     return { ok: true, evaluation, decision, legging: opened };
+  }
+
+  /**
+   * The composed entry-guard refusal reason at a gateway-side checkpoint, or null to proceed.
+   *
+   * The gateway can only see `stillWanted` — the manager owns entry arming, the breaker and full
+   * admission — so it supplies `true` for the facts it cannot observe and lets the manager assert
+   * them at its own three checkpoints. The DECISION itself still comes from the one pure function,
+   * so the reason text is identical wherever the refusal is taken.
+   */
+  private entryGuardRefusal(
+    stillWanted: (() => boolean) | undefined,
+    stage: "pre_build" | "pre_enqueue",
+  ): string | null {
+    const decision = evaluateLiveEntryGuard({
+      stage,
+      stillWanted: stillWantedSafely(stillWanted),
+      entryEnabled: true,
+      liveOrderEntryEnabled: true,
+      circuitClosed: true,
+      entryAdmissible: true,
+      attemptAborted: null,
+      hedgeFailure: null,
+    });
+    return decision.allowed ? null : decision.reason;
+  }
+
+  /**
+   * A proven ZERO-POST entry refusal taken before the manager was ever called.
+   *
+   * `REFUSED_BEFORE_SUBMIT` is the existing outcome class for exactly this: nothing reached the
+   * broker, so there is no exposure, no charge and nothing to unwind. It is emphatically NOT a
+   * broker rejection and NOT ambiguous — no durable intent was even created, because the refusal
+   * happened before the first `manager.submit`.
+   */
+  private refusedBeforeSubmit(
+    args: Parameters<BoxExecutionSimulator["simulateLeggingEntry"]>[0],
+    submittedAt: number,
+    tradeId: string | null,
+    detail: string,
+  ): Extract<BoxLeggingResult, { ok: false }> {
+    const refused = liveEntryFailure(
+      args.candidate,
+      args.detection.at,
+      submittedAt,
+      [],
+      "discovery_stopped",
+      detail,
+      this.deps.cfg,
+      tradeId,
+    );
+    refused.legging.outcome_class = "REFUSED_BEFORE_SUBMIT";
+    return refused;
   }
 
   /**
@@ -1010,7 +1103,9 @@ export function hasDurableLocalNoPostProvenance(intent: IBoxOrderIntent): boolea
     return event.to_state === "REJECTED" &&
       payload?.origin === "local_pre_submit_refusal" &&
       payload.no_broker_post === true &&
-      (payload.stage === "dequeue" || payload.stage === "pre_post");
+      (payload.stage === "dequeue" ||
+        payload.stage === "post_persist" ||
+        payload.stage === "pre_post");
   });
 }
 
@@ -1273,6 +1368,25 @@ function residualAfterUnwind(entries: BrokerOrder[], unwinds: BrokerOrder[]): Re
       created_at: entry.updated_at,
     }];
   });
+}
+
+/**
+ * Re-sort broker orders into CANONICAL role order.
+ *
+ * Entry requests are now built and transmitted HEDGE-FIRST, so the settled results arrive in
+ * transport order. Every consumer downstream pairs BY ROLE, but the execution RECORD builds its
+ * `legs` array positionally — so without this the persisted and API-visible leg order would have
+ * silently changed from `[k1_ce, k2_ce, k2_pe, k1_pe]` to the transport permutation.
+ *
+ * Transport order is an execution-safety decision; leg-array order is an output contract. This
+ * keeps them independent, which is exactly what "preserve accounting by role rather than array
+ * position" requires.
+ */
+function canonicalRoleOrder(orders: BrokerOrder[]): BrokerOrder[] {
+  const rank = new Map(BOX_LEG_ROLES.map((role, index) => [role, index]));
+  return [...orders].sort(
+    (a, b) => (rank.get(a.role) ?? BOX_LEG_ROLES.length) - (rank.get(b.role) ?? BOX_LEG_ROLES.length),
+  );
 }
 
 function ordersFromSettled(results: PromiseSettledResult<BrokerOrder>[]): BrokerOrder[] {

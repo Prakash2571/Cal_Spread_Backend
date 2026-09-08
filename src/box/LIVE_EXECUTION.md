@@ -21,6 +21,45 @@ Every process start resets these in-memory runtime controls to `false`:
 
 Scanner RUN/STOP is separate from these controls. STOP prevents discovery of new opportunities but does not stop monitoring or risk-reducing exits. A circuit-breaker trip disables entry but deliberately preserves the ability to cancel or reduce owned exposure.
 
+### Entry guards versus reduction permissions
+
+The controls above, the scanner decision, the reservation lease and the circuit breaker are **entry-only**. They may all refuse to create new exposure. None of them may prevent the reduction of exposure that is already owned and safely attributed.
+
+Concretely, these may block a new ENTRY: scanner STOP, entry disarmed, reservation/ownership loss, an open circuit breaker, and order-manager entry admission (health, reconciliation completeness, open-box and residual limits, crash-recovery quarantine).
+
+These may **not** be blocked by any of the above: EXIT, protective cancellation, partial risk reduction, emergency residual flattening, and reconciliation-authorized reduction. The enforcement point is mechanical rather than a convention: the composed entry guard is only ever consulted when `purpose === "ENTRY"`, and a reduction never carries one. Passing one on a non-entry purpose is ignored by construction.
+
+### The composed entry guard, and the five checkpoints
+
+The coordinator composes an ownership-aware `stillWanted` predicate — the caller's own condition folded together with "do we still hold the reservation lease" — and hands it to the gateway. Live entry re-evaluates that composed guard at **five** points, because an unbounded amount of wall-clock time can pass between a decision and a broker mutation:
+
+1. before the four broker requests are constructed;
+2. immediately before handing them to the order manager;
+3. at order-manager dequeue, once a concurrency slot is held;
+4. after the durable `CREATED -> SUBMITTING` writes complete;
+5. inside the adapter callback, as the last instruction before the HTTP POST.
+
+The final pre-POST decision folds in `stillWanted` (ownership/lease and scanner), entry armed, live-order authorization, a closed circuit breaker, full order-manager entry admission, the current feed-generation/depth check, and any hedge-leg failure for this attempt.
+
+A refusal at any checkpoint makes **no broker mutation**. The durable intent is terminalized through the existing structured local-no-POST provenance (`origin: local_pre_submit_refusal`, `no_broker_post: true`, plus the refusing `stage`) under an expected-state CAS, so a concurrent process's real broker result can never be overwritten. Such a refusal is deliberately **not** counted as a broker rejection and **not** treated as ambiguous — it becomes ambiguous only if the CAS loses or the POST status cannot be proven. A predicate that throws counts as a refusal, never as permission.
+
+### Hedge-first entry submission order
+
+The four entry orders are transmitted **BUY hedges first**, then uncovered SELLs:
+
+| Direction | Transport order |
+| --- | --- |
+| `LONG_BOX` | `k1_ce` BUY, `k2_pe` BUY, `k2_ce` SELL, `k1_pe` SELL |
+| `SHORT_BOX` | `k2_ce` BUY, `k1_pe` BUY, `k1_ce` SELL, `k2_pe` SELL |
+
+Previously the canonical role array `[k1_ce, k2_ce, k2_pe, k1_pe]` doubled as the transport order. For a `SHORT_BOX` that made the **first** broker POST a naked SELL, with its hedge second — so a failure between the two POSTs left uncovered short option exposure.
+
+Ordering the requests is not sufficient on its own. With `BOX_LIVE_ENTRY_SUBMIT_CONCURRENCY=4` all four legs are dequeued together and each performs its own durable writes, so whichever finished first would reach the broker first. An uncovered SELL therefore also waits on a barrier until every BUY hedge of the same attempt has **completed its POST round trip**. Hedge legs do not wait on each other, so the two BUYs still overlap and entry does not degrade into four serial round trips.
+
+Two consequences follow. A hedge that is rejected, or whose submission is ambiguous, stops the dependent uncovered SELLs *before* they POST — an unproven hedge is treated as a failed hedge, because guessing in the permissive direction would send a naked short against a hedge that may not exist. And role identities, sides, quantities and the four-leg economics are unchanged: only the transmission sequence differs. Output and accounting remain keyed by role, and the execution record's leg array stays in canonical role order.
+
+This reduces, but does not remove, legging risk. See "Remaining broker leg risk" below.
+
 ## Source of truth and persistence
 
 Broker orders and broker positions are authoritative for live fills and exposure. Mongo stores the durable strategy/accounting projection and the append-only order-intent journal. A deterministic identity such as `BOX:<trade-id>:ENTRY:k1_ce:attempt-1` is persisted before submission. `CREATED -> SUBMITTING` is an expected-state compare-and-set: only the manager whose durable transition was applied may POST, while losers adopt or reconcile the existing intent. Ambiguous or working outcomes retain identity and are never blindly resubmitted.
@@ -246,6 +285,26 @@ Emergency flatten requires the explicit runtime arm plus completed reconciliatio
 
 
 ---
+
+## Remaining broker leg risk
+
+**Four-leg Box entry is not atomic, and cannot be made atomic on these brokers.** Zerodha and Dhan expose four independent orders with no basket/atomic primitive and no fencing token, so some legging risk is irreducible. The guards above narrow the window; they do not close it.
+
+What is genuinely guaranteed:
+
+- no ENTRY leg POSTs after ownership loss, disarm, breaker trip or a withdrawn scanner decision is observed at any of the five checkpoints;
+- an uncovered SELL is never the first order transmitted, and never POSTs before every BUY hedge of its attempt has completed a POST round trip;
+- a rejected or ambiguous hedge stops its dependent uncovered SELLs before they POST;
+- a local refusal is a proven zero-POST outcome with durable provenance, never a broker rejection and never silently ambiguous.
+
+What remains genuinely unguaranteed:
+
+- a hedge BUY can be accepted and then a subsequent SELL rejected, leaving a real hedged-side-only position that must be unwound at cost through the existing partial-entry recovery path;
+- a leg can fill in the interval between the last guard evaluation and the broker's response, so "refused" never retroactively cancels an in-flight POST;
+- broker-side latency or an outage between POST and response yields an ambiguous leg, which is quarantined for reconciliation rather than guessed;
+- once all four legs are proven filled, a late local signal must **not** abort the established Box; it is unwound only on its own economics or exit rules.
+
+Operators should read the hedge-first ordering as "the riskier half is never exposed first", not as "the Box either exists or it does not".
 
 ## Paper live-parity profile (`BOX_PAPER_EXECUTION_PROFILE=live_parity`)
 
