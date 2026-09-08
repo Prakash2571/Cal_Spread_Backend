@@ -21,6 +21,15 @@
     "declaration": true,
     "declarationMap": true,
 
+    // NEVER EMIT A BUILD THAT DID NOT TYPECHECK.
+    //
+    // tsc's default is to emit JavaScript even when it reported errors. That default hid a real
+    // problem: with `@types/node` missing, `tsc -b` failed with TS2688 and STILL wrote a complete
+    // `dist/`, so `node --test` ran happily against output from a build that had never passed. A
+    // green test run therefore proved nothing about the build. Emitting nothing on error makes the
+    // failure impossible to ignore, because the tests then have no `dist/` to import at all.
+    "noEmitOnError": true,
+
     // Stricter Typechecking Options
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,

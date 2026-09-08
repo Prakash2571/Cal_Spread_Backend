@@ -15,6 +15,12 @@ import type { ExecutionTimingRecorder } from "./executionTiming.js";
 import { kindForPurpose } from "./executionTiming.js";
 import type { BrokerId } from "./latencyModel.js";
 import {
+  evaluateLiveEntryGuard,
+  stillWantedSafely,
+  type LiveEntryGuardDecision,
+  type LiveEntryGuardStage,
+} from "./liveEntryGuard.js";
+import {
   admitBoxOperation,
   BOX_ORDER_PRIORITY,
   type BoxSchedulingOccupancy,
@@ -73,6 +79,66 @@ export interface EntryCapitalStamp {
   /** The cap that was in force when the decision was taken (₹). 0 ⇒ disabled. */
   readonly configured_max_rupees: number;
   readonly checked_at: number;
+}
+
+/**
+ * The per-leg ENTRY guard: the caller's ownership/"still wanted" predicate plus this leg's place
+ * in the hedge-first transport sequence.
+ *
+ * EPHEMERAL, exactly like {@link CheckedFeedStamp} and {@link EntryCapitalStamp}: never written to
+ * the durable intent and never sent to a broker. It is live authority, not a record.
+ *
+ * ENTRY ONLY. The manager checks `purpose === "ENTRY"` before it consults any of this, because
+ * every condition here is a reason not to CREATE exposure and never a reason to leave existing
+ * exposure on the book. See {@link evaluateLiveEntryGuard}.
+ */
+export interface LiveEntryTransportGuard {
+  /**
+   * The composed ownership + scanner predicate, re-evaluated (not cached) at dequeue, after
+   * durable persistence, and immediately before the broker POST. Throwing counts as "no".
+   */
+  readonly stillWanted: () => boolean;
+  /** 0-based hedge-first transport rank within this attempt (see entrySubmissionOrder.ts). */
+  readonly transportRank: number;
+  /** True when this leg is a BUY hedge that the attempt's uncovered SELL legs depend on. */
+  readonly hedge: boolean;
+  /** How many BUY hedge legs this attempt has. Uncovered SELLs wait for all of them. */
+  readonly hedgeCount: number;
+}
+
+/**
+ * Per-attempt transport sequencing state for one entry attempt's four legs.
+ *
+ * WHY THIS IS NEEDED AT ALL. Building the requests in hedge-first order is not sufficient. With
+ * `BOX_LIVE_ENTRY_SUBMIT_CONCURRENCY = 4` all four legs are dequeued together and each then does
+ * its own two durable Mongo writes; whichever write finishes first would reach the broker first.
+ * Enqueue order therefore does NOT determine POST order, and the uncovered SELL could still win
+ * the race. This gate makes rank `n` wait until every rank below it has DECIDED — posted, or
+ * terminalized locally without posting.
+ *
+ * DEADLOCK SAFETY. Every rank that is admitted releases in a `finally`, every rank rejected before
+ * enqueue releases immediately, and `dispose` releases the rest. Rank 0 never waits. Because the
+ * queue is FIFO by sequence and the gateway enqueues in rank order, rank 0 is always dequeued
+ * first, so a lower rank can never be starved by a higher one holding its slot.
+ */
+interface EntryTransportGate {
+  /**
+   * Every rank that has registered for this attempt.
+   *
+   * Tracked EXPLICITLY rather than inferred from the decided/parked sets. Inferring it lost the
+   * gate — and with it the `hedgeFailure` record — the moment the last hedge woke the parked SELLs,
+   * because a woken waiter is no longer in either set. The SELLs then found no gate, read no hedge
+   * failure, and POSTed naked. The set is the authority for when the gate may be dropped.
+   */
+  readonly registered: Set<number>;
+  /** Ranks that have decided, and how. */
+  readonly decided: Map<number, "posted" | "no_post">;
+  /** Waiters parked until every BUY hedge rank has decided. */
+  waiters: Array<{ readonly rank: number; readonly wake: () => void }>;
+  /** Set when a BUY hedge leg fails definitively; dependent SELL legs then refuse before POST. */
+  hedgeFailure: string | null;
+  /** How many BUY hedge legs this attempt has; ranks `[0, hedgeCount)` are the hedges. */
+  hedgeCount: number;
 }
 
 export interface OrderIntentPersistence {
@@ -254,6 +320,8 @@ interface SubmitQueueAction {
   checkedFeed?: CheckedFeedStamp;
   /** Box-level ₹ capital evidence for an ENTRY leg. Ephemeral, like `checkedFeed`. */
   capital?: EntryCapitalStamp;
+  /** Live ENTRY ownership guard + hedge-first rank. ENTRY only; ephemeral, like `capital`. */
+  entry?: LiveEntryTransportGuard;
   resolve: (order: BrokerOrder) => void;
   reject: (error: unknown) => void;
   sequence: number;
@@ -383,6 +451,10 @@ export class BoxOrderManager {
   private lastReconciledAt: number | null = null;
   /** Guarded durable transitions the intent state machine refused. Bounded counter. */
   private durableTransitionRefusals = 0;
+  /** Hedge-first transport sequencing, one entry per live ENTRY attempt. Bounded by attempts. */
+  private readonly entryTransportGates = new Map<string, EntryTransportGate>();
+  /** ENTRY legs refused by the composed ownership guard, by stage. Diagnostics only. */
+  private readonly entryGuardRefusals = new Map<LiveEntryGuardStage, number>();
 
   constructor(
     private readonly deps: {
@@ -696,18 +768,40 @@ export class BoxOrderManager {
     request: BrokerOrderRequest,
     checkedFeed?: CheckedFeedStamp,
     capital?: EntryCapitalStamp,
+    entry?: LiveEntryTransportGuard,
   ): Promise<BrokerOrder> {
+    // ENTRY-ONLY GUARD, checked before anything is reserved or enqueued. `entry` is supplied only
+    // for ENTRY legs; an EXIT/PROTECTIVE_CANCEL/EMERGENCY_RESIDUAL never carries one and so can
+    // never be refused by it.
+    const entryGuard = request.purpose === "ENTRY" ? entry : undefined;
+    // Registered BEFORE any early return below, so that every rejection path from here on can
+    // release this rank and cannot strand a higher-ranked sibling waiting on it.
+    if (entryGuard) this.ensureEntryTransportGate(request.attempt_id, entryGuard);
+    const releaseOnReject = (error: Error): Promise<BrokerOrder> => {
+      if (entryGuard) {
+        this.decideEntryTransportRank(request, entryGuard, "no_post", error.message);
+      }
+      return Promise.reject(error);
+    };
+    if (entryGuard) {
+      const decision = this.evaluateEntryGuard(request, entryGuard, "pre_enqueue");
+      if (!decision.allowed) {
+        return releaseOnReject(
+          new BrokerPreSubmitRefusedError(request.client_order_id, "dequeue", false, decision.reason),
+        );
+      }
+    }
     if (request.purpose === "ENTRY" && !this.canEnter(request)) {
-      return Promise.reject(new Error("OrderManager entry controls or limits are closed."));
+      return releaseOnReject(new Error("OrderManager entry controls or limits are closed."));
     }
     if (request.purpose !== "ENTRY" && !this.canManageExposure()) {
       return Promise.reject(new Error("OrderManager exposure management is disabled."));
     }
     if (!this.withinQuantityLimits(request)) {
-      return Promise.reject(new Error("Order exceeds configured live leg quantity limits."));
+      return releaseOnReject(new Error("Order exceeds configured live leg quantity limits."));
     }
     if (this.activeClientIds.has(request.client_order_id)) {
-      return Promise.reject(new Error(`Order ${request.client_order_id} is already queued or active.`));
+      return releaseOnReject(new Error(`Order ${request.client_order_id} is already queued or active.`));
     }
     this.activeClientIds.add(request.client_order_id);
     if (request.purpose === "ENTRY") {
@@ -729,6 +823,7 @@ export class BoxOrderManager {
         request,
         ...(checkedFeed ? { checkedFeed } : {}),
         ...(capital ? { capital } : {}),
+        ...(entryGuard ? { entry: entryGuard } : {}),
         resolve,
         reject,
         sequence: this.sequence++,
@@ -933,6 +1028,10 @@ export class BoxOrderManager {
     }
     this.activeDailyRiskSeedTokens.clear();
     this.flattenChargeMutationsByDay.clear();
+    // Wake anything parked on the hedge-first barrier BEFORE rejecting the queue, so a disposed
+    // manager can never leave an entry leg awaiting a sibling that will now never run. The woken
+    // leg re-checks the guard, sees `disposed`, and terminalizes without POSTing.
+    this.drainEntryTransportGates();
     for (const action of this.queue.splice(0)) {
       if (action.kind === "submit") {
         this.activeClientIds.delete(action.request.client_order_id);
@@ -1112,6 +1211,187 @@ export class BoxOrderManager {
     return null;
   }
 
+  /* ------------------------------------------------------------------ */
+  /*  Live ENTRY ownership guard + hedge-first transport sequencing       */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * Evaluate the composed ENTRY permission at one checkpoint.
+   *
+   * Gathers the facts only this layer can see (controls, breaker, full `canEnter` admission, the
+   * attempt's hedge state) and delegates the DECISION to the pure
+   * {@link evaluateLiveEntryGuard}, so all five checkpoints share one rule.
+   *
+   * NEVER called for a non-ENTRY purpose — the callers gate on `purpose === "ENTRY"` — which is
+   * what keeps exits, protective cancels and residual flattening immune from every condition here.
+   */
+  private evaluateEntryGuard(
+    request: BrokerOrderRequest,
+    guard: LiveEntryTransportGuard,
+    stage: LiveEntryGuardStage,
+  ): LiveEntryGuardDecision {
+    const gate = this.entryTransportGates.get(request.attempt_id);
+    const decision = evaluateLiveEntryGuard({
+      stage,
+      stillWanted: stillWantedSafely(guard.stillWanted),
+      entryEnabled: this.controls.entryEnabled,
+      liveOrderEntryEnabled: this.controls.liveOrderEnabled,
+      circuitClosed: this.breakerReason === null,
+      // `pre_enqueue` runs before `canEnter` is consulted by `submit` itself, so it must not
+      // pre-empt that check's own distinct error; the later stages assert it fully.
+      entryAdmissible: stage === "pre_enqueue" ? true : this.canEnter(request),
+      attemptAborted: null,
+      hedgeFailure: guard.hedge ? null : gate?.hedgeFailure ?? null,
+    });
+    if (!decision.allowed) {
+      this.entryGuardRefusals.set(stage, (this.entryGuardRefusals.get(stage) ?? 0) + 1);
+    }
+    return decision;
+  }
+
+  /** {@link evaluateEntryGuard} as a reason string, matching the `*BlockReason` convention. */
+  private entryGuardBlockReason(
+    request: BrokerOrderRequest,
+    guard: LiveEntryTransportGuard,
+    stage: LiveEntryGuardStage,
+  ): string | null {
+    const decision = this.evaluateEntryGuard(request, guard, stage);
+    return decision.allowed ? null : decision.reason;
+  }
+
+  /** ENTRY legs refused by the composed ownership guard, by checkpoint. Diagnostics only. */
+  entryGuardDiagnostics(): Record<LiveEntryGuardStage, number> {
+    return {
+      pre_build: this.entryGuardRefusals.get("pre_build") ?? 0,
+      pre_enqueue: this.entryGuardRefusals.get("pre_enqueue") ?? 0,
+      dequeue: this.entryGuardRefusals.get("dequeue") ?? 0,
+      post_persist: this.entryGuardRefusals.get("post_persist") ?? 0,
+      pre_post: this.entryGuardRefusals.get("pre_post") ?? 0,
+    };
+  }
+
+  /** Create (or fetch) the transport gate for one entry attempt, and register this leg's rank. */
+  private ensureEntryTransportGate(
+    attemptId: string,
+    guard: LiveEntryTransportGuard,
+  ): EntryTransportGate {
+    let gate = this.entryTransportGates.get(attemptId);
+    if (!gate) {
+      gate = {
+        registered: new Set(),
+        decided: new Map(),
+        waiters: [],
+        hedgeFailure: null,
+        hedgeCount: guard.hedgeCount,
+      };
+      this.entryTransportGates.set(attemptId, gate);
+    }
+    gate.registered.add(guard.transportRank);
+    // Every leg of one attempt reports the same count; take the largest seen so a mis-supplied
+    // smaller value can never shrink the set of hedges a SELL must wait for.
+    gate.hedgeCount = Math.max(gate.hedgeCount, guard.hedgeCount);
+    return gate;
+  }
+
+  /**
+   * Record that one rank has decided, wake anything now unblocked, and remember a hedge failure.
+   *
+   * "DECIDED" for a hedge leg means its POST ROUND TRIP IS OVER — the adapter call returned or
+   * threw — not merely that it started. That is deliberate and is what makes the dependent-SELL
+   * protection real: only a completed hedge round trip can tell us whether the hedge was actually
+   * accepted, and therefore whether the uncovered SELL is safe to send at all.
+   *
+   * IDEMPOTENT: a rank already decided is not re-recorded, so a double decision (a submit-time
+   * rejection followed by a `finally`, say) cannot corrupt the sequence.
+   */
+  private decideEntryTransportRank(
+    request: BrokerOrderRequest,
+    guard: LiveEntryTransportGuard,
+    outcome: "posted" | "no_post",
+    reason?: string,
+  ): void {
+    const gate = this.entryTransportGates.get(request.attempt_id);
+    if (!gate) return;
+    if (!gate.decided.has(guard.transportRank)) {
+      gate.decided.set(guard.transportRank, outcome);
+    }
+    // A BUY hedge that never reached the broker — or reached it and was refused — leaves the
+    // dependent uncovered SELLs unhedged. Recording it is what lets those SELLs refuse BEFORE
+    // their own POST rather than becoming naked short exposure.
+    if (guard.hedge && reason !== undefined && gate.hedgeFailure === null) {
+      const how = outcome === "no_post" ? "did not reach the broker" : "failed at the broker";
+      gate.hedgeFailure = `${request.role} (${request.side}) ${how}: ${reason}`;
+    }
+    this.wakeEntryTransportWaiters(gate);
+    // Drop the gate only once EVERY REGISTERED rank has decided. A woken-but-not-yet-decided leg is
+    // still counted, which is what keeps `hedgeFailure` readable at its own pre-POST checkpoint.
+    if (gate.waiters.length === 0 && this.entryAllRanksDecided(gate)) {
+      this.entryTransportGates.delete(request.attempt_id);
+    }
+  }
+
+  /** True when every rank that registered for this attempt has reached a decision. */
+  private entryAllRanksDecided(gate: EntryTransportGate): boolean {
+    for (const rank of gate.registered) {
+      if (!gate.decided.has(rank)) return false;
+    }
+    return true;
+  }
+
+  /** Wake every parked leg whose hedge prerequisites are now satisfied. */
+  private wakeEntryTransportWaiters(gate: EntryTransportGate): void {
+    const ready = gate.waiters.filter((waiter) => this.entryHedgesDecided(gate, waiter.rank));
+    if (ready.length === 0) return;
+    gate.waiters = gate.waiters.filter((waiter) => !ready.includes(waiter));
+    for (const waiter of ready) waiter.wake();
+  }
+
+  /**
+   * True when every BUY hedge rank of the attempt has decided.
+   *
+   * The hedge ranks are exactly `[0, hedgeCount)` because {@link entrySubmissionOrder} places all
+   * BUY legs first. A leg with `rank < hedgeCount` is itself a hedge and waits for nothing.
+   */
+  private entryHedgesDecided(gate: EntryTransportGate, rank: number): boolean {
+    const hedgeCount = gate.hedgeCount;
+    if (rank < hedgeCount) return true;
+    for (let hedge = 0; hedge < hedgeCount; hedge++) {
+      if (!gate.decided.has(hedge)) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Park an uncovered SELL leg until every BUY hedge of the same attempt has completed its POST.
+   *
+   * THIS IS THE BARRIER THAT MAKES HEDGE-FIRST REAL. Building the four requests in hedge-first
+   * order is not enough: with `BOX_LIVE_ENTRY_SUBMIT_CONCURRENCY = 4` all four legs are dequeued
+   * together and each does its own durable Mongo writes, so without this the uncovered SELL could
+   * still win the race to the broker.
+   *
+   * Hedge legs return immediately, so the two BUYs still overlap each other and the entry does not
+   * degrade into four fully serial round trips. `dispose` drains parked waiters, and the caller
+   * re-checks the whole guard after waking — waking is never by itself permission to POST.
+   */
+  private awaitEntryTransportTurn(request: BrokerOrderRequest, guard: LiveEntryTransportGuard): Promise<void> {
+    const gate = this.entryTransportGates.get(request.attempt_id);
+    if (!gate || guard.hedge) return Promise.resolve();
+    if (this.entryHedgesDecided(gate, guard.transportRank)) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      gate.waiters.push({ rank: guard.transportRank, wake: resolve });
+    });
+  }
+
+  /** Release every parked entry leg, so disposal can never leave one waiting forever. */
+  private drainEntryTransportGates(): void {
+    for (const gate of this.entryTransportGates.values()) {
+      const waiters = gate.waiters;
+      gate.waiters = [];
+      for (const waiter of waiters) waiter.wake();
+    }
+    this.entryTransportGates.clear();
+  }
+
   /** Re-check mutable gates at the last safe point before any broker mutation. */
   private queuedActionBlockReason(action: QueueAction): string | null {
     if (action.kind === "cancel") {
@@ -1154,6 +1434,12 @@ export class BoxOrderManager {
   private async execute(action: SubmitQueueAction): Promise<void> {
     const request = this.deps.adapter.prepareOrder?.(action.request) ?? action.request;
     let intent = intentFromRequest(request, this.deps.adapter.mode, this.now());
+    // Hedge-first bookkeeping for this leg. `postBegan` flips inside the adapter's pre-POST
+    // callback, so the `finally` can tell "we transmitted" from "we refused locally" — the
+    // distinction the dependent uncovered SELL legs are waiting on.
+    const entryGuard = action.entry;
+    let postBegan = false;
+    let hedgeFailureReason: string | null = null;
     try {
       intent = await this.deps.persistence.create(intent);
       const persistedRequest = requestFromIntent(intent);
@@ -1169,7 +1455,13 @@ export class BoxOrderManager {
         return;
       }
 
-      const dequeueReason = this.checkedFeedBlockReason(request, action.checkedFeed);
+      // ── CHECKPOINT 3 of 5: AT DEQUEUE ────────────────────────────────────────────────
+      // A concurrency slot is held and the durable CREATED row exists, but nothing has been
+      // transmitted. Both the current-feed authority and (for ENTRY only) the composed ownership
+      // guard are asked again here, because an unbounded amount of wall-clock time may have passed
+      // while this leg sat in the priority queue behind its siblings.
+      const dequeueReason = this.checkedFeedBlockReason(request, action.checkedFeed) ??
+        (entryGuard ? this.entryGuardBlockReason(action.request, entryGuard, "dequeue") : null);
       if (dequeueReason) {
         const refusal = new BrokerPreSubmitRefusedError(
           request.client_order_id,
@@ -1177,6 +1469,7 @@ export class BoxOrderManager {
           true,
           dequeueReason,
         );
+        hedgeFailureReason = dequeueReason;
         const terminalized = await this.persistLocalPreSubmitRefusal(intent, refusal);
         if (!terminalized) {
           await this.resolveConcurrentSubmissionOwner(action, this.knownIntents.get(intent.client_order_id) ?? intent);
@@ -1209,11 +1502,44 @@ export class BoxOrderManager {
       // as rate limiting is exactly the kind of mislabelled measurement that corrupts calibration.
       this.markTiming(intent.client_order_id, "intent_persisted");
 
+      // ── CHECKPOINT 4 of 5: AFTER DURABLE PERSISTENCE ─────────────────────────────────
+      // The identity is durably spent and CAS-owned by this process, and still nothing has been
+      // transmitted. This is the cheapest possible place to discover that entry was disarmed or
+      // ownership was lost during the two Mongo round trips.
+      if (entryGuard) {
+        const persistedReason = this.entryGuardBlockReason(action.request, entryGuard, "post_persist");
+        if (persistedReason) {
+          const refusal = new BrokerPreSubmitRefusedError(
+            request.client_order_id,
+            "post_persist",
+            true,
+            persistedReason,
+          );
+          hedgeFailureReason = persistedReason;
+          const terminalized = await this.persistLocalPreSubmitRefusal(intent, refusal);
+          if (!terminalized) {
+            await this.resolveConcurrentSubmissionOwner(action, this.knownIntents.get(intent.client_order_id) ?? intent);
+            return;
+          }
+          action.reject(refusal);
+          return;
+        }
+        // HEDGE-FIRST BARRIER. An uncovered SELL parks here until every BUY hedge of this attempt
+        // has finished its POST round trip. Waking is not permission: the full guard is re-checked
+        // inside the pre-POST callback below, which is what catches a hedge that just failed.
+        await this.awaitEntryTransportTurn(action.request, entryGuard);
+      }
+
       let order: BrokerOrder;
       try {
         order = await this.deps.adapter.submitOrder(persistedRequest, () => {
-          const reason = this.checkedFeedBlockReason(request, action.checkedFeed);
+          // ── CHECKPOINT 5 of 5: THE FINAL BOUNDARY ────────────────────────────────────
+          // Adapter pacing is done; the next instruction after this callback returns is the HTTP
+          // POST. Throwing here PROVES no broker mutation was attempted.
+          const reason = this.checkedFeedBlockReason(request, action.checkedFeed) ??
+            (entryGuard ? this.entryGuardBlockReason(action.request, entryGuard, "pre_post") : null);
           if (reason) {
+            hedgeFailureReason = reason;
             throw new BrokerPreSubmitRefusedError(
               request.client_order_id,
               "pre_post",
@@ -1221,6 +1547,8 @@ export class BoxOrderManager {
               reason,
             );
           }
+          // Past the point of no return: from here a broker mutation may exist.
+          postBegan = true;
         });
       } catch (error) {
         if (error instanceof BrokerPreSubmitRefusedError) {
@@ -1241,6 +1569,9 @@ export class BoxOrderManager {
           this.noteBrokerReject(error.order, errorMessage(error));
           this.noteFailure("broker rejected order");
           this.evaluateLimits();
+          // A REJECTED hedge is a definitive hedge failure: the dependent uncovered SELL legs of
+          // this attempt are still parked behind the barrier and must now refuse before POSTing.
+          hedgeFailureReason = errorMessage(error);
           action.reject(error);
           return;
         }
@@ -1257,6 +1588,10 @@ export class BoxOrderManager {
           }
           this.unknownOrders++;
           this.noteFailure("ambiguous broker submission");
+          // An AMBIGUOUS hedge is treated as a hedge failure for sequencing purposes. We cannot
+          // prove the hedge exists, and "unproven hedge" must never authorise sending the
+          // uncovered SELL that depends on it. Never guess in the permissive direction.
+          hedgeFailureReason = errorMessage(error);
           action.reject(error);
           return;
         }
@@ -1273,12 +1608,14 @@ export class BoxOrderManager {
       if (RECONCILE_STATES.has(order.state)) {
         await this.persistOrder(intent, order, "adapter returned uncertain state; no retry");
         this.noteFailure("adapter returned uncertain order state");
+        hedgeFailureReason = `broker state ${order.state} is not proof of a hedge`;
       } else {
         await this.persistOrder(intent, order, "adapter order snapshot");
         if (order.state === "REJECTED") {
           this.rejects++;
           this.noteBrokerReject(order, order.reject_reason ?? "broker rejected order");
           this.noteFailure("broker rejected order");
+          hedgeFailureReason = order.reject_reason ?? "broker rejected order";
         } else if (order.state === "COMPLETE") {
           this.consecutiveFailures = 0;
         }
@@ -1288,7 +1625,20 @@ export class BoxOrderManager {
     } catch (error) {
       this.health.persistence = "unhealthy";
       this.noteFailure("order intent persistence failure");
+      hedgeFailureReason = errorMessage(error);
       action.reject(error);
+    } finally {
+      // HEDGE-FIRST RELEASE — on EVERY path out of this method, including the early `return`s and
+      // any throw. A rank that failed to release would leave its dependent uncovered SELL parked
+      // forever, so this is a liveness invariant, not bookkeeping.
+      if (entryGuard) {
+        this.decideEntryTransportRank(
+          action.request,
+          entryGuard,
+          postBegan ? "posted" : "no_post",
+          hedgeFailureReason ?? undefined,
+        );
+      }
     }
   }
 

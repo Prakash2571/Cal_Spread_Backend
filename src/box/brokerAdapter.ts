@@ -144,17 +144,32 @@ export interface BrokerModifyRequest {
 export type BeforeBrokerPost = () => void;
 
 /**
- * A current-feed authority check refused an order locally before broker mutation.
- * The durable identity is terminally spent once OrderManager surfaces this error.
+ * Where a local, proven no-POST refusal was taken.
+ *
+ * `post_persist` sits between the durable CREATED → SUBMITTING writes and the transport call: the
+ * identity is durably spent but nothing has been transmitted. It is distinct from `pre_post`
+ * (inside the adapter callback, after pacing) because the two answer different questions after the
+ * fact — "did we stop before even queuing for transport" versus "did we stop after waiting in
+ * pacing" — and an operator reading the intent audit needs to tell them apart.
+ */
+export type BrokerPreSubmitStage = "dequeue" | "post_persist" | "pre_post";
+
+/**
+ * A local authority check refused an order before any broker mutation.
+ *
+ * Sources: the current-feed/depth authority, and the composed live ENTRY ownership guard
+ * (see liveEntryGuard.ts). Either way the contract is the same and is the whole point of the
+ * type — NO BROKER POST WAS ATTEMPTED. It is therefore never a broker rejection and never
+ * ambiguous. The durable identity is terminally spent once OrderManager surfaces this error.
  */
 export class BrokerPreSubmitRefusedError extends Error {
   constructor(
     readonly clientOrderId: string,
-    readonly stage: "dequeue" | "pre_post",
+    readonly stage: BrokerPreSubmitStage,
     readonly durableIdentitySpent: boolean,
     readonly reason: string,
   ) {
-    super(`Local pre-submit feed refusal at ${stage}: ${reason}`);
+    super(`Local pre-submit refusal at ${stage}: ${reason}`);
     this.name = "BrokerPreSubmitRefusedError";
   }
 }
