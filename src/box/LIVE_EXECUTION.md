@@ -290,6 +290,37 @@ Emergency flatten requires the explicit runtime arm plus completed reconciliatio
 
 **Four-leg Box entry is not atomic, and cannot be made atomic on these brokers.** Zerodha and Dhan expose four independent orders with no basket/atomic primitive and no fencing token, so some legging risk is irreducible. The guards above narrow the window; they do not close it.
 
+### No database can make a four-leg broker entry atomic
+
+This must not be misunderstood, because it is the single most dangerous misreading of the safety model:
+
+- **Zerodha and Dhan provide no transaction spanning four independent orders.** There is no API in which the four legs commit or abort together. Each order is accepted, rejected or left working on its own.
+- **A database transaction is not a broker transaction.** MongoDB CAS, MongoDB multi-document transactions, PostgreSQL, Redis, fencing tokens and idempotency keys all constrain *our own records*. None of them constrains the exchange.
+- **A database rollback cannot undo an order already accepted or filled at the broker.** Rolling back our write only makes our books disagree with reality — which is strictly worse than recording the truth. This is why the durable intent is written *before* submission and why an ambiguous submission is quarantined rather than rolled back.
+- **Migrating the database would change none of this.** A store swap addresses no part of broker-side non-atomicity, and would add migration risk for no safety gain.
+
+What the durable CAS layer *does* buy is exactly this, and no more: exactly one process may own a deterministic order identity, our record of a fill can never regress or double-count, and a refusal before POST is provably a refusal. Those are prerequisites for safe recovery. They are not atomicity.
+
+### The concrete residual exposure
+
+- A **hedge BUY may be accepted while a later SELL is rejected**, leaving a real, one-sided position that exists at the broker regardless of what our database says.
+- **Hedge-first ordering reduces this risk but does not eliminate it.** It guarantees the *unbounded-risk* leg is never the one left alone while its hedge is in flight; it cannot guarantee four fills.
+- A leg can fill in the interval between the last guard evaluation and the broker's response, so a refusal never retroactively cancels an in-flight POST.
+- Latency or an outage between POST and response yields an ambiguous leg whose true state is unknown until reconciliation proves it.
+
+### Therefore the system depends on recovery, not prevention
+
+Because entry cannot be made all-or-none, correctness rests on the mechanisms *after* submission:
+
+1. **Protective cancellation**, with terminal confirmation — a cancel acknowledgement is not proof of cancellation.
+2. **Reconciliation** against authoritative broker REST order and position data.
+3. **Residual detection**, sized from broker cumulative filled quantity.
+4. **Emergency flattening** of attributed residual exposure.
+
+**Automatic flattening can itself fail** — no executable book, a rejected reduction, an authentication lapse, a broker outage, or exhausted retries. Unresolved or unprovable exposure must therefore raise a **high-priority operator alert** and must not be allowed to decay into a silent log line. Treat any of the following as requiring human attention: an intent in `RECONCILIATION_REQUIRED` or `UNKNOWN`, a quarantined attempt, a residual that has survived its flatten passes, a tripped circuit breaker with open exposure, and a shutdown that reported an unresolved drain.
+
+None of this makes live Box execution "safe by construction". It makes failures *detectable and attributable*, which is the strongest property available on retail broker APIs.
+
 What is genuinely guaranteed:
 
 - no ENTRY leg POSTs after ownership loss, disarm, breaker trip or a withdrawn scanner decision is observed at any of the five checkpoints;

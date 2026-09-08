@@ -5,10 +5,13 @@
   "main": "index.js",
   "scripts": {
     "build": "tsc -b",
+    "clean": "rm -rf dist tsconfig.tsbuildinfo",
     "start": "node dist/index.js",
     "dev": "npm run build && npm run start",
     "typecheck": "tsc -b",
-    "test": "npm run build && node --test \"tests/box/*.test.mjs\""
+    "test:unit": "node --test \"tests/box/*.test.mjs\"",
+    "test:integration": "node --test \"tests/integration/*.test.mjs\"",
+    "test": "npm run build && npm run test:unit && npm run test:integration"
   },
   "keywords": [],
   "author": "",

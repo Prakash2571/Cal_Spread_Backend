@@ -238,13 +238,19 @@ export async function liveStack({
   adapterOptions = {},
   limitOverrides = {},
   config = {},
+  /**
+   * Durable persistence. Defaults to the in-memory CAS model for fast unit coverage; the MongoDB
+   * integration suite injects the PRODUCTION `boxOrderIntentPersistence` here, so the very same
+   * gateway/manager wiring runs against the real Mongoose model and the real update pipeline.
+   */
+  persistence: injectedPersistence,
 } = {}) {
   const candidate = candidateFor(direction);
   const quotes = new BoxQuoteStore();
   // Deep two-sided books so the depth precheck admits all four bounded LIMIT legs.
   seedStore(quotes, exitQuotes(candidate, 198, { at: NOW, qty: 100_000 }), NOW);
 
-  const persistence = new MemoryPersistence();
+  const persistence = injectedPersistence ?? new MemoryPersistence();
   const adapter = recordingAdapter(adapterOptions);
   const violations = [];
   let clock = NOW;

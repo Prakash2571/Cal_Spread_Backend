@@ -1,0 +1,98 @@
+name: Lockfile bootstrap (temporary)
+
+# TEMPORARY, AND DELETED IN THE SAME PULL REQUEST once its output has been committed.
+#
+# WHY IT EXISTS. The committed package-lock.json is inconsistent with package.json (it pins
+# @types/node 26 against a ^22 range, lists typescript as a production dependency, carries no
+# devDependencies block at all, and omits mongoose and its entire transitive tree), so strict
+# `npm ci` correctly refuses. Regenerating it requires resolving every package against the real
+# npm registry to obtain genuine `integrity` hashes; a hand-written lockfile is not a lockfile.
+#
+# This job performs that resolution on a runner and publishes the result as an ARTIFACT. It does
+# NOT push, and it does not need write permissions: the regenerated lockfile is downloaded and
+# committed deliberately, so CI never mutates the dependency graph on its own.
+on:
+  push:
+    branches:
+      - 'fix/**'
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 22.23.2
+  NPM_VERSION: 11.4.2
+
+jobs:
+  regenerate:
+    name: Resolve a correct lockfile and publish it
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Pin npm
+        run: npm install -g npm@${{ env.NPM_VERSION }}
+
+      - name: Toolchain
+        run: |
+          echo "node: $(node -v)"
+          echo "npm:  $(npm -v)"
+
+      - name: Show why the committed lockfile is rejected
+        run: |
+          echo "--- strict npm ci against the CURRENT lockfile (expected to fail) ---"
+          npm ci 2>&1 | tail -40 || echo "(npm ci refused, as expected)"
+
+      # `--package-lock-only` resolves the full tree and writes the lockfile without building
+      # node_modules, which is exactly what is needed and is much faster.
+      - name: Regenerate the lockfile from package.json
+        run: |
+          rm -f package-lock.json
+          npm install --package-lock-only --no-audit --no-fund
+
+      - name: Summarise the regenerated lockfile
+        run: |
+          node --input-type=module -e "
+          import { readFileSync } from 'node:fs';
+          const lock = JSON.parse(readFileSync('package-lock.json', 'utf8'));
+          const root = lock.packages[''];
+          console.log('lockfileVersion:  ' + lock.lockfileVersion);
+          console.log('total packages:   ' + Object.keys(lock.packages).length);
+          console.log('dependencies:     ' + JSON.stringify(root.dependencies));
+          console.log('devDependencies:  ' + JSON.stringify(root.devDependencies));
+          for (const key of ['typescript', 'mongoose', 'mongodb', '@types/node', '@types/express', 'express', 'dotenv']) {
+            const entry = lock.packages['node_modules/' + key];
+            console.log('  ' + key.padEnd(16) + (entry ? entry.version : 'MISSING'));
+          }
+          const noIntegrity = Object.entries(lock.packages)
+            .filter(([name, meta]) => name && !meta.link && !meta.integrity)
+            .map(([name]) => name);
+          console.log('entries lacking integrity: ' + (noIntegrity.length ? noIntegrity.join(', ') : 'none'));
+          "
+
+      # Prove the regenerated lockfile actually satisfies the whole pipeline before it is committed.
+      - name: Strict npm ci with the regenerated lockfile
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Build output must exist
+        run: test -f dist/index.js && test -f dist/box/executionGateway.js
+
+      - name: Unit tests
+        run: npm run test:unit
+
+      - name: Publish the regenerated lockfile
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-lock
+          path: package-lock.json
+          retention-days: 3
