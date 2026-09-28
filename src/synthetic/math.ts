@@ -34,6 +34,7 @@
  */
 
 import type { Instrument } from "../kite.js";
+import type { BrokerId } from "../brokers/types.js";
 import type { OrderSide } from "../box/types.js";
 import { selectStrikeWindow, shouldRecentreWindow, strikeStepOf } from "../box/math.js";
 import {
@@ -129,7 +130,20 @@ export type SynthRejectReason =
   /** Market shut and this leg did not trade in the latest session. */
   | "no_close";
 
-export type SynthStatus = "ELIGIBLE" | "WATCHING" | "REJECTED" | "INDICATIVE";
+/** OPEN = this exact strike/direction is currently held as a paper position. */
+export type SynthStatus = "ELIGIBLE" | "OPEN" | "WATCHING" | "REJECTED" | "INDICATIVE";
+
+/** Why an ELIGIBLE opportunity is not being paper-entered right now. */
+export type SynthEntryBlock =
+  | "paper_off"
+  | "no_db"
+  | "feed_stale"
+  | "position_open"
+  | "entering"
+  | "cooldown"
+  | "expiry_cutoff"
+  | "max_open"
+  | "confirming";
 
 export interface SynthLegEvaluation {
   role: SynthLegRole;
@@ -193,6 +207,10 @@ export interface SynthOpportunity {
   price_source: "touch" | "last_close";
   status: SynthStatus;
   reject: SynthRejectReason | null;
+  /** Set by the engine on ELIGIBLE rows it is not entering, with the reason. */
+  entry_blocked: SynthEntryBlock | null;
+  /** The open paper position on this exact row (status OPEN), if any. */
+  position_id: string | null;
   legs: SynthLegEvaluation[];
   updated_at: number;
 }
@@ -438,28 +456,55 @@ function mid(q: SynthQuoteLike | undefined): number | null {
   return (q.bid + q.ask) / 2;
 }
 
+/** One order to be costed: futures legs use the futures card, options the option card. */
+export interface SynthChargeOrder {
+  role: SynthLegRole;
+  side: OrderSide;
+  tradingsymbol: string;
+  price: number;
+}
+
+function flipSide(side: OrderSide): OrderSide {
+  return side === "BUY" ? "SELL" : "BUY";
+}
+
+/** Total charges (₹) for a set of orders at the given prices. */
+export function synthOrderCharges(
+  orders: SynthChargeOrder[],
+  quantity: number,
+  optionRates: BoxChargeRates,
+  futuresRates: BoxChargeRates,
+): number {
+  let total = 0;
+  for (const o of orders) {
+    const order: BoxChargeOrder = {
+      side: o.side,
+      tradingsymbol: o.tradingsymbol,
+      quantity,
+      price: round2(o.price),
+    };
+    total += calculateLegCharges(order, o.role === "fut" ? futuresRates : optionRates).total;
+  }
+  return round2(total);
+}
+
 /** Entry charges for the three legs, and the estimated cost of unwinding them. */
 export function synthCharges(
-  legs: { role: SynthLegRole; side: OrderSide; tradingsymbol: string; price: number }[],
+  legs: SynthChargeOrder[],
   quantity: number,
   optionRates: BoxChargeRates,
   futuresRates: BoxChargeRates,
 ): { entry: number; exit: number } {
-  let entry = 0;
-  let exit = 0;
-  for (const l of legs) {
-    const rates = l.role === "fut" ? futuresRates : optionRates;
-    const order: BoxChargeOrder = {
-      side: l.side,
-      tradingsymbol: l.tradingsymbol,
-      quantity,
-      price: round2(l.price),
-    };
-    entry += calculateLegCharges(order, rates).total;
+  return {
+    entry: synthOrderCharges(legs, quantity, optionRates, futuresRates),
     // Exit projected at the entry prices, the conservative convention Box uses.
-    exit += calculateLegCharges({ ...order, side: l.side === "BUY" ? "SELL" : "BUY" }, rates).total;
-  }
-  return { entry: round2(entry), exit: round2(exit) };
+    exit: synthOrderCharges(
+      legs.map((l) => ({ ...l, side: flipSide(l.side) })),
+      quantity,
+      optionRates,
+      futuresRates,
+    ),
+  };
 }
 
 export interface SynthEvalParams {
@@ -641,6 +686,8 @@ export function evaluateSynthetic(args: {
     price_source: p.indicative ? "last_close" : "touch",
     status,
     reject,
+    entry_blocked: null,
+    position_id: null,
     legs,
     updated_at: p.now,
   };
@@ -648,9 +695,10 @@ export function evaluateSynthetic(args: {
 
 const STATUS_RANK: Record<SynthStatus, number> = {
   ELIGIBLE: 0,
-  WATCHING: 1,
-  INDICATIVE: 2,
-  REJECTED: 3,
+  OPEN: 1,
+  WATCHING: 2,
+  INDICATIVE: 3,
+  REJECTED: 4,
 };
 
 /** ELIGIBLE first, then by expected net (best first); unpriced last. */
@@ -663,4 +711,561 @@ export function sortOpportunities(list: SynthOpportunity[]): SynthOpportunity[] 
     if (an !== bn) return bn - an;
     return a.key.localeCompare(b.key);
   });
+}
+
+
+/* -------------------------------------------------------------------------- */
+/*  Paper positions                                                           */
+/* -------------------------------------------------------------------------- */
+/*
+ * A paper position is filled at the touch observed at the decision (BUY at the
+ * ask, SELL at the bid, one lot) and closed the same way: the long legs are sold
+ * into the bid and the short legs bought back at the ask. No mid, no LTP fill.
+ *
+ * Held to expiry, the three legs offset exactly (European options), so the
+ * position is worth its entry lock whatever the settlement price is. Before
+ * expiry its value moves with the basis. The exit rules are Box's, expressed on
+ * the same quantities:
+ *
+ *   entry edge      = entry lock per unit × quantity   (the hold-to-expiry gross)
+ *   gross now       = what closing all three legs at the touch returns
+ *   remaining edge  = entry edge − gross now           (what holding would still add)
+ *   captured        = gross now / |entry edge|
+ */
+
+export type SynthExitReason =
+  | "EDGE_CONVERGED"
+  | "PROFIT_CAPTURE"
+  | "EXPIRY_SAFETY"
+  /** Still open at expiry: settled at the parity lock. */
+  | "EXPIRED"
+  | "MANUAL";
+
+export const SYNTH_EXIT_REASONS: readonly SynthExitReason[] = [
+  "EDGE_CONVERGED",
+  "PROFIT_CAPTURE",
+  "EXPIRY_SAFETY",
+  "EXPIRED",
+  "MANUAL",
+];
+
+export type SynthExitBlockedReason =
+  | "unpriced"
+  | "net_below_floor"
+  | "insufficient_exit_liquidity"
+  | null;
+
+export interface SynthTradeLeg {
+  role: SynthLegRole;
+  /** The ENTRY side. The closing side is always the opposite. */
+  side: OrderSide;
+  instrument_type: "FUT" | "CE" | "PE";
+  strike: number;
+  tradingsymbol: string;
+  /**
+   * Token in the namespace of the broker that last priced this leg. Informational
+   * only: after a restart or broker switch the engine re-resolves the leg by
+   * (underlying, expiry, strike, type), never by this number.
+   */
+  token: number;
+  entry_price: number;
+  entry_bid: number;
+  entry_ask: number;
+  exit_price: number | null;
+  exit_bid: number | null;
+  exit_ask: number | null;
+}
+
+/** One paper trade, open or closed. Times are epoch ms; days are IST YYYY-MM-DD. */
+export interface SynthTrade {
+  id: string;
+  status: "open" | "closed";
+  key: string;
+  broker: BrokerId;
+  execution_mode: "paper_touch";
+  underlying: string;
+  name: string;
+  is_index: boolean;
+  expiry: string;
+  strike: number;
+  atm_strike: number;
+  atm_offset: number;
+  direction: SynthDirection;
+  lot_size: number;
+  quantity: number;
+  opened_at: number;
+  opened_day: string;
+  legs: SynthTradeLeg[];
+  entry_future_price: number;
+  entry_synthetic_price: number;
+  /** The parity gap locked at the entry touch, per unit (legs only). */
+  entry_lock_per_unit: number;
+  entry_carry_per_unit: number;
+  /** entry_lock_per_unit × quantity: the gross if held to expiry. */
+  entry_edge: number;
+  /** Including carry: the figure the entry gate used. */
+  entry_gross_edge: number;
+  entry_charges: number;
+  estimated_exit_charges: number;
+  /** entry_edge − entry charges − estimated exit charges. The exit thresholds scale on this. */
+  entry_net_edge: number;
+  expected_net_profit: number;
+  min_expected_net_profit: number;
+  safety_buffer: number;
+  expected_slippage: number;
+  rf_pct: number;
+  option_rate_version: string;
+  futures_rate_version: string;
+  closed_at: number | null;
+  closed_day: string | null;
+  exit_reason: SynthExitReason | null;
+  /** Price move only (legs), before charges. */
+  gross_pnl: number | null;
+  exit_charges: number | null;
+  /** Entry + exit charges. */
+  total_charges: number | null;
+  /** gross − total charges ("after charges"). */
+  net_pnl: number | null;
+  exit_note: string | null;
+}
+
+/** Open a paper trade at exactly the touch the opportunity was priced at. */
+export function openTradeFromOpportunity(args: {
+  opp: SynthOpportunity;
+  id: string;
+  broker: BrokerId;
+  now: number;
+  day: string;
+  optionRateVersion: string;
+  futuresRateVersion: string;
+}): SynthTrade | null {
+  const { opp } = args;
+  if (
+    opp.price_source !== "touch" ||
+    opp.future_price === null ||
+    opp.synthetic_price === null ||
+    opp.mispricing_per_unit === null ||
+    opp.gross_edge === null ||
+    opp.entry_charges === null ||
+    opp.estimated_exit_charges === null ||
+    opp.expected_net_profit === null
+  ) {
+    return null;
+  }
+  const legs: SynthTradeLeg[] = [];
+  for (const l of opp.legs) {
+    // Never invent a fill: every leg must have had a real touch.
+    if (l.price === null || !(l.price > 0) || !l.executable) return null;
+    legs.push({
+      role: l.role,
+      side: l.side,
+      instrument_type: l.instrument_type,
+      strike: l.strike,
+      tradingsymbol: l.tradingsymbol,
+      token: l.token,
+      entry_price: l.price,
+      entry_bid: l.bid,
+      entry_ask: l.ask,
+      exit_price: null,
+      exit_bid: null,
+      exit_ask: null,
+    });
+  }
+  const entryEdge = round2(opp.mispricing_per_unit * opp.quantity);
+  return {
+    id: args.id,
+    status: "open",
+    key: opp.key,
+    broker: args.broker,
+    execution_mode: "paper_touch",
+    underlying: opp.underlying,
+    name: opp.name,
+    is_index: opp.is_index,
+    expiry: opp.expiry,
+    strike: opp.strike,
+    atm_strike: opp.atm_strike,
+    atm_offset: opp.atm_offset,
+    direction: opp.direction,
+    lot_size: opp.lot_size,
+    quantity: opp.quantity,
+    opened_at: args.now,
+    opened_day: args.day,
+    legs,
+    entry_future_price: opp.future_price,
+    entry_synthetic_price: opp.synthetic_price,
+    entry_lock_per_unit: opp.mispricing_per_unit,
+    entry_carry_per_unit: opp.carry_per_unit,
+    entry_edge: entryEdge,
+    entry_gross_edge: opp.gross_edge,
+    entry_charges: opp.entry_charges,
+    estimated_exit_charges: opp.estimated_exit_charges,
+    entry_net_edge: round2(entryEdge - opp.entry_charges - opp.estimated_exit_charges),
+    expected_net_profit: opp.expected_net_profit,
+    min_expected_net_profit: opp.min_expected_net_profit,
+    safety_buffer: opp.safety_buffer,
+    expected_slippage: opp.expected_slippage,
+    rf_pct: opp.rf_pct,
+    option_rate_version: args.optionRateVersion,
+    futures_rate_version: args.futuresRateVersion,
+    closed_at: null,
+    closed_day: null,
+    exit_reason: null,
+    gross_pnl: null,
+    exit_charges: null,
+    total_charges: null,
+    net_pnl: null,
+    exit_note: null,
+  };
+}
+
+export interface SynthExitRules {
+  convergenceFloor: number;
+  convergencePct: number;
+  minExitNetPnl: number;
+  profitCapturePct: number;
+  minCapturedPct: number;
+}
+
+/** One leg as it would be CLOSED now. */
+export interface SynthExitLeg {
+  role: SynthLegRole;
+  /** The closing side (opposite of entry). */
+  side: OrderSide;
+  tradingsymbol: string;
+  token: number;
+  entry_price: number;
+  /** Closing touch: bid for a SELL, ask for a BUY. */
+  price: number | null;
+  qty_at_touch: number;
+  bid: number;
+  bid_qty: number;
+  ask: number;
+  ask_qty: number;
+  /** LTP used for the broker-screen mark (live last, or the last close when shut). */
+  ltp: number | null;
+  age_ms: number | null;
+  fresh: boolean;
+  executable: boolean;
+}
+
+export interface SynthExitMetrics {
+  legs: SynthExitLeg[];
+  executable: boolean;
+  /** Open P&L marked to LTP, price move only — what a broker screen shows. */
+  mtm_ltp: number | null;
+  /** Closing all three legs at the touch now, price move only. */
+  gross_pnl: number | null;
+  exit_charges: number | null;
+  total_charges: number | null;
+  /** gross_pnl − entry charges − exit charges ("net if closed now"). */
+  net_pnl: number | null;
+  remaining_edge: number | null;
+  captured_edge: number | null;
+  captured_pct: number | null;
+  convergence_threshold: number;
+  profit_capture_target: number;
+  min_exit_net_pnl: number;
+  expiry_safety: boolean;
+  /** The arithmetic says close AND all three legs can be closed. */
+  should_exit: boolean;
+  reason: SynthExitReason | null;
+  /** What the arithmetic concluded before asking whether it is executable. */
+  rule_reason: SynthExitReason | null;
+  blocked_reason: SynthExitBlockedReason;
+}
+
+function instrumentOf(t: SynthTrade, leg: SynthTradeLeg): SynthInstrument {
+  return {
+    token: leg.token,
+    tradingsymbol: leg.tradingsymbol,
+    exchange: "NFO",
+    strike: leg.strike,
+    instrument_type: leg.instrument_type,
+    expiry: t.expiry,
+    lot_size: t.lot_size,
+  };
+}
+
+/**
+ * Price the unwind of an open paper position and decide whether to close it.
+ *
+ * Mirrors Box's `evaluateExitDecision`: an early exit needs the net after every
+ * charge to clear `minExitNetPnl`, and either the edge to have converged or
+ * enough of it to have been captured. A converged position that would close at a
+ * loss is held (the lock pays at expiry). Expiry safety overrides profitability
+ * but never invents a price.
+ */
+export function evaluateSynthExit(args: {
+  trade: SynthTrade;
+  quoteFor: (token: number) => SynthQuoteLike | undefined;
+  ltpFor: (token: number) => number | null;
+  now: number;
+  quoteMaxAgeMs: number;
+  expirySafety: boolean;
+  rules: SynthExitRules;
+  optionRates: BoxChargeRates;
+  futuresRates: BoxChargeRates;
+}): SynthExitMetrics {
+  const { trade: t, rules } = args;
+  const legs: SynthExitLeg[] = [];
+  const closing: SynthChargeOrder[] = [];
+  let gross = 0;
+  let priced = true;
+  let mtm = 0;
+  let marked = true;
+
+  for (const leg of t.legs) {
+    const side = flipSide(leg.side);
+    const r = evaluateLeg({
+      role: leg.role,
+      side,
+      inst: instrumentOf(t, leg),
+      quote: args.quoteFor(leg.token),
+      quantity: t.quantity,
+      now: args.now,
+      maxAgeMs: args.quoteMaxAgeMs,
+    });
+    const ltp = args.ltpFor(leg.token);
+    legs.push({
+      role: leg.role,
+      side,
+      tradingsymbol: leg.tradingsymbol,
+      token: leg.token,
+      entry_price: leg.entry_price,
+      price: r.leg.price,
+      qty_at_touch: r.leg.qty_at_touch,
+      bid: r.leg.bid,
+      bid_qty: r.leg.bid_qty,
+      ask: r.leg.ask,
+      ask_qty: r.leg.ask_qty,
+      ltp,
+      age_ms: r.leg.age_ms,
+      fresh: r.leg.fresh,
+      executable: r.leg.executable,
+    });
+    // A long leg (entered BUY) gains when its price rises, a short leg when it falls.
+    const sign = leg.side === "BUY" ? 1 : -1;
+    if (r.leg.price === null) priced = false;
+    else {
+      gross += sign * (r.leg.price - leg.entry_price);
+      closing.push({ role: leg.role, side, tradingsymbol: leg.tradingsymbol, price: r.leg.price });
+    }
+    if (ltp === null || !(ltp > 0)) marked = false;
+    else mtm += sign * (ltp - leg.entry_price);
+  }
+
+  const grossPnl = priced ? round2(gross * t.quantity) : null;
+  const exitCharges = priced
+    ? synthOrderCharges(closing, t.quantity, args.optionRates, args.futuresRates)
+    : null;
+  const totalCharges = exitCharges === null ? null : round2(t.entry_charges + exitCharges);
+  const netPnl = grossPnl === null || totalCharges === null ? null : round2(grossPnl - totalCharges);
+  const remaining = grossPnl === null ? null : round2(t.entry_edge - grossPnl);
+  const capturedPct =
+    grossPnl === null || !(Math.abs(t.entry_edge) > 0)
+      ? null
+      : round2(grossPnl / Math.abs(t.entry_edge));
+  const threshold = round2(Math.max(rules.convergenceFloor, rules.convergencePct * t.entry_net_edge));
+  const captureTarget = round2(rules.profitCapturePct * t.entry_net_edge);
+  const executable = legs.length === 3 && legs.every((l) => l.executable);
+
+  let ruleReason: SynthExitReason | null = null;
+  let blocked: SynthExitBlockedReason = null;
+  if (netPnl === null) {
+    blocked = "unpriced";
+  } else if (netPnl > 0 && remaining !== null) {
+    const clearsFloor = netPnl >= rules.minExitNetPnl;
+    const converged = remaining <= threshold;
+    const capturedEnough =
+      netPnl >= captureTarget || (capturedPct !== null && capturedPct >= rules.minCapturedPct);
+    if (converged && clearsFloor) ruleReason = "EDGE_CONVERGED";
+    else if (clearsFloor && capturedEnough) ruleReason = "PROFIT_CAPTURE";
+    else if (converged || capturedEnough) blocked = "net_below_floor";
+  } else if (remaining !== null && remaining <= threshold) {
+    // Converged into a loss: hold, the lock still pays at expiry.
+    blocked = "net_below_floor";
+  }
+
+  const reason: SynthExitReason | null = executable
+    ? (ruleReason ?? (args.expirySafety ? "EXPIRY_SAFETY" : null))
+    : null;
+  if ((ruleReason !== null || args.expirySafety) && !executable) {
+    blocked = "insufficient_exit_liquidity";
+  }
+
+  return {
+    legs,
+    executable,
+    mtm_ltp: marked ? round2(mtm * t.quantity) : null,
+    gross_pnl: grossPnl,
+    exit_charges: exitCharges,
+    total_charges: totalCharges,
+    net_pnl: netPnl,
+    remaining_edge: remaining,
+    captured_edge: grossPnl,
+    captured_pct: capturedPct,
+    convergence_threshold: threshold,
+    profit_capture_target: captureTarget,
+    min_exit_net_pnl: rules.minExitNetPnl,
+    expiry_safety: args.expirySafety,
+    should_exit: reason !== null,
+    reason,
+    rule_reason: ruleReason,
+    blocked_reason: blocked,
+  };
+}
+
+/** Close a trade at the touch priced in `m` (which must be executable). */
+export function closeTradeAtTouch(
+  t: SynthTrade,
+  m: SynthExitMetrics,
+  reason: SynthExitReason,
+  now: number,
+  day: string,
+): SynthTrade | null {
+  if (!m.executable || m.gross_pnl === null || m.exit_charges === null) return null;
+  const byRole = new Map(m.legs.map((l) => [l.role, l]));
+  return {
+    ...t,
+    status: "closed",
+    legs: t.legs.map((leg) => {
+      const ex = byRole.get(leg.role);
+      return {
+        ...leg,
+        exit_price: ex?.price ?? null,
+        exit_bid: ex ? ex.bid : null,
+        exit_ask: ex ? ex.ask : null,
+      };
+    }),
+    closed_at: now,
+    closed_day: day,
+    exit_reason: reason,
+    gross_pnl: m.gross_pnl,
+    exit_charges: m.exit_charges,
+    total_charges: round2(t.entry_charges + m.exit_charges),
+    net_pnl: round2(m.gross_pnl - t.entry_charges - m.exit_charges),
+    exit_note: null,
+  };
+}
+
+/**
+ * A position still open at expiry settles at its parity lock: at settlement the
+ * option pair and the future offset exactly, whatever the settlement price.
+ *
+ * The exit cost is the unwind estimate recorded at entry, used as a conservative
+ * stand-in. Exercise STT and physical-delivery charges are not modelled.
+ */
+export function settleTradeAtExpiry(t: SynthTrade, now: number, day: string): SynthTrade {
+  const exitCharges = t.estimated_exit_charges;
+  const total = round2(t.entry_charges + exitCharges);
+  return {
+    ...t,
+    status: "closed",
+    closed_at: now,
+    closed_day: day,
+    exit_reason: "EXPIRED",
+    gross_pnl: t.entry_edge,
+    exit_charges: exitCharges,
+    total_charges: total,
+    net_pnl: round2(t.entry_edge - total),
+    exit_note:
+      "Held to expiry and settled at the parity lock. Exit charges are the unwind estimate " +
+      "recorded at entry; exercise and delivery charges are not modelled.",
+  };
+}
+
+export const IST_CLOSE_MINUTES = 15 * 60 + 30;
+
+/** Minutes since IST midnight. */
+export function istMinutesOfDay(now: number): number {
+  const ist = new Date(now + 5.5 * 60 * 60 * 1000);
+  return ist.getUTCHours() * 60 + ist.getUTCMinutes();
+}
+
+/** On expiry day, from `minutes` before 15:30 IST. */
+export function inExpirySafetyWindow(
+  expiry: string,
+  today: string,
+  now: number,
+  minutes: number,
+): boolean {
+  return expiry === today && istMinutesOfDay(now) >= IST_CLOSE_MINUTES - minutes;
+}
+
+/** Past expiry, or expiry day after the close with the market shut. */
+export function isPastSettlement(
+  expiry: string,
+  today: string,
+  now: number,
+  marketOpen: boolean,
+): boolean {
+  if (expiry < today) return true;
+  return expiry === today && !marketOpen && istMinutesOfDay(now) >= IST_CLOSE_MINUTES;
+}
+
+export interface SynthDayPnl {
+  day: string;
+  open_count: number;
+  /** Σ open P&L at LTP, price move only (the broker-screen figure). */
+  open_mtm_ltp: number;
+  /** Open positions whose LTP mark is incomplete, excluded from the sum above. */
+  open_unmarked_count: number;
+  /** Σ closing-now gross at the touch. */
+  open_running_gross_pnl: number;
+  /** Σ closing-now net after entry + exit charges. */
+  open_running_net_pnl: number;
+  /** Open positions with no closing price on some leg, excluded from the two sums above. */
+  open_unpriced_count: number;
+  closed_count: number;
+  closed_realised_gross_pnl: number;
+  closed_charges: number;
+  closed_realised_net_pnl: number;
+  /** open running net + closed realised net. */
+  total_net_pnl: number;
+  /** open running gross + closed realised gross (before charges). */
+  total_gross_pnl: number;
+}
+
+export function computeSynthDayPnl(args: {
+  day: string;
+  open: { mtm_ltp: number | null; gross_pnl: number | null; net_pnl: number | null }[];
+  closedToday: SynthTrade[];
+}): SynthDayPnl {
+  let mtm = 0;
+  let unmarked = 0;
+  let openGross = 0;
+  let openNet = 0;
+  let unpriced = 0;
+  for (const o of args.open) {
+    if (o.mtm_ltp === null) unmarked++;
+    else mtm += o.mtm_ltp;
+    if (o.gross_pnl === null || o.net_pnl === null) unpriced++;
+    else {
+      openGross += o.gross_pnl;
+      openNet += o.net_pnl;
+    }
+  }
+  let gross = 0;
+  let charges = 0;
+  let net = 0;
+  for (const t of args.closedToday) {
+    gross += t.gross_pnl ?? 0;
+    charges += t.total_charges ?? 0;
+    net += t.net_pnl ?? 0;
+  }
+  return {
+    day: args.day,
+    open_count: args.open.length,
+    open_mtm_ltp: round2(mtm),
+    open_unmarked_count: unmarked,
+    open_running_gross_pnl: round2(openGross),
+    open_running_net_pnl: round2(openNet),
+    open_unpriced_count: unpriced,
+    closed_count: args.closedToday.length,
+    closed_realised_gross_pnl: round2(gross),
+    closed_charges: round2(charges),
+    closed_realised_net_pnl: round2(net),
+    total_net_pnl: round2(openNet + net),
+    total_gross_pnl: round2(openGross + gross),
+  };
 }

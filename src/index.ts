@@ -134,8 +134,11 @@ const brokerManager = new ActiveBrokerManager({
   // broadcast path. Separate lane, separate destination.
   onBoxLaneTicks: (ticks) => {
     brokerManager.noteTick();
-    boxModule.engine.ingestBoxLaneTicks(ticks);
-    // The synthetic-futures scanner watches its own tokens on the same lane.
+    // The lane is shared with the synthetic-futures scanner. Box receives only the
+    // tokens IT holds, exactly as before the scanner existed, so the scanner's books
+    // (up to thousands while Box is idle) never enter Box's quote store or liveness.
+    const forBox = ticks.filter((t) => brokerManager.boxSubscriptions.owns("strategy", t.token));
+    if (forBox.length > 0) boxModule.engine.ingestBoxLaneTicks(forBox);
     syntheticModule.engine.onTicks(ticks);
   },
   onBoxLaneConnection: (connected) => {
@@ -5269,7 +5272,14 @@ const boxModule: BoxModule = registerBoxModule(app, {
     setStrategyTokens: (tokens) => brokerManager.setStrategyTokens(tokens),
     // The DEDICATED Box lane — a second socket on the same active broker, with its own
     // refcount table and token budget.
-    setBoxTokens: (tokens) => brokerManager.setBoxTokens(tokens),
+    //
+    // Box has PRIORITY on this lane. The synthetic scanner borrows Box's budget while
+    // the Box scanner is stopped, so before Box's set goes upstream the scanner gives
+    // back whatever it must, synchronously: the socket never exceeds its limit.
+    setBoxTokens: (tokens) => {
+      syntheticModule.engine.yieldToBox(new Set(tokens).size);
+      brokerManager.setBoxTokens(tokens);
+    },
     subscribedCount: () => brokerManager.subscribedCount(),
     isConnected: () => brokerManager.feedConnected(),
   },
@@ -5288,9 +5298,10 @@ onFeedSessionLost = () => {
 };
 
 // ============================================================================
-//  Futures vs synthetic-futures arbitrage SCANNER (detection only, never orders).
-//  Synthetic = K + CE(K) - PE(K) at ATM / ATM±1 / ±2 / ±3 of the SAME expiry as
-//  the future. Its tokens ride the Box lane under the "scanner" owner.
+//  Futures vs synthetic-futures arbitrage scanner + PAPER trading (never real
+//  orders). Synthetic = K + CE(K) - PE(K) at ATM / ATM±1 / ±2 / ±3 of the SAME
+//  expiry as the future. Its tokens ride the Box lane under the "scanner" owner;
+//  paper trades persist in `synth_trades`.
 // ============================================================================
 const syntheticModule: SyntheticModule = registerSyntheticModule(app, {
   getAllInstruments: getAllInstrumentsCached,
@@ -5302,6 +5313,16 @@ const syntheticModule: SyntheticModule = registerSyntheticModule(app, {
   getRfPct: () => adminRfRate,
   activeBroker: () => brokerManager.activeBroker,
   setTokens: (tokens) => brokerManager.setSyntheticTokens(tokens),
+  // How Box is using the shared lane: while the Box scanner is stopped this scanner
+  // may use the part of Box's budget that Box is not holding for open positions.
+  boxLane: () => {
+    const boxCfg = boxModule.engine.getConfigRaw();
+    return {
+      running: boxModule.engine.exposureSummary().scannerRunning,
+      heldTokens: brokerManager.boxSubscriptions.stats().strategy,
+      budget: boxCfg.boxDedicatedMarketFeed ? boxCfg.maxSubscribedTokens : 0,
+    };
+  },
   requireAdmin,
   getAdminRole,
 });
@@ -5328,19 +5349,25 @@ brokerManager.attach(
   {
     stopScanner: () => {
       boxModule.engine.stop();
-      // Detection only, but its tokens are in the OLD broker's namespace: stop it and
-      // let the operator restart it on the new broker.
+      // Discovery stops (the operator restarts it on the new broker). Its open PAPER
+      // positions stay and are re-linked to the new broker's contracts below.
       syntheticModule.engine.stop();
     },
     invalidateBooks: () => {
       boxModule.engine.invalidateBooks();
-      syntheticModule.engine.invalidateBooks();
+      // Forget every token until the universe is reloaded in the new namespace.
+      syntheticModule.engine.invalidateNamespace();
     },
     // Contract reservations are broker-namespaced, so a switch must drop the ones this
     // process owns. Previously defined on the engine but never wired to anything, which
     // meant they survived a switch until their TTL.
     clearInstrumentReservations: () => boxModule.engine.clearInstrumentReservations(),
-    reloadUniverse: () => boxModule.engine.reloadUniverse(),
+    reloadUniverse: async () => {
+      await boxModule.engine.reloadUniverse();
+      await syntheticModule.engine.reloadUniverse().catch((e) =>
+        console.warn("[Synthetic] universe reload after broker switch failed:", e),
+      );
+    },
     publish: () => boxModule.engine.publishNow(),
     dropMarketDataSessions: () => marketDataSessions.dropAll(),
   },
@@ -5450,6 +5477,8 @@ const httpServer = app.listen(PORT, () => {
     // monitor. Discovery of NEW boxes stays off until an admin presses RUN,
     // but an OPEN position must be managed from the moment the process is up.
     void boxModule.boot().catch((e) => console.warn("[Box] boot failed:", e));
+    // Same for synthetic-futures PAPER positions: adopt and monitor them at once.
+    void syntheticModule.boot().catch((e) => console.warn("[Synthetic] boot failed:", e));
   })
     // The startup chain had NO catch. A rejection anywhere in it (the Redis warm-load
     // pings run outside their own try) skipped the flush retry, the hourly and option-OI

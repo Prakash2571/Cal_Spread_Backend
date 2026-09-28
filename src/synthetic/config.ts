@@ -2,9 +2,9 @@
  * Configuration for the futures-vs-synthetic arbitrage scanner.
  *
  * Every value is read from the environment once, at construction, through the same
- * typed-helper style Box uses. The scanner never places an order, so nothing here
- * can authorise a trade. These settings only control what is watched and when a
- * mispricing is flagged ELIGIBLE.
+ * typed-helper style Box uses. Nothing here can send a real order: positions are
+ * PAPER fills at the observed touch. These settings control what is watched, when
+ * a mispricing is ELIGIBLE, and when a paper position is opened and closed.
  *
  * CHARGES
  * A conversion/reversal has two OPTION legs and one FUTURE leg. They are taxed
@@ -58,10 +58,20 @@ export interface SynthConfig {
   publishIntervalMs: number;
   /** How often the universe (expiry/strikes) is rebuilt while running (ms). */
   universeRefreshMs: number;
-  /** Upper bound on tokens this scanner adds to the Box market-data lane. */
+  /** Tokens this scanner may add to the Box market-data lane while Box is RUNNING. */
   maxTokens: number;
+  /**
+   * While the Box scanner is STOPPED, also use the part of Box's own token budget
+   * (`BOX_MAX_SUBSCRIBED_TOKENS`) that Box is not holding for open positions. Box
+   * always has priority: the moment it starts, this scanner shrinks back first.
+   */
+  shareBoxBudget: boolean;
+  /** Hard ceiling for the whole Box lane socket (Kite allows 3000 per connection). */
+  laneTokenLimit: number;
   /** Upper bound on underlyings watched; 0 = only the token budget binds. */
   maxUnderlyings: number;
+  /** Cap on opportunity rows pushed to the browser per snapshot (all are evaluated). */
+  maxPublishedOpportunities: number;
   /** ELIGIBLE threshold: minimum expected net profit per lot, after every cost (₹). */
   minExpectedNetProfit: number;
   /** Risk allowance carried inside the expected-net figure (₹). */
@@ -77,6 +87,35 @@ export interface SynthConfig {
   enableReversal: boolean;
   /** Skip underlyings whose matched expiry is today (settlement-day risk). */
   skipExpiryDay: boolean;
+
+  /* ---------------------------- paper trading ----------------------------- */
+
+  /** Open a PAPER position automatically when an opportunity is ELIGIBLE. */
+  paperTrading: boolean;
+  /** Open paper positions at most (one per underlying on top of this). */
+  maxOpenPositions: number;
+  /**
+   * Consecutive evaluations a signal must hold before it is acted on — entries and
+   * rule-based exits alike — so one flickering book cannot open or close a position.
+   */
+  signalConfirmations: number;
+  /** After a position on an underlying closes, wait this long before re-entering it. */
+  reentryCooldownMs: number;
+
+  /* ------------------------ exit rules (Box semantics) --------------------- */
+
+  /** EDGE_CONVERGED when remaining edge <= max(floor, pct × entry net edge). */
+  convergenceFloor: number;
+  convergencePct: number;
+  /** Never close early for less than this net P&L, after every charge (₹). */
+  minExitNetPnl: number;
+  /** PROFIT_CAPTURE when net >= this fraction of the entry net edge... */
+  profitCapturePct: number;
+  /** ...or when this fraction of the entry edge has been captured gross. */
+  minCapturedPct: number;
+  /** On expiry day, close at the touch from this many minutes before 15:30 IST. */
+  expirySafetyMinutes: number;
+
   optionRates: BoxChargeRates;
   futuresRates: BoxChargeRates;
 }
@@ -111,7 +150,10 @@ export function loadSynthConfig(): SynthConfig {
     publishIntervalMs: Math.max(200, num("SYNTH_PUBLISH_INTERVAL_MS", 1000)),
     universeRefreshMs: Math.max(60_000, num("SYNTH_UNIVERSE_REFRESH_MS", 15 * 60_000)),
     maxTokens: num("SYNTH_MAX_TOKENS", 750),
+    shareBoxBudget: bool("SYNTH_SHARE_BOX_BUDGET", true),
+    laneTokenLimit: num("SYNTH_LANE_TOKEN_LIMIT", 3000),
     maxUnderlyings: num("SYNTH_MAX_UNDERLYINGS", 0),
+    maxPublishedOpportunities: Math.max(10, num("SYNTH_MAX_PUBLISHED_OPPORTUNITIES", 150)),
     minExpectedNetProfit: num("SYNTH_MIN_EXPECTED_NET_PROFIT", 500),
     safetyBuffer: num("SYNTH_SAFETY_BUFFER", 100),
     expectedSlippage: num("SYNTH_EXPECTED_SLIPPAGE", 0),
@@ -120,6 +162,17 @@ export function loadSynthConfig(): SynthConfig {
     enableConversion: bool("SYNTH_ENABLE_CONVERSION", true),
     enableReversal: bool("SYNTH_ENABLE_REVERSAL", true),
     skipExpiryDay: bool("SYNTH_SKIP_EXPIRY_DAY", false),
+    paperTrading: bool("SYNTH_PAPER_TRADING", true),
+    maxOpenPositions: num("SYNTH_MAX_OPEN_POSITIONS", 10),
+    signalConfirmations: Math.max(1, Math.floor(num("SYNTH_SIGNAL_CONFIRMATIONS", 2))),
+    reentryCooldownMs: num("SYNTH_REENTRY_COOLDOWN_MS", 60_000),
+    // Scaled from Box's defaults to this scanner's smaller ₹500 entry gate.
+    convergenceFloor: num("SYNTH_CONVERGENCE_FLOOR", 100),
+    convergencePct: num("SYNTH_CONVERGENCE_PCT", 0.2),
+    minExitNetPnl: num("SYNTH_MIN_EXIT_NET_PNL", 250),
+    profitCapturePct: num("SYNTH_PROFIT_CAPTURE_PCT", 0.75),
+    minCapturedPct: num("SYNTH_MIN_CAPTURED_PCT", 0.75),
+    expirySafetyMinutes: num("SYNTH_EXPIRY_SAFETY_MINUTES", 45),
     optionRates,
     futuresRates: loadFuturesChargeRates(optionRates),
   };

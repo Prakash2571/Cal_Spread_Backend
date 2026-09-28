@@ -3,11 +3,12 @@
  *
  * Same access pattern as Box: every route needs an admin token (full OR trade
  * access) in `x-admin-token`, and the SSE endpoint accepts it as a query
- * parameter because EventSource cannot set headers. Nothing here places an order.
+ * parameter because EventSource cannot set headers. Nothing here can send a real
+ * order: positions are paper fills at the observed touch.
  */
 
 import type { Express, Request, RequestHandler, Response } from "express";
-import type { SyntheticEngine } from "./engine.js";
+import { toTradeView, type SyntheticEngine } from "./engine.js";
 
 export interface SyntheticRouteDeps {
   engine: SyntheticEngine;
@@ -72,6 +73,44 @@ export function registerSyntheticRoutes(app: Express, deps: SyntheticRouteDeps):
       opportunities: engine.getOpportunities(Number.isFinite(limit) ? limit : undefined),
       status: engine.getStatus(),
     });
+  });
+
+  /* ----------------------------- paper trades ----------------------------- */
+
+  /** Open paper positions with their live marks (in memory, so this is cheap). */
+  app.get("/api/synthetic/trades/open", requireAdmin, (_req: Request, res: Response) => {
+    res.json({ db_enabled: engine.getStatus().db_enabled, open: engine.getOpenPositions() });
+  });
+
+  /** Closed paper trades, newest first. `scope=today` is served from memory. */
+  app.get("/api/synthetic/trades/history", requireAdmin, async (req: Request, res: Response) => {
+    const scope = req.query.scope === "today" ? "today" : "all";
+    const raw = Number(req.query.limit);
+    const limit = Number.isFinite(raw) && raw > 0 ? Math.min(Math.floor(raw), 2000) : 500;
+    try {
+      res.json(await engine.getHistory(scope, limit));
+    } catch (err) {
+      fail(res, err);
+    }
+  });
+
+  /** Close one open paper position now, at the executable touch. */
+  app.post("/api/synthetic/trades/:id/close", requireAdmin, async (req: Request, res: Response) => {
+    try {
+      const r = await engine.closeManually(String(req.params.id ?? ""));
+      if (!r.ok) {
+        res.status(r.status).json({ error: r.error });
+        return;
+      }
+      res.json({
+        ok: true,
+        trade: toTradeView(r.trade),
+        open: engine.getOpenPositions(),
+        status: engine.getStatus(),
+      });
+    } catch (err) {
+      fail(res, err);
+    }
   });
 
   app.get("/api/synthetic/chain/:underlying", requireAdmin, (req: Request, res: Response) => {
