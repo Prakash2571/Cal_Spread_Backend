@@ -39,7 +39,9 @@ can send a real order.
 
 **Entry** (scanner running, market open, feed live, `synth_trades` storage connected):
 - the opportunity is ELIGIBLE on `SYNTH_SIGNAL_CONFIRMATIONS` consecutive evaluations
-  (default 2), so one flickering book cannot open a position;
+  over NEW books (default 2). A confirmation needs a leg's book version to change, so
+  a quiet tick or a settings change confirms nothing, and one flickering book cannot
+  open a position;
 - at most one open position per underlying (also enforced by a unique Mongo index), at
   most `SYNTH_MAX_OPEN_POSITIONS` in total, and `SYNTH_REENTRY_COOLDOWN_MS` after an
   underlying's last close;
@@ -62,12 +64,18 @@ entry edge − gross now. `net` = gross now − entry charges − exit charges a
 | `MANUAL` | "Close now" (`POST /trades/:id/close`), at the touch |
 
 - A position that has converged into a loss is held: the lock still pays at expiry.
-- Rule exits also need `SYNTH_SIGNAL_CONFIRMATIONS` evaluations; expiry safety acts at once.
+- Rule exits also need `SYNTH_SIGNAL_CONFIRMATIONS` evaluations over new books; expiry
+  safety acts at once.
 - No exit is ever filled at an invented price. If a leg has no book or less than one lot
   at the touch, the position stays open and says why.
 - Open positions are monitored with the scanner stopped and are adopted again after a
-  restart. After a broker switch their legs are re-resolved by (underlying, expiry,
-  strike, type) in the new broker's instruments.
+  restart. Legs are always re-resolved by (underlying, expiry, strike, type) in the
+  active broker's instruments, never trusted by token: an adopted position is unlinked
+  (shown, not subscribed) until that succeeds, retried every 10 s.
+- Broker switch, Dhan logout or lost session: the scanner releases its whole lease and
+  forgets every token. No refresh starts while a switch is in progress, and a refresh
+  that sees the broker generation change mid-flight is discarded, so an old-broker token
+  is never subscribed on the new socket. The switch's own reload re-links the positions.
 
 **P&L** follows `.kiro/steering/trade-realism.md` in the frontend: open positions are marked
 to LTP (price move only). Charges are shown beside P&L, and "net" figures are labelled as
@@ -106,10 +114,14 @@ scanner's own `BoxQuoteStore`.
 
 Persistence (`synth_trades`, Box connection): one document per trade, `status`
 `open|closed`. The unique partial index `synth_open_one_per_underlying` allows one open
-position per underlying. Closing is a single `$set` guarded on `status: "open"`, so two
-racing closes can never both land. Without MongoDB the scanner still detects, but it does
-not paper-trade (`paper_blocked_reason: "no_db"`), like Box. Runtime threshold changes
-last until restart.
+position per underlying. `autoIndex` is off: the index is created and read back at boot
+(`ensureReady`), the way the Box reservation store does it. Until that succeeds, entries
+are paused with `paper_blocked_reason: "unsafe_index"`, while open positions are still
+monitored and closed. Closing is a single `$set` guarded on `status: "open"`, so two
+racing closes can never both land. A close that loses that race, or an insert rejected as
+a duplicate, is reconciled with the stored row. Without MongoDB the scanner still detects,
+but it does not paper-trade (`paper_blocked_reason: "no_db"`), like Box. Runtime threshold
+changes last until restart.
 
 ## API (admin token required, `x-admin-token`)
 

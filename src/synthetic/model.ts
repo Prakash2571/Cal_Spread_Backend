@@ -4,6 +4,11 @@
  * Bound to the Box connection (BOX_MONGODB_URI, falling back to MONGODB_URI) so
  * the arbitrage books live together, but in a collection of its own: nothing here
  * reads or writes `box_trades` or the calendar collections.
+ *
+ * `autoIndex` IS DISABLED. The one-open-position-per-underlying guarantee rests on
+ * a unique index, so it is created deliberately and READ BACK by
+ * `ensureSynthTradeIndexes()` (repository.ts) before any paper entry is allowed,
+ * the same way the Box reservation store treats its atomicity-critical index.
  */
 
 import mongoose from "mongoose";
@@ -37,7 +42,7 @@ const synthLegSchema = new mongoose.Schema<SynthTradeLeg>(
 
 const synthTradeSchema = new mongoose.Schema<ISynthTrade>(
   {
-    status: { type: String, enum: ["open", "closed"], default: "open", index: true },
+    status: { type: String, enum: ["open", "closed"], default: "open" },
     key: { type: String, required: true },
     broker: { type: String, enum: BROKER_IDS, default: "zerodha" },
     execution_mode: { type: String, enum: ["paper_touch"], default: "paper_touch" },
@@ -81,30 +86,9 @@ const synthTradeSchema = new mongoose.Schema<ISynthTrade>(
     net_pnl: { type: Number, default: null },
     exit_note: { type: String, default: null },
   },
-  { collection: "synth_trades" },
+  // Indexes are created and verified explicitly (see the module docblock).
+  { collection: "synth_trades", autoIndex: false },
 );
-
-/**
- * At most ONE open paper position per underlying.
- *
- * Enforced by the database, not only in memory, so two processes (or a retried
- * insert) can never both hold the same underlying: the second insert is rejected
- * as a duplicate and treated as "already open".
- */
-synthTradeSchema.index(
-  { underlying: 1 },
-  {
-    unique: true,
-    partialFilterExpression: { status: "open" },
-    name: "synth_open_one_per_underlying",
-  },
-);
-
-/** The Closed-trades read path, newest first. */
-synthTradeSchema.index({ status: 1, closed_at: -1 });
-
-/** Today's closed trades, for the day P&L after a restart. */
-synthTradeSchema.index({ closed_day: 1 });
 
 export const SynthTradeModel: mongoose.Model<ISynthTrade> = boxConnection
   ? boxConnection.model<ISynthTrade>("SynthTrade", synthTradeSchema)

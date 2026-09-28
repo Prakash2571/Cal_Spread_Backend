@@ -77,7 +77,14 @@ import {
 export interface SynthTradeStore {
   /** Whether trades can be read and written right now. */
   enabled(): boolean;
+  /**
+   * Create and verify what the atomicity guarantees rest on (the unique index).
+   * Throws when that cannot be established; paper entries stay off until it succeeds.
+   */
+  ensureReady?(): Promise<void>;
   newId(): string;
+  /** The stored row, used to reconcile a write whose outcome was ambiguous. */
+  get(id: string): Promise<SynthTrade | null>;
   /** "duplicate" when the underlying already has an open position. */
   insertOpen(trade: SynthTrade): Promise<"ok" | "duplicate">;
   /** Atomic open → closed. False when it was not open (already closed elsewhere). */
@@ -111,6 +118,14 @@ export interface SyntheticEngineDeps {
   store: SynthTradeStore;
   /** Box's use of the lane. Without it the budget is fixed at SYNTH_MAX_TOKENS. */
   boxLane?: () => BoxLaneUsage;
+  /**
+   * True while a broker switch is in progress. No refresh or re-link starts then:
+   * the universe still belongs to the outgoing broker until the switch's own
+   * `reloadUniverse()` runs.
+   */
+  switching?: () => boolean;
+  /** The broker generation. A refresh that sees it change mid-flight is discarded. */
+  brokerGeneration?: () => number;
   config?: SynthConfig;
 }
 
@@ -176,6 +191,8 @@ const UNBUILT_RETRY_MS = 60_000;
 const CLOSE_RETRY_MS = 5_000;
 /** Adopting open positions is retried this often until the store answers. */
 const LOAD_RETRY_MS = 30_000;
+/** Unlinked positions are re-resolved this often (instrument dump only, no REST). */
+const RELINK_RETRY_MS = 10_000;
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -210,6 +227,8 @@ export class SyntheticEngine {
   private booted = false;
   /** Open positions and today's closed trades have been read from the store. */
   private loaded = false;
+  /** The store's uniqueness guarantee is verified. Only ENTRIES wait for it. */
+  private indexReady = false;
   private loading = false;
   private lastLoadAttemptAt = 0;
   private strikeLevel: SynthStrikeLevel;
@@ -251,6 +270,8 @@ export class SyntheticEngine {
   /* ---------------------------- opportunities ----------------------------- */
   private opportunities: SynthOpportunity[] = [];
   private eligibleStreak = new Map<string, number>();
+  /** The book versions each ELIGIBLE key was last confirmed on. */
+  private eligibleSig = new Map<string, string>();
   private evaluatedAt: number | null = null;
 
   /* ---------------------------- paper positions ---------------------------- */
@@ -259,6 +280,11 @@ export class SyntheticEngine {
   /** Positions whose legs are not (yet) resolved on the active broker. */
   private unlinked = new Set<string>();
   private exitStreak = new Map<string, number>();
+  private exitSig = new Map<string, string>();
+  /** Ids this process has closed, so an in-flight load can never re-adopt one. */
+  private closedIds = new Set<string>();
+  private relinking = false;
+  private lastRelinkAt = 0;
   private pendingEntries = new Set<string>();
   private closing = new Set<string>();
   private retryAt = new Map<string, number>();
@@ -290,51 +316,72 @@ export class SyntheticEngine {
   }
 
   /**
-   * Adopt open positions and today's closed trades from the store.
+   * Adopt open positions and today's closed trades, then verify the store's
+   * uniqueness index.
    *
-   * Retried from the loop until it succeeds, and automatic entries wait for it: an
+   * Retried from the loop until both succeed. Automatic entries wait for both: an
    * entry made before the book is known could not respect the one-per-underlying
-   * and max-open limits.
+   * and max-open limits, and without the verified index nothing stops two processes
+   * opening the same underlying. Monitoring and exits need only the load, so a bad
+   * index never leaves an open position unmanaged.
    */
   private async loadFromStore(): Promise<void> {
-    if (this.loaded || this.loading) return;
+    if (this.loading || (this.loaded && this.indexReady)) return;
     this.lastLoadAttemptAt = Date.now();
     if (!this.deps.store.enabled()) return;
     this.loading = true;
     try {
-      const open = await this.deps.store.loadOpen();
-      for (const t of open) {
-        if (this.positions.has(t.id)) continue;
-        this.positions.set(t.id, t);
-        // Entry-time tokens may belong to another broker. Nothing is subscribed until
-        // the next universe refresh has re-resolved every leg in the active namespace.
-        this.unlinked.add(t.id);
-      }
-      const today = this.deps.istDayKey();
-      const closed = await this.deps.store.loadClosed({ limit: 2000, sinceDay: today });
-      const known = new Set(this.closedToday.map((t) => t.id));
-      this.closedToday = [...this.closedToday, ...closed.filter((t) => !known.has(t.id))].sort(
-        (a, b) => (b.closed_at ?? 0) - (a.closed_at ?? 0),
-      );
-      this.closedDay = today;
-      this.loaded = true;
-      if (open.length > 0) {
-        console.log(`[Synthetic] adopted ${open.length} open paper position(s)`);
-        // Re-link and subscribe them without waiting for the next scheduled refresh.
-        this.universeAt = null;
-        this.lastRefreshAttemptAt = 0;
+      if (!this.loaded) await this.loadTrades();
+      if (!this.indexReady) {
+        await this.deps.store.ensureReady?.();
+        this.indexReady = true;
       }
     } catch (err) {
-      this.lastError = `Could not load paper trades: ${message(err)}`;
-      console.warn("[Synthetic] loading paper trades failed:", err);
+      this.lastError = `Paper-trade storage is not ready: ${message(err)}`;
+      console.warn("[Synthetic] paper-trade storage not ready:", err);
     } finally {
       this.loading = false;
     }
   }
 
+  private async loadTrades(): Promise<void> {
+    const open = await this.deps.store.loadOpen();
+    this.adopt(open);
+    const today = this.deps.istDayKey();
+    const closed = await this.deps.store.loadClosed({ limit: 2000, sinceDay: today });
+    const known = new Set(this.closedToday.map((t) => t.id));
+    this.closedToday = [...this.closedToday, ...closed.filter((t) => !known.has(t.id))].sort(
+      (a, b) => (b.closed_at ?? 0) - (a.closed_at ?? 0),
+    );
+    this.closedDay = today;
+    this.loaded = true;
+    if (open.length > 0) {
+      console.log(`[Synthetic] adopted ${open.length} open paper position(s)`);
+    }
+  }
+
+  /**
+   * Take stored open rows into memory. Each one starts unlinked: its entry-time
+   * tokens may belong to another broker, so nothing is subscribed until the legs
+   * have been re-resolved in the active namespace (next tick, see `relinkNow`).
+   */
+  private adopt(rows: SynthTrade[]): void {
+    let added = 0;
+    for (const t of rows) {
+      if (t.status !== "open" || this.positions.has(t.id) || this.closedIds.has(t.id)) continue;
+      this.positions.set(t.id, t);
+      this.unlinked.add(t.id);
+      added++;
+    }
+    if (added > 0) this.lastRelinkAt = 0;
+  }
+
   async start(): Promise<{ ok: true } | { ok: false; error: string }> {
     if (!this.deps.marketData.isAuthenticated()) {
       return { ok: false, error: "No broker session: connect the active broker first." };
+    }
+    if (this.deps.switching?.()) {
+      return { ok: false, error: "A broker switch is in progress. Try again in a moment." };
     }
     if (this.running) return { ok: true };
     this.running = true;
@@ -342,11 +389,14 @@ export class SyntheticEngine {
     this.ensureLoop();
     await this.loadFromStore();
     try {
+      // A refresh already in flight was planned without discovery: let it finish,
+      // then build the windows with RUN on.
+      if (this.refreshing) await this.refreshing.catch(() => undefined);
       await this.refreshUniverse();
     } catch (err) {
       this.lastError = message(err);
     }
-    this.evaluate(Date.now(), this.deps.isMarketOpen());
+    this.evaluate(Date.now(), this.deps.isMarketOpen(), false);
     this.publish();
     return { ok: true };
   }
@@ -399,6 +449,14 @@ export class SyntheticEngine {
    * Kite token could be subscribed on a Dhan socket as a different instrument.
    */
   invalidateNamespace(): void {
+    // Release the whole lease first. After a broker switch the coordinator is already
+    // empty and this does nothing; after a lost or logged-out session it is what stops
+    // the old set being replayed onto the next socket, where yieldToBox could not shed it.
+    try {
+      this.deps.setTokens([]);
+    } catch (err) {
+      console.warn("[Synthetic] releasing subscriptions failed:", err);
+    }
     this.namespaceEpoch++;
     this.namespaceStale = true;
     this.quotes.invalidateGeneration();
@@ -411,16 +469,25 @@ export class SyntheticEngine {
     this.watched.clear();
     this.opportunities = [];
     this.eligibleStreak.clear();
+    this.eligibleSig.clear();
     this.exitStreak.clear();
+    this.exitSig.clear();
     this.universeAt = null;
     for (const id of this.positions.keys()) this.unlinked.add(id);
   }
 
-  /** After a broker switch: rebuild in the new namespace and re-link open positions. */
+  /**
+   * After a broker switch: rebuild in the new namespace and re-link open positions.
+   *
+   * Bumping the epoch first discards any refresh still in flight, whichever broker's
+   * dump it loaded. This is the only refresh allowed to run while the registry still
+   * reports the switch as in progress.
+   */
   async reloadUniverse(): Promise<void> {
+    this.namespaceEpoch++;
     if (this.refreshing) await this.refreshing.catch(() => undefined);
     this.universeAt = null;
-    if (this.active()) await this.refreshUniverse();
+    if (this.active()) await this.refreshUniverse(true);
   }
 
   setStrikeLevel(level: unknown): { ok: true } | { ok: false; error: string } {
@@ -440,7 +507,7 @@ export class SyntheticEngine {
         if (next) this.windows.set(u, next);
       }
       this.fitToBudget(this.tokenBudget(), true);
-      this.evaluate(now, this.deps.isMarketOpen());
+      this.evaluate(now, this.deps.isMarketOpen(), false);
     }
     return { ok: true };
   }
@@ -468,7 +535,8 @@ export class SyntheticEngine {
     }
     this.minExpectedNetProfit = next.min;
     this.safetyBuffer = next.buf;
-    this.evaluate(Date.now(), this.deps.isMarketOpen());
+    // Not an observation: the books are the same, so it must not confirm a signal.
+    this.evaluate(Date.now(), this.deps.isMarketOpen(), false);
     return { ok: true };
   }
 
@@ -558,22 +626,38 @@ export class SyntheticEngine {
     return this.running || this.positions.size > 0;
   }
 
-  /** Rebuild expiry pairing, strike windows, position links and subscriptions. Single-flight. */
-  refreshUniverse(): Promise<void> {
+  /**
+   * Rebuild expiry pairing, strike windows, position links and subscriptions. Single-flight.
+   *
+   * `allowDuringSwitch` is set only by `reloadUniverse()`, the switch's own hook.
+   */
+  refreshUniverse(allowDuringSwitch = false): Promise<void> {
     if (this.refreshing) return this.refreshing;
-    this.refreshing = this.doRefreshUniverse().finally(() => {
+    this.refreshing = this.doRefreshUniverse(allowDuringSwitch).finally(() => {
       this.refreshing = null;
     });
     return this.refreshing;
   }
 
-  private async doRefreshUniverse(): Promise<void> {
-    if (!this.active() || !this.deps.marketData.isAuthenticated()) return;
+  private generation(): number {
+    return this.deps.brokerGeneration?.() ?? 0;
+  }
+
+  /** A closure that says whether work begun now belongs to a superseded namespace. */
+  private staleCheck(): () => boolean {
     const epoch = this.namespaceEpoch;
+    const gen = this.generation();
+    return () => epoch !== this.namespaceEpoch || gen !== this.generation();
+  }
+
+  private async doRefreshUniverse(allowDuringSwitch: boolean): Promise<void> {
+    if (!this.active() || !this.deps.marketData.isAuthenticated()) return;
+    if (!allowDuringSwitch && this.deps.switching?.()) return;
+    const superseded = this.staleCheck();
     this.lastRefreshAttemptAt = Date.now();
     const today = this.deps.istDayKey();
     const [all, board] = await Promise.all([this.deps.getAllInstruments(), this.deps.getBoard()]);
-    if (epoch !== this.namespaceEpoch || !this.active()) return;
+    if (superseded() || !this.active()) return;
 
     this.chains = indexSyntheticChains(all, today);
     this.board = new Map(board.map((b) => [b.symbol, b]));
@@ -596,9 +680,11 @@ export class SyntheticEngine {
       ordered.map((b) => b.symbol),
       this.tokenBudget(),
     );
-    if (picked.length > 0) {
-      await this.seedFromRest(picked, resolve);
-      if (epoch !== this.namespaceEpoch || !this.active()) return;
+    // Only windows that do not exist yet need a REST price to be centred on.
+    const unseeded = picked.filter((u) => !this.windows.has(u));
+    if (unseeded.length > 0) {
+      await this.seedFromRest(unseeded, resolve, superseded);
+      if (superseded() || !this.active()) return;
     }
 
     const now = Date.now();
@@ -633,8 +719,8 @@ export class SyntheticEngine {
     this.fitToBudget(this.tokenBudget(), true);
 
     if (!this.deps.isMarketOpen()) {
-      await this.seedCloses(resolve);
-      if (epoch !== this.namespaceEpoch) return;
+      await this.seedCloses(resolve, superseded);
+      if (superseded()) return;
       this.closeViewPending = false;
     }
     this.universeAt = Date.now();
@@ -678,10 +764,33 @@ export class SyntheticEngine {
     }
   }
 
+  /**
+   * Re-resolve unlinked positions from the (cached) instrument dump and subscribe
+   * them. Much cheaper than a refresh (no REST), so it is retried every few seconds
+   * while any position is unlinked: an unlinked position cannot be priced or exited.
+   */
+  private async relinkNow(): Promise<void> {
+    if (this.relinking) return;
+    this.relinking = true;
+    this.lastRelinkAt = Date.now();
+    const superseded = this.staleCheck();
+    try {
+      const all = await this.deps.getAllInstruments();
+      if (superseded() || this.namespaceStale || this.deps.switching?.()) return;
+      this.relinkPositions(all);
+      this.applySubscriptions();
+    } catch (err) {
+      console.warn("[Synthetic] re-linking open positions failed:", err);
+    } finally {
+      this.relinking = false;
+    }
+  }
+
   /** One REST snapshot of every picked future, to centre windows before ticks. */
   private async seedFromRest(
     picked: string[],
     resolve: (token: number) => string | null,
+    superseded: () => boolean,
   ): Promise<void> {
     const byToken = new Map<number, string>();
     for (const u of picked) {
@@ -694,6 +803,7 @@ export class SyntheticEngine {
     if (ids.length === 0) return;
     try {
       const quotes = await this.deps.marketData.getQuoteFull(ids);
+      if (superseded()) return;
       for (const q of quotes) {
         const u = byToken.get(q.instrument_token);
         if (u && q.last_price > 0) this.seededRef.set(u, q.last_price);
@@ -711,13 +821,17 @@ export class SyntheticEngine {
    * view uses), so a strike that has not traded for days cannot pair with today's
    * future and fake a mispricing.
    */
-  private async seedCloses(resolve: (token: number) => string | null): Promise<void> {
+  private async seedCloses(
+    resolve: (token: number) => string | null,
+    superseded: () => boolean,
+  ): Promise<void> {
     const ids = [...this.watched]
       .map((t) => resolve(t))
       .filter((s): s is string => typeof s === "string");
     if (ids.length === 0) return;
     try {
       const quotes = await this.deps.marketData.getQuoteFull(ids);
+      if (superseded()) return;
       const sessionDay = quotes.reduce((latest, q) => {
         const d = q.last_trade_time.slice(0, 10);
         return d > latest ? d : latest;
@@ -784,7 +898,9 @@ export class SyntheticEngine {
     try {
       const now = Date.now();
       const marketOpen = this.deps.isMarketOpen();
-      if (!this.loaded && now - this.lastLoadAttemptAt >= LOAD_RETRY_MS) void this.loadFromStore();
+      if ((!this.loaded || !this.indexReady) && now - this.lastLoadAttemptAt >= LOAD_RETRY_MS) {
+        void this.loadFromStore();
+      }
       this.rollDay(now);
       if (this.lastMarketOpen === true && !marketOpen) this.closeViewPending = true;
       this.lastMarketOpen = marketOpen;
@@ -805,10 +921,25 @@ export class SyntheticEngine {
     if (today === this.closedDay) return;
     this.closedDay = today;
     this.closedToday = this.closedToday.filter((t) => t.closed_day === today);
+    // Only needed while a load could still return a row closed moments ago.
+    this.closedIds.clear();
   }
 
   private maybeRefreshUniverse(now: number): void {
-    if (!this.active() || this.refreshing || !this.deps.marketData.isAuthenticated()) return;
+    if (!this.active() || !this.deps.marketData.isAuthenticated()) return;
+    // Mid-switch the dump still belongs to the outgoing broker: the switch reloads.
+    if (this.deps.switching?.()) return;
+    // Independent of any refresh in flight: that refresh may have re-linked BEFORE a
+    // position was adopted, and an unlinked position cannot be priced or exited.
+    if (
+      this.unlinked.size > 0 &&
+      !this.namespaceStale &&
+      !this.relinking &&
+      now - this.lastRelinkAt >= RELINK_RETRY_MS
+    ) {
+      void this.relinkNow();
+    }
+    if (this.refreshing) return;
     const sinceAttempt = now - this.lastRefreshAttemptAt;
     const due =
       this.universeAt === null
@@ -938,17 +1069,29 @@ export class SyntheticEngine {
       }
     }
 
-    // A signal must hold for N consecutive evaluations before it is entered.
+    // A signal must hold across N evaluations on NEW books before it is entered: an
+    // evaluation over the same books (a settings change, a quiet tick) confirms nothing.
     if (observe) {
       const streak = new Map<string, number>();
+      const sigs = new Map<string, string>();
       for (const o of out) {
-        if (o.status === "ELIGIBLE") streak.set(o.key, (this.eligibleStreak.get(o.key) ?? 0) + 1);
+        if (o.status !== "ELIGIBLE") continue;
+        const sig = this.bookSig(o.legs.map((l) => l.token));
+        const prev = this.eligibleStreak.get(o.key) ?? 0;
+        streak.set(o.key, this.eligibleSig.get(o.key) === sig ? Math.max(prev, 1) : prev + 1);
+        sigs.set(o.key, sig);
       }
       this.eligibleStreak = streak;
+      this.eligibleSig = sigs;
     }
     this.annotate(out, now, marketOpen);
     this.opportunities = sortOpportunities(out);
     this.evaluatedAt = now;
+  }
+
+  /** The book versions of these tokens: changes whenever any of their books does. */
+  private bookSig(tokens: number[]): string {
+    return tokens.map((t) => this.quotes.get(t)?.version ?? 0).join(":");
   }
 
   /** Mark the rows that are held, and say why an ELIGIBLE row is not being entered. */
@@ -960,7 +1103,7 @@ export class SyntheticEngine {
       openUnderlyings.add(t.underlying);
     }
     const today = this.deps.istDayKey(now);
-    const db = this.deps.store.enabled() && this.loaded;
+    const db = this.deps.store.enabled() && this.loaded && this.indexReady;
     const feedOk = this.feedHealthy(now, marketOpen);
     const full = this.positions.size + this.pendingEntries.size >= this.cfg.maxOpenPositions;
     for (const o of out) {
@@ -1008,7 +1151,8 @@ export class SyntheticEngine {
   /** Paper-enter every ELIGIBLE, unblocked opportunity, best first. */
   private autoEnter(now: number, marketOpen: boolean): void {
     if (!this.running || !this.cfg.paperTrading || !marketOpen || this.namespaceStale) return;
-    if (!this.deps.store.enabled() || !this.loaded || !this.feedHealthy(now, marketOpen)) return;
+    if (!this.deps.store.enabled() || !this.loaded || !this.indexReady) return;
+    if (!this.feedHealthy(now, marketOpen)) return;
     for (const o of this.opportunities) {
       if (o.status !== "ELIGIBLE") break; // sorted: every ELIGIBLE row comes first
       if (o.entry_blocked !== null) continue;
@@ -1039,11 +1183,19 @@ export class SyntheticEngine {
       if (!trade) return;
       const res = await this.deps.store.insertOpen(trade);
       this.cooldownUntil.set(u, Date.now() + this.cfg.reentryCooldownMs);
-      // Another process already holds this underlying: never open it twice.
-      if (res === "duplicate") return;
+      if (res === "duplicate") {
+        // The underlying is already open in the store: another process's position, or
+        // this insert itself landing twice (a retried write whose first ack was lost).
+        // Never open it twice; adopt whatever is stored so it is monitored here too.
+        this.adopt(await this.deps.store.loadOpen());
+        return;
+      }
       this.positions.set(trade.id, trade);
       // The namespace changed while the insert was in flight: re-link before subscribing.
-      if (epoch !== this.namespaceEpoch) this.unlinked.add(trade.id);
+      if (epoch !== this.namespaceEpoch) {
+        this.unlinked.add(trade.id);
+        this.lastRelinkAt = 0;
+      }
       this.eligibleStreak.delete(o.key);
       this.fitToBudget(this.tokenBudget(), true);
       console.log(
@@ -1076,9 +1228,18 @@ export class SyntheticEngine {
       const linked = !this.namespaceStale && !this.unlinked.has(t.id);
       const m = this.priceExit(t, now, today, marketOpen, linked);
       this.metrics.set(t.id, m);
-      // Rule exits must hold for N evaluations; expiry safety acts at once.
-      const streak = m.rule_reason !== null && m.executable ? (this.exitStreak.get(t.id) ?? 0) + 1 : 0;
-      this.exitStreak.set(t.id, streak);
+      // Rule exits must hold across N evaluations on new books; expiry safety acts at once.
+      if (m.rule_reason !== null && m.executable) {
+        const sig = this.bookSig(t.legs.map((l) => l.token));
+        if (this.exitSig.get(t.id) !== sig) {
+          this.exitStreak.set(t.id, (this.exitStreak.get(t.id) ?? 0) + 1);
+          this.exitSig.set(t.id, sig);
+        }
+      } else {
+        this.exitStreak.delete(t.id);
+        this.exitSig.delete(t.id);
+      }
+      const streak = this.exitStreak.get(t.id) ?? 0;
       if (!marketOpen || !feedOk || !linked || !m.should_exit || m.reason === null) continue;
       if (m.reason !== "EXPIRY_SAFETY" && streak < this.cfg.signalConfirmations) continue;
       const closed = closeTradeAtTouch(t, m, m.reason, now, today);
@@ -1119,15 +1280,27 @@ export class SyntheticEngine {
         throw new Error("paper-trade storage is unavailable, so the close cannot be recorded");
       }
       const won = await this.deps.store.close(closed);
+      this.closedIds.add(open.id);
       this.positions.delete(open.id);
       this.metrics.delete(open.id);
       this.exitStreak.delete(open.id);
+      this.exitSig.delete(open.id);
       this.retryAt.delete(open.id);
       this.unlinked.delete(open.id);
       this.cooldownUntil.set(open.underlying, Date.now() + this.cfg.reentryCooldownMs);
       if (!won) {
-        // Closed elsewhere (a racing request or another process): never close twice.
+        // Closed elsewhere (a racing request or another process): never close twice,
+        // but do count the close that DID land, so today's P&L is not short of it.
         this.applySubscriptions();
+        const stored = await this.deps.store.get(open.id).catch(() => null);
+        if (
+          stored &&
+          stored.status === "closed" &&
+          stored.closed_day === this.closedDay &&
+          !this.closedToday.some((c) => c.id === stored.id)
+        ) {
+          this.closedToday.unshift(stored);
+        }
         return { ok: false, error: "This position was already closed." };
       }
       if (closed.closed_day === this.closedDay) this.closedToday.unshift(closed);
@@ -1328,14 +1501,16 @@ export class SyntheticEngine {
       broker: this.deps.activeBroker(),
       detection_only: !this.cfg.paperTrading,
       execution_mode: "paper_touch" as const,
-      paper_trading: this.cfg.paperTrading && db && this.loaded,
+      paper_trading: this.cfg.paperTrading && db && this.loaded && this.indexReady,
       paper_blocked_reason: !this.cfg.paperTrading
         ? "disabled"
         : !db
           ? "no_db"
           : !this.loaded
             ? "loading"
-            : null,
+            : !this.indexReady
+              ? "unsafe_index"
+              : null,
       db_enabled: db,
       strike_level: this.strikeLevel,
       paired_underlyings: this.chains.size,

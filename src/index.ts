@@ -5323,6 +5323,10 @@ const syntheticModule: SyntheticModule = registerSyntheticModule(app, {
       budget: boxCfg.boxDedicatedMarketFeed ? boxCfg.maxSubscribedTokens : 0,
     };
   },
+  // Mid-switch the instrument universe still belongs to the outgoing broker, so the
+  // scanner starts no refresh then; a refresh that sees the generation move is dropped.
+  switching: () => brokerManager.switching,
+  brokerGeneration: () => brokerManager.generation,
   requireAdmin,
   getAdminRole,
 });
