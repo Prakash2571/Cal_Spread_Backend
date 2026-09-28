@@ -230,6 +230,17 @@ export class SubscriptionCoordinator {
     return { droppedTokens, droppedLeases };
   }
 
+  /**
+   * Whether `owner` currently holds `token`. O(1), for per-tick routing.
+   *
+   * The Box lane is shared by the Box strategy and the synthetic scanner; this is
+   * what lets each lane tick be delivered only to the owners that asked for it.
+   */
+  owns(owner: SubscriptionOwner, token: number): boolean {
+    const entry = this.counts.get(token);
+    return entry !== undefined && entry[owner] > 0;
+  }
+
   /** Every token with at least one consumer. */
   activeTokens(): number[] {
     return [...this.counts.keys()];

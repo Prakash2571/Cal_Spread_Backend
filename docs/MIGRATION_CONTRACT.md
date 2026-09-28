@@ -209,6 +209,7 @@ spread). Collection names are contract — a Go rewrite must read/write the same
 | `box_order_intents` | `src/box/model.ts` | **durable order intents** — the recovery backbone | `client_order_id` (unique), `broker_order_id` (unique sparse), `state`, `broker`, `broker_correlation_id`, `filled_quantity` |
 | `box_execution_attempts` | `src/box/model.ts` | one row per execution attempt | `resolved`, `resolved_at`, `broker` |
 | `box_daily_pnl` | `src/box/model.ts` | per-day realised P&L | unique `{day, trade_id}` |
+| `synth_trades` | `src/synthetic/model.ts` | synthetic-futures PAPER trades, open + closed (box connection) | `status`, `underlying`, `expiry`, `legs`, unique open-per-underlying index |
 | `trades` | `src/db.ts` | calendar trades | `symbol`, `status` |
 | `trade_log` | `src/db.ts` | charges/P&L ledger | `trade_id`, `at` |
 | `kite_session`, `dhan_session` | `src/db.ts` | broker sessions (single-doc) | `access_token`, `expiry_time`, `login_date` |

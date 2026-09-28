@@ -526,9 +526,9 @@ Charge reconciliation: `BOX_RECONCILE_CHARGES`, `BOX_REQUIRE_PRICED_CHARGES`,
 `BOX_CHARGE_RECONCILE_MAX_ATTEMPTS`, `BOX_CHARGE_RECONCILE_RETRY_BASE_MS`,
 `BOX_CHARGE_RECONCILE_WARN_PCT`.
 
-## Futures vs synthetic scanner (`src/synthetic/config.ts`)
+## Futures vs synthetic scanner and paper trading (`src/synthetic/config.ts`)
 
-Detection only: nothing here can place an order. See `docs/SYNTHETIC_FUTURES_ARBITRAGE.md`.
+Paper only: nothing here can send a real order. See `docs/SYNTHETIC_FUTURES_ARBITRAGE.md`.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -540,8 +540,19 @@ Detection only: nothing here can place an order. See `docs/SYNTHETIC_FUTURES_ARB
 | `SYNTH_DEFAULT_RF_PCT` | `0` | rf used when the admin has not set one. |
 | `SYNTH_ENABLE_CONVERSION` / `SYNTH_ENABLE_REVERSAL` | `true` | Directions evaluated. |
 | `SYNTH_SKIP_EXPIRY_DAY` | `false` | Skip underlyings whose matched expiry is today. |
-| `SYNTH_MAX_TOKENS` | `750` | Tokens added to the Box lane (owner `scanner`). Keep `BOX_MAX_SUBSCRIBED_TOKENS + SYNTH_MAX_TOKENS` under the broker's per-socket limit (Kite 3000). |
+| `SYNTH_MAX_TOKENS` | `750` | Tokens on the Box lane (owner `scanner`) while the Box scanner is RUNNING. |
+| `SYNTH_SHARE_BOX_BUDGET` | `true` | While the Box scanner is stopped, also use the part of `BOX_MAX_SUBSCRIBED_TOKENS` Box is not holding for open positions. Box always has priority and gets it back first. |
+| `SYNTH_LANE_TOKEN_LIMIT` | `3000` | Hard ceiling for the whole Box lane socket (Kite's per-connection limit). The synthetic budget never pushes Box + synthetic past it. |
 | `SYNTH_MAX_UNDERLYINGS` | `0` | Cap on underlyings (0 = token budget only). |
+| `SYNTH_MAX_PUBLISHED_OPPORTUNITIES` | `150` | Rows per SSE snapshot (ELIGIBLE/OPEN first, then the best per underlying). All rows are still evaluated. |
+| `SYNTH_PAPER_TRADING` | `true` | Auto paper-enter ELIGIBLE opportunities while RUN is on. Needs MongoDB (`synth_trades`). |
+| `SYNTH_MAX_OPEN_POSITIONS` | `10` | Open paper positions at most (and never two on one underlying). |
+| `SYNTH_SIGNAL_CONFIRMATIONS` | `2` | Consecutive evaluations over NEW books (a leg's book must have changed) an entry or rule exit must hold before it is acted on. |
+| `SYNTH_REENTRY_COOLDOWN_MS` | `60000` | Wait after an underlying's position closes before re-entering it. |
+| `SYNTH_CONVERGENCE_FLOOR` / `SYNTH_CONVERGENCE_PCT` | `100` / `0.2` | EDGE_CONVERGED when remaining edge ≤ max(floor, pct × entry net edge). |
+| `SYNTH_MIN_EXIT_NET_PNL` | `250` | Never close early for less net P&L than this, after all charges. |
+| `SYNTH_PROFIT_CAPTURE_PCT` / `SYNTH_MIN_CAPTURED_PCT` | `0.75` / `0.75` | PROFIT_CAPTURE when net ≥ pct × entry net edge, or gross ≥ pct × entry edge. |
+| `SYNTH_EXPIRY_SAFETY_MINUTES` | `45` | On expiry day, close at the touch from this long before 15:30 IST (and no new entries). |
 | `SYNTH_QUOTE_MAX_AGE_MS` / `SYNTH_FEED_MAX_AGE_MS` | `15000` / `10000` | Leg book trust window / feed-stale report. |
 | `SYNTH_ATM_HYSTERESIS` / `SYNTH_WINDOW_MIN_INTERVAL_MS` | `0.15` / `15000` | Window re-centre damping. |
 | `SYNTH_EVAL_INTERVAL_MS` / `SYNTH_PUBLISH_INTERVAL_MS` / `SYNTH_UNIVERSE_REFRESH_MS` | `500` / `1000` / `900000` | Cadences. |

@@ -333,6 +333,18 @@ export class ActiveBrokerManager {
     return this.gen;
   }
 
+  /**
+   * True while a broker switch is in progress.
+   *
+   * Between the books being invalidated and the new broker becoming active the
+   * instrument universe still belongs to the OUTGOING broker, so a consumer that
+   * rebuilds its token set in that window would subscribe old tokens on the new
+   * socket. Consumers wait for the switch's own reload hook instead.
+   */
+  get switching(): boolean {
+    return this.transitioning;
+  }
+
   /** Record that a tick arrived, for the feed-health model. */
   noteTick(at: number = Date.now()): void {
     this.lastTickAt = at;
