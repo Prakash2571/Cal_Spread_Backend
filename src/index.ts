@@ -55,6 +55,7 @@ import { startEodScheduler, backfillStockFutures, checkAndRecomputeSummary } fro
 // cache and charge estimator by injection. It owns its own routes, models and
 // collections; the calendar strategy remains unchanged.
 import { registerBoxModule, type BoxModule } from "./box/index.js";
+import { registerSyntheticModule, type SyntheticModule } from "./synthetic/index.js";
 import { ActiveBrokerManager } from "./brokers/registry.js";
 import { registerBrokerRoutes } from "./brokers/routes.js";
 import { registerMarketDataRoutes } from "./marketDataRoutes.js";
@@ -134,8 +135,13 @@ const brokerManager = new ActiveBrokerManager({
   onBoxLaneTicks: (ticks) => {
     brokerManager.noteTick();
     boxModule.engine.ingestBoxLaneTicks(ticks);
+    // The synthetic-futures scanner watches its own tokens on the same lane.
+    syntheticModule.engine.onTicks(ticks);
   },
-  onBoxLaneConnection: (connected) => boxModule.engine.onBoxLaneConnection(connected),
+  onBoxLaneConnection: (connected) => {
+    boxModule.engine.onBoxLaneConnection(connected);
+    syntheticModule.engine.invalidateBooks();
+  },
   // Dhan ticks are pushed into the shared hub's caches so EVERY existing consumer
   // (the Box quote store, SSE clients, analytics) sees them through the same path it
   // already uses. No consumer needs to know which broker produced a tick.
@@ -5276,7 +5282,29 @@ const boxModule: BoxModule = registerBoxModule(app, {
   // ACTIVE broker's adapter and REFUSES to build one for any other broker.
   createLiveAdapter: (ctx) => brokerManager.createLiveAdapter(ctx),
 });
-onFeedSessionLost = () => boxModule.engine.onSessionLost();
+onFeedSessionLost = () => {
+  boxModule.engine.onSessionLost();
+  syntheticModule.engine.stop();
+};
+
+// ============================================================================
+//  Futures vs synthetic-futures arbitrage SCANNER (detection only, never orders).
+//  Synthetic = K + CE(K) - PE(K) at ATM / ATM±1 / ±2 / ±3 of the SAME expiry as
+//  the future. Its tokens ride the Box lane under the "scanner" owner.
+// ============================================================================
+const syntheticModule: SyntheticModule = registerSyntheticModule(app, {
+  getAllInstruments: getAllInstrumentsCached,
+  getBoard: async () => deriveFnoBoard(await getAllInstrumentsCached()),
+  marketData: brokerManager.marketData(),
+  isMarketOpen,
+  istDayKey,
+  makeIdResolver,
+  getRfPct: () => adminRfRate,
+  activeBroker: () => brokerManager.activeBroker,
+  setTokens: (tokens) => brokerManager.setSyntheticTokens(tokens),
+  requireAdmin,
+  getAdminRole,
+});
 
 /**
  * Give the broker manager its view of live exposure, and the teardown hooks a switch
@@ -5298,8 +5326,16 @@ brokerManager.attach(
     unresolvedIntentsFor: (broker) => countUnresolvedBoxOrderIntentsForBroker(broker),
   },
   {
-    stopScanner: () => boxModule.engine.stop(),
-    invalidateBooks: () => boxModule.engine.invalidateBooks(),
+    stopScanner: () => {
+      boxModule.engine.stop();
+      // Detection only, but its tokens are in the OLD broker's namespace: stop it and
+      // let the operator restart it on the new broker.
+      syntheticModule.engine.stop();
+    },
+    invalidateBooks: () => {
+      boxModule.engine.invalidateBooks();
+      syntheticModule.engine.invalidateBooks();
+    },
     // Contract reservations are broker-namespaced, so a switch must drop the ones this
     // process owns. Previously defined on the engine but never wired to anything, which
     // meant they survived a switch until their TTL.
@@ -5471,6 +5507,12 @@ const shutdownCoordinator = new ShutdownCoordinator({
       // request must not be able to start a new box on the way out.
       name: "disable new Box entry discovery",
       run: () => boxModule.engine.stop(),
+    },
+    {
+      // Detection only, so order does not matter for safety; it just ends its SSE
+      // streams so the HTTP drain below is not held open by them.
+      name: "stop the synthetic-futures scanner",
+      run: () => syntheticModule.engine.dispose(),
     },
     {
       /**

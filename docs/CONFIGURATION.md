@@ -526,6 +526,31 @@ Charge reconciliation: `BOX_RECONCILE_CHARGES`, `BOX_REQUIRE_PRICED_CHARGES`,
 `BOX_CHARGE_RECONCILE_MAX_ATTEMPTS`, `BOX_CHARGE_RECONCILE_RETRY_BASE_MS`,
 `BOX_CHARGE_RECONCILE_WARN_PCT`.
 
+## Futures vs synthetic scanner (`src/synthetic/config.ts`)
+
+Detection only: nothing here can place an order. See `docs/SYNTHETIC_FUTURES_ARBITRAGE.md`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SYNTH_STRIKE_LEVEL` | `3` | Strikes each side of ATM used for the synthetic (1, 2 or 3). Changeable at runtime. |
+| `SYNTH_MIN_EXPECTED_NET_PROFIT` | `500` | ₹ per lot after every cost for ELIGIBLE. Runtime-tunable (in memory). |
+| `SYNTH_SAFETY_BUFFER` | `100` | ₹ held back inside expected net. Runtime-tunable (in memory). |
+| `SYNTH_EXPECTED_SLIPPAGE` | `0` | ₹ round-trip slippage allowance, all three legs. |
+| `SYNTH_INCLUDE_CARRY` | `true` | Finance the net option premium to expiry at the admin rf (`POST /api/rf`). |
+| `SYNTH_DEFAULT_RF_PCT` | `0` | rf used when the admin has not set one. |
+| `SYNTH_ENABLE_CONVERSION` / `SYNTH_ENABLE_REVERSAL` | `true` | Directions evaluated. |
+| `SYNTH_SKIP_EXPIRY_DAY` | `false` | Skip underlyings whose matched expiry is today. |
+| `SYNTH_MAX_TOKENS` | `750` | Tokens added to the Box lane (owner `scanner`). Keep `BOX_MAX_SUBSCRIBED_TOKENS + SYNTH_MAX_TOKENS` under the broker's per-socket limit (Kite 3000). |
+| `SYNTH_MAX_UNDERLYINGS` | `0` | Cap on underlyings (0 = token budget only). |
+| `SYNTH_QUOTE_MAX_AGE_MS` / `SYNTH_FEED_MAX_AGE_MS` | `15000` / `10000` | Leg book trust window / feed-stale report. |
+| `SYNTH_ATM_HYSTERESIS` / `SYNTH_WINDOW_MIN_INTERVAL_MS` | `0.15` / `15000` | Window re-centre damping. |
+| `SYNTH_EVAL_INTERVAL_MS` / `SYNTH_PUBLISH_INTERVAL_MS` / `SYNTH_UNIVERSE_REFRESH_MS` | `500` / `1000` / `900000` | Cadences. |
+| `SYNTH_FUT_STT_SELL_PCT` | `0.05` | Futures STT, sell side, % of notional. Option legs use the `BOX_*` charge card. |
+| `SYNTH_FUT_EXCHANGE_TXN_PCT` | `0.00173` | NSE futures transaction charge, % of notional. |
+| `SYNTH_FUT_IPFT_PER_CRORE` | `10` | NSE IPFT on futures, ₹/crore. |
+| `SYNTH_FUT_STAMP_DUTY_BUY_PCT` | `0.002` | Stamp duty on futures purchases. |
+| `SYNTH_FUT_CHARGE_RATE_VERSION` | `nse-futures-2026-04-01` | Stamped rate-card label. |
+
 ## P&L / caching
 
 `BOX_PNL_ARCHIVE_HOUR`, `BOX_PNL_ARCHIVE_DRAIN_DELAY_MS`, `BOX_PNL_VERIFY_HOURS`,
