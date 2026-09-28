@@ -443,6 +443,16 @@ export class ActiveBrokerManager {
     this.boxSubscriptions.setOwnerTokens("strategy", tokens);
   }
 
+  /**
+   * Replace the futures-vs-synthetic SCANNER's token set on the Box lane.
+   *
+   * Same lane as Box (full depth), but a different owner ("scanner"), so the two
+   * refcount independently: neither can unsubscribe a token the other still wants.
+   */
+  setSyntheticTokens(tokens: number[]): void {
+    this.boxSubscriptions.setOwnerTokens("scanner", tokens);
+  }
+
   /** Per-lane feed statistics for diagnostics. */
   laneStats(lane: MarketDataLane): LaneFeedStats {
     const wanted = lane === "box" ? this.boxSubscriptions.size : this.subscriptions.size;
