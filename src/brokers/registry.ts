@@ -1156,7 +1156,7 @@ export class ActiveBrokerManager {
   margins(): BoxMarginProvider {
     return {
       broker: this.active,
-      basketMargin: async (orders) => {
+      basketMargin: async (orders, opts) => {
         if (this.active === "zerodha") {
           // Mapped field-by-field rather than passed through. `BoxMarginOrder` carries
           // a Dhan-only pricing hint (`reference_price`), and Kite's basket endpoint is
@@ -1173,6 +1173,7 @@ export class ActiveBrokerManager {
               quantity: o.quantity,
               price: o.price,
             })),
+            opts ?? {},
           );
           this.lastMarginSource = "kite_basket";
           return { ...res, source: "kite_basket" as const };

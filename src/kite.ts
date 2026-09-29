@@ -694,12 +694,18 @@ export class KiteClient {
   /**
    * Basket margin (/margins/basket): net margin for a set of orders, factoring
    * in hedge/spread benefits. Used to size a calendar spread's capital.
+   *
+   * `considerPositions` (default true, the existing behaviour) nets the basket
+   * against the account's open positions. Pass false for a STANDALONE figure, e.g.
+   * for a paper trade that must not be credited with real positions' hedges.
    */
   async getBasketMargin(
     orders: BasketOrder[],
+    opts: { considerPositions?: boolean } = {},
   ): Promise<{ initial: number; final: number; total: number }> {
+    const considerPositions = opts.considerPositions !== false;
     const res = await fetch(
-      `${KITE_API_ROOT}/margins/basket?consider_positions=true`,
+      `${KITE_API_ROOT}/margins/basket?consider_positions=${considerPositions ? "true" : "false"}`,
       {
         method: "POST",
         headers: { ...this.authHeader(), "Content-Type": "application/json" },

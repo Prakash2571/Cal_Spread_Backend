@@ -48,6 +48,20 @@ can send a real order.
 - no entries on expiry day inside the expiry-safety window;
 - filled at exactly the touch it was priced at (BUY at ask, SELL at bid), one lot.
 
+**Fills are LIMIT orders at the best bid / best ask.** Every leg is priced as a limit
+order at the touch (best ask to buy, best bid to sell) and is only sent when at least
+one lot rests at that price, so it fills in full at its limit. Never a market order, and
+never a deeper level. A leg is refused if its side is empty, if less than a lot rests at
+the touch, if its book is older than `SYNTH_QUOTE_MAX_AGE_MS`, or if the book is crossed
+(best bid ≥ best ask: an inconsistent snapshot whose touch is not really available).
+Exits are closing limit orders on the same rule, so a crossed book also holds an exit
+(expiry safety included) until it uncrosses. Each leg stores the evidence for its entry
+and exit fills: best bid and best ask with their quantities, the quantity at the limit
+price, the book's age, and the top five levels a side (`entry_*` / `exit_*`). The page
+checks every fill against that recorded book: the limit equals the best level on its
+side, at least one lot rests there, and the book is not crossed. Trades stored before the
+book was recorded show "not recorded".
+
 An ELIGIBLE row that is not entered carries `entry_blocked` with the reason. The row of
 a held position shows status `OPEN`.
 
@@ -76,6 +90,41 @@ entry edge − gross now. `net` = gross now − entry charges − exit charges a
   forgets every token. No refresh starts while a switch is in progress, and a refresh
   that sees the broker generation change mid-flight is discarded, so an old-broker token
   is never subscribed on the new socket. The switch's own reload re-links the positions.
+
+**Margin**: right after entry, and off the fill path, the three legs are sent together
+to the ACTIVE broker's basket-margin calculator, the same one Box uses:
+- Zerodha: `/margins/basket`;
+- Dhan: `/margincalculator/multi`, or a flagged per-leg sum if that fails.
+
+The orders are the exact limit orders filled, with product `NRML`, so the future/option
+hedge is recognised. The basket is asked on its own (`considerPositions: false`, i.e.
+Kite `consider_positions=false`), so real positions in the account cannot shrink a paper
+trade's figure. It is stored on the trade as `margin`, `margin_source`,
+`margin_hedge_benefit` and `margin_at`:
+- a failed fetch is retried (3 attempts, then up to 3 sweeps 60 s apart). A sweep counts
+  only when the broker is actually asked, so a session outage uses up none;
+- the failure reason is stored in `margin_error`. It is shown as unavailable, never as ₹0;
+- trades opened on another broker are not re-margined, because their tradingsymbols use
+  that broker's naming. They say so in `margin_error`;
+- margin is never written onto a deleted row.
+
+`day_pnl` carries `open_margin`, the margin the open positions block now, and
+`closed_margin`, a day sum over today's closes.
+
+**Delete** (`DELETE /api/synthetic/trades/:id`, full admin, 20/min, body
+`{ reason?, expected_status? }`) removes a paper trade, open or closed, from every list,
+count, P&L and margin figure:
+- it is a SOFT delete: the row stays as `status: "deleted"` with the admin role, the
+  time and the reason;
+- an open position stops being monitored and its tokens are released;
+- its underlying waits out `SYNTH_REENTRY_COOLDOWN_MS`, so the scanner does not
+  reopen the same trade at once;
+- `expected_status` is the status the confirmation showed. A position that closed while
+  the dialog was open is refused (409), not deleted with the P&L it just booked. It is
+  also refused while an exit is in flight;
+- it is safe to retry. A write whose answer was lost is reconciled from the stored row,
+  and deleting an already-deleted trade returns ok with `already_deleted: true`;
+- a load or close that was in flight cannot bring a deleted trade back.
 
 **P&L** follows `.kiro/steering/trade-realism.md` in the frontend: open positions are marked
 to LTP (price move only). Charges are shown beside P&L, and "net" figures are labelled as
@@ -113,7 +162,7 @@ scanner's own `BoxQuoteStore`.
 - `routes.ts`: HTTP routes.
 
 Persistence (`synth_trades`, Box connection): one document per trade, `status`
-`open|closed`. The unique partial index `synth_open_one_per_underlying` allows one open
+`open|closed|deleted`. The unique partial index `synth_open_one_per_underlying` allows one open
 position per underlying. `autoIndex` is off: the index is created and read back at boot
 (`ensureReady`), the way the Box reservation store does it. Until that succeeds, entries
 are paused with `paper_blocked_reason: "unsafe_index"`, while open positions are still
@@ -135,8 +184,9 @@ changes last until restart.
 | GET | `/api/synthetic/trades/open` | → `{ db_enabled, open }` with live marks |
 | GET | `/api/synthetic/trades/history` | `?scope=today\|all&limit=` → `{ db_enabled, scope, trades }` |
 | POST | `/api/synthetic/trades/:id/close` | 409 with the reason when a leg cannot be closed at the touch |
+| DELETE | `/api/synthetic/trades/:id` | full admin; `{ reason?, expected_status? }` → `{ deleted_id, deleted_from, already_deleted, status, open, closed_today }`; 409 when it changed state or is closing |
 | GET | `/api/synthetic/chain/:underlying` | |
-| GET | `/api/synthetic/stream` | SSE `snapshot` `{status, opportunities, open_trades}`, plus `entry` / `exit` `{trade}`. Token in `?x-admin-token=` |
+| GET | `/api/synthetic/stream` | SSE `snapshot` `{status, opportunities, open_trades}`, plus `entry` / `exit` `{trade}` and `trade_deleted` `{id, from}`. Token in `?x-admin-token=` |
 
 The snapshot carries at most `SYNTH_MAX_PUBLISHED_OPPORTUNITIES` rows: every ELIGIBLE and
 OPEN row, then the best row per underlying. The status counts always cover every row.

@@ -128,7 +128,15 @@ export interface BoxBasketMargin {
 export interface BoxMarginProvider {
   /** Which broker's margin model produced the figure (for provenance display). */
   readonly broker: BrokerId;
-  basketMargin(orders: BoxMarginOrder[]): Promise<BoxBasketMargin>;
+  /**
+   * `considerPositions: false` asks for the basket on its own, not netted against the
+   * account's open positions. Optional: omitted, each broker keeps its existing
+   * behaviour (Kite nets against positions; Dhan's calculator never does).
+   */
+  basketMargin(
+    orders: BoxMarginOrder[],
+    opts?: { considerPositions?: boolean },
+  ): Promise<BoxBasketMargin>;
 }
 
 /**

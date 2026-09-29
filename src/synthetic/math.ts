@@ -35,6 +35,7 @@
 
 import type { Instrument } from "../kite.js";
 import type { BrokerId } from "../brokers/types.js";
+import type { BoxMarginSource } from "../box/brokerContext.js";
 import type { OrderSide } from "../box/types.js";
 import { selectStrikeWindow, shouldRecentreWindow, strikeStepOf } from "../box/math.js";
 import {
@@ -128,7 +129,12 @@ export type SynthRejectReason =
   | "below_expected_net_profit"
   | "market_closed"
   /** Market shut and this leg did not trade in the latest session. */
-  | "no_close";
+  | "no_close"
+  /**
+   * Best bid ≥ best ask. Not a state continuous trading can hold, so the snapshot
+   * is inconsistent and its touch is not a price that is really available.
+   */
+  | "crossed_book";
 
 /** OPEN = this exact strike/direction is currently held as a paper position. */
 export type SynthStatus = "ELIGIBLE" | "OPEN" | "WATCHING" | "REJECTED" | "INDICATIVE";
@@ -431,6 +437,7 @@ function evaluateLeg(args: {
   const t = touch(quote, side);
   let reject: SynthRejectReason | null = null;
   if (!(t.price > 0)) reject = side === "BUY" ? "missing_ask" : "missing_bid";
+  else if (quote.bid > 0 && quote.ask > 0 && quote.bid >= quote.ask) reject = "crossed_book";
   else if (t.qty < quantity) reject = "insufficient_qty";
   else if (!fresh) reject = "stale_quote";
   return {
@@ -755,6 +762,19 @@ export type SynthExitBlockedReason =
   | "insufficient_exit_liquidity"
   | null;
 
+/** Top of the book at the moment of a fill: up to five levels a side, best first. */
+export interface SynthDepth {
+  bids: { price: number; qty: number }[];
+  asks: { price: number; qty: number }[];
+}
+
+/**
+ * Every paper leg is a LIMIT order priced at the touch (best ask to buy, best bid
+ * to sell) and is only sent when at least one lot rests at that price, so it fills
+ * in full at its limit. The `*_bid*`, `*_ask*`, `*_qty_at_touch`, `*_age_ms` and
+ * `*_depth` fields record the book that decision was taken on, so a fill can be
+ * checked against it. They are optional: trades stored before they existed lack them.
+ */
 export interface SynthTradeLeg {
   role: SynthLegRole;
   /** The ENTRY side. The closing side is always the opposite. */
@@ -768,13 +788,30 @@ export interface SynthTradeLeg {
    * (underlying, expiry, strike, type), never by this number.
    */
   token: number;
+  /** Entry fill = the LIMIT price: the best ask for a BUY, the best bid for a SELL. */
   entry_price: number;
   entry_bid: number;
   entry_ask: number;
+  entry_bid_qty?: number | null;
+  entry_ask_qty?: number | null;
+  /** Quantity resting at the entry limit price (always ≥ one lot). */
+  entry_qty_at_touch?: number | null;
+  /** How long the book had been unchanged when the order was priced (ms). */
+  entry_age_ms?: number | null;
+  entry_depth?: SynthDepth | null;
+  /** Exit fill = the closing LIMIT price: the best bid to sell, the best ask to buy back. */
   exit_price: number | null;
   exit_bid: number | null;
   exit_ask: number | null;
+  exit_bid_qty?: number | null;
+  exit_ask_qty?: number | null;
+  exit_qty_at_touch?: number | null;
+  exit_age_ms?: number | null;
+  exit_depth?: SynthDepth | null;
 }
+
+/** Where a margin figure came from: the active broker's basket-margin calculator. */
+export type SynthMarginSource = BoxMarginSource;
 
 /** One paper trade, open or closed. Times are epoch ms; days are IST YYYY-MM-DD. */
 export interface SynthTrade {
@@ -783,6 +820,8 @@ export interface SynthTrade {
   key: string;
   broker: BrokerId;
   execution_mode: "paper_touch";
+  /** Every leg is a limit order at the touch (see SynthTradeLeg). */
+  order_type: "LIMIT";
   underlying: string;
   name: string;
   is_index: boolean;
@@ -827,6 +866,29 @@ export interface SynthTrade {
   /** gross − total charges ("after charges"). */
   net_pnl: number | null;
   exit_note: string | null;
+  /**
+   * Margin the three legs block together (₹), from the broker's basket-margin
+   * calculator (hedge benefit included), captured just after entry. Null until the
+   * broker has answered, or when it could not be obtained.
+   */
+  margin: number | null;
+  margin_source: SynthMarginSource | null;
+  /** Hedge benefit the broker recognised for the basket (₹), when it reports one. */
+  margin_hedge_benefit: number | null;
+  margin_at: number | null;
+  /** Why the margin is missing, when a fetch failed. */
+  margin_error: string | null;
+}
+
+/** Copy the top of a book (at most five levels a side). */
+export function depthOf(q: {
+  bids?: { price: number; qty: number }[];
+  asks?: { price: number; qty: number }[];
+} | undefined): SynthDepth | null {
+  if (!q) return null;
+  const pick = (levels: { price: number; qty: number }[] | undefined) =>
+    (levels ?? []).slice(0, 5).map((l) => ({ price: l.price, qty: l.qty }));
+  return { bids: pick(q.bids), asks: pick(q.asks) };
 }
 
 /** Open a paper trade at exactly the touch the opportunity was priced at. */
@@ -838,6 +900,8 @@ export function openTradeFromOpportunity(args: {
   day: string;
   optionRateVersion: string;
   futuresRateVersion: string;
+  /** The book behind each leg at this instant, recorded as evidence of the fill. */
+  depthFor?: (token: number) => SynthDepth | null;
 }): SynthTrade | null {
   const { opp } = args;
   if (
@@ -866,6 +930,11 @@ export function openTradeFromOpportunity(args: {
       entry_price: l.price,
       entry_bid: l.bid,
       entry_ask: l.ask,
+      entry_bid_qty: l.bid_qty,
+      entry_ask_qty: l.ask_qty,
+      entry_qty_at_touch: l.qty_at_touch,
+      entry_age_ms: l.age_ms,
+      entry_depth: args.depthFor?.(l.token) ?? null,
       exit_price: null,
       exit_bid: null,
       exit_ask: null,
@@ -878,6 +947,7 @@ export function openTradeFromOpportunity(args: {
     key: opp.key,
     broker: args.broker,
     execution_mode: "paper_touch",
+    order_type: "LIMIT",
     underlying: opp.underlying,
     name: opp.name,
     is_index: opp.is_index,
@@ -915,6 +985,11 @@ export function openTradeFromOpportunity(args: {
     total_charges: null,
     net_pnl: null,
     exit_note: null,
+    margin: null,
+    margin_source: null,
+    margin_hedge_benefit: null,
+    margin_at: null,
+    margin_error: null,
   };
 }
 
@@ -946,6 +1021,8 @@ export interface SynthExitLeg {
   age_ms: number | null;
   fresh: boolean;
   executable: boolean;
+  /** Why this leg cannot be closed at the touch right now, or null when it can. */
+  reject: SynthRejectReason | null;
 }
 
 export interface SynthExitMetrics {
@@ -1042,6 +1119,7 @@ export function evaluateSynthExit(args: {
       age_ms: r.leg.age_ms,
       fresh: r.leg.fresh,
       executable: r.leg.executable,
+      reject: r.reject,
     });
     // A long leg (entered BUY) gains when its price rises, a short leg when it falls.
     const sign = leg.side === "BUY" ? 1 : -1;
@@ -1115,13 +1193,17 @@ export function evaluateSynthExit(args: {
   };
 }
 
-/** Close a trade at the touch priced in `m` (which must be executable). */
+/**
+ * Close a trade at the touch priced in `m` (which must be executable): each leg is a
+ * closing LIMIT order at the best bid (to sell) or best ask (to buy back).
+ */
 export function closeTradeAtTouch(
   t: SynthTrade,
   m: SynthExitMetrics,
   reason: SynthExitReason,
   now: number,
   day: string,
+  depthFor?: (token: number) => SynthDepth | null,
 ): SynthTrade | null {
   if (!m.executable || m.gross_pnl === null || m.exit_charges === null) return null;
   const byRole = new Map(m.legs.map((l) => [l.role, l]));
@@ -1135,6 +1217,11 @@ export function closeTradeAtTouch(
         exit_price: ex?.price ?? null,
         exit_bid: ex ? ex.bid : null,
         exit_ask: ex ? ex.ask : null,
+        exit_bid_qty: ex ? ex.bid_qty : null,
+        exit_ask_qty: ex ? ex.ask_qty : null,
+        exit_qty_at_touch: ex ? ex.qty_at_touch : null,
+        exit_age_ms: ex ? ex.age_ms : null,
+        exit_depth: ex ? (depthFor?.(ex.token) ?? null) : null,
       };
     }),
     closed_at: now,
@@ -1224,11 +1311,22 @@ export interface SynthDayPnl {
   total_net_pnl: number;
   /** open running gross + closed realised gross (before charges). */
   total_gross_pnl: number;
+  /** Σ margin the open positions block now (₹); positions without a figure are excluded. */
+  open_margin: number;
+  open_margin_unknown: number;
+  /** Σ margin of the positions closed today (₹). A day SUM, not a concurrent peak. */
+  closed_margin: number;
+  closed_margin_unknown: number;
 }
 
 export function computeSynthDayPnl(args: {
   day: string;
-  open: { mtm_ltp: number | null; gross_pnl: number | null; net_pnl: number | null }[];
+  open: {
+    mtm_ltp: number | null;
+    gross_pnl: number | null;
+    net_pnl: number | null;
+    margin: number | null;
+  }[];
   closedToday: SynthTrade[];
 }): SynthDayPnl {
   let mtm = 0;
@@ -1236,7 +1334,11 @@ export function computeSynthDayPnl(args: {
   let openGross = 0;
   let openNet = 0;
   let unpriced = 0;
+  let openMargin = 0;
+  let openMarginUnknown = 0;
   for (const o of args.open) {
+    if (o.margin === null) openMarginUnknown++;
+    else openMargin += o.margin;
     if (o.mtm_ltp === null) unmarked++;
     else mtm += o.mtm_ltp;
     if (o.gross_pnl === null || o.net_pnl === null) unpriced++;
@@ -1248,10 +1350,16 @@ export function computeSynthDayPnl(args: {
   let gross = 0;
   let charges = 0;
   let net = 0;
+  let closedMargin = 0;
+  let closedMarginUnknown = 0;
   for (const t of args.closedToday) {
     gross += t.gross_pnl ?? 0;
     charges += t.total_charges ?? 0;
     net += t.net_pnl ?? 0;
+    // `?? null` because trades stored before margin existed have no field at all.
+    const m = t.margin ?? null;
+    if (m === null) closedMarginUnknown++;
+    else closedMargin += m;
   }
   return {
     day: args.day,
@@ -1267,5 +1375,41 @@ export function computeSynthDayPnl(args: {
     closed_realised_net_pnl: round2(net),
     total_net_pnl: round2(openNet + net),
     total_gross_pnl: round2(openGross + gross),
+    open_margin: Math.round(openMargin),
+    open_margin_unknown: openMarginUnknown,
+    closed_margin: Math.round(closedMargin),
+    closed_margin_unknown: closedMarginUnknown,
   };
+}
+
+/**
+ * The basket-margin orders for a trade's three ENTRY legs.
+ *
+ * All three go in ONE request with their real sides, so the broker recognises the
+ * hedge between the future and the option pair. They are the exact LIMIT orders the
+ * paper fill assumed (entry price, one lot, carry-forward product), so the figure is
+ * reproducible. Margining the legs one by one would overstate the requirement.
+ */
+export function synthMarginOrders(t: SynthTrade): {
+  exchange: string;
+  tradingsymbol: string;
+  transaction_type: OrderSide;
+  variety: string;
+  product: string;
+  order_type: string;
+  quantity: number;
+  price: number;
+  reference_price: number;
+}[] {
+  return t.legs.map((l) => ({
+    exchange: "NFO",
+    tradingsymbol: l.tradingsymbol,
+    transaction_type: l.side,
+    variety: "regular",
+    product: "NRML",
+    order_type: "LIMIT",
+    quantity: t.quantity,
+    price: round2(l.entry_price),
+    reference_price: round2(l.entry_price),
+  }));
 }

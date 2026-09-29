@@ -5313,6 +5313,9 @@ const syntheticModule: SyntheticModule = registerSyntheticModule(app, {
   getRfPct: () => adminRfRate,
   activeBroker: () => brokerManager.activeBroker,
   setTokens: (tokens) => brokerManager.setSyntheticTokens(tokens),
+  // The ACTIVE broker's basket-margin calculator, as Box uses: Kite /margins/basket or
+  // Dhan's multi-order calculator. Each trade's three legs are margined together.
+  margins: brokerManager.margins(),
   // How Box is using the shared lane: while the Box scanner is stopped this scanner
   // may use the part of Box's budget that Box is not holding for open positions.
   boxLane: () => {

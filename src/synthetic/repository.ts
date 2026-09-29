@@ -1,11 +1,15 @@
 /**
  * `synth_trades` persistence, behind the engine's `SynthTradeStore` seam.
  *
- * Two writes matter and both are atomic:
+ * The writes that matter are all atomic:
  *   - an entry is an insert that the unique partial index rejects when the
  *     underlying already has an open position;
  *   - an exit is a single `$set` guarded on `status: "open"`, so a manual close
- *     racing an automatic one can never close a position twice.
+ *     racing an automatic one can never close a position twice;
+ *   - a delete is a SOFT delete (`status: "deleted"`), guarded on the status the
+ *     caller saw, so it can never swallow a close that landed in between;
+ *   - margin is written only by `setMargin`. A close never carries margin fields,
+ *     so a close cannot overwrite a margin figure that arrived while it was in flight.
  *
  * The unique index is created and verified by `ensureReady()` rather than left to
  * Mongoose's autoIndex (see model.ts); the engine allows no paper entry until it
@@ -14,7 +18,7 @@
 
 import mongoose from "mongoose";
 import { isBoxConnectionReady } from "../db.js";
-import type { SynthTradeStore } from "./engine.js";
+import type { SynthMarginPatch, SynthTradeStore } from "./engine.js";
 import type { SynthTrade } from "./math.js";
 import { SynthTradeModel, type ISynthTrade } from "./model.js";
 
@@ -78,24 +82,43 @@ export function synthIndexValidationError(indexes: readonly SynthIndexDescriptio
 }
 
 function toRecord(t: SynthTrade): SynthTradeRecord {
-  const { id, opened_at, closed_at, ...rest } = t;
+  const { id, opened_at, closed_at, margin_at, ...rest } = t;
   return {
     ...rest,
     _id: new mongoose.Types.ObjectId(id),
     opened_at: new Date(opened_at),
     closed_at: closed_at === null ? null : new Date(closed_at),
+    margin_at: margin_at === null ? null : new Date(margin_at),
   };
 }
 
 function fromRecord(r: SynthTradeRecord): SynthTrade {
-  const { _id, opened_at, closed_at, __v: _version, ...rest } = r as SynthTradeRecord & {
-    __v?: number;
-  };
+  const {
+    _id,
+    opened_at,
+    closed_at,
+    margin_at,
+    status,
+    deleted_at: _deletedAt,
+    deleted_from: _deletedFrom,
+    delete_reason: _deleteReason,
+    deleted_by: _deletedBy,
+    __v: _version,
+    ...rest
+  } = r as SynthTradeRecord & { __v?: number };
   return {
     ...rest,
+    // Rows written before these fields existed read as "no figure yet".
+    order_type: "LIMIT",
+    margin: rest.margin ?? null,
+    margin_source: rest.margin_source ?? null,
+    margin_hedge_benefit: rest.margin_hedge_benefit ?? null,
+    margin_error: rest.margin_error ?? null,
     id: String(_id),
+    status: status === "open" ? "open" : "closed",
     opened_at: new Date(opened_at).getTime(),
     closed_at: closed_at ? new Date(closed_at).getTime() : null,
+    margin_at: margin_at ? new Date(margin_at).getTime() : null,
   };
 }
 
@@ -148,15 +171,64 @@ export const mongoSynthTradeStore: SynthTradeStore = {
   },
 
   async close(trade: SynthTrade): Promise<boolean> {
-    const { _id, ...fields } = toRecord(trade);
+    // Margin is owned by setMargin: never written here, so a close cannot clobber it.
+    const {
+      _id,
+      margin: _m,
+      margin_source: _ms,
+      margin_hedge_benefit: _mh,
+      margin_at: _ma,
+      margin_error: _me,
+      ...fields
+    } = toRecord(trade);
     const res = await SynthTradeModel.updateOne({ _id, status: "open" }, { $set: fields });
     return res.matchedCount === 1;
   },
 
-  async get(id: string): Promise<SynthTrade | null> {
+  async setMargin(id: string, patch: SynthMarginPatch): Promise<void> {
+    if (!mongoose.isValidObjectId(id)) return;
+    await SynthTradeModel.updateOne(
+      // Open or closed rows only: a deleted row is an audit record and stays as it was.
+      { _id: new mongoose.Types.ObjectId(id), status: { $ne: "deleted" } },
+      {
+        $set: {
+          margin: patch.margin,
+          margin_source: patch.margin_source,
+          margin_hedge_benefit: patch.margin_hedge_benefit,
+          margin_at: patch.margin_at === null ? null : new Date(patch.margin_at),
+          margin_error: patch.margin_error,
+        },
+      },
+    );
+  },
+
+  async markDeleted(
+    id: string,
+    from: "open" | "closed",
+    audit: { reason: string | null; actor: string; at: number },
+  ): Promise<boolean> {
+    if (!mongoose.isValidObjectId(id)) return false;
+    const res = await SynthTradeModel.updateOne(
+      { _id: new mongoose.Types.ObjectId(id), status: from },
+      {
+        $set: {
+          status: "deleted",
+          deleted_at: new Date(audit.at),
+          deleted_from: from,
+          delete_reason: audit.reason,
+          deleted_by: audit.actor,
+        },
+      },
+    );
+    return res.matchedCount === 1;
+  },
+
+  async get(id: string): Promise<(SynthTrade & { deleted?: boolean; deleted_from?: "open" | "closed" }) | null> {
     if (!mongoose.isValidObjectId(id)) return null;
     const row = await SynthTradeModel.findById(id).lean<SynthTradeRecord>();
-    return row ? fromRecord(row) : null;
+    if (!row) return null;
+    if (row.status !== "deleted") return fromRecord(row);
+    return { ...fromRecord(row), deleted: true, deleted_from: row.deleted_from === "open" ? "open" : "closed" };
   },
 
   async loadOpen(): Promise<SynthTrade[]> {
