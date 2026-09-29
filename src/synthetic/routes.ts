@@ -8,6 +8,7 @@
  */
 
 import type { Express, Request, RequestHandler, Response } from "express";
+import { rateLimit } from "../ratelimit.js";
 import { toTradeView, type SyntheticEngine } from "./engine.js";
 
 export interface SyntheticRouteDeps {
@@ -22,8 +23,26 @@ function fail(res: Response, err: unknown): void {
   res.status(500).json({ error: message });
 }
 
+/**
+ * A tight bucket for the destructive delete, far below the global /api limit, as for
+ * Box: deleting trades is a one-at-a-time operator action.
+ */
+const deleteRateLimit = rateLimit({
+  windowMs: 60_000,
+  max: 20,
+  message: "Too many delete requests. Slow down.",
+});
+
 export function registerSyntheticRoutes(app: Express, deps: SyntheticRouteDeps): void {
   const { engine, requireAdmin } = deps;
+  const requireFull = (req: Request, res: Response): boolean => {
+    const token = req.header("x-admin-token") ?? undefined;
+    if (deps.getAdminRole(token) !== "full") {
+      res.status(403).json({ error: "Full administrator access required." });
+      return false;
+    }
+    return true;
+  };
 
   app.get("/api/synthetic/status", requireAdmin, (_req: Request, res: Response) => {
     res.json(engine.getStatus());
@@ -112,6 +131,57 @@ export function registerSyntheticRoutes(app: Express, deps: SyntheticRouteDeps):
       fail(res, err);
     }
   });
+
+  /**
+   * Delete a PAPER trade (open or closed). Full admin only, like Box.
+   * Body: { reason?, expected_status?: "open" | "closed" }. A soft delete, kept as an
+   * audit record; retrying one is safe. Returns the corrected state so the page
+   * updates without a reload.
+   */
+  app.delete(
+    "/api/synthetic/trades/:id",
+    deleteRateLimit,
+    requireAdmin,
+    async (req: Request, res: Response) => {
+      if (!requireFull(req, res)) return;
+      try {
+        const id = String(req.params.id ?? "");
+        const body = (req.body ?? {}) as { reason?: unknown; expected_status?: unknown };
+        const reason =
+          typeof body.reason === "string" && body.reason.trim() !== ""
+            ? body.reason.trim().slice(0, 500)
+            : null;
+        // The status the operator saw when confirming. A trade that changed state in
+        // the meantime is refused, not deleted.
+        const expected =
+          body.expected_status === "open" || body.expected_status === "closed"
+            ? body.expected_status
+            : undefined;
+        const actor = deps.getAdminRole(req.header("x-admin-token") ?? undefined) ?? "admin";
+        const r = await engine.deleteTrade(id, {
+          reason,
+          actor,
+          ...(expected === undefined ? {} : { expected }),
+        });
+        if (!r.ok) {
+          res.status(r.status).json({ error: r.error });
+          return;
+        }
+        const today = await engine.getHistory("today", 2000);
+        res.json({
+          ok: true,
+          deleted_id: id,
+          deleted_from: r.from,
+          already_deleted: r.already,
+          status: engine.getStatus(),
+          open: engine.getOpenPositions(),
+          closed_today: today.trades,
+        });
+      } catch (err) {
+        fail(res, err);
+      }
+    },
+  );
 
   app.get("/api/synthetic/chain/:underlying", requireAdmin, (req: Request, res: Response) => {
     const u = String(req.params.underlying ?? "").toUpperCase();

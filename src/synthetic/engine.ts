@@ -34,7 +34,7 @@ import type { Response } from "express";
 import type { Instrument } from "../kite.js";
 import type { Tick } from "../ticker.js";
 import type { BrokerId } from "../brokers/types.js";
-import type { BoxMarketDataProvider } from "../box/brokerContext.js";
+import type { BoxMarginProvider, BoxMarketDataProvider } from "../box/brokerContext.js";
 import { BoxQuoteStore } from "../box/quotes.js";
 import {
   SYNTH_TUNING_LIMITS,
@@ -48,6 +48,7 @@ import {
   buildSynthWindow,
   closeTradeAtTouch,
   computeSynthDayPnl,
+  depthOf,
   evaluateSynthExit,
   evaluateSynthetic,
   inExpirySafetyWindow,
@@ -56,16 +57,19 @@ import {
   openTradeFromOpportunity,
   settleTradeAtExpiry,
   sortOpportunities,
+  synthMarginOrders,
   synthTokensFor,
   synthWindowNeedsRebuild,
   synthWindowTokens,
   type SynthBoardItem,
   type SynthChainIndex,
   type SynthDayPnl,
+  type SynthDepth,
   type SynthDirection,
   type SynthExitLeg,
   type SynthExitMetrics,
   type SynthExitRules,
+  type SynthMarginSource,
   type SynthOpportunity,
   type SynthQuoteLike,
   type SynthTrade,
@@ -83,14 +87,38 @@ export interface SynthTradeStore {
    */
   ensureReady?(): Promise<void>;
   newId(): string;
-  /** The stored row, used to reconcile a write whose outcome was ambiguous. */
-  get(id: string): Promise<SynthTrade | null>;
+  /**
+   * The stored row, used to reconcile a write whose outcome was ambiguous.
+   * `deleted` is set when the row was soft-deleted (its status then reads "closed"),
+   * with `deleted_from` saying whether it was open or closed when deleted.
+   */
+  get(id: string): Promise<(SynthTrade & { deleted?: boolean; deleted_from?: "open" | "closed" }) | null>;
   /** "duplicate" when the underlying already has an open position. */
   insertOpen(trade: SynthTrade): Promise<"ok" | "duplicate">;
   /** Atomic open → closed. False when it was not open (already closed elsewhere). */
   close(trade: SynthTrade): Promise<boolean>;
+  /** Record a trade's margin figure. The only writer of the margin fields. */
+  setMargin(id: string, patch: SynthMarginPatch): Promise<void>;
+  /**
+   * Soft-delete a trade whose status is still `from`. False when it no longer is
+   * (closed or deleted in between). The row is kept as an audit record.
+   */
+  markDeleted(
+    id: string,
+    from: "open" | "closed",
+    audit: { reason: string | null; actor: string; at: number },
+  ): Promise<boolean>;
   loadOpen(): Promise<SynthTrade[]>;
   loadClosed(opts: { limit: number; sinceDay?: string }): Promise<SynthTrade[]>;
+}
+
+/** The margin fields of a trade, written together. */
+export interface SynthMarginPatch {
+  margin: number | null;
+  margin_source: SynthMarginSource | null;
+  margin_hedge_benefit: number | null;
+  margin_at: number | null;
+  margin_error: string | null;
 }
 
 /** How Box is using the shared lane right now. */
@@ -116,6 +144,11 @@ export interface SyntheticEngineDeps {
   /** Declare this scanner's ENTIRE token set (one diff on the Box lane). */
   setTokens: (tokens: number[]) => void;
   store: SynthTradeStore;
+  /**
+   * The ACTIVE broker's basket-margin calculator (the same one Box uses). Without it
+   * trades carry no margin figure.
+   */
+  margins?: BoxMarginProvider;
   /** Box's use of the lane. Without it the budget is fixed at SYNTH_MAX_TOKENS. */
   boxLane?: () => BoxLaneUsage;
   /**
@@ -157,9 +190,10 @@ export interface SynthChainSide {
 }
 
 /** A trade as the API returns it: ISO times instead of epoch ms. */
-export type SynthTradeView = Omit<SynthTrade, "opened_at" | "closed_at"> & {
+export type SynthTradeView = Omit<SynthTrade, "opened_at" | "closed_at" | "margin_at"> & {
   opened_at: string;
   closed_at: string | null;
+  margin_at: string | null;
 };
 
 /** An open position with its live marks, as the Open tab renders it. */
@@ -193,6 +227,11 @@ const CLOSE_RETRY_MS = 5_000;
 const LOAD_RETRY_MS = 30_000;
 /** Unlinked positions are re-resolved this often (instrument dump only, no REST). */
 const RELINK_RETRY_MS = 10_000;
+/** Attempts per margin capture, with a growing pause between them. */
+const MARGIN_ATTEMPTS = 3;
+/** Open positions still lacking margin are retried this often, a few times at most. */
+const MARGIN_BACKFILL_MS = 60_000;
+const MAX_MARGIN_BACKFILLS = 3;
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -202,12 +241,24 @@ function iso(ms: number): string {
   return new Date(ms).toISOString();
 }
 
+/** The margin fields of a trade, to copy between records of the same trade. */
+function marginOf(t: SynthTrade): SynthMarginPatch {
+  return {
+    margin: t.margin,
+    margin_source: t.margin_source,
+    margin_hedge_benefit: t.margin_hedge_benefit,
+    margin_at: t.margin_at,
+    margin_error: t.margin_error,
+  };
+}
+
 export function toTradeView(t: SynthTrade): SynthTradeView {
   return {
     ...t,
     legs: t.legs.map((l) => ({ ...l })),
     opened_at: iso(t.opened_at),
     closed_at: t.closed_at === null ? null : iso(t.closed_at),
+    margin_at: t.margin_at === null ? null : iso(t.margin_at),
   };
 }
 
@@ -283,6 +334,11 @@ export class SyntheticEngine {
   private exitSig = new Map<string, string>();
   /** Ids this process has closed, so an in-flight load can never re-adopt one. */
   private closedIds = new Set<string>();
+  /** Ids deleted by this process, so no in-flight load or late write can bring one back. */
+  private deletedIds = new Set<string>();
+  private marginInFlight = new Set<string>();
+  private marginBackfills = new Map<string, number>();
+  private lastMarginSweepAt = 0;
   private relinking = false;
   private lastRelinkAt = 0;
   private pendingEntries = new Set<string>();
@@ -350,7 +406,8 @@ export class SyntheticEngine {
     const today = this.deps.istDayKey();
     const closed = await this.deps.store.loadClosed({ limit: 2000, sinceDay: today });
     const known = new Set(this.closedToday.map((t) => t.id));
-    this.closedToday = [...this.closedToday, ...closed.filter((t) => !known.has(t.id))].sort(
+    const fresh = closed.filter((t) => !known.has(t.id) && !this.deletedIds.has(t.id));
+    this.closedToday = [...this.closedToday, ...fresh].sort(
       (a, b) => (b.closed_at ?? 0) - (a.closed_at ?? 0),
     );
     this.closedDay = today;
@@ -369,6 +426,7 @@ export class SyntheticEngine {
     let added = 0;
     for (const t of rows) {
       if (t.status !== "open" || this.positions.has(t.id) || this.closedIds.has(t.id)) continue;
+      if (this.deletedIds.has(t.id)) continue;
       this.positions.set(t.id, t);
       this.unlinked.add(t.id);
       added++;
@@ -905,6 +963,7 @@ export class SyntheticEngine {
       if (this.lastMarketOpen === true && !marketOpen) this.closeViewPending = true;
       this.lastMarketOpen = marketOpen;
       this.maybeRefreshUniverse(now);
+      this.backfillMargins(now);
       if (this.active() && !this.namespaceStale) this.fitToBudget(this.tokenBudget());
       this.evaluate(now, marketOpen);
       this.monitorPositions(now, marketOpen);
@@ -921,8 +980,9 @@ export class SyntheticEngine {
     if (today === this.closedDay) return;
     this.closedDay = today;
     this.closedToday = this.closedToday.filter((t) => t.closed_day === today);
-    // Only needed while a load could still return a row closed moments ago.
+    // Only needed while a load could still return a row closed or deleted moments ago.
     this.closedIds.clear();
+    this.deletedIds.clear();
   }
 
   private maybeRefreshUniverse(now: number): void {
@@ -1179,6 +1239,8 @@ export class SyntheticEngine {
         day: this.deps.istDayKey(now),
         optionRateVersion: this.cfg.optionRates.rateVersion,
         futuresRateVersion: this.cfg.futuresRates.rateVersion,
+        // Same instant as the pricing above: the book each limit order was filled against.
+        depthFor: (token) => this.depthFor(token),
       });
       if (!trade) return;
       const res = await this.deps.store.insertOpen(trade);
@@ -1205,6 +1267,8 @@ export class SyntheticEngine {
       this.broadcast("entry", { trade: toTradeView(trade) });
       this.refreshRows();
       this.publish();
+      // Off the fill path: the trade already exists, margin is enrichment.
+      void this.captureMargin(trade.id);
     } catch (err) {
       this.cooldownUntil.set(u, Date.now() + this.cfg.reentryCooldownMs);
       this.lastError = `Paper entry on ${u} failed: ${message(err)}`;
@@ -1242,7 +1306,7 @@ export class SyntheticEngine {
       const streak = this.exitStreak.get(t.id) ?? 0;
       if (!marketOpen || !feedOk || !linked || !m.should_exit || m.reason === null) continue;
       if (m.reason !== "EXPIRY_SAFETY" && streak < this.cfg.signalConfirmations) continue;
-      const closed = closeTradeAtTouch(t, m, m.reason, now, today);
+      const closed = closeTradeAtTouch(t, m, m.reason, now, today, (tok) => this.depthFor(tok));
       if (closed) void this.finalize(t, closed);
     }
   }
@@ -1295,6 +1359,7 @@ export class SyntheticEngine {
         const stored = await this.deps.store.get(open.id).catch(() => null);
         if (
           stored &&
+          !stored.deleted &&
           stored.status === "closed" &&
           stored.closed_day === this.closedDay &&
           !this.closedToday.some((c) => c.id === stored.id)
@@ -1303,6 +1368,9 @@ export class SyntheticEngine {
         }
         return { ok: false, error: "This position was already closed." };
       }
+      // A margin figure may have landed on the open record while the close was in
+      // flight (the store keeps margin out of closes, so the database has it too).
+      if (closed.margin === null && open.margin !== null) Object.assign(closed, marginOf(open));
       if (closed.closed_day === this.closedDay) this.closedToday.unshift(closed);
       this.applySubscriptions();
       console.log(
@@ -1323,6 +1391,275 @@ export class SyntheticEngine {
     } finally {
       this.closing.delete(open.id);
     }
+  }
+
+  /** The top of a token's current book, as evidence of what a fill was priced on. */
+  private depthFor(token: number): SynthDepth | null {
+    return depthOf(this.quotes.get(token));
+  }
+
+  /* -------------------------------- margin -------------------------------- */
+
+  /**
+   * Ask the active broker what the trade's three legs block TOGETHER, and store it.
+   *
+   * One basket request with the real sides, so the hedge between the future and the
+   * option pair is recognised; margining the legs one by one would overstate it.
+   * Only for trades opened on the ACTIVE broker: their stored tradingsymbols are in
+   * that broker's naming. Best-effort, retried, and never on the fill path.
+   */
+  private async captureMargin(id: string): Promise<void> {
+    const provider = this.deps.margins;
+    if (!provider || this.marginInFlight.has(id)) return;
+    const t = this.positions.get(id);
+    if (!t || t.margin !== null) return;
+    if (t.broker !== this.deps.activeBroker() || !this.deps.marketData.isAuthenticated()) return;
+    this.marginInFlight.add(id);
+    const orders = synthMarginOrders(t);
+    let lastError = "no response";
+    try {
+      for (let attempt = 1; attempt <= MARGIN_ATTEMPTS; attempt++) {
+        // Deleted meanwhile: nothing left to enrich.
+        if (this.deletedIds.has(id)) return;
+        try {
+          // STANDALONE basket: a paper trade must not be netted against whatever real
+          // positions the broker account holds, which could shrink the figure.
+          const res = await provider.basketMargin(orders, { considerPositions: false });
+          if (res.source === "unavailable" || !Number.isFinite(res.total)) {
+            throw new Error("the broker's margin calculator returned no figure");
+          }
+          const patch: SynthMarginPatch = {
+            // A hedged basket can legitimately need little margin: accept a small figure.
+            margin: Math.max(0, Math.round(res.total)),
+            margin_source: res.source,
+            margin_hedge_benefit:
+              typeof res.hedge_benefit === "number" && Number.isFinite(res.hedge_benefit)
+                ? Math.round(res.hedge_benefit)
+                : null,
+            margin_at: Date.now(),
+            margin_error: null,
+          };
+          if (res.source === "dhan_per_leg_fallback") {
+            console.warn(
+              `[Synthetic] margin for ${t.underlying} is a PER-LEG SUM (₹${patch.margin}), not a ` +
+                "netted basket figure: it OVERSTATES a hedged conversion/reversal.",
+            );
+          }
+          if (this.deletedIds.has(id)) return;
+          this.applyMargin(id, patch);
+          await this.deps.store.setMargin(id, patch).catch((err) => {
+            console.warn(`[Synthetic] storing margin for ${t.underlying} failed:`, err);
+          });
+          this.publish();
+          return;
+        } catch (err) {
+          lastError = message(err);
+          if (attempt < MARGIN_ATTEMPTS) await new Promise((r) => setTimeout(r, 1500 * attempt));
+        }
+      }
+      console.warn(`[Synthetic] basket margin for ${t.underlying} unavailable: ${lastError}`);
+      if (this.deletedIds.has(id)) return;
+      // Stored too, so the reason survives a restart and shows on the closed row.
+      const failed: SynthMarginPatch = { ...marginOf(t), margin: null, margin_error: lastError };
+      this.applyMargin(id, failed);
+      await this.deps.store.setMargin(id, failed).catch(() => undefined);
+      this.publish();
+    } finally {
+      this.marginInFlight.delete(id);
+    }
+  }
+
+  /** Patch margin onto whichever in-memory copy of the trade exists. */
+  private applyMargin(id: string, patch: SynthMarginPatch): void {
+    const open = this.positions.get(id);
+    if (open) Object.assign(open, patch);
+    const closed = this.closedToday.find((c) => c.id === id);
+    if (closed) Object.assign(closed, patch);
+  }
+
+  /**
+   * Retry margin for open positions that still lack it: adopted after a restart,
+   * opened while the session was down, or whose capture failed. A few rounds each.
+   */
+  private backfillMargins(now: number): void {
+    if (!this.deps.margins || now - this.lastMarginSweepAt < MARGIN_BACKFILL_MS) return;
+    this.lastMarginSweepAt = now;
+    const active = this.deps.activeBroker();
+    const authed = this.deps.marketData.isAuthenticated();
+    for (const t of this.positions.values()) {
+      if (t.margin !== null || this.marginInFlight.has(t.id)) continue;
+      if (t.broker !== active) {
+        // Its tradingsymbols use the other broker's naming, so it is not re-margined here.
+        // Say so, rather than showing "fetching…" for ever.
+        t.margin_error ??= `Opened on ${t.broker}; margin is only asked from the broker a trade was opened on.`;
+        continue;
+      }
+      // Session down (or mid-switch): nothing would be asked, so it is not a round.
+      if (!authed || this.namespaceStale) continue;
+      const tries = this.marginBackfills.get(t.id) ?? 0;
+      if (tries >= MAX_MARGIN_BACKFILLS) continue;
+      this.marginBackfills.set(t.id, tries + 1);
+      void this.captureMargin(t.id);
+    }
+  }
+
+  /* -------------------------------- delete -------------------------------- */
+
+  /**
+   * Delete a PAPER trade, open or closed, from every list and P&L figure.
+   *
+   * A soft delete: the row stays in `synth_trades` as `status: "deleted"` with the
+   * admin role, when and why. An open position stops being monitored and its tokens
+   * are released; its underlying then waits out the re-entry cooldown, so the scanner
+   * does not immediately open the same trade again.
+   *
+   * `expected` is the status the operator SAW when they confirmed. A position that
+   * closed while the confirmation was open is refused (409) rather than deleted along
+   * with the realised P&L it just booked.
+   *
+   * Safe to retry: a delete whose write landed but whose answer was lost is
+   * reconciled from the stored row, so the retry succeeds instead of leaving a
+   * position that is deleted in the database but still monitored here.
+   */
+  async deleteTrade(
+    id: string,
+    opts: { reason: string | null; actor: string; expected?: "open" | "closed" },
+  ): Promise<
+    | { ok: true; from: "open" | "closed"; already: boolean }
+    | { ok: false; status: number; error: string }
+  > {
+    if (!this.deps.store.enabled()) {
+      return { ok: false, status: 503, error: "Paper-trade storage is not connected." };
+    }
+    const audit = { reason: opts.reason, actor: opts.actor, at: Date.now() };
+
+    const open = this.positions.get(id);
+    if (open) {
+      if (opts.expected === "closed") {
+        return { ok: false, status: 409, error: "This trade is open, not closed. Reload the page and try again." };
+      }
+      if (this.closing.has(id)) {
+        return {
+          ok: false,
+          status: 409,
+          error: "This position is being closed right now. Wait for the exit, then delete it.",
+        };
+      }
+      // Hold it like a close, so the monitor cannot exit it while the delete is in flight.
+      this.closing.add(id);
+      let outcome: "deleted" | "open" | "closed" | "missing";
+      try {
+        outcome = await this.markDeletedReconciled(id, "open", audit);
+        if (outcome === "deleted") this.forgetOpen(open);
+      } finally {
+        this.closing.delete(id);
+      }
+      if (outcome === "closed") {
+        return {
+          ok: false,
+          status: 409,
+          error:
+            "This position closed while the delete was in flight. Nothing was deleted: it is " +
+            "under Closed trades now, and can be deleted there.",
+        };
+      }
+      if (outcome !== "deleted") return { ok: false, status: 409, error: "The trade could not be deleted." };
+      this.afterDelete(id, open, "open", opts.reason);
+      return { ok: true, from: "open", already: false };
+    }
+
+    const stored = await this.deps.store.get(id);
+    if (!stored) return { ok: false, status: 404, error: "No such paper trade." };
+    if (stored.deleted) {
+      // Already deleted, e.g. by an earlier attempt whose answer was lost, or elsewhere.
+      // Make memory agree and report success, so retrying a delete is safe.
+      const listed = this.forgetClosed(id);
+      if (listed) this.afterDelete(id, stored, "closed", opts.reason);
+      return { ok: true, from: stored.deleted_from ?? "closed", already: true };
+    }
+    if (stored.status === "open") {
+      // Open in the store but not in this process: another process is managing it.
+      return {
+        ok: false,
+        status: 409,
+        error: "This position is open but not managed by this server process; it cannot be deleted here.",
+      };
+    }
+    if (opts.expected === "open") {
+      return {
+        ok: false,
+        status: 409,
+        error:
+          `This position closed while the confirmation was open (${stored.exit_reason ?? "closed"}, ` +
+          `net ₹${Math.round(stored.net_pnl ?? 0).toLocaleString("en-IN")} after charges). Nothing was ` +
+          "deleted: it is under Closed trades now, and can be deleted there if you still want to.",
+      };
+    }
+    const outcome = await this.markDeletedReconciled(id, "closed", audit);
+    if (outcome !== "deleted") return { ok: false, status: 409, error: "The trade could not be deleted." };
+    this.forgetClosed(id);
+    this.afterDelete(id, stored, "closed", opts.reason);
+    return { ok: true, from: "closed", already: false };
+  }
+
+  /**
+   * Soft-delete, and when the write fails or matches nothing, read the row back to
+   * learn what really happened: an acknowledgement can be lost after the write landed.
+   */
+  private async markDeletedReconciled(
+    id: string,
+    from: "open" | "closed",
+    audit: { reason: string | null; actor: string; at: number },
+  ): Promise<"deleted" | "open" | "closed" | "missing"> {
+    let writeError: unknown = null;
+    try {
+      if (await this.deps.store.markDeleted(id, from, audit)) return "deleted";
+    } catch (err) {
+      writeError = err;
+    }
+    let stored: Awaited<ReturnType<SynthTradeStore["get"]>>;
+    try {
+      stored = await this.deps.store.get(id);
+    } catch (err) {
+      throw writeError ?? err;
+    }
+    if (stored?.deleted) return "deleted";
+    if (writeError) throw writeError;
+    return stored ? stored.status : "missing";
+  }
+
+  /** Drop a deleted open position from memory and release its legs. */
+  private forgetOpen(t: SynthTrade): void {
+    const id = t.id;
+    this.deletedIds.add(id);
+    this.closedIds.add(id);
+    this.positions.delete(id);
+    this.metrics.delete(id);
+    this.exitStreak.delete(id);
+    this.exitSig.delete(id);
+    this.retryAt.delete(id);
+    this.unlinked.delete(id);
+    this.marginBackfills.delete(id);
+    this.cooldownUntil.set(t.underlying, Date.now() + this.cfg.reentryCooldownMs);
+    this.applySubscriptions();
+  }
+
+  /** Drop a deleted closed trade from today's list. True when it was listed. */
+  private forgetClosed(id: string): boolean {
+    this.deletedIds.add(id);
+    const before = this.closedToday.length;
+    this.closedToday = this.closedToday.filter((c) => c.id !== id);
+    return this.closedToday.length !== before;
+  }
+
+  private afterDelete(id: string, t: SynthTrade, from: "open" | "closed", reason: string | null): void {
+    console.log(
+      `[Synthetic] paper trade DELETED (${from}) ${t.direction} ${t.underlying} K=${t.strike}` +
+        (reason ? ` — ${reason}` : ""),
+    );
+    this.broadcast("trade_deleted", { id, from });
+    this.refreshRows();
+    this.publish();
   }
 
   /** Close an open paper position now, at the executable touch. */
@@ -1350,7 +1687,7 @@ export class SyntheticEngine {
     const today = this.deps.istDayKey(now);
     const m = this.priceExit(t, now, today, marketOpen, true);
     this.metrics.set(id, m);
-    const closed = closeTradeAtTouch(t, m, "MANUAL", now, today);
+    const closed = closeTradeAtTouch(t, m, "MANUAL", now, today, (tok) => this.depthFor(tok));
     if (!closed) {
       const thin = m.legs
         .filter((l) => !l.executable)
@@ -1358,9 +1695,11 @@ export class SyntheticEngine {
           `${l.tradingsymbol} (${
             l.price === null
               ? `no ${l.side === "BUY" ? "ask" : "bid"}`
-              : !l.fresh
-                ? "stale book"
-                : "under one lot at the touch"
+              : l.reject === "crossed_book"
+                ? "crossed book: best bid ≥ best ask"
+                : !l.fresh
+                  ? "stale book"
+                  : "under one lot at the touch"
           })`,
         );
       return {
@@ -1481,6 +1820,7 @@ export class SyntheticEngine {
           mtm_ltp: m?.mtm_ltp ?? null,
           gross_pnl: m?.gross_pnl ?? null,
           net_pnl: m?.net_pnl ?? null,
+          margin: t.margin,
         };
       }),
       closedToday: this.closedToday,
@@ -1535,6 +1875,8 @@ export class SyntheticEngine {
       opportunity_count: this.opportunities.length,
       open_count: this.positions.size,
       max_open_positions: this.cfg.maxOpenPositions,
+      /** Whether trades get a margin figure (a basket-margin calculator is wired). */
+      margin_enabled: this.deps.margins !== undefined,
       unlinked_positions: [...this.positions.keys()].filter((id) => this.unlinked.has(id)).length,
       day_pnl: this.dayPnl(),
       rf_pct: this.rfPct(),
