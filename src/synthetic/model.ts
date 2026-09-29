@@ -141,3 +141,29 @@ const synthTradeSchema = new mongoose.Schema<ISynthTrade>(
 export const SynthTradeModel: mongoose.Model<ISynthTrade> = boxConnection
   ? boxConnection.model<ISynthTrade>("SynthTrade", synthTradeSchema)
   : mongoose.model<ISynthTrade>("SynthTrade", synthTradeSchema);
+
+/**
+ * Admin-controlled synthetic settings (collection: `synth_settings`), one row per
+ * setting, `{ _id: key, value }`, the same layout as `box_settings`. The env var is
+ * the DEFAULT: a saved value overrides it at boot, and deleting the row restores it.
+ */
+export interface ISynthSetting {
+  /** The setting key, e.g. "max_open_positions". */
+  _id: string;
+  value: number;
+  updated_at: Date;
+}
+
+const synthSettingSchema = new mongoose.Schema<ISynthSetting>(
+  {
+    _id: { type: String },
+    value: { type: Number, required: true },
+    updated_at: { type: Date, default: () => new Date() },
+  },
+  // Only the built-in `_id` index is needed.
+  { collection: "synth_settings", autoIndex: false },
+);
+
+export const SynthSettingModel: mongoose.Model<ISynthSetting> = boxConnection
+  ? boxConnection.model<ISynthSetting>("SynthSetting", synthSettingSchema)
+  : mongoose.model<ISynthSetting>("SynthSetting", synthSettingSchema);

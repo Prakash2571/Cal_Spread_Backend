@@ -42,9 +42,13 @@ can send a real order.
   over NEW books (default 2). A confirmation needs a leg's book version to change, so
   a quiet tick or a settings change confirms nothing, and one flickering book cannot
   open a position;
-- at most one open position per underlying (also enforced by a unique Mongo index), at
-  most `SYNTH_MAX_OPEN_POSITIONS` in total, and `SYNTH_REENTRY_COOLDOWN_MS` after an
-  underlying's last close;
+- at most one open position per underlying (also enforced by a unique Mongo index), and
+  `SYNTH_REENTRY_COOLDOWN_MS` after an underlying's last close;
+- at most **max open trades** in total. It is set on the page (any whole number, `0` = no
+  limit, the default) and saved. Lowering it never closes a position; it only stops new
+  entries;
+- room in the token budget for the new position's three legs. Open legs are never dropped,
+  so this only binds when `SYNTH_MAX_TOKENS` is set very low (`token_budget`);
 - no entries on expiry day inside the expiry-safety window;
 - filled at exactly the touch it was priced at (BUY at ask, SELL at bid), one lot.
 
@@ -169,8 +173,14 @@ are paused with `paper_blocked_reason: "unsafe_index"`, while open positions are
 monitored and closed. Closing is a single `$set` guarded on `status: "open"`, so two
 racing closes can never both land. A close that loses that race, or an insert rejected as
 a duplicate, is reconciled with the stored row. Without MongoDB the scanner still detects,
-but it does not paper-trade (`paper_blocked_reason: "no_db"`), like Box. Runtime threshold
-changes last until restart.
+but it does not paper-trade (`paper_blocked_reason: "no_db"`), like Box.
+
+Settings (`synth_settings`, Box connection, one row per key like `box_settings`): the
+entry gate, safety buffer and max open trades. They are changed on the page and saved in
+one write. If the save fails, the change is rolled back and reported (503). A saved value
+overrides the env default at boot, and paper entries wait until saved settings are loaded.
+With storage down, a change applies to the running process only (`persisted: false`) and
+is saved once storage connects; it is not overwritten by older saved values.
 
 ## API (admin token required, `x-admin-token`)
 
@@ -179,7 +189,7 @@ changes last until restart.
 | GET | `/api/synthetic/status` | |
 | POST | `/api/synthetic/start` · `/stop` | |
 | POST | `/api/synthetic/strike-level` | `{ level: 1\|2\|3 }` |
-| POST | `/api/synthetic/settings` | `{ min_expected_net_profit?, safety_buffer? }` |
+| POST | `/api/synthetic/settings` | `{ min_expected_net_profit?, safety_buffer?, max_open_positions? }` (0 = no limit) → `{ persisted, status }`; saved |
 | GET | `/api/synthetic/opportunities` | `?limit=` |
 | GET | `/api/synthetic/trades/open` | → `{ db_enabled, open }` with live marks |
 | GET | `/api/synthetic/trades/history` | `?scope=today\|all&limit=` → `{ db_enabled, scope, trades }` |

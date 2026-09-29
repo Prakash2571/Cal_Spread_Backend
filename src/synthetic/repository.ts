@@ -18,9 +18,15 @@
 
 import mongoose from "mongoose";
 import { isBoxConnectionReady } from "../db.js";
+import { SYNTH_SETTING_KEYS, type SynthSettingKey, type SynthSettings } from "./config.js";
 import type { SynthMarginPatch, SynthTradeStore } from "./engine.js";
 import type { SynthTrade } from "./math.js";
-import { SynthTradeModel, type ISynthTrade } from "./model.js";
+import {
+  SynthSettingModel,
+  SynthTradeModel,
+  type ISynthSetting,
+  type ISynthTrade,
+} from "./model.js";
 
 /** Mongo duplicate-key error code. */
 const DUPLICATE_KEY = 11000;
@@ -236,6 +242,35 @@ export const mongoSynthTradeStore: SynthTradeStore = {
       .sort({ opened_at: 1 })
       .lean<SynthTradeRecord[]>();
     return rows.map(fromRecord);
+  },
+
+  /** The saved settings (raw, validated by the engine). Keys never saved are absent. */
+  async loadSettings(): Promise<Partial<Record<SynthSettingKey, number>>> {
+    const rows = await SynthSettingModel.find().lean<ISynthSetting[]>();
+    const out: Partial<Record<SynthSettingKey, number>> = {};
+    for (const row of rows) {
+      const key = SYNTH_SETTING_KEYS.find((k) => k === row._id);
+      if (key && typeof row.value === "number" && Number.isFinite(row.value)) out[key] = row.value;
+    }
+    return out;
+  },
+
+  /**
+   * Save every setting in ONE command. Throws on failure: the admin is told the value
+   * was saved, so a silent failure would show a setting that reverts on restart.
+   */
+  async saveSettings(values: SynthSettings): Promise<void> {
+    const now = new Date();
+    await SynthSettingModel.bulkWrite(
+      SYNTH_SETTING_KEYS.map((key) => ({
+        updateOne: {
+          filter: { _id: key },
+          update: { $set: { value: values[key], updated_at: now } },
+          upsert: true,
+        },
+      })),
+      { ordered: false },
+    );
   },
 
   async loadClosed(opts: { limit: number; sinceDay?: string }): Promise<SynthTrade[]> {

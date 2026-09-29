@@ -210,6 +210,7 @@ spread). Collection names are contract — a Go rewrite must read/write the same
 | `box_execution_attempts` | `src/box/model.ts` | one row per execution attempt | `resolved`, `resolved_at`, `broker` |
 | `box_daily_pnl` | `src/box/model.ts` | per-day realised P&L | unique `{day, trade_id}` |
 | `synth_trades` | `src/synthetic/model.ts` | synthetic-futures PAPER trades, open + closed + soft-deleted (box connection) | `status` (`open`/`closed`/`deleted`), `underlying`, `expiry`, `legs`, `margin`, unique open-per-underlying index |
+| `synth_settings` | `src/synthetic/model.ts` | admin synthetic settings (entry gate, safety buffer, max open trades) | `_id` (setting key), `value` |
 | `trades` | `src/db.ts` | calendar trades | `symbol`, `status` |
 | `trade_log` | `src/db.ts` | charges/P&L ledger | `trade_id`, `at` |
 | `kite_session`, `dhan_session` | `src/db.ts` | broker sessions (single-doc) | `access_token`, `expiry_time`, `login_date` |

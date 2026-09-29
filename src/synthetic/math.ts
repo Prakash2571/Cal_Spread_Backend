@@ -149,6 +149,8 @@ export type SynthEntryBlock =
   | "cooldown"
   | "expiry_cutoff"
   | "max_open"
+  /** No room in the token budget for another position's three legs. */
+  | "token_budget"
   | "confirming";
 
 export interface SynthLegEvaluation {
