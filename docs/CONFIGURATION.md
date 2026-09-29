@@ -533,8 +533,8 @@ Paper only: nothing here can send a real order. See `docs/SYNTHETIC_FUTURES_ARBI
 | Variable | Default | Meaning |
 |---|---|---|
 | `SYNTH_STRIKE_LEVEL` | `3` | Strikes each side of ATM used for the synthetic (1, 2 or 3). Changeable at runtime. |
-| `SYNTH_MIN_EXPECTED_NET_PROFIT` | `500` | ₹ per lot after every cost for ELIGIBLE. Runtime-tunable (in memory). |
-| `SYNTH_SAFETY_BUFFER` | `100` | ₹ held back inside expected net. Runtime-tunable (in memory). |
+| `SYNTH_MIN_EXPECTED_NET_PROFIT` | `500` | ₹ per lot after every cost for ELIGIBLE. Default only: set on the page, saved in `synth_settings`. |
+| `SYNTH_SAFETY_BUFFER` | `100` | ₹ held back inside expected net. Default only: set on the page, saved in `synth_settings`. |
 | `SYNTH_EXPECTED_SLIPPAGE` | `0` | ₹ round-trip slippage allowance, all three legs. |
 | `SYNTH_INCLUDE_CARRY` | `true` | Finance the net option premium to expiry at the admin rf (`POST /api/rf`). |
 | `SYNTH_DEFAULT_RF_PCT` | `0` | rf used when the admin has not set one. |
@@ -546,7 +546,7 @@ Paper only: nothing here can send a real order. See `docs/SYNTHETIC_FUTURES_ARBI
 | `SYNTH_MAX_UNDERLYINGS` | `0` | Cap on underlyings (0 = token budget only). |
 | `SYNTH_MAX_PUBLISHED_OPPORTUNITIES` | `150` | Rows per SSE snapshot (ELIGIBLE/OPEN first, then the best per underlying). All rows are still evaluated. |
 | `SYNTH_PAPER_TRADING` | `true` | Auto paper-enter ELIGIBLE opportunities while RUN is on. Needs MongoDB (`synth_trades`). |
-| `SYNTH_MAX_OPEN_POSITIONS` | `10` | Open paper positions at most (and never two on one underlying). |
+| `SYNTH_MAX_OPEN_POSITIONS` | `0` | Open paper positions at most; `0` = no limit. Never two on one underlying, whatever this is. Default only: set on the page (any whole number), saved in `synth_settings`. |
 | `SYNTH_SIGNAL_CONFIRMATIONS` | `2` | Consecutive evaluations over NEW books (a leg's book must have changed) an entry or rule exit must hold before it is acted on. |
 | `SYNTH_REENTRY_COOLDOWN_MS` | `60000` | Wait after an underlying's position closes before re-entering it. |
 | `SYNTH_CONVERGENCE_FLOOR` / `SYNTH_CONVERGENCE_PCT` | `100` / `0.2` | EDGE_CONVERGED when remaining edge ≤ max(floor, pct × entry net edge). |

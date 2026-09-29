@@ -37,10 +37,14 @@ import type { BrokerId } from "../brokers/types.js";
 import type { BoxMarginProvider, BoxMarketDataProvider } from "../box/brokerContext.js";
 import { BoxQuoteStore } from "../box/quotes.js";
 import {
+  SYNTH_SETTING_KEYS,
   SYNTH_TUNING_LIMITS,
   clampSynthStrikeLevel,
   loadSynthConfig,
+  parseSynthSetting,
   type SynthConfig,
+  type SynthSettingKey,
+  type SynthSettings,
   type SynthStrikeLevel,
 } from "./config.js";
 import {
@@ -110,6 +114,10 @@ export interface SynthTradeStore {
   ): Promise<boolean>;
   loadOpen(): Promise<SynthTrade[]>;
   loadClosed(opts: { limit: number; sinceDay?: string }): Promise<SynthTrade[]>;
+  /** Saved runtime settings (unvalidated). Keys never saved are absent. */
+  loadSettings(): Promise<Partial<Record<SynthSettingKey, number>>>;
+  /** Save every runtime setting at once. Throws on failure. */
+  saveSettings(values: SynthSettings): Promise<void>;
 }
 
 /** The margin fields of a trade, written together. */
@@ -285,6 +293,18 @@ export class SyntheticEngine {
   private strikeLevel: SynthStrikeLevel;
   private minExpectedNetProfit: number;
   private safetyBuffer: number;
+  /** Open paper positions at most; 0 = no limit. Runtime-tunable and saved. */
+  private maxOpenPositions: number;
+  /** Saved settings have been read and applied (entries wait for this). */
+  private settingsLoaded = false;
+  /** Changed here while storage was unavailable: saved when it connects. */
+  private settingsDirty = false;
+  /**
+   * Settings loads and saves run one at a time, in order, so a slow boot-time load
+   * can never overwrite a newer admin change and a failed save can never make the
+   * load skip the stored values.
+   */
+  private settingsLock: Promise<void> = Promise.resolve();
 
   /* ------------------------------- universe ------------------------------- */
   private board = new Map<string, SynthBoardItem>();
@@ -358,6 +378,7 @@ export class SyntheticEngine {
     this.strikeLevel = this.cfg.strikeLevel;
     this.minExpectedNetProfit = this.cfg.minExpectedNetProfit;
     this.safetyBuffer = this.cfg.safetyBuffer;
+    this.maxOpenPositions = this.cfg.maxOpenPositions;
     this.closedDay = deps.istDayKey();
   }
 
@@ -382,11 +403,14 @@ export class SyntheticEngine {
    * index never leaves an open position unmanaged.
    */
   private async loadFromStore(): Promise<void> {
-    if (this.loading || (this.loaded && this.indexReady)) return;
+    if (this.loading || this.storeReady()) return;
     this.lastLoadAttemptAt = Date.now();
     if (!this.deps.store.enabled()) return;
     this.loading = true;
     try {
+      // Settings first: an entry must never be taken under the env defaults when the
+      // operator has saved different ones (e.g. a lower max open, a higher gate).
+      if (!this.settingsLoaded) await this.loadSettings();
       if (!this.loaded) await this.loadTrades();
       if (!this.indexReady) {
         await this.deps.store.ensureReady?.();
@@ -398,6 +422,84 @@ export class SyntheticEngine {
     } finally {
       this.loading = false;
     }
+  }
+
+  /** Settings, trades and the uniqueness index are all ready: entries may proceed. */
+  private storeReady(): boolean {
+    return this.settingsLoaded && this.loaded && this.indexReady;
+  }
+
+  /** Run settings work after any already queued, never interleaved with it. */
+  private withSettingsLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.settingsLock.then(fn, fn);
+    this.settingsLock = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /**
+   * Apply the saved settings over the env defaults. A change the admin made while
+   * storage was down is newer and wins; it is saved now instead.
+   */
+  private loadSettings(): Promise<void> {
+    return this.withSettingsLock(() => this.loadSettingsNow());
+  }
+
+  private async loadSettingsNow(): Promise<void> {
+    if (this.settingsLoaded) return;
+    const stored = await this.deps.store.loadSettings();
+    if (!this.settingsDirty) {
+      const next = this.settingsSnapshot();
+      const applied: string[] = [];
+      for (const key of SYNTH_SETTING_KEYS) {
+        const raw = stored[key];
+        if (raw === undefined) continue;
+        const r = parseSynthSetting(key, raw);
+        if (r.ok) {
+          next[key] = r.value;
+          applied.push(`${key}=${r.value}`);
+        } else {
+          console.warn(`[Synthetic] ignoring saved ${key}: ${r.error}`);
+        }
+      }
+      this.applySettings(next);
+      if (applied.length > 0) console.log(`[Synthetic] applied saved settings: ${applied.join(", ")}`);
+    }
+    if (this.settingsDirty) {
+      await this.deps.store.saveSettings(this.settingsSnapshot());
+      this.settingsDirty = false;
+    }
+    this.settingsLoaded = true;
+  }
+
+  private settingsSnapshot(): SynthSettings {
+    return {
+      min_expected_net_profit: this.minExpectedNetProfit,
+      safety_buffer: this.safetyBuffer,
+      max_open_positions: this.maxOpenPositions,
+    };
+  }
+
+  private applySettings(v: SynthSettings): void {
+    this.minExpectedNetProfit = v.min_expected_net_profit;
+    this.safetyBuffer = v.safety_buffer;
+    this.maxOpenPositions = v.max_open_positions;
+  }
+
+  /** True when another position may be opened under the max-open setting (0 = no limit). */
+  private underMaxOpen(): boolean {
+    return this.maxOpenPositions <= 0 || this.positions.size + this.pendingEntries.size < this.maxOpenPositions;
+  }
+
+  /**
+   * True when the token budget can carry one more position's three legs. Open legs
+   * are never dropped, so a position may only be opened while they fit (only binds
+   * when SYNTH_MAX_TOKENS is set very low).
+   */
+  private roomForAnotherPosition(budget: number): boolean {
+    return (this.positions.size + this.pendingEntries.size + 1) * POSITION_TOKENS <= budget;
   }
 
   private async loadTrades(): Promise<void> {
@@ -570,32 +672,63 @@ export class SyntheticEngine {
     return { ok: true };
   }
 
-  updateSettings(body: {
-    min_expected_net_profit?: unknown;
-    safety_buffer?: unknown;
-  }): { ok: true } | { ok: false; error: string } {
-    const next = { min: this.minExpectedNetProfit, buf: this.safetyBuffer };
-    if (body.min_expected_net_profit !== undefined) {
-      const v = Number(body.min_expected_net_profit);
-      const lim = SYNTH_TUNING_LIMITS.min_expected_net_profit;
-      if (!Number.isFinite(v) || v < lim.min || v > lim.max) {
-        return { ok: false, error: `min_expected_net_profit must be ${lim.min}..${lim.max}` };
-      }
-      next.min = v;
+  /**
+   * ADMIN: change the entry gate, the safety buffer and/or the max open positions
+   * (0 = no limit). Takes effect on the next evaluation and is SAVED, so it survives a
+   * restart. If the save fails the change is rolled back and reported, so the page
+   * never shows a value that would revert. With storage not connected the change
+   * applies to this process only (`persisted: false`) and is saved once it connects.
+   *
+   * Only NEW entries are affected: lowering max open never closes an open position.
+   */
+  updateSettings(
+    body: Partial<Record<SynthSettingKey, unknown>>,
+  ): Promise<{ ok: true; persisted: boolean } | { ok: false; status: number; error: string }> {
+    return this.withSettingsLock(() => this.updateSettingsNow(body));
+  }
+
+  private async updateSettingsNow(
+    body: Partial<Record<SynthSettingKey, unknown>>,
+  ): Promise<{ ok: true; persisted: boolean } | { ok: false; status: number; error: string }> {
+    const next = this.settingsSnapshot();
+    let changed = false;
+    for (const key of SYNTH_SETTING_KEYS) {
+      if (body[key] === undefined) continue;
+      const r = parseSynthSetting(key, body[key]);
+      if (!r.ok) return { ok: false, status: 400, error: r.error };
+      next[key] = r.value;
+      changed = true;
     }
-    if (body.safety_buffer !== undefined) {
-      const v = Number(body.safety_buffer);
-      const lim = SYNTH_TUNING_LIMITS.safety_buffer;
-      if (!Number.isFinite(v) || v < lim.min || v > lim.max) {
-        return { ok: false, error: `safety_buffer must be ${lim.min}..${lim.max}` };
-      }
-      next.buf = v;
+    if (!changed) {
+      return {
+        ok: false,
+        status: 400,
+        error: `Nothing to change: send any of ${SYNTH_SETTING_KEYS.join(", ")}.`,
+      };
     }
-    this.minExpectedNetProfit = next.min;
-    this.safetyBuffer = next.buf;
+    const before = this.settingsSnapshot();
+    this.applySettings(next);
+    if (this.deps.store.enabled()) {
+      try {
+        await this.deps.store.saveSettings(next);
+        this.settingsDirty = false;
+      } catch (err) {
+        this.applySettings(before);
+        return { ok: false, status: 503, error: `Could not save the settings: ${message(err)}` };
+      }
+    } else {
+      this.settingsDirty = true;
+    }
+    console.log(
+      `[Synthetic] settings ${this.settingsDirty ? "changed (not saved: storage unavailable)" : "saved"}: ` +
+        `gate ₹${before.min_expected_net_profit} → ₹${next.min_expected_net_profit}, ` +
+        `safety ₹${before.safety_buffer} → ₹${next.safety_buffer}, max open ` +
+        `${before.max_open_positions || "no limit"} → ${next.max_open_positions || "no limit"}`,
+    );
     // Not an observation: the books are the same, so it must not confirm a signal.
     this.evaluate(Date.now(), this.deps.isMarketOpen(), false);
-    return { ok: true };
+    this.publish();
+    return { ok: true, persisted: !this.settingsDirty };
   }
 
   /* -------------------------------- ticks --------------------------------- */
@@ -956,7 +1089,7 @@ export class SyntheticEngine {
     try {
       const now = Date.now();
       const marketOpen = this.deps.isMarketOpen();
-      if ((!this.loaded || !this.indexReady) && now - this.lastLoadAttemptAt >= LOAD_RETRY_MS) {
+      if (!this.storeReady() && now - this.lastLoadAttemptAt >= LOAD_RETRY_MS) {
         void this.loadFromStore();
       }
       this.rollDay(now);
@@ -1163,9 +1296,10 @@ export class SyntheticEngine {
       openUnderlyings.add(t.underlying);
     }
     const today = this.deps.istDayKey(now);
-    const db = this.deps.store.enabled() && this.loaded && this.indexReady;
+    const db = this.deps.store.enabled() && this.storeReady();
     const feedOk = this.feedHealthy(now, marketOpen);
-    const full = this.positions.size + this.pendingEntries.size >= this.cfg.maxOpenPositions;
+    const full = !this.underMaxOpen();
+    const tokensFull = !this.roomForAnotherPosition(this.tokenBudget());
     for (const o of out) {
       const pid = openByKey.get(o.key);
       if (pid !== undefined) {
@@ -1190,7 +1324,9 @@ export class SyntheticEngine {
                     ? "expiry_cutoff"
                     : full
                       ? "max_open"
-                      : (this.eligibleStreak.get(o.key) ?? 0) < this.cfg.signalConfirmations
+                      : tokensFull
+                        ? "token_budget"
+                        : (this.eligibleStreak.get(o.key) ?? 0) < this.cfg.signalConfirmations
                         ? "confirming"
                         : null;
     }
@@ -1211,12 +1347,14 @@ export class SyntheticEngine {
   /** Paper-enter every ELIGIBLE, unblocked opportunity, best first. */
   private autoEnter(now: number, marketOpen: boolean): void {
     if (!this.running || !this.cfg.paperTrading || !marketOpen || this.namespaceStale) return;
-    if (!this.deps.store.enabled() || !this.loaded || !this.indexReady) return;
+    if (!this.deps.store.enabled() || !this.storeReady()) return;
     if (!this.feedHealthy(now, marketOpen)) return;
+    const budget = this.tokenBudget();
     for (const o of this.opportunities) {
       if (o.status !== "ELIGIBLE") break; // sorted: every ELIGIBLE row comes first
       if (o.entry_blocked !== null) continue;
-      if (this.positions.size + this.pendingEntries.size >= this.cfg.maxOpenPositions) break;
+      // Each entry adds to pendingEntries synchronously, so these re-check per row.
+      if (!this.underMaxOpen() || !this.roomForAnotherPosition(budget)) break;
       if (this.pendingEntries.has(o.underlying) || this.hasOpen(o.underlying)) continue;
       void this.enter(o);
     }
@@ -1728,9 +1866,12 @@ export class SyntheticEngine {
   }
 
   /**
-   * The rows pushed to the browser: every ELIGIBLE and OPEN row, then the best row
-   * of each underlying, then the next best, up to the cap. Counts in the status
-   * always describe the full evaluated set.
+   * The rows pushed to the browser: every ELIGIBLE row that could still be entered
+   * (not on an underlying already held), then the best row of each underlying, then
+   * the next best, up to the cap. Held rows (OPEN, or ELIGIBLE on a held underlying)
+   * compete for the cap like any other, so the stream stays bounded however many
+   * positions are open; the Open tab lists every one. Counts in the status always
+   * describe the full evaluated set.
    */
   private publishedOpportunities(): SynthOpportunity[] {
     const cap = this.cfg.maxPublishedOpportunities;
@@ -1744,7 +1885,9 @@ export class SyntheticEngine {
       taken.add(o.key);
       seen.add(o.underlying);
     };
-    for (const o of all) if (o.status === "ELIGIBLE" || o.status === "OPEN") take(o);
+    for (const o of all) {
+      if (o.status === "ELIGIBLE" && o.entry_blocked !== "position_open") take(o);
+    }
     for (const o of all) {
       if (picked.length >= cap) break;
       if (!taken.has(o.key) && !seen.has(o.underlying)) take(o);
@@ -1841,12 +1984,12 @@ export class SyntheticEngine {
       broker: this.deps.activeBroker(),
       detection_only: !this.cfg.paperTrading,
       execution_mode: "paper_touch" as const,
-      paper_trading: this.cfg.paperTrading && db && this.loaded && this.indexReady,
+      paper_trading: this.cfg.paperTrading && db && this.storeReady(),
       paper_blocked_reason: !this.cfg.paperTrading
         ? "disabled"
         : !db
           ? "no_db"
-          : !this.loaded
+          : !this.settingsLoaded || !this.loaded
             ? "loading"
             : !this.indexReady
               ? "unsafe_index"
@@ -1874,7 +2017,8 @@ export class SyntheticEngine {
       eligible_count: this.opportunities.filter((o) => o.status === "ELIGIBLE").length,
       opportunity_count: this.opportunities.length,
       open_count: this.positions.size,
-      max_open_positions: this.cfg.maxOpenPositions,
+      /** 0 = no limit (only one open position per underlying). */
+      max_open_positions: this.maxOpenPositions,
       /** Whether trades get a margin figure (a basket-margin calculator is wired). */
       margin_enabled: this.deps.margins !== undefined,
       unlinked_positions: [...this.positions.keys()].filter((id) => this.unlinked.has(id)).length,
@@ -1905,7 +2049,11 @@ export class SyntheticEngine {
       enable_reversal: this.cfg.enableReversal,
       skip_expiry_day: this.cfg.skipExpiryDay,
       paper_trading: this.cfg.paperTrading,
-      max_open_positions: this.cfg.maxOpenPositions,
+      max_open_positions: this.maxOpenPositions,
+      /** The env default (SYNTH_MAX_OPEN_POSITIONS) a saved value overrides. */
+      default_max_open_positions: this.cfg.maxOpenPositions,
+      /** False when a change could not be saved yet (storage unavailable). */
+      settings_persisted: !this.settingsDirty,
       signal_confirmations: this.cfg.signalConfirmations,
       reentry_cooldown_ms: this.cfg.reentryCooldownMs,
       convergence_floor: this.cfg.convergenceFloor,

@@ -76,14 +76,22 @@ export function registerSyntheticRoutes(app: Express, deps: SyntheticRouteDeps):
     res.json({ ok: true, strike_level: engine.getStatus().strike_level, status: engine.getStatus() });
   });
 
-  /** Body: { min_expected_net_profit?, safety_buffer? }. In memory; resets on restart. */
-  app.post("/api/synthetic/settings", requireAdmin, (req: Request, res: Response) => {
-    const r = engine.updateSettings(req.body ?? {});
-    if (!r.ok) {
-      res.status(400).json({ error: r.error });
-      return;
+  /**
+   * Body: { min_expected_net_profit?, safety_buffer?, max_open_positions? }
+   * (max_open_positions 0 = no limit). Saved in `synth_settings`, so it survives a
+   * restart; `persisted: false` means storage was unavailable and it is not saved yet.
+   */
+  app.post("/api/synthetic/settings", requireAdmin, async (req: Request, res: Response) => {
+    try {
+      const r = await engine.updateSettings(req.body ?? {});
+      if (!r.ok) {
+        res.status(r.status).json({ error: r.error });
+        return;
+      }
+      res.json({ ok: true, persisted: r.persisted, status: engine.getStatus() });
+    } catch (err) {
+      fail(res, err);
     }
-    res.json({ ok: true, status: engine.getStatus() });
   });
 
   app.get("/api/synthetic/opportunities", requireAdmin, (req: Request, res: Response) => {

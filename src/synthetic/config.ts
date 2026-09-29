@@ -92,7 +92,11 @@ export interface SynthConfig {
 
   /** Open a PAPER position automatically when an opportunity is ELIGIBLE. */
   paperTrading: boolean;
-  /** Open paper positions at most (one per underlying on top of this). */
+  /**
+   * Open paper positions at most; 0 = no limit. Whatever this is, there is never more
+   * than one open position per underlying. Changeable at runtime (and saved) from the
+   * page; this is only the default.
+   */
   maxOpenPositions: number;
   /**
    * Consecutive evaluations a signal must hold before it is acted on — entries and
@@ -163,7 +167,8 @@ export function loadSynthConfig(): SynthConfig {
     enableReversal: bool("SYNTH_ENABLE_REVERSAL", true),
     skipExpiryDay: bool("SYNTH_SKIP_EXPIRY_DAY", false),
     paperTrading: bool("SYNTH_PAPER_TRADING", true),
-    maxOpenPositions: num("SYNTH_MAX_OPEN_POSITIONS", 10),
+    // 0 = no limit: the only standing rule is one open position per underlying.
+    maxOpenPositions: Math.floor(num("SYNTH_MAX_OPEN_POSITIONS", 0)),
     signalConfirmations: Math.max(1, Math.floor(num("SYNTH_SIGNAL_CONFIRMATIONS", 2))),
     reentryCooldownMs: num("SYNTH_REENTRY_COOLDOWN_MS", 60_000),
     // Scaled from Box's defaults to this scanner's smaller ₹500 entry gate.
@@ -178,8 +183,41 @@ export function loadSynthConfig(): SynthConfig {
   };
 }
 
-/** Bounds for the two thresholds an admin may change from the UI. */
+/** Bounds for the settings an admin may change from the UI. */
 export const SYNTH_TUNING_LIMITS = {
   min_expected_net_profit: { min: 0, max: 100_000 },
   safety_buffer: { min: 0, max: 50_000 },
+  /** 0 = no limit. A whole number. */
+  max_open_positions: { min: 0, max: 10_000 },
 } as const;
+
+/** The runtime settings, by their API/storage name. Saved in `synth_settings`. */
+export const SYNTH_SETTING_KEYS = [
+  "min_expected_net_profit",
+  "safety_buffer",
+  "max_open_positions",
+] as const;
+export type SynthSettingKey = (typeof SYNTH_SETTING_KEYS)[number];
+export type SynthSettings = Record<SynthSettingKey, number>;
+
+/** A valid value for `key`, or the reason `raw` is not one. Pure: used for API input and stored rows. */
+export function parseSynthSetting(
+  key: SynthSettingKey,
+  raw: unknown,
+): { ok: true; value: number } | { ok: false; error: string } {
+  const v = typeof raw === "string" && raw.trim() !== "" ? Number(raw) : raw;
+  const lim = SYNTH_TUNING_LIMITS[key];
+  if (typeof v !== "number" || !Number.isFinite(v) || v < lim.min || v > lim.max) {
+    return {
+      ok: false,
+      error:
+        key === "max_open_positions"
+          ? `max_open_positions must be a whole number from ${lim.min} to ${lim.max} (0 = no limit)`
+          : `${key} must be a number from ${lim.min} to ${lim.max}`,
+    };
+  }
+  if (key === "max_open_positions" && !Number.isInteger(v)) {
+    return { ok: false, error: "max_open_positions must be a whole number (0 = no limit)" };
+  }
+  return { ok: true, value: v };
+}
