@@ -1,9 +1,9 @@
 # Fair Value — status
 
-State: Doing
+State: Done
 Updated: 2026-10-04
 Blockers: None. Production expiry-time policy is deliberately unconfigured per user decision.
-Next action: Complete final publication checks, commit verified task paths in both CalSpread repositories, and push origin/main without force as explicitly requested on 2026-10-04.
+Next action: None for implementation/publication. Before any separately authorized deployment/use, configure verified expiry-time and discount inputs; analytics remains disabled by default.
 
 ## Completed
 
@@ -119,7 +119,20 @@ Next action: Complete final publication checks, commit verified task paths in bo
 - Both workflow files are read-only CI, with no deployment job. Hook/deployment
   API returned no configured hooks or deployment records. Added Fair Value tests
   and documentation verification to backend CI; frontend CI uses its test loader.
-- Publication SHAs/check URLs will be recorded after the verified pushes.
+- Feature commits safely pushed with `git push origin main:main`, no force:
+  - Backend `168d0b9ddf9f9d3a20fab59dd768817bbebd8ea3`
+    ([commit](https://github.com/Prakash2571/Cal_Spread_Backend/commit/168d0b9ddf9f9d3a20fab59dd768817bbebd8ea3)).
+  - Frontend `7057ac76debf572447d7237df73cec683b1d9ee5`
+    ([commit](https://github.com/Prakash2571/Cal_Spread/commit/7057ac76debf572447d7237df73cec683b1d9ee5)).
+- Local HEAD/origin/main and GitHub commits/main API matched for both feature commits;
+  both working trees were clean immediately after publication.
+- Backend `gh run watch 37183404266 --exit-status`: exit 0, **success**;
+  [CI](https://github.com/Prakash2571/Cal_Spread_Backend/actions/runs/37183404266).
+- Frontend `gh run list --branch main --limit 5 --json ...`: feature commit CI
+  **success**; [CI](https://github.com/Prakash2571/Cal_Spread/actions/runs/37183402956).
+- This receipt is a documentation-only follow-up to the published feature. All
+  requested stages and publication verification are complete. No deployment or
+  live-trading enablement was performed.
 
 ## Reconciliation notes
 

@@ -55,5 +55,13 @@ Exact commands, stage history and GitHub receipts:
 
 User requested safe GitHub main publication on 2026-10-04. Both upstream branches
 matched their inspected baselines; repository workflows are read-only CI. Feature
-commit/push receipts will be added after publication. No deployment or live-trading
-enablement is part of this delivery.
+commits safely pushed without force:
+
+- Backend [168d0b9](https://github.com/Prakash2571/Cal_Spread_Backend/commit/168d0b9ddf9f9d3a20fab59dd768817bbebd8ea3),
+  [CI passed](https://github.com/Prakash2571/Cal_Spread_Backend/actions/runs/37183404266).
+- Frontend [7057ac7](https://github.com/Prakash2571/Cal_Spread/commit/7057ac76debf572447d7237df73cec683b1d9ee5),
+  [CI passed](https://github.com/Prakash2571/Cal_Spread/actions/runs/37183402956).
+
+Local and GitHub main SHAs matched after publication. No deployment or live-trading
+enablement was performed. Analytics remains disabled by default and verified
+expiry/discount configuration is still required.
