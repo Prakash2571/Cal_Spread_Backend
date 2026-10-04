@@ -9,6 +9,24 @@ Setup and credentials live in [`.env.example`](.env.example); admin auth lives i
 [`../Cal_Spread/ADMIN_SETUP.md`](../Cal_Spread/ADMIN_SETUP.md). This file is about what the
 service can actually do.
 
+## Fair Value — full-admin option valuation
+
+The dedicated **Fair Value** page estimates market-consistent European option
+theoretical values, bid/mid/ask IV, listed-expiry smiles and maturity structure.
+It includes price-space SVI fitting with numerical arbitrage diagnostics,
+validated interpolation fallbacks, a hypothetical strike/expiry calculator,
+leave-one-strike-out estimates, documented sensitivity scenarios and bounded
+versioned history. All related APIs, exports and streams require **full admin**.
+
+Analytics is off by default and needs a verified expiry-time policy for date-only
+instrument masters plus a supplied discount curve or explicit flat-rate fallback.
+It reuses the active broker's feed with bounded low-priority subscriptions and
+isolated worker threads. No order placement is provided.
+
+Read [the formulas, configuration, quality labels and limitations](docs/FAIR_VALUE.md).
+Run `npm test` for the application/feature suites. Independent reference and local
+browser/Mongo verification commands are documented in that guide.
+
 ---
 
 ## 1. Live market data from one Kite session

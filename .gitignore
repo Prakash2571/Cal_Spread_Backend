@@ -5,3 +5,6 @@
 # committing it makes the working tree dirty after `npm run build` (which blocks
 # `git pull` on the deploy box) and can let a stale entry mask a real rebuild.
 tsconfig.tsbuildinfo
+
+# Project-local verification environments and temporary artifacts.
+/scratch/

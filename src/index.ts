@@ -56,6 +56,7 @@ import { startEodScheduler, backfillStockFutures, checkAndRecomputeSummary } fro
 // collections; the calendar strategy remains unchanged.
 import { registerBoxModule, type BoxModule } from "./box/index.js";
 import { registerSyntheticModule, type SyntheticModule } from "./synthetic/index.js";
+import { registerFairValueModule } from "./fairValue/index.js";
 import { ActiveBrokerManager } from "./brokers/registry.js";
 import { registerBrokerRoutes } from "./brokers/routes.js";
 import { registerMarketDataRoutes } from "./marketDataRoutes.js";
@@ -5334,6 +5335,36 @@ const syntheticModule: SyntheticModule = registerSyntheticModule(app, {
   getAdminRole,
 });
 
+// Full-admin read-only analytics: existing futures/data lane, bounded spare token
+// budget, independent quote state and worker threads. No execution adapter is injected.
+const fairValueModule = registerFairValueModule(app, {
+  getAllInstruments: getAllInstrumentsCached,
+  getBoard: async () => deriveFnoBoard(await getAllInstrumentsCached()),
+  metadataVersion: () => `${brokerManager.activeBroker}:${brokerManager.instrumentProvider.loadedAt() ?? "unloaded"}`,
+  activeBroker: () => brokerManager.activeBroker,
+  brokerGeneration: () => brokerManager.generation,
+  dataReady: () => brokerManager.activeHealth().data_ready,
+  switching: () => brokerManager.switching,
+  setTokens: (tokens) => brokerManager.subscriptions.setOwnerTokens("analytics", tokens),
+  tokenBudget: () => {
+    const subscriptions = brokerManager.subscriptions;
+    const priority = subscriptions.activeTokens().filter((t) => {
+      const counts = subscriptions.countsFor(t)!;
+      return counts.total > counts.analytics;
+    }).length;
+    return Math.max(0, 2800 - priority);
+  },
+  // Retain cache/fan-out without opening the legacy Kite-only socket. The
+  // coordinator already owns subscriptions on the ACTIVE broker.
+  retainFeed: () => tickerHub.retainFanout(),
+  feedStatus: () => brokerManager.laneStats("futures"),
+  requireFullAdmin,
+  getAdminRole,
+});
+brokerManager.subscriptions.setAnalyticsYield((priority) => fairValueModule.engine.yieldToPriority(priority));
+tickerHub.addTickListener((ticks) => fairValueModule.engine.ingestTicks(ticks));
+tickerHub.addConnectionListener(() => fairValueModule.engine.invalidate());
+
 /**
  * Give the broker manager its view of live exposure, and the teardown hooks a switch
  * needs. Done here rather than in the constructor because the engine must exist first
@@ -5364,6 +5395,7 @@ brokerManager.attach(
       boxModule.engine.invalidateBooks();
       // Forget every token until the universe is reloaded in the new namespace.
       syntheticModule.engine.invalidateNamespace();
+      fairValueModule.engine.invalidateNamespace();
     },
     // Contract reservations are broker-namespaced, so a switch must drop the ones this
     // process owns. Previously defined on the engine but never wired to anything, which
@@ -5486,6 +5518,7 @@ const httpServer = app.listen(PORT, () => {
     void boxModule.boot().catch((e) => console.warn("[Box] boot failed:", e));
     // Same for synthetic-futures PAPER positions: adopt and monitor them at once.
     void syntheticModule.boot().catch((e) => console.warn("[Synthetic] boot failed:", e));
+    void fairValueModule.boot().catch((e) => console.warn("[Fair Value] boot failed:", e));
   })
     // The startup chain had NO catch. A rejection anywhere in it (the Redis warm-load
     // pings run outside their own try) skipped the flush retry, the hourly and option-OI
@@ -5549,6 +5582,10 @@ const shutdownCoordinator = new ShutdownCoordinator({
       // streams so the HTTP drain below is not held open by them.
       name: "stop the synthetic-futures scanner",
       run: () => syntheticModule.engine.dispose(),
+    },
+    {
+      name: "stop Fair Value analytics workers",
+      run: () => fairValueModule.engine.dispose(),
     },
     {
       /**

@@ -11,7 +11,8 @@
     "typecheck": "tsc -b",
     "test:unit": "node --test \"tests/box/*.test.mjs\"",
     "test:integration": "node --test \"tests/integration/*.test.mjs\"",
-    "test": "npm run build && npm run test:unit && npm run test:integration"
+    "test:fair-value": "node --test \"tests/fairValue/*.test.mjs\"",
+    "test": "npm run build && npm run test:unit && npm run test:fair-value && npm run test:integration"
   },
   "keywords": [],
   "author": "",

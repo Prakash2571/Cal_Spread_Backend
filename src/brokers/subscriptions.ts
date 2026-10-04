@@ -75,6 +75,8 @@ export class SubscriptionCoordinator {
    */
   private leases = new Map<string, { owner: SubscriptionOwner; tokens: Set<number> }>();
   private leaseSeq = 0;
+  /** Optional low-priority analytics yield before another owner's transport mutation. */
+  private analyticsYield: ((priorityTokens: Set<number>) => void) | null = null;
 
   constructor(
     private transport: SubscriptionTransport,
@@ -95,6 +97,7 @@ export class SubscriptionCoordinator {
    */
   acquire(owner: SubscriptionOwner, tokens: number[]): { leaseId: string; release: () => void } {
     const unique = new Set(tokens.filter((t) => Number.isFinite(t) && t > 0));
+    this.yieldAnalytics(owner, unique, false);
     const leaseId = `${owner}:${++this.leaseSeq}`;
     this.leases.set(leaseId, { owner, tokens: unique });
 
@@ -166,6 +169,7 @@ export class SubscriptionCoordinator {
    */
   setOwnerTokens(owner: SubscriptionOwner, tokens: number[]): void {
     const want = new Set(tokens.filter((t) => Number.isFinite(t) && t > 0));
+    this.yieldAnalytics(owner, want, true);
 
     // Drop this owner's existing leases from the counts without touching upstream yet.
     const previouslyHeld = new Set<number>();
@@ -248,6 +252,20 @@ export class SubscriptionCoordinator {
 
   get size(): number {
     return this.counts.size;
+  }
+
+  setAnalyticsYield(handler: (priorityTokens: Set<number>) => void): void {
+    this.analyticsYield = handler;
+  }
+
+  private yieldAnalytics(owner: SubscriptionOwner, tokens: Set<number>, replacing: boolean): void {
+    if (owner === "analytics" || !this.analyticsYield) return;
+    const priority = new Set(tokens);
+    for (const [token, counts] of this.counts) {
+      if (counts.total - counts.analytics - (replacing ? counts[owner] : 0) > 0) priority.add(token);
+    }
+    try { this.analyticsYield(priority); }
+    catch (error) { console.warn("[Subscriptions] analytics yield failed:", error); }
   }
 
   /** Refcounts for one token, or null when nobody wants it. */

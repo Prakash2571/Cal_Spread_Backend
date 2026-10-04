@@ -143,6 +143,16 @@ export class TickerHub {
     };
   }
 
+  /** Keep downstream cache/fan-out retained without selecting or opening a broker
+   * socket. Active-broker subscriptions remain the coordinator's responsibility.
+   * Legacy SSE disconnects cannot tear down a headless analytics holding.
+   */
+  retainFanout(): () => void {
+    const key = {};
+    this.retainers.add(key);
+    return () => { this.retainers.delete(key); };
+  }
+
   /** Subscribe extra tokens for a headless consumer. */
   subscribeTokens(tokens: number[]): void {
     if (tokens.length === 0) return;
