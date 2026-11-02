@@ -12,7 +12,7 @@ Date: 2026-11-02. Repositories: `Prakash2571/Cal_Spread_Backend` and `Prakash257
 - Calendar, captures/history, NIFTY analytics, broker switching/data namespaces,
   session-backed tick SSE, Synthetic paper trading and full-admin Fair Value retained.
 - Frontend shared broker badges and Synthetic presentation preserved; no hidden Box calls.
-- Go/PostgreSQL backend CI and paired frontend real-Go HTTP CI prepared.
+- Go/PostgreSQL backend CI and paired frontend real-Go HTTP CI published and passing.
 
 Approved scope: fresh local data, no import, local setup/CI, both mains published after
 verification. EC2 deployment is handled by the owner.
@@ -81,7 +81,7 @@ Reports/screenshots/downloads are retained in the frontend's ignored
 `scratch/go-integration/browser-YQPNFa/`. Verification uses generated loopback data,
 actual Go app/authorization/workers and disposable PostgreSQL schemas.
 Local `actionlint` was unavailable; workflow structure was reviewed and remote CI
-verification will be recorded with publication.
+verification succeeded on the published migration, as linked below.
 
 ## Local use
 
@@ -98,5 +98,15 @@ HTTP/storage/lifecycle differences are documented in the task STATUS and stage r
 
 ## Publication
 
-Reference checkpoint `8de7ca5` is committed locally. Final migration commits/main
-pushes and their GitHub CI receipts are the remaining publication step.
+Both migrations are committed and pushed to **main**:
+
+- Backend runtime [`0217698`](https://github.com/Prakash2571/Cal_Spread_Backend/commit/0217698f48db179d686a28dff052d666d830968c),
+  preserving reference checkpoint `8de7ca5` in Git history.
+- Frontend [`08f4707`](https://github.com/Prakash2571/Cal_Spread/commit/08f47070d0c7f93ecf72d406a4046bb9356f3823).
+- Backend [CI 41418473148](https://github.com/Prakash2571/Cal_Spread_Backend/actions/runs/41418473148): **success**,
+  including required PostgreSQL/race/module checks and standalone binary artifact.
+- Frontend [CI 41418509911](https://github.com/Prakash2571/Cal_Spread/actions/runs/41418509911): **success**,
+  including build/unit and real-Go HTTP/PostgreSQL integration against published backend main.
+
+Both push commands exited 0 and both worktrees matched origin/main. Final receipt
+commits update documentation/completion state only, preserving these verified runtime fingerprints.
