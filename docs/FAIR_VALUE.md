@@ -101,7 +101,7 @@ Yahoo dividend yields. A different-expiry future is never silently substituted.
 
 `φ(x)=exp(−x²/2)/sqrt(2π)` and `N(x)=.5(1+erf(x/sqrt(2)))`.
 Cephes/SciPy erf/erfc rational approximations preserve normal tails; attribution is
-in `src/fairValue/THIRD_PARTY.md`.
+in `docs/THIRD_PARTY.md`.
 
 Final surface prices use `k=ln(K/F)`, `w=σ²T`,
 `d1=−k/sqrt(w)+sqrt(w)/2`, `d2=d1−sqrt(w)`:
@@ -135,10 +135,11 @@ ATM gamma/theta singularity is unavailable rather than an invented finite number
 
 ## Verification
 
-Run `npm run build && npm run test:fair-value`.
-Independent reference check:
-`PYTHONPATH=scratch/quantlib python3 scripts/fair_value_quantlib.py`.
-QuantLib is verification-only, not a production dependency. Reference prices span
+Run `TEST_DATABASE_URL=<local test database> make check` for the Go mathematics,
+service, authorization, workers and PostgreSQL suites. Checked numerical goldens
+retain their pinned reference provenance. The independent QuantLib check performed
+before migration is recorded in the historical task reports; it is not a production
+dependency. Reference prices span
 calls/puts, extreme moneyness, short/long maturities and negative discount rates;
 IV reference checks are limited to well-conditioned premiums.
 
@@ -340,7 +341,7 @@ not inferred automatically.
 `GET/PATCH /api/fair-value/config` supplies the full settings object. PATCH accepts
 validated partial nested settings. Unknown/prototype keys, wrong types and invalid
 bounds are rejected; timestamps normalize to UTC. The complete object is hashed
-to a config version and persisted in Mongo; failed persistence is explicitly
+to a config version and persisted in PostgreSQL; failed persistence is explicitly
 memory-only. Priority: defaults, `FAIR_VALUE_CONFIG_JSON`, then saved validated
 full-admin settings.
 
@@ -364,12 +365,12 @@ full-admin settings.
 | `max_expiries` | 4 | integer 1..12; nearest listed dates, omissions exposed. |
 | `universe_refresh_ms` | 60000 | ms, integer 15000..300000; cached universe/window refresh. |
 | `recenter_log_distance` | .02 | absolute log spot movement, .001.. .20; 15-second minimum interval. |
-| `workers` | 1 | integer 1..2; independent worker threads. |
-| `worker_timeout_ms` | 8000 | ms, integer 100..30000; reject/terminate over-budget worker. |
+| `workers` | 1 | integer 1..2; bounded analytics worker goroutines. |
+| `worker_timeout_ms` | 8000 | ms, integer 100..30000; reject over-budget job and discard its late result. |
 | `max_queue` | 8 | integer 1..16; worker/refit/persistence resource caps. |
 | `history_limit` | 100 | integer 1..500; snapshots per underlying. |
 | `history_interval_ms` | 60000 | ms, integer 10000..3600000. |
-| `history_retention_days` | 7 | integer 1..30; API filter and Mongo TTL. |
+| `history_retention_days` | 7 | integer 1..30; API expiry filter and PostgreSQL pruning. |
 | `history_memory_max_bytes` | 16777216 | bytes, integer 1048576..67108864; total memory history; at most 20 underlying histories. |
 | `independent_cache_limit` | 64 | integer 1..128. |
 | `independent_cache_ttl_ms` | 60000 | ms, integer 1000..600000; surface freshness remains authoritative. |
@@ -384,8 +385,10 @@ Fixed bounds: analytics yields **before** higher-priority subscription transport
 preserving 200 tokens below the 3000-token lane limit; execution limits are not
 modified. Watches expire after 180 seconds idle. Verified listing metadata is
 capped at 20000 contracts per underlying and excluded from fit transfer/archived
-quote input. Workers use 96 MiB old/16 MiB young generation limits. At most 20
-streams; consumers above 256000 queued output bytes close. Heavy requests have
+quote input. Go workers have no per-worker heap cap; all model loops/inputs are bounded.
+A timed-out goroutine finishes in the background and its result is dropped. A deadline
+belongs to its original job and cannot reject a later job on a reused worker. At most 20
+streams; a write that cannot finish within 10 seconds closes its stream. Heavy requests have
 a 30/minute cap under the existing app limiter. Frontend updates throttle to five
 seconds; a 15-second auth/status heartbeat continues during display pause.
 
@@ -559,32 +562,26 @@ Historical viewing is labelled and disables current calculators/refits.
   observations, visibly distinct from all broker listings.
 - Frozen local-IV Greeks only; no surface-aware/sticky-delta/full spot-carry theta
   or rho. Scenario sensitivities are alternatives, not confidence intervals.
-- Memory history may retain fewer rows due to byte caps. Mongo is optional; failed
+- Memory history may retain fewer rows due to byte caps. PostgreSQL is optional; failed
   writes retry within bounded queues with visible degradation.
 - Optional 3D surface is not included; IV/variance/ATM-maturity/residual charts are.
 
 Verification (local fixture/reference data):
 
 ```bash
-# Backend
-npm test
-PYTHONPATH=scratch/quantlib python3 scripts/fair_value_quantlib.py
-node scripts/fair_value_mongo_test.mjs
-node scripts/fair_value_mongo_test.mjs --box-integration
-node scripts/fair_value_app_smoke.mjs
+# Backend (Go, required local PostgreSQL)
+TEST_DATABASE_URL='postgres://calspread@127.0.0.1:55472/calspread_test?sslmode=disable' make check
 # Frontend
 npm run build && npm test
-PLAYWRIGHT_BROWSERS_PATH=scratch/browsers node scripts/fair_value_browser_test.mjs
+node scripts/fair_value_browser_test.mjs
 ```
 
-QuantLib 1.40 is verification-only. Reference check: 1344 call/put prices and 786
+The historical QuantLib 1.40 reference check covered 1344 call/put prices and 786
 well-conditioned IV inversions, observed maximum price difference
 5.820766091346741e-11. Tests cover mathematical failures, target exclusion,
 admin/stream revocation, consistent snapshots and real worker timeout isolation.
-Ephemeral Mongo verifies persistence/restart reads; Chromium verifies actual
-React/API workflows, mobile containment and non-admin zero-data requests. Actual
-app smoke uses dummy credentials, no broker session, paper execution and invalid
-analytics config to verify isolation. Exact outcomes are in task STATUS.md;
-pre-existing optional database tests remain explicitly skipped without fixtures;
-`--box-integration` runs the existing 16-test integration file on the ephemeral
-server's separate throwaway database, with mocked broker adapters.
+Ephemeral PostgreSQL schemas verify persistence/restart reads; browser verification
+uses the real Go routes/models/workers with fixture market data, including mobile
+containment and non-admin zero-data requests. Full-app Go tests exercise the assembled
+handler, middleware, broker hooks and shutdown. Exact commands/results are in the
+migration STATUS.md. `REQUIRE_DB_TESTS=1` forbids silent database skips in the required checks.

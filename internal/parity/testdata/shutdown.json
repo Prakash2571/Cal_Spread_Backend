@@ -1,0 +1,15 @@
+{
+  "reference_commit": "1ea1d958ebf5c4a0fc673d786f5ee9638bdffa8d",
+  "source": "src/index.ts",
+  "source_sha256": "a0dbce19932b3ce01da498b94c826ee4b719ff57c4c010d59e9fab874a546560",
+  "steps": [
+    "disable new Box entry discovery",
+    "stop the synthetic-futures scanner",
+    "stop Fair Value analytics workers",
+    "stop accepting new HTTP connections",
+    "stop capture/flush schedulers",
+    "dispose Box engine (positions preserved)",
+    "stop broker market-data feeds",
+    "close MongoDB connections"
+  ]
+}

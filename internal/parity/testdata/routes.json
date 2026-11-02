@@ -1,0 +1,420 @@
+{
+  "reference_commit": "1ea1d958ebf5c4a0fc673d786f5ee9638bdffa8d",
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/api/broker/status",
+      "source": "src/brokers/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/broker/switch-blockers",
+      "source": "src/brokers/routes.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/broker/select",
+      "source": "src/brokers/routes.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/dhan/login",
+      "source": "src/brokers/routes.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/dhan/session",
+      "source": "src/brokers/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/dhan/status",
+      "source": "src/brokers/routes.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/dhan/verify-ip",
+      "source": "src/brokers/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/dhan/instruments/diagnostics",
+      "source": "src/brokers/routes.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/dhan/logout",
+      "source": "src/brokers/routes.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/dhan/postback",
+      "source": "src/brokers/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/dhan/access-token",
+      "source": "src/brokers/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/dhan/token",
+      "source": "src/brokers/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/fair-value/status",
+      "source": "src/fairValue/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/fair-value/config",
+      "source": "src/fairValue/routes.ts"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/fair-value/config",
+      "source": "src/fairValue/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/fair-value/underlyings",
+      "source": "src/fairValue/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/fair-value/snapshot/:underlying",
+      "source": "src/fairValue/routes.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/fair-value/refresh",
+      "source": "src/fairValue/routes.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/fair-value/pause",
+      "source": "src/fairValue/routes.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/fair-value/calculate",
+      "source": "src/fairValue/routes.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/fair-value/independent",
+      "source": "src/fairValue/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/fair-value/history/:underlying",
+      "source": "src/fairValue/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/fair-value/history/:underlying/:id",
+      "source": "src/fairValue/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/fair-value/export/:underlying",
+      "source": "src/fairValue/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/fair-value/stream",
+      "source": "src/fairValue/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/status",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/internal/kite-token",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/kite/token",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/rf",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/rf/current",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/rf",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/admin/verify",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/access/verify",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/admin/status",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/login",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/login",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/session",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/callback",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/logout",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/kite/access-token",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/profile",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/instruments",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/fno-stocks",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/fno-stocks/:symbol",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/dividends",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/debug/indices",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/history/:symbol",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/spread-history/:symbol",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/intraday/:symbol",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/minute/:symbol",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/fivemin/:symbol",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/fno-board",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/option-chain/:underlying",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/option-oi-baseline/:underlying",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/option-prev-close/:underlying",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/option-oi-series/:underlying",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/option-oi-frame/:underlying",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/futures-oi-frame/:underlying",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/spread-stats/:symbol",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/trades",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/trades",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/trades/:id/close",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/trades/:id",
+      "source": "src/index.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/quotes",
+      "source": "src/marketDataRoutes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/quotes",
+      "source": "src/marketDataRoutes.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/stream/session",
+      "source": "src/marketDataRoutes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/stream/session/:id",
+      "source": "src/marketDataRoutes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/stream",
+      "source": "src/marketDataRoutes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/market-data/status",
+      "source": "src/marketDataRoutes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/market-data/diagnostics",
+      "source": "src/marketDataRoutes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/synthetic/status",
+      "source": "src/synthetic/routes.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/synthetic/start",
+      "source": "src/synthetic/routes.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/synthetic/stop",
+      "source": "src/synthetic/routes.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/synthetic/strike-level",
+      "source": "src/synthetic/routes.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/synthetic/settings",
+      "source": "src/synthetic/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/synthetic/opportunities",
+      "source": "src/synthetic/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/synthetic/trades/open",
+      "source": "src/synthetic/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/synthetic/trades/history",
+      "source": "src/synthetic/routes.ts"
+    },
+    {
+      "method": "POST",
+      "path": "/api/synthetic/trades/:id/close",
+      "source": "src/synthetic/routes.ts"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/synthetic/trades/:id",
+      "source": "src/synthetic/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/synthetic/chain/:underlying",
+      "source": "src/synthetic/routes.ts"
+    },
+    {
+      "method": "GET",
+      "path": "/api/synthetic/stream",
+      "source": "src/synthetic/routes.ts"
+    }
+  ]
+}

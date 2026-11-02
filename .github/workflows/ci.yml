@@ -1,15 +1,10 @@
 name: CI
 
-# Every push to main and every pull request must install cleanly, typecheck, build, and pass both
-# the unit suite and the real-MongoDB integration suite.
 on:
   push:
     branches: [main]
   pull_request:
 
-# Read-only token. This workflow requires NO repository secrets and NO broker credentials:
-# broker interactions use deterministic fakes, and persistence integration runs against a pinned
-# local MongoDB service container. Nothing here may print a credential, because none is available.
 permissions:
   contents: read
 
@@ -17,216 +12,46 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# Pinned explicitly rather than by major. Node 22.23.2 bundles npm 11.4.2; the npm pin is applied
-# anyway so a change to the bundled version cannot silently alter installation behaviour.
-env:
-  NODE_VERSION: 22.23.2
-  NPM_VERSION: 11.4.2
-  MONGO_IMAGE: mongo:7.0.14
-
 jobs:
-  # ── 1. Clean dependency installation ────────────────────────────────────────────────────
-  #
-  # STRICT `npm ci`, with no `npm install` fallback. The previous workflow ran
-  # `npm ci || npm install`, which meant a lockfile that did not match package.json produced a
-  # warning annotation and a GREEN build. `npm ci` is the only install command here, so a stale or
-  # incomplete lockfile now fails the pipeline.
-  install:
-    name: 1. Clean install (strict npm ci)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-
-      - name: Pin npm
-        run: npm install -g npm@${{ env.NPM_VERSION }}
-
-      - name: Record toolchain versions
-        run: |
-          echo "node: $(node -v)"
-          echo "npm:  $(npm -v)"
-
-      - name: npm ci
-        run: npm ci
-
-      # `npm ci` already refuses a lockfile that disagrees with package.json. This additionally
-      # proves the install did not need to REWRITE the lockfile: if `npm ci` ever leaves the working
-      # tree dirty, the committed lockfile was not a faithful resolution.
-      - name: Lockfile must be complete and in sync
-        run: git diff --exit-code -- package-lock.json
-
-      # Read straight from the committed lockfile, so this records what `npm ci` was PINNED to
-      # rather than whatever happened to resolve. Deterministic, and always exits 0.
-      - name: Record resolved dependency versions
-        run: |
-          node --input-type=module -e "
-          import { readFileSync } from 'node:fs';
-          const lock = JSON.parse(readFileSync('package-lock.json', 'utf8'));
-          console.log('lockfileVersion: ' + lock.lockfileVersion);
-          for (const key of ['typescript', 'mongoose', 'mongodb', '@types/node', 'express', 'dotenv']) {
-            const entry = lock.packages['node_modules/' + key];
-            console.log(key.padEnd(14) + ' ' + (entry ? entry.version : 'MISSING'));
-          }
-          "
-
-      - name: Upload npm logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: npm-logs-install
-          path: ~/.npm/_logs/
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # ── 2. Typecheck ────────────────────────────────────────────────────────────────────────
-  typecheck:
-    name: 2. Typecheck
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-      - name: Pin npm
-        run: npm install -g npm@${{ env.NPM_VERSION }}
-      - run: npm ci
-      - name: npm run typecheck
-        run: npm run typecheck
-      - name: Upload npm logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: npm-logs-typecheck
-          path: ~/.npm/_logs/
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # ── 3. Build ────────────────────────────────────────────────────────────────────────────
-  build:
-    name: 3. Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-      - name: Pin npm
-        run: npm install -g npm@${{ env.NPM_VERSION }}
-      - run: npm ci
-      - name: npm run build
-        run: npm run build
-      # `noEmitOnError` is enabled in tsconfig.json, so a failed typecheck now produces NO `dist/` at
-      # all. Asserting the entrypoint exists turns "the build silently emitted nothing" into a
-      # failure rather than an empty success.
-      - name: Build output must exist
-        run: test -f dist/index.js && test -f dist/box/executionGateway.js
-      - name: Upload npm logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: npm-logs-build
-          path: ~/.npm/_logs/
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # ── 4. Unit tests (no database) ─────────────────────────────────────────────────────────
-  #
-  # Fast, hermetic coverage. Files that carry an env-gated real-MongoDB section skip that section
-  # here; the integration job below is where those run for real.
-  unit:
-    name: 4. Unit tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-      - name: Pin npm
-        run: npm install -g npm@${{ env.NPM_VERSION }}
-      - run: npm ci
-      - run: npm run build
-      - name: npm run test:unit
-        run: npm run test:unit
-      - name: Fair Value mathematics, admin authorization and worker isolation
-        run: npm run test:fair-value
-      - name: Fair Value configuration and private API documentation
-        run: node scripts/fair_value_docs_check.mjs
-      - name: Upload npm logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: npm-logs-unit
-          path: ~/.npm/_logs/
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # ── 5. Real MongoDB integration tests ───────────────────────────────────────────────────
-  #
-  # Runs the production Mongoose models and the real MongoDB update/aggregation pipeline against a
-  # PINNED MongoDB service container. `BOX_REQUIRE_MONGODB=1` makes an unreachable database a hard
-  # FAILURE rather than a skip, so this job cannot go green without having actually tested Mongo.
-  integration:
-    name: 5. MongoDB integration tests
+  go:
+    name: Go build, vet, race and PostgreSQL tests
     runs-on: ubuntu-latest
     services:
-      mongodb:
-        image: mongo:7.0.14
+      postgres:
+        image: postgres:18.0
+        env:
+          POSTGRES_USER: calspread
+          POSTGRES_PASSWORD: local-ci-only
+          POSTGRES_DB: calspread_test
         ports:
-          - 27017:27017
+          - 5432:5432
         options: >-
-          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok'"
-          --health-interval 10s
+          --health-cmd "pg_isready -U calspread -d calspread_test"
+          --health-interval 5s
           --health-timeout 5s
           --health-retries 10
     env:
-      BOX_TEST_MONGODB_URI: mongodb://127.0.0.1:27017/calspread_box_ci
-      # The switch that forbids a silent skip.
-      BOX_REQUIRE_MONGODB: '1'
+      TEST_DATABASE_URL: postgres://calspread:local-ci-only@127.0.0.1:5432/calspread_test?sslmode=disable
+      REQUIRE_DB_TESTS: '1'
+      GOTOOLCHAIN: local
+      GOTELEMETRY: 'off'
+      TZ: Asia/Kolkata
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-go@v5
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-      - name: Pin npm
-        run: npm install -g npm@${{ env.NPM_VERSION }}
-      - run: npm ci
-      - run: npm run build
-
-      # ESM input type: package.json declares "type": "module", and mongoose is a declared
-      # dependency, so this needs no extra install and no CommonJS require.
-      - name: Record MongoDB and driver versions
-        run: |
-          node --input-type=module -e "
-          import mongoose from 'mongoose';
-          await mongoose.connect(process.env.BOX_TEST_MONGODB_URI);
-          const info = await mongoose.connection.db.admin().serverInfo();
-          console.log('mongod:      ' + info.version);
-          console.log('mongoose:    ' + mongoose.version);
-          await mongoose.disconnect();
-          "
-
-      # The unit suite runs here too, because with the URI present its env-gated real-MongoDB
-      # sections activate — that is where the pre-existing Mongo CAS assertions live.
-      - name: npm run test:unit (with MongoDB available)
-        run: npm run test:unit
-
-      - name: npm run test:integration
-        run: npm run test:integration
-
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
+          go-version: '1.25.x'
+          cache: true
+      - name: Locked dependency download
+        run: go mod download
+      - name: Build, vet, formatting and required database/race checks
+        run: bash scripts/check.sh
+      - name: Module files remain in sync
+        run: go mod tidy && git diff --exit-code -- go.mod go.sum
+      - name: Build the standalone local server
+        run: make build
+      - uses: actions/upload-artifact@v4
         with:
-          name: logs-integration
-          path: |
-            ~/.npm/_logs/
-          if-no-files-found: ignore
-          retention-days: 7
+          name: calspread-linux-amd64
+          path: outputs/calspread
+          if-no-files-found: error

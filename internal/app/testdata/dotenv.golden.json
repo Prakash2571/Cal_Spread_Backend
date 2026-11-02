@@ -1,0 +1,1366 @@
+{
+ "generator": "dotenv 17.4.2 (scratch/go-migration/tmp/server/dotenv-17.4.2/package), node v22.22.1",
+ "reported": [
+  "A",
+  "B",
+  "C",
+  "DOTENV_CONFIG_PATH",
+  "DOTENV_CONFIG_OVERRIDE",
+  "DOTENV_KEY"
+ ],
+ "parse": [
+  {
+   "name": "basic",
+   "src": "A=1\nB=2",
+   "entries": [
+    [
+     "A",
+     "1"
+    ],
+    [
+     "B",
+     "2"
+    ]
+   ]
+  },
+  {
+   "name": "surrounding spaces",
+   "src": "  A = 1  \n B=  2\t",
+   "entries": [
+    [
+     "A",
+     "1"
+    ],
+    [
+     "B",
+     "2"
+    ]
+   ]
+  },
+  {
+   "name": "export prefix",
+   "src": "export A=1\nexport   B=2\nexportC=3",
+   "entries": [
+    [
+     "A",
+     "1"
+    ],
+    [
+     "B",
+     "2"
+    ],
+    [
+     "exportC",
+     "3"
+    ]
+   ]
+  },
+  {
+   "name": "colon separator",
+   "src": "A: 1\nB:2\nC:  three",
+   "entries": [
+    [
+     "A",
+     "1"
+    ],
+    [
+     "C",
+     "three"
+    ]
+   ]
+  },
+  {
+   "name": "quotes",
+   "src": "S='single'\nD=\"double\"\nT=`back`\nI='it''s'",
+   "entries": [
+    [
+     "S",
+     "single"
+    ],
+    [
+     "D",
+     "double"
+    ],
+    [
+     "T",
+     "back"
+    ],
+    [
+     "I",
+     "it''s"
+    ]
+   ]
+  },
+  {
+   "name": "double-quoted escapes",
+   "src": "N=\"a\\nb\\rc\"\nS='a\\nb'\nT=`a\\nb`",
+   "entries": [
+    [
+     "N",
+     "a\nb\rc"
+    ],
+    [
+     "S",
+     "a\\nb"
+    ],
+    [
+     "T",
+     "a\\nb"
+    ]
+   ]
+  },
+  {
+   "name": "literal backslashes",
+   "src": "A=\"a\\\\nb\"\nB=a\\nb",
+   "entries": [
+    [
+     "A",
+     "a\\\nb"
+    ],
+    [
+     "B",
+     "a\\nb"
+    ]
+   ]
+  },
+  {
+   "name": "multiline double quoted",
+   "src": "M=\"line1\nline2\n  line3\"\nNEXT=1",
+   "entries": [
+    [
+     "M",
+     "line1\nline2\n  line3"
+    ],
+    [
+     "NEXT",
+     "1"
+    ]
+   ]
+  },
+  {
+   "name": "multiline single quoted",
+   "src": "M='one\ntwo'\nNEXT=2",
+   "entries": [
+    [
+     "M",
+     "one\ntwo"
+    ],
+    [
+     "NEXT",
+     "2"
+    ]
+   ]
+  },
+  {
+   "name": "comments",
+   "src": "# comment\nA=1 # trailing\nB=2#nospace\nC='x # y' # z\n  # indented\nD=\"h#sh\"",
+   "entries": [
+    [
+     "A",
+     "1"
+    ],
+    [
+     "B",
+     "2"
+    ],
+    [
+     "C",
+     "x # y"
+    ],
+    [
+     "D",
+     "h#sh"
+    ]
+   ]
+  },
+  {
+   "name": "empty values",
+   "src": "A=\nB=''\nC=\"\"\nD=``\nE= \nF",
+   "entries": [
+    [
+     "A",
+     ""
+    ],
+    [
+     "B",
+     ""
+    ],
+    [
+     "C",
+     ""
+    ],
+    [
+     "D",
+     ""
+    ],
+    [
+     "E",
+     ""
+    ]
+   ]
+  },
+  {
+   "name": "unterminated quotes",
+   "src": "A='abc\nB=\"def\nC=`ghi\nD=ok",
+   "entries": [
+    [
+     "A",
+     "'abc"
+    ],
+    [
+     "B",
+     "\"def"
+    ],
+    [
+     "C",
+     "`ghi"
+    ],
+    [
+     "D",
+     "ok"
+    ]
+   ]
+  },
+  {
+   "name": "mismatched trailing quote",
+   "src": "A='a' b'\nB=\"a\" b\"\nC='a'b\nD=\"a\"'",
+   "entries": [
+    [
+     "A",
+     "a' b"
+    ],
+    [
+     "B",
+     "a\" b"
+    ],
+    [
+     "C",
+     "'a'b"
+    ],
+    [
+     "D",
+     "\"a\"'"
+    ]
+   ]
+  },
+  {
+   "name": "equals in value",
+   "src": "A=b=c\nB==x\nURL=postgres://u:p@h:5432/db?sslmode=disable",
+   "entries": [
+    [
+     "A",
+     "b=c"
+    ],
+    [
+     "B",
+     "=x"
+    ],
+    [
+     "URL",
+     "postgres://u:p@h:5432/db?sslmode=disable"
+    ]
+   ]
+  },
+  {
+   "name": "key characters",
+   "src": "a.b-c=1\nA_1=2\n1X=3\nA B=4\n=5\n-x=6\n.y=7",
+   "entries": [
+    [
+     "a.b-c",
+     "1"
+    ],
+    [
+     "A_1",
+     "2"
+    ],
+    [
+     "1X",
+     "3"
+    ],
+    [
+     "-x",
+     "6"
+    ],
+    [
+     ".y",
+     "7"
+    ]
+   ]
+  },
+  {
+   "name": "duplicates",
+   "src": "A=1\nB=x\nA=2",
+   "entries": [
+    [
+     "A",
+     "2"
+    ],
+    [
+     "B",
+     "x"
+    ]
+   ]
+  },
+  {
+   "name": "proto key",
+   "src": "__proto__=x\nconstructor=y\nB=1",
+   "entries": [
+    [
+     "constructor",
+     "y"
+    ],
+    [
+     "B",
+     "1"
+    ]
+   ]
+  },
+  {
+   "name": "unicode whitespace",
+   "src": "﻿A=1\nB= x \nC=　y\nD=a b",
+   "entries": [
+    [
+     "A",
+     "1"
+    ],
+    [
+     "B",
+     "x"
+    ],
+    [
+     "C",
+     "y"
+    ],
+    [
+     "D",
+     "a b"
+    ]
+   ]
+  },
+  {
+   "name": "line endings",
+   "src": "A=1\r\nB=2\r\nC=3\rD=4",
+   "entries": [
+    [
+     "A",
+     "1"
+    ],
+    [
+     "B",
+     "2"
+    ],
+    [
+     "C",
+     "3"
+    ],
+    [
+     "D",
+     "4"
+    ]
+   ]
+  },
+  {
+   "name": "escaped quotes",
+   "src": "A=\"a\\\"b\"\nB='a\\'b'\nC=\"a\\\"\nD=`a\\`b`",
+   "entries": [
+    [
+     "A",
+     "a\\\"b"
+    ],
+    [
+     "B",
+     "a\\'b"
+    ],
+    [
+     "C",
+     "a\\"
+    ],
+    [
+     "D",
+     "a\\`b"
+    ]
+   ]
+  },
+  {
+   "name": "inner other quotes",
+   "src": "A=`a\"b'c`\nB=\"x'y\"\nC='p\"q'",
+   "entries": [
+    [
+     "A",
+     "a\"b'c"
+    ],
+    [
+     "B",
+     "x'y"
+    ],
+    [
+     "C",
+     "p\"q"
+    ]
+   ]
+  },
+  {
+   "name": "tabs and spaces",
+   "src": "A=\tx\t\nB=  'quoted'  \nC=\" spaced \"",
+   "entries": [
+    [
+     "A",
+     "x"
+    ],
+    [
+     "B",
+     "quoted"
+    ],
+    [
+     "C",
+     " spaced "
+    ]
+   ]
+  },
+  {
+   "name": "values that look like options",
+   "src": "PORT=3001\nEXTRA_SESSION_DAYS=2026-11-08,2027-10-29\nFAIR_VALUE_CONFIG_JSON={\"enabled\":true}\nEMPTY=",
+   "entries": [
+    [
+     "PORT",
+     "3001"
+    ],
+    [
+     "EXTRA_SESSION_DAYS",
+     "2026-11-08,2027-10-29"
+    ],
+    [
+     "FAIR_VALUE_CONFIG_JSON",
+     "{\"enabled\":true}"
+    ],
+    [
+     "EMPTY",
+     ""
+    ]
+   ]
+  },
+  {
+   "name": "blank lines",
+   "src": "\n\n  \nA=1\n\n\nB=2\n",
+   "entries": [
+    [
+     "A",
+     "1"
+    ],
+    [
+     "B",
+     "2"
+    ]
+   ]
+  },
+  {
+   "name": "no trailing newline",
+   "src": "A=last",
+   "entries": [
+    [
+     "A",
+     "last"
+    ]
+   ]
+  },
+  {
+   "name": ".env.example",
+   "src": "# Copy this file to \".env\" and fill in your Kite Connect credentials.\n# Get these from the Kite developer console: https://developers.kite.trade/apps\n\nKITE_API_KEY=your_api_key_here\nKITE_API_SECRET=your_api_secret_here\n\n# Port this backend listens on.\nPORT=3001\n\n# IST dates that ARE trading sessions despite falling on a weekend — NSE's muhurat\n# and other special sessions. Comma-separated ISO dates, e.g.\n#   EXTRA_SESSION_DAYS=2026-11-08,2027-10-29\n# Without this, intraday capture skips them (the gate is weekday-based) and their\n# buckets can only ever come from the Kite historical backfill.\n#\n# The reverse case — a weekday that is an exchange HOLIDAY — needs no configuration:\n# capture asks the exchange's own timestamp whether anything traded today and skips\n# the day by itself, so the charts don't gain a flat session that never happened.\nEXTRA_SESSION_DAYS=\n\n# Where the frontend runs (used for CORS + post-login redirect).\n# NOTE: Use 127.0.0.1 (not localhost) so it matches the Kite Redirect URL.\nFRONTEND_URL=http://127.0.0.1:5173\n\n# IMPORTANT: In the Kite developer console, set your app's\n# \"Redirect URL\" to your frontend verify route. Kite requires HTTPS, but\n# allows a http://127.0.0.1 URL for local testing (localhost is NOT allowed\n# unless you serve the frontend over HTTPS). Use exactly:\n#   http://127.0.0.1:5173/zerodha/verify\n# and browse your app at http://127.0.0.1:5173 (not http://localhost:5173).\n\n# Full-admin secret - required for /admin/verify (Zerodha login + trades + all).\nADMIN_SECRET=your_secret_key_here\n\n# Trade-access password - required for /admin/access (view & take trades only,\n# NO Zerodha login controls). Shares the same trades as the full admin.\nACCESS_SECRET=your_trade_access_password_here\n\n# Shared secret for GET /api/internal/kite-token. The local \"market_data\"\n# recorder calls this endpoint (header: x-internal-secret) to reuse THIS app's\n# Zerodha access token, so it needs no separate Kite subscription. Use a long\n# random string and set the SAME value as INTERNAL_TOKEN_SECRET in market_data.\n# If left blank, the endpoint is disabled (returns 503).\nINTERNAL_TOKEN_SECRET=\n\n# Passcode for the public, curl-friendly token route:\n#   GET /api/kite/token?passcode=...   (or header x-token-passcode)\n# Once the admin has connected Zerodha, anyone with this passcode can fetch the\n# day's access token via a simple curl (no admin login needed). Keep it separate\n# from ADMIN_SECRET so it can be shared with scripts without granting admin\n# access. Use a long random string, e.g. `openssl rand -hex 32`.\n#\n# ONE passcode covers BOTH brokers' token routes and the rf read:\n#   GET /api/kite/token   -> { authenticated, api_key, access_token, login_date }\n#   GET /api/dhan/token   -> { authenticated, client_id, access_token, expires_at,\n#                              login_date }\n#   GET /api/rf           -> { rf }\n#\n#   curl \"https://<host>/api/dhan/token?passcode=YOUR_PASSCODE\"\n#   curl -H \"x-token-passcode: YOUR_PASSCODE\" https://<host>/api/dhan/token\n#\n# Each token route answers 409 when that broker has no live (unexpired) session, rather\n# than serving a dead token.\n#\n# BECAUSE IT IS SHARED, THE TWO BROKERS ARE NOT INDEPENDENTLY REVOCABLE: rotating this\n# rotates access to both, and a leak exposes both. That is the accepted tradeoff for\n# managing a single secret.\n#\n# Keep it separate from ADMIN_SECRET — an admin token can place, close and delete trades\n# and switch broker, whereas this grants only a token read.\n#\n# TREAT WHAT THESE ROUTES RETURN AS A TRADING CREDENTIAL. A Dhan access token plus the\n# client id can place and cancel orders. Your DHAN_STATIC_PUBLIC_IP whitelisting bounds\n# that to the whitelisted IP, so do NOT whitelist a host you only meant to give read\n# access to.\n#\n# If left blank every route above is DISABLED (503). An unset secret NEVER means\n# \"no passcode required\".\nTOKEN_ROUTE_SECRET=\n\n# MongoDB connection string (Mongoose) for persisting calendar-spread trades.\n# Include the database name in the URI itself, e.g.\n#   mongodb+srv://user:pass@cluster.mongodb.net/calspread?retryWrites=true&w=majority\n# If left blank, the trades feature is disabled (the rest of the app still works).\nMONGODB_URI=\n\n# MongoDB connection string for the trade/charges LEDGER (collection: trade_log).\n#\n# Every trade writes one append-only document per event (entry, exit) recording\n# what was transacted and what it cost: the contract value, the per-leg fills,\n# and the full charge breakdown (brokerage, STT, exchange transaction charge,\n# SEBI turnover charge, GST, stamp duty) exactly as Zerodha's virtual contract\n# note API returned it — including the raw API payload, so the record survives a\n# future change to Zerodha's charge heads. Exit documents also carry gross P&L,\n# total charges and net P&L for the round trip.\n#\n# It is separate from MONGODB_URI because the ledger is accounting data: the\n# `trades` documents are mutable (updated on close, deletable from the UI),\n# whereas these are never rewritten, so the tax record of a trade outlives the\n# trade itself and the collection can be exported for book-keeping as-is.\n# Include the database name in the URI, e.g.\n#   mongodb+srv://user:pass@cluster.mongodb.net/calspread_ledger?retryWrites=true&w=majority\n# If left blank, the ledger is written to the MONGODB_URI database instead.\nTRADE_LOG_URI=\n\n# MongoDB connection string for the nse_fno ARCHIVE database (read-only).\n# Contains historical stock_futures data up to Aug 31, 2025 (fnodata1 cluster).\n# Example: mongodb+srv://user:pass@fnodata1.mongodb.net/nse_fno?retryWrites=true&w=majority\n# If left blank, historical spread computation for pre-2026 dates is disabled.\nNSE_FNO_ARCHIVE_URI=\n\n# MongoDB connection string for the nse_fno CURRENT database (read-write).\n# Contains stock_futures data from Jan 1, 2026 onwards (fnodata2 cluster).\n# This is where new daily F&O closing data is written by the EOD scheduler.\n# Example: mongodb+srv://user:pass@fnodata2.mongodb.net/nse_fno?retryWrites=true&w=majority\n# If left blank, EOD stock_futures capture is disabled.\nNSE_FNO_CURRENT_URI=\n\n# MongoDB connection string for the spread database (read-write).\n# Contains spread_daily and spread_summary collections (calspread cluster).\n# Example: mongodb+srv://user:pass@calspread.mongodb.net/calspread?retryWrites=true&w=majority\n# If left blank, spread computation and summary are disabled.\nNSE_FNO_SPREAD_URI=\n\n\n# ---------------------------------------------------------------------------\n# Upstash Redis (REST) — durable store for the Analytics caches.\n#\n# Copy both values from the Upstash console: your database -> Connect -> REST.\n# They look like:\n#   UPSTASH_REDIS_REST_URL=https://your-db-name-12345.upstash.io\n#   UPSTASH_REDIS_REST_TOKEN=AX...long-token...\n#\n# What this buys you. Without it the option/futures OI frames, the per-minute\n# chain snapshots behind the OI Δ% / buildup windows, and the previous-session\n# close baseline all live only in memory — so every deploy or crash throws the\n# session away and rebuilds it with hundreds of Kite historical calls, and any\n# multi-day history (2 days, 1 week) is lost until it is re-accumulated. With it\n# set, the backend warm-loads all of that on boot and only asks Kite for the gap.\n#\n# Retention is enforced in Redis (pruned buckets are deleted and every key\n# carries a TTL), so nothing needs cleaning up by hand:\n#   option/futures OI frames   1m -> 1 day, 5m -> 3 days, 15m -> 7 days, 1h -> 7 days\n#   per-minute chain snapshots 1 day     (serves the 1m/5m/15m/1h windows)\n#   per-hour  chain snapshots  4 days\n#   previous-session close     2 days\n#\n# Cost: one pipelined request per minute during market hours, about 10-12 commands\n# in it (~4K/day, ~90K/month). That fits the Upstash free tier's 500K/month with\n# plenty of room. Key TTLs are refreshed at most every 15 minutes rather than on\n# every write, which is what keeps the count down.\n#\n# If left blank the app behaves exactly as it did before Redis existed:\n# everything stays in memory and is rebuilt from Kite after a restart.\nUPSTASH_REDIS_REST_URL=\nUPSTASH_REDIS_REST_TOKEN=\n\n# Fair Value: full-admin, read-only option valuations; independent of trading.\n# Default off. A saved full-admin analytics setting may override this default.\nFAIR_VALUE_ENABLED=false\n# Hard deployment disable: saved/UI analytics settings cannot override true.\nFAIR_VALUE_DISABLED=false\n# Optional validated JSON settings patch. Supply a verified expiry-time policy\n# and discount curve/explicit flat fallback. See docs/FAIR_VALUE.md for all settings.\nFAIR_VALUE_CONFIG_JSON=\n\n\n\n# ---------------------------------------------------------------------------\n# Box arbitrage (PAPER BY DEFAULT; LIVE ONLY WHEN DOUBLE-GATED)\n#\n# An independent module (src/box/) that reuses this app's Kite session, shared\n# WebSocket, instrument cache and Zerodha charge estimator. Three modes simulate\n# fills; live mode can place broker orders only when BOTH deployment gates below\n# are explicit, Mongo/Kite/reconciliation are healthy, and full-admin runtime\n# controls are armed. See README section 7 and src/box/LIVE_EXECUTION.md.\n#\n# Box positions use their own collections (box_trades, box_trade_events) in the\n# MONGODB_URI database, so the calendar trade book is untouched. With no\n# MONGODB_URI the box scanner refuses to start rather than operating unrecorded.\n#\n# EVERY VALUE BELOW IS OPTIONAL — the defaults are the shipped specification and\n# keep execution in paper_latency with live trading disabled.\n# ---------------------------------------------------------------------------\n\n# Dedicated MongoDB connection string for the BOX collections (box_trades and\n# box_trade_events), so the Box strategy book can live in its own database,\n# entirely apart from the calendar trade book. Include the database name in\n# the URI, e.g.\n#   mongodb+srv://user:pass@cluster.mongodb.net/calspread_box?retryWrites=true\n# If left blank, the box collections are created in the MONGODB_URI database\n# instead (still their own collections, so calendar data is never touched).\n# With BOTH this and MONGODB_URI unset the box scanner refuses to start rather\n# than operating without durable records.\nBOX_MONGODB_URI=\n\n# THE ENTRY GATE: minimum GROSS edge (₹) from the SPREAD alone.\n#\n#   grossEdge = ((K2 - K1) - executableBoxCostPerUnit) x lotSize\n#\n# Charges are still estimated, stored and displayed — they are simply NOT\n# deducted before deciding to enter, because fees are managed by hand.\nMIN_BOX_GROSS_EDGE=1200\n\n# OPTIONAL additional floor (₹) on the projected NET edge\n# (gross - entryFees - estExitFees - safetyBuffer).\n# 0 (the default) disables it, so the gross spread above is the only gate. Set a\n# positive number to also require an after-cost cushion.\nMIN_BOX_NET_EDGE=0\n\n# Whether to skip a box whose charges Zerodha could not price. This is NOT about\n# the threshold (which is gross-only): the exit rules are evaluated net of\n# charges, so a position with no charge figures could never have its net P&L\n# computed and would never auto-exit. Set to false to enter anyway and manage\n# those positions by hand.\nBOX_REQUIRE_PRICED_CHARGES=true\n\n# Conservative slippage/safety allowance (₹) per complete box round trip, on top\n# of the real Zerodha charges. Reported in the projected NET edge (and used by the\n# optional net floor above), but NOT part of the gross entry gate.\nBOX_SAFETY_BUFFER=150\n\n# How long (ms) an UNCHANGED order book is still trusted.\n#\n# This is NOT a \"price age\" limit. A depth feed only sends a message when the book\n# CHANGES, so silence is not staleness: a resting book nobody has touched for ten\n# seconds is still the current, executable book. Illiquid F&O strikes are quiet for\n# long stretches, so a sub-second value here does not make the system safer — it\n# simply makes it unable to trade anything but the most active names.\n# All four legs must pass, and the check is re-applied after the charge call.\nBOX_QUOTE_MAX_AGE_MS=15000\n\n# FEED LIVENESS (ms): maximum age of the newest tick across the WHOLE universe.\n#\n# This is the check that actually catches \"we are holding old data and do not know\n# it\" — a silently dropped WebSocket leaves every cached book looking normal. With\n# hundreds of instruments subscribed something is always trading during market\n# hours, so universal silence means the connection is broken rather than the market\n# being calm. When it trips, no entry and no automatic exit happens at all.\nBOX_FEED_MAX_AGE_MS=5000\n\n# Maximum age (ms) of the underlying value used to place the ATM window.\nBOX_UNDERLYING_MAX_AGE_MS=10000\n\n# A deliberate LOWER bound (₹) on what a round trip can cost in charges, used\n# ONLY by the prefilter and ONLY when MIN_BOX_NET_EDGE above is turned on. It must\n# UNDER-state real charges: a larger value would discard boxes that would have\n# qualified. Eight option orders at ₹20 brokerage plus GST is already about ₹189,\n# so 160 is safe.\nBOX_PREFILTER_CHARGE_ALLOWANCE=160\n\n# ATM re-centring damps. The spot must move past the midpoint between the current\n# ATM and its neighbour by this extra fraction of a strike step before the seven-\n# strike window moves, and a window is never rebuilt more often than the interval.\nBOX_ATM_HYSTERESIS=0.15\nBOX_WINDOW_MIN_INTERVAL_MS=15000\n\n# Automatic-exit rules. A box closes when EITHER\n#   remainingEdge <= max(FLOOR, PCT x entryNetEdge) AND currentNetPnL >= MIN_EXIT_NET_PNL\n#   OR currentNetPnL >= PROFIT_CAPTURE_PCT x entryNetEdge\n# and in both cases only while the net P&L is positive and all four reversed legs\n# have fresh one-lot touch liquidity.\nBOX_CONVERGENCE_FLOOR=200\nBOX_CONVERGENCE_PCT=0.2\nBOX_MIN_EXIT_NET_PNL=600\nBOX_PROFIT_CAPTURE_PCT=0.75\n\n# Minutes before the 15:30 IST close, on expiry day, to start forcing an\n# executable close so a position is never abandoned at expiry. If the touch\n# cannot fill it, the condition is recorded and exposed - never faked.\nBOX_EXPIRY_SAFETY_MINUTES=45\n\n# Cadences (ms): open-position monitoring, the slow flush of live figures to\n# Mongo, the SSE publish rate to the UI, and universe/expiry/window refresh.\nBOX_MONITOR_INTERVAL_MS=1000\nBOX_PERSIST_INTERVAL_MS=30000\nBOX_PUBLISH_INTERVAL_MS=500\nBOX_UNIVERSE_REFRESH_MS=60000\n\n# How often (ms) the LAST-CLOSE view is rebuilt while the market is shut. Pressing\n# RUN outside market hours never trades: it shows each box priced from the last\n# traded / closing prices so a mispricing at the close is still visible, marked\n# price_source \"last_close\" and status INDICATIVE. Costs one REST /quote call per\n# 500 instruments, and the numbers cannot move while the exchange is closed.\nBOX_INDICATIVE_REFRESH_MS=60000\n\n# Cap on simultaneously subscribed box option tokens. Zerodha allows roughly\n# 3,000 instruments per WebSocket connection and the calendar board already uses\n# part of that budget on the SAME shared socket, so this bounds the box universe.\n# Underlyings that do not fit are reported in skipped_symbols on /api/box/status.\n# Legs of an OPEN position are always subscribed regardless of this budget.\nBOX_MAX_SUBSCRIBED_TOKENS=2200\n\n# Optional hard cap on how many underlyings are scanned (0 = no cap beyond the\n# token budget above).\nBOX_MAX_UNDERLYINGS=0\n\n# Charge-estimate cache TTL (ms) and how many charge calls may be in flight.\nBOX_CHARGE_CACHE_TTL_MS=30000\nBOX_CHARGE_CONCURRENCY=3\n\n# ---------------------------------------------------------------------------\n# Local charge rate card (units matter — read the suffix on each line)\n#\n# These are the statutory/broker rates the local calculator bills. They are the\n# largest cost in a box round trip, so a wrong value here silently makes every\n# paper P&L wrong. Verify against zerodha.com/charges for YOUR account.\n#\n# STT: PERCENT of premium, sell side only. 0.15% since 1 April 2026, when option\n# STT was flattened to a uniform rate (futures went 0.02% -> 0.05% at the same\n# time). The previous default here was 0.10%, which understated the biggest cost\n# in the trade and flattered results.\nBOX_STT_SELL_PCT=0.15\n# Round the STT head to the NEAREST RUPEE, as the contract note does.\nBOX_STT_ROUND_NEAREST_RUPEE=true\n# NSE options transaction charge: PERCENT of premium, both sides.\nBOX_EXCHANGE_TXN_PCT=0.03503\n# NSE IPFT: RUPEES PER CRORE of premium (not a percent). Rs 50/crore on options.\nBOX_IPFT_PER_CRORE=50\n# SEBI turnover fee: PERCENT of premium, both sides (Rs 10 per crore).\nBOX_SEBI_PCT=0.0001\n# Stamp duty: PERCENT of premium, BUY side only.\nBOX_STAMP_DUTY_BUY_PCT=0.003\n# GST: PERCENT applied to (brokerage + exchange txn + SEBI).\nBOX_GST_PCT=18\n# Flat brokerage per executed option order (RUPEES).\nBOX_BROKERAGE_PER_ORDER=20\n#\n# Identifier for the rate card above, stamped onto every trade and execution\n# attempt. Statutory rates change, so a P&L figure is only interpretable next to\n# the rates that produced it. Bump this whenever you change a rate.\nBOX_CHARGE_RATE_VERSION=zerodha-nse-options-2026-04-01\n\n# Which Box execution model is used. FOUR values are accepted:\n#\n#   paper_touch     fill at the touch visible in the DETECTION snapshot (optimistic)\n#   paper_latency   (default) fill from the latest valid book at a simulated arrival\n#   paper_legging   FOUR independent simulated orders with emergency unwind\n#   live            broker-authoritative execution; blocked unless the separate\n#                   BOX_LIVE_TRADING_ENABLED gate is also true\n#\n# Unknown values fail closed during configuration. The default remains paper_latency\n# so existing deployments cannot start placing real orders after an upgrade.\nBOX_EXECUTION_MODE=paper_latency\n# Independent deployment kill switch. Setting this alone does nothing; live requires\n# BOTH BOX_EXECUTION_MODE=live and BOX_LIVE_TRADING_ENABLED=true.\nBOX_LIVE_TRADING_ENABLED=false\n\n# Live runtime controls still start false on every process start and must be armed\n# through the full-admin API. See src/box/LIVE_EXECUTION.md before enabling live.\nBOX_LIVE_RECONCILE_INTERVAL_MS=60000\nBOX_LIVE_FEED_RECONNECT_WARMUP_MS=5000\nBOX_LIVE_MAX_OPEN_BOXES=1\nBOX_LIVE_MAX_CONCURRENT_EXECUTIONS=1\nBOX_LIVE_MAX_RESIDUAL_LEGS=1\nBOX_LIVE_DAILY_LOSS_LIMIT=5000\nBOX_LIVE_REJECT_LIMIT=3\nBOX_LIVE_CONSECUTIVE_FAILURE_LIMIT=3\nBOX_LIVE_MAX_OPEN_LEG_QUANTITY=100\nBOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY=400\nBOX_LIVE_HTTP_TIMEOUT_MS=5000\nBOX_LIVE_ACK_TIMEOUT_MS=3000\nBOX_LIVE_WORKING_TIMEOUT_MS=30000\nBOX_LIVE_PARTIAL_TIMEOUT_MS=10000\nBOX_LIVE_CANCEL_TIMEOUT_MS=5000\nBOX_LIVE_MAX_MODIFICATIONS=2\nBOX_LIVE_MAX_CHASE_TICKS=2\n\n# ---------------------------------------------------------------------------\n# TRANSPORT PACING — real broker rate limits, NOT simulated latency.\n# ---------------------------------------------------------------------------\n# These two are REAL waits. They exist because the broker enforces a request rate,\n# and lowering them below the documented floors earns a 429 (which, at Zerodha,\n# still consumes the daily order-request budget). They are NOT the paper simulation\n# delays: BOX_SIMULATED_DECISION_MS and BOX_SIMULATED_LATENCY_MS are paper-only and\n# are never consulted on the live path.\n#\n# GENERAL pacing: order-status polls, order/position lists, funds, margins, health.\n# Also the poll cadence while waiting for a working order to resolve. Unchanged.\nBOX_LIVE_BROKER_MIN_INTERVAL_MS=250\n#\n# ORDER-MUTATION pacing: place / modify / cancel only. 0 = derive from the broker's\n# published order limit (Zerodha 110 ms, floor 100 ms from its documented 10 order\n# requests/second; Dhan 120 ms, matching the floor its own HTTP layer imposes).\n# A positive value is an operator override and is CLAMPED UP to the broker floor —\n# this is a real rate limit, so it can be relaxed towards the floor but never below\n# it and never to zero. Cancellation is in this faster bucket deliberately: a\n# protective cancel is the operation you least want to slow down.\nBOX_LIVE_BROKER_ORDER_MIN_INTERVAL_MS=0\n\n# ---------------------------------------------------------------------------\n# FOUR-LEG ENTRY BURST\n# ---------------------------------------------------------------------------\n# How many ENTRY role submissions of ONE Box may be in transport at once (1..4).\n#\n# A live concurrency slot is held for an order's ENTIRE lifecycle, submit through\n# terminal polling. With BOX_LIVE_MAX_CONCURRENT_EXECUTIONS=1 leg 2 is not even\n# persisted until leg 1 fully resolves, so the Box sits UNHEDGED for three complete\n# order lifecycles. This bounds how many of the four may be in flight together.\n#\n# ENTRY only, and scoped to a single Box pipeline, so it can never let two\n# overlapping candidates bypass contract reservations. Burst slots are invisible to\n# emergency/cancel/exit admission, so an entry burst cannot delay protective work.\n# Broker rate limits are still enforced independently by the pacer above.\n#\n# 1 = exactly the pre-existing serialised behaviour. 4 = recommended for production.\nBOX_LIVE_ENTRY_SUBMIT_CONCURRENCY=1\n\n# ---------------------------------------------------------------------------\n# MAXIMUM ₹ PER BOX  (an admission metric — NOT broker margin)\n# ---------------------------------------------------------------------------\n# Refuses an entry whose four bounded LIMIT orders would transact more than this\n# many rupees. 0 = disabled (the default, so existing deployments are unaffected).\n#\n# THE NUMBER IS:  gross_entry_order_notional_rupees\n#                 = SUM( |limit_price x quantity| ) over the four ENTRY legs,\n#                   computed from the ACTUAL immutable bounded LIMIT requests.\n#\n# IT IS **NOT** BROKER MARGIN, and must never be described as such. A four-leg Box\n# is a hedged structure: its real margin requirement is typically a small fraction\n# of gross option notional, and can even be a net CREDIT. An operator who read\n# \"margin\" here and set a matching cap would be off by roughly an order of\n# magnitude. If a broker margin estimate is available it is reported separately as\n# broker_estimated_margin_rupees and is never substituted for this metric.\n#\n# Checked from the immutable order requests BEFORE any broker submission, and\n# re-verified at dequeue (the last safe moment). Exactly at the cap is admitted;\n# one paisa over is refused. Exits are never gated by it.\nBOX_LIVE_MAX_BOX_CAPITAL_RUPEES=0\n# Paper mirror, for exercising the same admission arithmetic under live_parity.\n# LIVE remains the authoritative safety gate. 0 = disabled.\nBOX_PAPER_MAX_BOX_CAPITAL_RUPEES=0\n\n# ---------------------------------------------------------------------------\n# ONE ACTIVE BOX PER UNDERLYING  (optional strategy restriction)\n# ---------------------------------------------------------------------------\n# When true, a second Box may not enter on an underlying that already has one,\n# REGARDLESS of strike pair, expiry or direction: RELIANCE 2500/2600 active blocks\n# RELIANCE 2550/2650 even though they share no option contract.\n#\n# WHY: concurrent same-underlying Boxes can hold opposite option roles that\n# economically offset each other, so the broker's net position per contract no\n# longer decomposes cleanly per Box — which makes reconciliation, partial-exit\n# accounting and residual attribution much harder exactly when they matter most.\n#\n# This is an ADDITIONAL layer. It never replaces the existing exact-contract\n# reservations, and with it false the behaviour is unchanged. Refusals are reported\n# as `underlying_already_active`, never as a contract-reservation conflict.\n#\n# ENTRY only: it can never block an exit, a protective cancel or a residual flatten.\nBOX_ONE_ACTIVE_BOX_PER_UNDERLYING=false\n\n# ---------------------------------------------------------------------------\n# SESSION CYCLE BUDGET  (one-shot trading)\n# ---------------------------------------------------------------------------\n# How many COMPLETE Box lifecycles an armed session may run.\n#   0 = unlimited (default)\n#   1 = one-shot\n#   N = N cycles\n#\n# A \"complete lifecycle\" is ENTRY -> HOLD/MONITOR -> EXIT -> FLAT. It is NOT \"one\n# broker order\", and reaching the limit does NOT stop the engine: monitoring,\n# auto-exit, partial-exit cleanup, residual flattening, reconciliation and recovery\n# all continue. Only NEW ENTRY is disabled.\n#\n# A cycle is CONSUMED when a full four-leg Box is established (which is what gates\n# new entry, so with max=1 the second candidate is refused while the first Box is\n# still open) and COMPLETED when that Box reaches fully FLAT. A rejected,\n# partially-filled-then-unwound or economics-aborted entry establishes no Box and\n# therefore consumes nothing.\n#\n# The counters are DURABLE (collection `box_trading_session`). Restarting Node does\n# not hand back a spent budget, and if the record cannot be READ, entry fails CLOSED\n# — an unread session is not an unarmed one. A session must be armed explicitly\n# through the full-admin API; arming is refused while any consumed cycle still has\n# live exposure, so it cannot be used to bypass the limit.\nBOX_SESSION_MAX_COMPLETED_TRADES=0\n\n# paper_legging leg submission: \"parallel\" (default, all four at once) or\n# \"sequential\" (each next order only after the previous FILLED).\nBOX_LEG_EXECUTION_MODE=parallel\n# How long (ms) a leg may rest before it is deemed unfilled and the box aborts.\nBOX_LEG_TIMEOUT_MS=500\n# Simulated latency (ms) for the emergency unwind of a partial/aborted fill.\nBOX_LEG_UNWIND_LATENCY_MS=150\n\n# ---------------------------------------------------------------------------\n# DEDICATED BOX MARKET-DATA LANE\n#\n# Two physically separate upstream WebSockets for the ONE active broker:\n#\n#   futures lane — calendar-spread board, spot, futures analytics, browser SSE\n#   box lane     — option strikes for the Box scanner (bid/ask/depth)\n#\n# This is NOT two brokers at once. Exactly one broker is ACTIVE and both lanes\n# belong to it: two Zerodha sockets, or two Dhan sockets, never one of each.\n#\n# Why: sharing one connection makes the two workloads compete for one token\n# budget, and every strike the board displaces is an arbitrage the scanner cannot\n# see. Split, each lane has its own refcount table, its own budget and its own\n# health — so a wide option universe cannot starve the board and vice versa.\n#\n# Connection budget. Zerodha permits 3 sockets per API key: two are used here\n# (one per lane) and the third is deliberately left free for a separate service.\n# PM2 stops the old process before starting the new one, so a deploy never needs\n# four. Dhan permits 5 sockets per user at 5000 instruments each, so two lanes fit\n# comfortably. The lane count is fixed at two by construction — no code path opens\n# an unbounded number of sockets.\n#\n# Turning this off falls back to the single shared feed, exactly as before.\nBOX_DEDICATED_MARKET_FEED=true\n\n# ---------------------------------------------------------------------------\n# SHARED-CONTRACT EXECUTION COORDINATION\n#\n# Two Box opportunities can need the SAME option contract. A 1300/1320 box and a\n# 1320/1340 box have different candidate keys (underlying|expiry|K1|K2|DIRECTION)\n# and both trade the 1320 strike. Every duplicate guard in the engine is keyed on\n# that candidate key, so without this layer the two look unrelated and can be\n# submitted in the same instant — each assuming the whole displayed size at 1320.\n#\n# The coordinator wraps the execution gateway, so it sits ABOVE the paper/live\n# branch: paper is coordinated by exactly the same code as live. A simulator that\n# lets two boxes consume one resting lot is not modelling anything real.\n#\n# Unrelated boxes are NOT serialised: two boxes sharing no contract execute\n# concurrently, and there is no global execution mutex.\n# ---------------------------------------------------------------------------\n# Master switch. Turning this off restores the un-coordinated behaviour in which\n# overlapping boxes can submit the same contract simultaneously. Emergency escape\n# hatch, not a tuning knob.\nBOX_EXECUTION_COORDINATOR_ENABLED=true\n# How long (ms) a box may wait for a contract another execution holds. This is the\n# GIVE-UP bound, not the normal path: the loser is woken by the holder's release,\n# typically within a millisecond, then RE-PRICED before it may proceed. Raising it\n# only keeps dead opportunities alive longer.\nBOX_CONFLICT_WAIT_MAX_MS=250\n# Reservation TTL (ms). The crash-recovery mechanism — a dead or wedged execution\n# cannot hold a contract past it — and also how long a reservation is HELD when the\n# terminal broker state was ambiguous, so keep it well above a round trip.\nBOX_INSTRUMENT_LOCK_TTL_MS=5000\n# Optional per-underlying execution budget; 0 disables it. A risk cap layered ON TOP\n# of exact-contract exclusion, never a replacement — RELIANCE 2500CE and RELIANCE\n# 2800CE share no contract and must still be able to execute concurrently.\nBOX_MAX_CONCURRENT_PER_UNDERLYING=2\n# Fraction of the originally detected gross edge that must survive for a box that\n# waited on a conflict to be allowed to execute. Arriving at the front of the queue\n# is not a reason to trade.\nBOX_CONFLICT_REVALIDATE_MIN_EDGE_RATIO=0.8\n# Require a DURABLE (cross-process) reservation tier before LIVE execution runs.\n# Off by default because this deploys as a single PM2 fork process, where the\n# in-process store is authoritative and strictly stronger than a network lock: it\n# cannot time out, fail or be delayed. Set true when running multiple workers —\n# live execution then fails CLOSED instead of silently losing conflict protection.\nBOX_RESERVATION_REQUIRE_DURABLE=false\n# Build the DURABLE (cross-process) reservation tier. ON by default: the in-process\n# store is only authoritative for ONE process, and the moment there are two — PM2\n# cluster mode, several workers, another EC2 instance, a Kubernetes replica — both see\n# the same option contract as free and both submit. MongoDB is already mandatory for\n# the Box module, so this adds no new operational dependency.\n# When it cannot be reached: LIVE Box ENTRY fails closed; exits, residual flattening\n# and reconciliation stay available; paper degrades to a labelled local_only mode.\nBOX_DURABLE_RESERVATIONS_ENABLED=true\n# How often a held reservation is renewed. Defaults to a third of the lock TTL, so two\n# consecutive renewals may fail before the lease is genuinely at risk. A bounded timer,\n# NOT one renewal per market tick — that would be thousands of writes a minute.\nBOX_RESERVATION_RENEW_INTERVAL_MS=1666\n# Clock-skew grace for durable expiry decisions. Creates an asymmetric dead band: the\n# holder stops claiming ownership this long BEFORE its lease expires, and a challenger\n# may only reclaim it this long AFTER. Handing a contract to nobody for 2x this is a\n# missed opportunity; handing it to two workers is a naked position.\nBOX_RESERVATION_CLOCK_SKEW_GRACE_MS=250\n# How long a reservation held over an UNRESOLVED broker state keeps being renewed.\n# Unbounded renewal would lock a strike all day on one ambiguous outcome; no renewal\n# would drop protection while real exposure may still exist. After this it is left to\n# lapse by TTL — never actively released, because releasing is the \"assume there is no\n# exposure\" mistake. Residual flattening is not gated by any of this.\nBOX_RESERVATION_UNCERTAIN_HOLD_MAX_MS=60000\n# Lock NAMESPACE. Development, staging and production MUST NOT share one, or a laptop\n# pointed at the production cluster could take a contract the real trading process\n# needs — or believe it holds one production is actively trading.\n#\n# LEFT UNSET DELIBERATELY. A copied .env carrying a hard-coded value is exactly how two\n# environments end up in one namespace, so set it explicitly per deployment, e.g.\n#   CALSPREAD_DEPLOYMENT_ID=production-mumbai\n# Unset, it falls back to NODE_ENV and then \"development\" — so production and a laptop\n# are still separated as long as NODE_ENV is set. Starting LIVE without an explicit\n# value logs a warning.\nCALSPREAD_DEPLOYMENT_ID=\n# Optional host/replica label used in owner ids and conflict logs. Defaults to the\n# machine hostname; PM2's NODE_APP_INSTANCE is folded in automatically when set.\nCALSPREAD_INSTANCE_ID=\n# Net two boxes wanting OPPOSITE sides of one contract against each other.\n# MUST stay false until the ledger can represent virtual ownership of both boxes\n# while broker net exposure is zero. Until then opposite-side overlaps take the same\n# safe path as same-side ones: serialise, confirm, re-evaluate.\nBOX_INTERNAL_NETTING_ENABLED=false\n\n# ---------------------------------------------------------------------------\n# paper_legging: EXECUTABLE ORDER PRICING (marketable-limit, not a market order)\n#\n# A simulated leg no longer consumes whatever the book shows on arrival. Each\n# order carries a LIMIT a bounded number of ticks past the touch it was priced\n# against, and the book is walked only down to that limit — a level worse than the\n# limit is never filled. This is the difference between \"pay up to ₹100.10\" and\n# \"pay whatever is showing\".\n#\n#   BUY  limit = reference_ask + chaseTicks × tickSize\n#   SELL limit = reference_bid − chaseTicks × tickSize\n#\n# Entries chase a small band; emergency unwinds may reach wider because flattening\n# exposure matters more than the price. The real instrument tick size is used\n# where the dump supplies it; BOX_DEFAULT_TICK_SIZE is the fallback.\nBOX_LEG_MAX_CHASE_TICKS=2\nBOX_UNWIND_MAX_CHASE_TICKS=5\nBOX_DEFAULT_TICK_SIZE=0.05\n\n# ---------------------------------------------------------------------------\n# paper_legging: CONSERVATIVE QUEUE APPROXIMATION\n#\n# We cannot see NSE order-level queue priority from level-2 depth, so we do NOT\n# pretend the displayed quantity is all ours.\n#\n#   BOX_QUEUE_MODEL=haircut (default) treats only a fraction of each displayed\n#     level as executable for us: effectiveQty = floor(displayed × (1 − pct/100)).\n#   BOX_QUEUE_MODEL=none uses the raw displayed quantity — the optimistic baseline\n#     to compare against.\n#\n# Deterministic (no randomness): the same recorded book + same config always fills\n# identically. This is a transparent approximation, NOT a reconstruction of true\n# queue position — see README §7.\nBOX_QUEUE_MODEL=haircut\nBOX_QUEUE_LIQUIDITY_HAIRCUT_PCT=30\n\n# ---------------------------------------------------------------------------\n# paper_legging: FOUR-LEG TEMPORAL COHERENCE\n#\n# Maximum spread (ms) between the newest and oldest leg EXCHANGE timestamps a\n# candidate may show and still auto-enter. When all four legs carry a valid\n# exchange timestamp and the dispersion exceeds this, the candidate is rejected as\n# \"cross_leg_time_skew\" rather than traded on books that are not a coherent\n# cross-sectional snapshot. 0 disables the check. When any leg lacks an exchange\n# timestamp the check is skipped and the existing receive-time freshness logic\n# stands (a missing timestamp is never itself grounds for rejection).\nBOX_MAX_CROSS_LEG_EXCHANGE_DISPERSION_MS=250\n\n# Asynchronous verification of the LOCAL charge maths against Zerodha's virtual\n# contract note. Never blocks execution — a trade is already open by the time this\n# runs. Retries are BOUNDED so a broker outage cannot become a hot retry loop, and\n# per-head differences (brokerage / STT / exchange / SEBI / GST / stamp) are stored\n# on the trade so a drifted statutory rate can be identified rather than guessed at.\nBOX_CHARGE_RECONCILE_MAX_ATTEMPTS=3\nBOX_CHARGE_RECONCILE_RETRY_BASE_MS=5000\n\n# How many opportunities the UI is sent.\nBOX_MAX_PUBLISHED_OPPORTUNITIES=60\n\n# ---------------------------------------------------------------------------\n# Box daily P&L cache + nightly archive (OPTIONAL, OFF by default)\n#\n# When enabled AND Upstash Redis is configured (UPSTASH_REDIS_REST_URL/TOKEN\n# above), the RUNNING net P&L of the day's box trades — open positions plus every\n# trade closed today — is mirrored to Redis on a slow cadence. This is a fast,\n# restart-surviving cache of \"how is today going\", NOT a replacement for the\n# box_trades book (entries/exits still persist to Mongo exactly as before).\n#\n# Once a night a cron drains that day's cached P&L into a dedicated MongoDB\n# collection, `box_daily_pnl` (one document per trade per day, plus a per-day\n# summary). The drain is STREAMED — one document at a time with a small delay —\n# so a day's rows are never written in a single burst, and a failure part-way\n# through is retried on the next pass rather than losing data. Two later passes\n# re-check the day and finish anything the first drain missed.\n#\n# With BOX_PNL_CACHE_ENABLED unset/false, none of this runs: no Redis writes, no\n# new collection, and the module behaves exactly as it did before.\nBOX_PNL_CACHE_ENABLED=false\n\n# How often (ms) the running day-P&L snapshot is written to Redis while enabled.\n# One small pipelined request per interval, so 30s is inexpensive.\nBOX_PNL_CACHE_INTERVAL_MS=30000\n\n# TTL (seconds) on a day's cached P&L hash in Redis. Must comfortably outlive the\n# verify passes below (default 3 days) so a delayed/retried archive still has the\n# cache to read from.\nBOX_PNL_CACHE_TTL_SEC=259200\n\n# IST hour (0-23) at which the day's cached P&L is drained to Mongo. Default 21\n# (9 PM), well after the 15:30 close so the day is final.\nBOX_PNL_ARCHIVE_HOUR=21\n\n# IST hours (comma-separated, 0-23) at which the archive is re-checked and\n# completed if the 9 PM drain did not finish. Default \"22,23\" (10 PM & 11 PM).\nBOX_PNL_VERIFY_HOURS=22,23\n\n# Delay (ms) between each document while streaming the archive into Mongo, so the\n# nightly transfer never lands as one bulk write. Default 50ms.\nBOX_PNL_ARCHIVE_DRAIN_DELAY_MS=50\n\n\n# ============================================================================\n#  DHAN (DhanHQ v2) — the SECOND broker\n#\n#  Calspread supports two brokers: Zerodha and Dhan. Historical trades from both\n#  coexist in the database forever, but ONLY ONE broker is ever active for market\n#  data, the Box scanner, the quote/depth feed, new trades, live order execution,\n#  positions, reconciliation, margins and charges.\n#\n#  Leaving this whole block unset is fine: the app boots Zerodha-only exactly as\n#  before and reports Dhan as \"not configured\".\n#\n#  Create the API key/secret at web.dhan.co → My Profile → \"Access DhanHQ APIs\" →\n#  toggle to \"API key\". Keys are valid for 12 months.\n# ============================================================================\n\n# Your Dhan client id (the numeric account id shown in the Dhan dashboard).\nDHAN_CLIENT_ID=\n\n# The API key and secret of your Dhan app.\n#\n# THE SECRET IS SERVER-SIDE ONLY. It is sent to Dhan as a request header from this\n# process and is never returned by any endpoint or exposed to the browser.\nDHAN_API_KEY=\nDHAN_API_SECRET=\n\n# Where Dhan sends the browser after a successful login. This MUST match the\n# redirect URL configured on the Dhan app EXACTLY, or the login fails.\n#\n# The frontend serves this path and forwards the ?tokenId=... to the backend, which\n# exchanges it for an access token. The token never reaches the browser.\nDHAN_REDIRECT_URL=https://calspread.online/dhan/verify\n\n# Dhan's order-update postback endpoint. Optional but recommended.\n#\n# Treated strictly as a HINT that accelerates order-state updates — REST\n# reconciliation remains the source of truth, because a postback can be lost,\n# duplicated, reordered or arrive unauthenticated.\nDHAN_POSTBACK_URL=https://calspread.online/api/dhan/postback\n\n# ---------------------------------------------------------------------------\n#  Dhan safety gates. Both default to the SAFE setting.\n# ---------------------------------------------------------------------------\n\n# Master switch for REAL Dhan orders. With this false, Dhan can serve market data\n# and paper trading but the live execution adapter refuses to be constructed.\nDHAN_LIVE_TRADING_ENABLED=false\n\n# Whether Dhan's data APIs may be used at all. Default true.\nDHAN_DATA_ENABLED=true\n\n# STATIC IP — read this before enabling live Dhan trading.\n#\n# Dhan requires the CALLER'S PUBLIC IP to be whitelisted before it will accept order\n# placement, modification or cancellation.\n#\n# PREFERRED: set the server's public IP here. Dhan exposes its own whitelist via\n# GET /ip/getIP, so this value is VERIFIED against Dhan's primaryIP/secondaryIP\n# rather than trusted. That turns the precondition from a declaration into a checked\n# fact, and readiness then reports exactly which side disagrees.\n#\n# Verified at boot (when Dhan is active) and on every switch to Dhan. After\n# whitelisting a new address, POST /api/dhan/verify-ip re-checks it without a restart.\nDHAN_STATIC_PUBLIC_IP=\n\n# Manual declaration, retained as an ADDITIONAL operator gate.\n#\n#   - With DHAN_STATIC_PUBLIC_IP set: the API check decides readiness. This flag is\n#     then only a kill switch — setting it explicitly false still blocks trading even\n#     when the IP verifies.\n#   - With DHAN_STATIC_PUBLIC_IP unset: this flag alone decides, and the health report\n#     says so, because a declaration is materially weaker evidence.\n#\n# Defaults to FALSE and FAILS CLOSED throughout. Note that setting it true without\n# actually whitelisting the IP does not make orders work — it only removes the local\n# guard, and Dhan then rejects the orders at the edge, potentially part-way through\n# building a four-leg box.\nDHAN_STATIC_IP_EXPECTED=false\n\n# ---------------------------------------------------------------------------\n#  Dhan transport tuning (optional)\n# ---------------------------------------------------------------------------\n\n# Per-request deadline (ms). `fetch` has no timeout of its own, so this is what\n# stops an unresponsive socket from wedging the request pacer.\nDHAN_HTTP_TIMEOUT_MS=8000\n\n# Minimum gap between Dhan API requests (ms) — a simple, predictable pacer that\n# keeps us clear of Dhan's per-endpoint rate limits.\nDHAN_MIN_INTERVAL_MS=120\n\n# Attempts for a RETRYABLE READ, including the first. Order submissions are NEVER\n# retried regardless of this value.\nDHAN_MAX_READ_ATTEMPTS=3\n\n# Depth levels to subscribe: 5 (default), 20 or 200.\n#\n# Leave at 5. The Box scanner watches thousands of strikes and the FULL packet's\n# 5-level ladder is what it is sized for. Dhan's 20- and 200-level feeds are a\n# separate architecture with far tighter instrument limits (200-depth is one\n# instrument per connection), so forcing the scanner onto them would exhaust\n# connections rather than improve a decision.\nDHAN_DEPTH_LEVEL=5\n\n# ---------------------------------------------------------------------------\n#  Dhan charges — NOT the same as Zerodha's\n#\n#  The statutory heads (STT, exchange transaction charge, SEBI fee, stamp duty,\n#  GST) are set by the exchange and government and are identical at every broker.\n#  BROKERAGE is not. A four-leg box round trip is EIGHT orders, so a per-order\n#  difference is multiplied eightfold against a ₹1,200 entry gate — which is why\n#  Dhan trades are costed with Dhan's card and labelled `dhan_estimate`, never\n#  with Zerodha's.\n# ---------------------------------------------------------------------------\n\n# Flat brokerage per executed order (₹). Set this to match YOUR Dhan plan.\nDHAN_BROKERAGE_PER_ORDER=20\n\n# Statutory rates. Change only when the government does.\nDHAN_STT_SELL_PCT=0.1\nDHAN_EXCHANGE_TXN_PCT=0.03503\nDHAN_IPFT_PER_CRORE=50\nDHAN_SEBI_PCT=0.0001\nDHAN_STAMP_DUTY_BUY_PCT=0.003\nDHAN_GST_PCT=18\n\n# Stamped onto every Dhan trade so a historical record stays interpretable after a\n# rate change.\nDHAN_CHARGE_RATE_VERSION=dhan-nse-options-2026-04-01\n\n\n# ===========================================================================\n# LIVE-CALIBRATED EXECUTION TWIN\n#\n# Everything in this block is ADDITIVE and defaults to today's behaviour.\n# Nothing here enables live trading, and nothing here changes the default\n# execution mode. See src/box/LIVE_EXECUTION.md for the full model, the\n# calibration honesty contract, and the \"Observable parity\" section stating\n# exactly what the simulator can and cannot claim.\n# ===========================================================================\n\n# ---------------------------------------------------------------------------\n# PAPER EXECUTION PROFILE\n#\n#   standard     Today's paper behaviour, byte-for-byte. The default.\n#   live_parity  EVIDENCE-DRIVEN. Shared-liquidity ledger, the live scheduling\n#                policy, latency drawn from MEASURED live samples when\n#                calibration is valid, and a real cancel-vs-fill race window.\n#                Nothing in this profile is fabricated.\n#   stress       RESILIENCE TESTING ONLY. Deliberately injects faults (broker\n#                slowdown, feed gaps, rejects, duplicate/out-of-order events).\n#                A SEPARATE profile precisely so an injected fault can never be\n#                mistaken for measured behaviour.\n#\n# `stress` is never a fallback: an unrecognised value becomes `standard`, and\n# STARTUP REFUSES if `stress` is combined with BOX_EXECUTION_MODE=live.\nBOX_PAPER_EXECUTION_PROFILE=standard\n\n# ---------------------------------------------------------------------------\n# LIVE-CALIBRATION CONSUMPTION (live_parity only)\n#\n# How much measured evidence paper requires before it trusts a distribution.\n# Below these thresholds it falls back to the documented constants and reports\n# `measured: no` / `confidence: LOW` — it never presents a constant as a\n# measurement.\n\n# Fresh measured samples before a calibrated distribution is used at all.\nBOX_PAPER_CALIBRATION_MIN_SAMPLES=30\n\n# Fresh samples before a TIME-OF-DAY bucket (OPEN / NORMAL / CLOSE) is trusted\n# on its own rather than pooled. Deliberately higher than the value above:\n# activating a narrow bucket on a handful of observations is the definition of\n# overfitting, and produces confident-looking numbers with no basis.\nBOX_PAPER_CALIBRATION_BUCKET_MIN_SAMPLES=60\n\n# Samples from sessions older than this are excluded from ACTIVE calibration.\n# They are still RETAINED for analytics and drift detection — the point is that\n# yesterday's latency regime must not silently calibrate today. 3 days: long\n# enough to survive a weekend gap, short enough that a fortnight-old network\n# regime never applies.\nBOX_PAPER_CALIBRATION_MAX_AGE_MS=259200000\n\n# Enable coarse OPEN / NORMAL / CLOSE bucketing at all. Buckets still have to\n# earn their own sample count above before being used.\nBOX_PAPER_CALIBRATION_TIME_BUCKETS=true\n\n# Fallback cancel-request -> terminal window (ms) for paper's cancel-vs-fill\n# race, used when no measured CANCEL latency exists yet.\n#\n# DELIBERATELY NON-ZERO. Zero would mean \"cancels are instantaneous\", which is\n# the optimistic assumption the race model exists to remove: in reality the\n# exchange can still fill a resting order while our cancel is in flight.\nBOX_PAPER_CANCEL_LATENCY_MS=150\n\n# ---------------------------------------------------------------------------\n# EXECUTION TIMING OBSERVABILITY\n#\n# Records monotonic stage timestamps for every real broker operation — queue\n# wait, transport pacing, HTTP, broker ACK, each cumulative fill, cancel\n# request/confirmation — and feeds them to the calibration store paper reads\n# from. This is the mechanism by which the simulator becomes more accurate as\n# real executions are observed.\n#\n# FAIL-OPEN AND OFF THE HOT PATH: it performs no I/O, never awaits, and every\n# method is individually guarded, because it runs inside protective-cancel and\n# unwind paths. Lost measurement is counted and reported, never hidden.\nBOX_EXECUTION_TIMING_METRICS_ENABLED=true\nBOX_EXECUTION_TIMING_WINDOW=500\n\n# Measure event-loop delay and process pressure.\n#\n# WHY IT MATTERS: \"POST->ACK took 900ms\" has two very different explanations —\n# the broker was slow, or the broker replied in 90ms and our event loop was\n# blocked for 810ms. Only one of those belongs in a broker latency\n# distribution, and a sample measured during a significant stall is therefore\n# EXCLUDED from calibration. Cheap (native histogram, one low-frequency timer)\n# and fail-open.\nBOX_EXECUTION_EVENT_LOOP_METRICS_ENABLED=true\n\n# Deployment region LABEL for calibration data. Never auto-detected, and a\n# calibration store REFUSES to import another region's samples: two deployments\n# have different physical round-trip times to the broker, so a merged\n# distribution would describe neither.\n# BOX_DEPLOYMENT_REGION=ap-south-1\n\n# ---------------------------------------------------------------------------\n# CALIBRATION PERSISTENCE\n#\n# Without this, a restart at 09:30 throws away the morning's evidence and drops\n# paper back to its constants — exactly when calibration is most valuable.\n#\n# Bounded and asynchronous by construction: recording is one in-memory append\n# with no await and no I/O. A full buffer drops the OLDEST observations and\n# reports the loss; a failed flush discards the batch rather than growing memory\n# without bound. Losing latency samples is survivable; losing the trading\n# process is not. No substitute samples are ever generated.\nBOX_LIVE_TIMING_PERSIST_ENABLED=false\nBOX_LIVE_TIMING_BATCH_SIZE=50\nBOX_LIVE_TIMING_FLUSH_MS=15000\n\n# ---------------------------------------------------------------------------\n# SHADOW VALIDATION MODE\n#\n# The REAL market feed and the REAL strategy run, paper live_parity produces the\n# orders it would have produced, and NO BROKER ORDER IS EVER SUBMITTED. This\n# gives a continuous, zero-risk stream of predictions to compare against real\n# executions once live trading is separately enabled for an actual trade.\n#\n# Enforced three independent ways, because a flag that is merely checked before\n# submitting gets bypassed by new code paths:\n#   1. startup REFUSES if this is combined with BOX_EXECUTION_MODE=live;\n#   2. no live adapter is constructed outside live mode, so no object capable of\n#      reaching a broker exists;\n#   3. a guard turns any attempted submit/modify/cancel into a loud throw.\nBOX_SHADOW_MODE_ENABLED=false\n\n\n# Fallback durable-write delay (ms) paper applies between acquiring a concurrency\n# slot and transmitting.\n#\n# ZERO ON PURPOSE. The live path really does pay two Mongo round trips there,\n# inside the already-held slot, before it may send. But until that has actually\n# been measured we do not know its size, and a guessed database latency would be\n# a fabrication. 0 means \"knowingly optimistic on this stage, and it says so\" —\n# calibrationStatus() reports persistence_window_measured: false. Once\n# persistence_wait_ms has samples, paper uses the measured p50 instead. Set this\n# only if you have measured your own deployment.\nBOX_PAPER_PERSISTENCE_MS=0\n\n# ===========================================================================\n# THE FOUR EXECUTION SETTINGS, AND HOW THEY DIFFER\n#\n# Two independent axes. BOX_EXECUTION_MODE decides whether real orders can exist\n# at all; BOX_PAPER_EXECUTION_PROFILE decides how faithfully paper behaves.\n#\n#   standard     profile. No broker orders. Today's paper behaviour,\n#                byte-for-byte: constant latency, no cancel race, no shared\n#                liquidity. The comparison baseline.\n#\n#   live_parity  profile. No broker orders. EVIDENCE-DRIVEN: shared liquidity\n#                ledger, the live scheduling policy, and latency + cancel windows\n#                drawn from MEASURED live observations when calibration is valid.\n#                Every figure reports whether it is measured.\n#\n#   stress       profile. No broker orders. DELIBERATELY SYNTHETIC fault\n#                injection for resilience testing. A separate profile so an\n#                injected fault can never be mistaken for observed behaviour.\n#                Refuses to start alongside live execution. Never called parity.\n#\n#   live         MODE. **REAL ORDERS.** The only one of the four that can place\n#                them, and only with BOX_LIVE_TRADING_ENABLED=true as a second\n#                gate — without it, startup fails rather than degrading.\n#\n# WHAT live_parity KNOWS: scheduler wait, durable-persistence latency, transport\n# pacing, POST->HTTP response, POST->ACK, ACK->first fill, ACK->terminal,\n# partial->terminal and cancel-request->terminal, all measured per broker, per\n# operation kind, per marketable/passive profile and per time-of-day bucket.\n# Fills come from real observed WebSocket depth walked within a bounded LIMIT.\n#\n# WHAT live_parity STILL CANNOT KNOW — and therefore never fabricates:\n#   * true NSE queue position of our order\n#   * hidden or iceberg liquidity\n#   * matching-engine ordering\n#   * another participant's future order\n#   * exact market impact of our own order\n#\n# THIS IS NOT AN EXACT EXCHANGE SIMULATOR and must never be described as one. It\n# is a deterministic digital twin of the OBSERVABLE execution path.\n# ===========================================================================\n\n# ===========================================================================\n# RECOMMENDED PAPER-VALIDATION CONFIGURATION\n#\n# Copy this block to validate the simulator against reality. It places NO real\n# orders: BOX_EXECUTION_MODE stays paper, and BOX_LIVE_TRADING_ENABLED is\n# untouched. The live double gate is deliberately left exactly as it is.\n#\n#   BOX_EXECUTION_MODE=paper_legging\n#   BOX_PAPER_EXECUTION_PROFILE=live_parity\n#   BOX_QUEUE_MODEL=haircut\n#   BOX_QUEUE_LIQUIDITY_HAIRCUT_PCT=30\n#\n#   # Scheduler parity: paper must use the SAME cap and pacing as live, or its\n#   # queueing model describes a deployment you are not running.\n#   BOX_PAPER_MAX_CONCURRENT_EXECUTIONS=1     # = BOX_LIVE_MAX_CONCURRENT_EXECUTIONS\n#   BOX_LIVE_BROKER_MIN_INTERVAL_MS=250       # shared by both schedulers\n#\n#   # Measure, and keep what was measured across restarts. Without persistence,\n#   # a restart at 09:30 discards the morning's evidence.\n#   BOX_EXECUTION_TIMING_METRICS_ENABLED=true\n#   BOX_EXECUTION_EVENT_LOOP_METRICS_ENABLED=true\n#   BOX_LIVE_TIMING_PERSIST_ENABLED=true\n#   BOX_DEPLOYMENT_REGION=ap-south-1          # a LABEL; samples never cross regions\n#\n# Expect UNCALIBRATED, measured: no and confidence: LOW on day one. That is\n# correct: there is no evidence yet. Watch GET /api/box/execution-diagnostics as\n# sample counts accumulate and the status climbs.\n#\n# To run the real strategy against the real feed while submitting nothing, add\n# BOX_SHADOW_MODE_ENABLED=true.\n#\n# DO NOT set BOX_EXECUTION_MODE=live or BOX_LIVE_TRADING_ENABLED=true as part of\n# validation. Enabling live trading is a separate, deliberate decision.\n# ===========================================================================\n",
+   "entries": [
+    [
+     "KITE_API_KEY",
+     "your_api_key_here"
+    ],
+    [
+     "KITE_API_SECRET",
+     "your_api_secret_here"
+    ],
+    [
+     "PORT",
+     "3001"
+    ],
+    [
+     "EXTRA_SESSION_DAYS",
+     ""
+    ],
+    [
+     "FRONTEND_URL",
+     "http://127.0.0.1:5173"
+    ],
+    [
+     "ADMIN_SECRET",
+     "your_secret_key_here"
+    ],
+    [
+     "ACCESS_SECRET",
+     "your_trade_access_password_here"
+    ],
+    [
+     "INTERNAL_TOKEN_SECRET",
+     ""
+    ],
+    [
+     "TOKEN_ROUTE_SECRET",
+     ""
+    ],
+    [
+     "MONGODB_URI",
+     ""
+    ],
+    [
+     "TRADE_LOG_URI",
+     ""
+    ],
+    [
+     "NSE_FNO_ARCHIVE_URI",
+     ""
+    ],
+    [
+     "NSE_FNO_CURRENT_URI",
+     ""
+    ],
+    [
+     "NSE_FNO_SPREAD_URI",
+     ""
+    ],
+    [
+     "UPSTASH_REDIS_REST_URL",
+     ""
+    ],
+    [
+     "UPSTASH_REDIS_REST_TOKEN",
+     ""
+    ],
+    [
+     "FAIR_VALUE_ENABLED",
+     "false"
+    ],
+    [
+     "FAIR_VALUE_DISABLED",
+     "false"
+    ],
+    [
+     "FAIR_VALUE_CONFIG_JSON",
+     ""
+    ],
+    [
+     "BOX_MONGODB_URI",
+     ""
+    ],
+    [
+     "MIN_BOX_GROSS_EDGE",
+     "1200"
+    ],
+    [
+     "MIN_BOX_NET_EDGE",
+     "0"
+    ],
+    [
+     "BOX_REQUIRE_PRICED_CHARGES",
+     "true"
+    ],
+    [
+     "BOX_SAFETY_BUFFER",
+     "150"
+    ],
+    [
+     "BOX_QUOTE_MAX_AGE_MS",
+     "15000"
+    ],
+    [
+     "BOX_FEED_MAX_AGE_MS",
+     "5000"
+    ],
+    [
+     "BOX_UNDERLYING_MAX_AGE_MS",
+     "10000"
+    ],
+    [
+     "BOX_PREFILTER_CHARGE_ALLOWANCE",
+     "160"
+    ],
+    [
+     "BOX_ATM_HYSTERESIS",
+     "0.15"
+    ],
+    [
+     "BOX_WINDOW_MIN_INTERVAL_MS",
+     "15000"
+    ],
+    [
+     "BOX_CONVERGENCE_FLOOR",
+     "200"
+    ],
+    [
+     "BOX_CONVERGENCE_PCT",
+     "0.2"
+    ],
+    [
+     "BOX_MIN_EXIT_NET_PNL",
+     "600"
+    ],
+    [
+     "BOX_PROFIT_CAPTURE_PCT",
+     "0.75"
+    ],
+    [
+     "BOX_EXPIRY_SAFETY_MINUTES",
+     "45"
+    ],
+    [
+     "BOX_MONITOR_INTERVAL_MS",
+     "1000"
+    ],
+    [
+     "BOX_PERSIST_INTERVAL_MS",
+     "30000"
+    ],
+    [
+     "BOX_PUBLISH_INTERVAL_MS",
+     "500"
+    ],
+    [
+     "BOX_UNIVERSE_REFRESH_MS",
+     "60000"
+    ],
+    [
+     "BOX_INDICATIVE_REFRESH_MS",
+     "60000"
+    ],
+    [
+     "BOX_MAX_SUBSCRIBED_TOKENS",
+     "2200"
+    ],
+    [
+     "BOX_MAX_UNDERLYINGS",
+     "0"
+    ],
+    [
+     "BOX_CHARGE_CACHE_TTL_MS",
+     "30000"
+    ],
+    [
+     "BOX_CHARGE_CONCURRENCY",
+     "3"
+    ],
+    [
+     "BOX_STT_SELL_PCT",
+     "0.15"
+    ],
+    [
+     "BOX_STT_ROUND_NEAREST_RUPEE",
+     "true"
+    ],
+    [
+     "BOX_EXCHANGE_TXN_PCT",
+     "0.03503"
+    ],
+    [
+     "BOX_IPFT_PER_CRORE",
+     "50"
+    ],
+    [
+     "BOX_SEBI_PCT",
+     "0.0001"
+    ],
+    [
+     "BOX_STAMP_DUTY_BUY_PCT",
+     "0.003"
+    ],
+    [
+     "BOX_GST_PCT",
+     "18"
+    ],
+    [
+     "BOX_BROKERAGE_PER_ORDER",
+     "20"
+    ],
+    [
+     "BOX_CHARGE_RATE_VERSION",
+     "zerodha-nse-options-2026-04-01"
+    ],
+    [
+     "BOX_EXECUTION_MODE",
+     "paper_latency"
+    ],
+    [
+     "BOX_LIVE_TRADING_ENABLED",
+     "false"
+    ],
+    [
+     "BOX_LIVE_RECONCILE_INTERVAL_MS",
+     "60000"
+    ],
+    [
+     "BOX_LIVE_FEED_RECONNECT_WARMUP_MS",
+     "5000"
+    ],
+    [
+     "BOX_LIVE_MAX_OPEN_BOXES",
+     "1"
+    ],
+    [
+     "BOX_LIVE_MAX_CONCURRENT_EXECUTIONS",
+     "1"
+    ],
+    [
+     "BOX_LIVE_MAX_RESIDUAL_LEGS",
+     "1"
+    ],
+    [
+     "BOX_LIVE_DAILY_LOSS_LIMIT",
+     "5000"
+    ],
+    [
+     "BOX_LIVE_REJECT_LIMIT",
+     "3"
+    ],
+    [
+     "BOX_LIVE_CONSECUTIVE_FAILURE_LIMIT",
+     "3"
+    ],
+    [
+     "BOX_LIVE_MAX_OPEN_LEG_QUANTITY",
+     "100"
+    ],
+    [
+     "BOX_LIVE_MAX_GROSS_OPEN_LEG_QUANTITY",
+     "400"
+    ],
+    [
+     "BOX_LIVE_HTTP_TIMEOUT_MS",
+     "5000"
+    ],
+    [
+     "BOX_LIVE_ACK_TIMEOUT_MS",
+     "3000"
+    ],
+    [
+     "BOX_LIVE_WORKING_TIMEOUT_MS",
+     "30000"
+    ],
+    [
+     "BOX_LIVE_PARTIAL_TIMEOUT_MS",
+     "10000"
+    ],
+    [
+     "BOX_LIVE_CANCEL_TIMEOUT_MS",
+     "5000"
+    ],
+    [
+     "BOX_LIVE_MAX_MODIFICATIONS",
+     "2"
+    ],
+    [
+     "BOX_LIVE_MAX_CHASE_TICKS",
+     "2"
+    ],
+    [
+     "BOX_LIVE_BROKER_MIN_INTERVAL_MS",
+     "250"
+    ],
+    [
+     "BOX_LIVE_BROKER_ORDER_MIN_INTERVAL_MS",
+     "0"
+    ],
+    [
+     "BOX_LIVE_ENTRY_SUBMIT_CONCURRENCY",
+     "1"
+    ],
+    [
+     "BOX_LIVE_MAX_BOX_CAPITAL_RUPEES",
+     "0"
+    ],
+    [
+     "BOX_PAPER_MAX_BOX_CAPITAL_RUPEES",
+     "0"
+    ],
+    [
+     "BOX_ONE_ACTIVE_BOX_PER_UNDERLYING",
+     "false"
+    ],
+    [
+     "BOX_SESSION_MAX_COMPLETED_TRADES",
+     "0"
+    ],
+    [
+     "BOX_LEG_EXECUTION_MODE",
+     "parallel"
+    ],
+    [
+     "BOX_LEG_TIMEOUT_MS",
+     "500"
+    ],
+    [
+     "BOX_LEG_UNWIND_LATENCY_MS",
+     "150"
+    ],
+    [
+     "BOX_DEDICATED_MARKET_FEED",
+     "true"
+    ],
+    [
+     "BOX_EXECUTION_COORDINATOR_ENABLED",
+     "true"
+    ],
+    [
+     "BOX_CONFLICT_WAIT_MAX_MS",
+     "250"
+    ],
+    [
+     "BOX_INSTRUMENT_LOCK_TTL_MS",
+     "5000"
+    ],
+    [
+     "BOX_MAX_CONCURRENT_PER_UNDERLYING",
+     "2"
+    ],
+    [
+     "BOX_CONFLICT_REVALIDATE_MIN_EDGE_RATIO",
+     "0.8"
+    ],
+    [
+     "BOX_RESERVATION_REQUIRE_DURABLE",
+     "false"
+    ],
+    [
+     "BOX_DURABLE_RESERVATIONS_ENABLED",
+     "true"
+    ],
+    [
+     "BOX_RESERVATION_RENEW_INTERVAL_MS",
+     "1666"
+    ],
+    [
+     "BOX_RESERVATION_CLOCK_SKEW_GRACE_MS",
+     "250"
+    ],
+    [
+     "BOX_RESERVATION_UNCERTAIN_HOLD_MAX_MS",
+     "60000"
+    ],
+    [
+     "CALSPREAD_DEPLOYMENT_ID",
+     ""
+    ],
+    [
+     "CALSPREAD_INSTANCE_ID",
+     ""
+    ],
+    [
+     "BOX_INTERNAL_NETTING_ENABLED",
+     "false"
+    ],
+    [
+     "BOX_LEG_MAX_CHASE_TICKS",
+     "2"
+    ],
+    [
+     "BOX_UNWIND_MAX_CHASE_TICKS",
+     "5"
+    ],
+    [
+     "BOX_DEFAULT_TICK_SIZE",
+     "0.05"
+    ],
+    [
+     "BOX_QUEUE_MODEL",
+     "haircut"
+    ],
+    [
+     "BOX_QUEUE_LIQUIDITY_HAIRCUT_PCT",
+     "30"
+    ],
+    [
+     "BOX_MAX_CROSS_LEG_EXCHANGE_DISPERSION_MS",
+     "250"
+    ],
+    [
+     "BOX_CHARGE_RECONCILE_MAX_ATTEMPTS",
+     "3"
+    ],
+    [
+     "BOX_CHARGE_RECONCILE_RETRY_BASE_MS",
+     "5000"
+    ],
+    [
+     "BOX_MAX_PUBLISHED_OPPORTUNITIES",
+     "60"
+    ],
+    [
+     "BOX_PNL_CACHE_ENABLED",
+     "false"
+    ],
+    [
+     "BOX_PNL_CACHE_INTERVAL_MS",
+     "30000"
+    ],
+    [
+     "BOX_PNL_CACHE_TTL_SEC",
+     "259200"
+    ],
+    [
+     "BOX_PNL_ARCHIVE_HOUR",
+     "21"
+    ],
+    [
+     "BOX_PNL_VERIFY_HOURS",
+     "22,23"
+    ],
+    [
+     "BOX_PNL_ARCHIVE_DRAIN_DELAY_MS",
+     "50"
+    ],
+    [
+     "DHAN_CLIENT_ID",
+     ""
+    ],
+    [
+     "DHAN_API_KEY",
+     ""
+    ],
+    [
+     "DHAN_API_SECRET",
+     ""
+    ],
+    [
+     "DHAN_REDIRECT_URL",
+     "https://calspread.online/dhan/verify"
+    ],
+    [
+     "DHAN_POSTBACK_URL",
+     "https://calspread.online/api/dhan/postback"
+    ],
+    [
+     "DHAN_LIVE_TRADING_ENABLED",
+     "false"
+    ],
+    [
+     "DHAN_DATA_ENABLED",
+     "true"
+    ],
+    [
+     "DHAN_STATIC_PUBLIC_IP",
+     ""
+    ],
+    [
+     "DHAN_STATIC_IP_EXPECTED",
+     "false"
+    ],
+    [
+     "DHAN_HTTP_TIMEOUT_MS",
+     "8000"
+    ],
+    [
+     "DHAN_MIN_INTERVAL_MS",
+     "120"
+    ],
+    [
+     "DHAN_MAX_READ_ATTEMPTS",
+     "3"
+    ],
+    [
+     "DHAN_DEPTH_LEVEL",
+     "5"
+    ],
+    [
+     "DHAN_BROKERAGE_PER_ORDER",
+     "20"
+    ],
+    [
+     "DHAN_STT_SELL_PCT",
+     "0.1"
+    ],
+    [
+     "DHAN_EXCHANGE_TXN_PCT",
+     "0.03503"
+    ],
+    [
+     "DHAN_IPFT_PER_CRORE",
+     "50"
+    ],
+    [
+     "DHAN_SEBI_PCT",
+     "0.0001"
+    ],
+    [
+     "DHAN_STAMP_DUTY_BUY_PCT",
+     "0.003"
+    ],
+    [
+     "DHAN_GST_PCT",
+     "18"
+    ],
+    [
+     "DHAN_CHARGE_RATE_VERSION",
+     "dhan-nse-options-2026-04-01"
+    ],
+    [
+     "BOX_PAPER_EXECUTION_PROFILE",
+     "standard"
+    ],
+    [
+     "BOX_PAPER_CALIBRATION_MIN_SAMPLES",
+     "30"
+    ],
+    [
+     "BOX_PAPER_CALIBRATION_BUCKET_MIN_SAMPLES",
+     "60"
+    ],
+    [
+     "BOX_PAPER_CALIBRATION_MAX_AGE_MS",
+     "259200000"
+    ],
+    [
+     "BOX_PAPER_CALIBRATION_TIME_BUCKETS",
+     "true"
+    ],
+    [
+     "BOX_PAPER_CANCEL_LATENCY_MS",
+     "150"
+    ],
+    [
+     "BOX_EXECUTION_TIMING_METRICS_ENABLED",
+     "true"
+    ],
+    [
+     "BOX_EXECUTION_TIMING_WINDOW",
+     "500"
+    ],
+    [
+     "BOX_EXECUTION_EVENT_LOOP_METRICS_ENABLED",
+     "true"
+    ],
+    [
+     "BOX_LIVE_TIMING_PERSIST_ENABLED",
+     "false"
+    ],
+    [
+     "BOX_LIVE_TIMING_BATCH_SIZE",
+     "50"
+    ],
+    [
+     "BOX_LIVE_TIMING_FLUSH_MS",
+     "15000"
+    ],
+    [
+     "BOX_SHADOW_MODE_ENABLED",
+     "false"
+    ],
+    [
+     "BOX_PAPER_PERSISTENCE_MS",
+     "0"
+    ]
+   ]
+  }
+ ],
+ "config": [
+  {
+   "name": "default .env, existing variables win",
+   "files": {
+    ".env": "QT1mcm9tLWZpbGUKQj0idHdvIHdvcmRzIgpDPTM="
+   },
+   "env": {
+    "A": "preset"
+   },
+   "argv": [],
+   "result": {
+    "A": "preset",
+    "B": "two words",
+    "C": "3",
+    "DOTENV_CONFIG_PATH": null,
+    "DOTENV_CONFIG_OVERRIDE": null,
+    "DOTENV_KEY": null
+   }
+  },
+  {
+   "name": "existing empty variable is kept",
+   "files": {
+    ".env": "QT1mcm9tLWZpbGUKQj0y"
+   },
+   "env": {
+    "A": ""
+   },
+   "argv": [],
+   "result": {
+    "A": "",
+    "B": "2",
+    "C": null,
+    "DOTENV_CONFIG_PATH": null,
+    "DOTENV_CONFIG_OVERRIDE": null,
+    "DOTENV_KEY": null
+   }
+  },
+  {
+   "name": "no .env file",
+   "files": {},
+   "env": {},
+   "argv": [],
+   "result": {
+    "A": null,
+    "B": null,
+    "C": null,
+    "DOTENV_CONFIG_PATH": null,
+    "DOTENV_CONFIG_OVERRIDE": null,
+    "DOTENV_KEY": null
+   }
+  },
+  {
+   "name": "DOTENV_CONFIG_PATH relative",
+   "files": {
+    ".env": "QT1kZWZhdWx0",
+    "custom.env": "QT1jdXN0b20KQj1i"
+   },
+   "env": {
+    "DOTENV_CONFIG_PATH": "custom.env"
+   },
+   "argv": [],
+   "result": {
+    "A": "custom",
+    "B": "b",
+    "C": null,
+    "DOTENV_CONFIG_PATH": "custom.env",
+    "DOTENV_CONFIG_OVERRIDE": null,
+    "DOTENV_KEY": null
+   }
+  },
+  {
+   "name": "DOTENV_CONFIG_PATH empty means .env",
+   "files": {
+    ".env": "QT1kZWZhdWx0"
+   },
+   "env": {
+    "DOTENV_CONFIG_PATH": ""
+   },
+   "argv": [],
+   "result": {
+    "A": "default",
+    "B": null,
+    "C": null,
+    "DOTENV_CONFIG_PATH": "",
+    "DOTENV_CONFIG_OVERRIDE": null,
+    "DOTENV_KEY": null
+   }
+  },
+  {
+   "name": "DOTENV_CONFIG_PATH missing file",
+   "files": {
+    ".env": "QT1kZWZhdWx0"
+   },
+   "env": {
+    "DOTENV_CONFIG_PATH": "nope.env"
+   },
+   "argv": [],
+   "result": {
+    "A": null,
+    "B": null,
+    "C": null,
+    "DOTENV_CONFIG_PATH": "nope.env",
+    "DOTENV_CONFIG_OVERRIDE": null,
+    "DOTENV_KEY": null
+   }
+  },
+  {
+   "name": "DOTENV_CONFIG_PATH under home",
+   "files": {
+    "home/h.env": "QT1ob21l"
+   },
+   "env": {
+    "DOTENV_CONFIG_PATH": "~/h.env"
+   },
+   "argv": [],
+   "result": {
+    "A": "home",
+    "B": null,
+    "C": null,
+    "DOTENV_CONFIG_PATH": "~/h.env",
+    "DOTENV_CONFIG_OVERRIDE": null,
+    "DOTENV_KEY": null
+   }
+  },
+  {
+   "name": "DOTENV_CONFIG_OVERRIDE=false still overrides",
+   "files": {
+    ".env": "QT1mcm9tLWZpbGU="
+   },
+   "env": {
+    "A": "preset",
+    "DOTENV_CONFIG_OVERRIDE": "false"
+   },
+   "argv": [],
+   "result": {
+    "A": "from-file",
+    "B": null,
+    "C": null,
+    "DOTENV_CONFIG_PATH": null,
+    "DOTENV_CONFIG_OVERRIDE": "false",
+    "DOTENV_KEY": null
+   }
+  },
+  {
+   "name": "DOTENV_CONFIG_OVERRIDE empty does not",
+   "files": {
+    ".env": "QT1mcm9tLWZpbGU="
+   },
+   "env": {
+    "A": "preset",
+    "DOTENV_CONFIG_OVERRIDE": ""
+   },
+   "argv": [],
+   "result": {
+    "A": "preset",
+    "B": null,
+    "C": null,
+    "DOTENV_CONFIG_PATH": null,
+    "DOTENV_CONFIG_OVERRIDE": "",
+    "DOTENV_KEY": null
+   }
+  },
+  {
+   "name": "argv path wins over DOTENV_CONFIG_PATH",
+   "files": {
+    "custom.env": "QT1jdXN0b20=",
+    "other.env": "QT1vdGhlcg=="
+   },
+   "env": {
+    "DOTENV_CONFIG_PATH": "custom.env"
+   },
+   "argv": [
+    "dotenv_config_path=other.env"
+   ],
+   "result": {
+    "A": "other",
+    "B": null,
+    "C": null,
+    "DOTENV_CONFIG_PATH": "custom.env",
+    "DOTENV_CONFIG_OVERRIDE": null,
+    "DOTENV_KEY": null
+   }
+  },
+  {
+   "name": "argv override",
+   "files": {
+    ".env": "QT1mcm9tLWZpbGU="
+   },
+   "env": {
+    "A": "preset"
+   },
+   "argv": [
+    "dotenv_config_override=1"
+   ],
+   "result": {
+    "A": "from-file",
+    "B": null,
+    "C": null,
+    "DOTENV_CONFIG_PATH": null,
+    "DOTENV_CONFIG_OVERRIDE": null,
+    "DOTENV_KEY": null
+   }
+  },
+  {
+   "name": "argv option needs a value",
+   "files": {
+    ".env": "QT1kZWZhdWx0",
+    "x.env": "QT14"
+   },
+   "env": {},
+   "argv": [
+    "dotenv_config_path="
+   ],
+   "result": {
+    "A": "default",
+    "B": null,
+    "C": null,
+    "DOTENV_CONFIG_PATH": null,
+    "DOTENV_CONFIG_OVERRIDE": null,
+    "DOTENV_KEY": null
+   }
+  },
+  {
+   "name": "DOTENV_KEY without a vault reads .env",
+   "files": {
+    ".env": "QT1wbGFpbg=="
+   },
+   "env": {
+    "DOTENV_KEY": "dotenv://:key_1234@dotenvx.com/vault/.env.vault?environment=production"
+   },
+   "argv": [],
+   "result": {
+    "A": "plain",
+    "B": null,
+    "C": null,
+    "DOTENV_CONFIG_PATH": null,
+    "DOTENV_CONFIG_OVERRIDE": null,
+    "DOTENV_KEY": "dotenv://:key_1234@dotenvx.com/vault/.env.vault?environment=production"
+   }
+  },
+  {
+   "name": "CRLF file",
+   "files": {
+    ".env": "QT0xDQpCPSJ4Ig0K"
+   },
+   "env": {},
+   "argv": [],
+   "result": {
+    "A": "1",
+    "B": "x",
+    "C": null,
+    "DOTENV_CONFIG_PATH": null,
+    "DOTENV_CONFIG_OVERRIDE": null,
+    "DOTENV_KEY": null
+   }
+  },
+  {
+   "name": "latin1 encoding",
+   "files": {
+    ".env": "QT3pCg=="
+   },
+   "env": {
+    "DOTENV_CONFIG_ENCODING": "latin1"
+   },
+   "argv": [],
+   "result": {
+    "A": "é",
+    "B": null,
+    "C": null,
+    "DOTENV_CONFIG_PATH": null,
+    "DOTENV_CONFIG_OVERRIDE": null,
+    "DOTENV_KEY": null
+   }
+  },
+  {
+   "name": "invalid UTF-8 byte",
+   "files": {
+    ".env": "QT1h/2IK"
+   },
+   "env": {},
+   "argv": [],
+   "result": {
+    "A": "a�b",
+    "B": null,
+    "C": null,
+    "DOTENV_CONFIG_PATH": null,
+    "DOTENV_CONFIG_OVERRIDE": null,
+    "DOTENV_KEY": null
+   }
+  },
+  {
+   "name": "a directory instead of a file",
+   "files": {
+    "dir/.keep": ""
+   },
+   "env": {
+    "DOTENV_CONFIG_PATH": "dir"
+   },
+   "argv": [],
+   "result": {
+    "A": null,
+    "B": null,
+    "C": null,
+    "DOTENV_CONFIG_PATH": "dir",
+    "DOTENV_CONFIG_OVERRIDE": null,
+    "DOTENV_KEY": null
+   }
+  }
+ ]
+}

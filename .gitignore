@@ -8,3 +8,6 @@ tsconfig.tsbuildinfo
 
 # Project-local verification environments and temporary artifacts.
 /scratch/
+
+# Reproducible Go build output; reference JSON and text receipts remain tracked.
+/outputs/calspread

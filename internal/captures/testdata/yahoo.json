@@ -1,0 +1,1503 @@
+{
+ "generated_from": "src/eodCapture.ts, src/hourlyCapture.ts, src/yahoo.ts (Node v22.22.1)",
+ "now": "2026-10-27T06:00:00.000Z",
+ "chart_root": "https://query1.finance.yahoo.com/v8/finance/chart",
+ "cases": [
+  {
+   "symbol": "RELIANCE",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":2500.5,\"chartPreviousClose\":2400},\"events\":{\"dividends\":{\"1775800800\":{\"amount\":4.25,\"date\":1775800800},\"1790488800\":{\"amount\":5.5,\"date\":1790488800}}}}],\"error\":null}}",
+   "request": {
+    "path": "/RELIANCE.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0.3899220155968806,
+   "rejected": false
+  },
+  {
+   "symbol": "M&M",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":3012.35},\"events\":{\"dividends\":{\"1784440800\":{\"amount\":21.1,\"date\":1784440800}}}}],\"error\":null}}",
+   "request": {
+    "path": "/M%26M.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0.7004498149285442,
+   "rejected": false
+  },
+  {
+   "symbol": "BAJAJ-AUTO",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":9000},\"events\":{\"dividends\":{\"1792216800\":{\"amount\":80,\"date\":1792216800}}}}],\"error\":null}}",
+   "request": {
+    "path": "/BAJAJ-AUTO.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0.8888888888888888,
+   "rejected": false
+  },
+  {
+   "symbol": "L&T FIN",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":150.75},\"events\":{\"dividends\":{}}}],\"error\":null}}",
+   "request": {
+    "path": "/L%26T%20FIN.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "ÉTOILE*(x)!~'",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":99},\"events\":{\"dividends\":{\"1792648800\":{\"amount\":1,\"date\":1792648800}}}}],\"error\":null}}",
+   "request": {
+    "path": "/%C3%89TOILE*(x)!~'.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 1.0101010101010102,
+   "rejected": false
+  },
+  {
+   "symbol": "A/B?C#D%E+F=G",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":10},\"events\":{\"dividends\":{\"1792648800\":{\"amount\":0.3}}}}],\"error\":null}}",
+   "request": {
+    "path": "/A%2FB%3FC%23D%25E%2BF%3DG.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 3,
+   "rejected": false
+  },
+  {
+   "symbol": "SUMORDER",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":7},\"events\":{\"dividends\":{\"1792821600\":{\"amount\":0.3},\"1788760800\":{\"amount\":0.1},\"z\":{\"amount\":0.7,\"date\":1793080800},\"1792303200\":{\"amount\":0.2},\"9999999999\":{\"amount\":0.05},\"a\":{\"amount\":0.11,\"date\":1793080800}}}}]}}",
+   "request": {
+    "path": "/SUMORDER.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 20.85714285714286,
+   "rejected": false
+  },
+  {
+   "symbol": "OLD",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":100},\"events\":{\"dividends\":{\"1758520800\":{\"amount\":9,\"date\":1758520800},\"1761544799\":{\"amount\":3,\"date\":1761544799},\"1761544800\":{\"amount\":2,\"date\":1761544800}}}}],\"error\":null}}",
+   "request": {
+    "path": "/OLD.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 2,
+   "rejected": false
+  },
+  {
+   "symbol": "DATESTR",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":100},\"events\":{\"dividends\":{\"x\":{\"amount\":1,\"date\":\"1792994400\"},\"y\":{\"amount\":2,\"date\":\"soon\"},\"w\":{\"amount\":4,\"date\":[1792994400]},\"v\":{\"amount\":8,\"date\":true},\"u\":{\"amount\":16,\"date\":null}}}}],\"error\":null}}",
+   "request": {
+    "path": "/DATESTR.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 5,
+   "rejected": false
+  },
+  {
+   "symbol": "AMTSTR",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":100},\"events\":{\"dividends\":{\"1792735200\":7,\"1792821600\":null,\"1792908000\":{\"amount\":null},\"1792994400\":{\"amount\":\"5\",\"date\":1792994400}}}}],\"error\":null}}",
+   "request": {
+    "path": "/AMTSTR.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "PREV",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"chartPreviousClose\":400},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":4}}}}],\"error\":null}}",
+   "request": {
+    "path": "/PREV.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 1,
+   "rejected": false
+  },
+  {
+   "symbol": "PRICENULL",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":null,\"chartPreviousClose\":400},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":4}}}}],\"error\":null}}",
+   "request": {
+    "path": "/PRICENULL.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 1,
+   "rejected": false
+  },
+  {
+   "symbol": "PRICE0",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":0,\"chartPreviousClose\":400},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":4}}}}],\"error\":null}}",
+   "request": {
+    "path": "/PRICE0.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "PRICENEG",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":-5},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":4}}}}],\"error\":null}}",
+   "request": {
+    "path": "/PRICENEG.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "PRICESTR",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":\"250\"},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":4}}}}],\"error\":null}}",
+   "request": {
+    "path": "/PRICESTR.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 1.6,
+   "rejected": false
+  },
+  {
+   "symbol": "PRICESTR0",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":\"0\"},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":4}}}}],\"error\":null}}",
+   "request": {
+    "path": "/PRICESTR0.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "PRICEBAD",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":\"abc\"},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":4}}}}],\"error\":null}}",
+   "request": {
+    "path": "/PRICEBAD.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": "NaN",
+   "rejected": false
+  },
+  {
+   "symbol": "PRICEARR",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":[250]},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":4}}}}],\"error\":null}}",
+   "request": {
+    "path": "/PRICEARR.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 1.6,
+   "rejected": false
+  },
+  {
+   "symbol": "PRICEARR2",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":[250,1]},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":4}}}}],\"error\":null}}",
+   "request": {
+    "path": "/PRICEARR2.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": "NaN",
+   "rejected": false
+  },
+  {
+   "symbol": "PRICEARR0",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":[]},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":4}}}}],\"error\":null}}",
+   "request": {
+    "path": "/PRICEARR0.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "PRICEOBJ",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":{}},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":4}}}}],\"error\":null}}",
+   "request": {
+    "path": "/PRICEOBJ.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": "NaN",
+   "rejected": false
+  },
+  {
+   "symbol": "PRICETRUE",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":true},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":4}}}}],\"error\":null}}",
+   "request": {
+    "path": "/PRICETRUE.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 400,
+   "rejected": false
+  },
+  {
+   "symbol": "NOEVENTS",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":100}}],\"error\":null}}",
+   "request": {
+    "path": "/NOEVENTS.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "EVENTSNULL",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":100},\"events\":null}],\"error\":null}}",
+   "request": {
+    "path": "/EVENTSNULL.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "DIVNULL",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":100},\"events\":{\"dividends\":null}}],\"error\":null}}",
+   "request": {
+    "path": "/DIVNULL.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "DIVARR",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":100},\"events\":{\"dividends\":[{\"amount\":1,\"date\":1792994400},{\"amount\":2}]}}],\"error\":null}}",
+   "request": {
+    "path": "/DIVARR.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 1,
+   "rejected": false
+  },
+  {
+   "symbol": "DIVSTR",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":100},\"events\":{\"dividends\":\"ab\"}}],\"error\":null}}",
+   "request": {
+    "path": "/DIVSTR.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "DIVNUM",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":100},\"events\":{\"dividends\":5}}],\"error\":null}}",
+   "request": {
+    "path": "/DIVNUM.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "NORESULT",
+   "body": "{\"chart\":{\"result\":[]}}",
+   "request": {
+    "path": "/NORESULT.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "NULLRESULT",
+   "body": "{\"chart\":{\"result\":null,\"error\":{\"code\":\"Not Found\"}}}",
+   "request": {
+    "path": "/NULLRESULT.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "RESULTOBJ",
+   "body": "{\"chart\":{\"result\":{\"0\":{\"meta\":{\"regularMarketPrice\":50},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":1}}}}}}}",
+   "request": {
+    "path": "/RESULTOBJ.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 2,
+   "rejected": false
+  },
+  {
+   "symbol": "RESULTSTR",
+   "body": "{\"chart\":{\"result\":\"abc\"}}",
+   "request": {
+    "path": "/RESULTSTR.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "RESULT0",
+   "body": "{\"chart\":{\"result\":[0]}}",
+   "request": {
+    "path": "/RESULT0.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "NOCHART",
+   "body": "{}",
+   "request": {
+    "path": "/NOCHART.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "CHARTARR",
+   "body": "{\"chart\":[{\"result\":[]}]}",
+   "request": {
+    "path": "/CHARTARR.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "NULLJSON",
+   "body": "null",
+   "request": {
+    "path": "/NULLJSON.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": true
+  },
+  {
+   "symbol": "NUMJSON",
+   "body": "5",
+   "request": {
+    "path": "/NUMJSON.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "STRJSON",
+   "body": "\"chart\"",
+   "request": {
+    "path": "/STRJSON.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "BADJSON",
+   "body": "{not json",
+   "request": {
+    "path": "/BADJSON.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "TRAILING",
+   "body": "{\"chart\":{}} x",
+   "request": {
+    "path": "/TRAILING.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "EMPTYBODY",
+   "body": "",
+   "request": {
+    "path": "/EMPTYBODY.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "BOM",
+   "body": "﻿{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":100},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":4}}}}],\"error\":null}}",
+   "request": {
+    "path": "/BOM.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 4,
+   "rejected": false
+  },
+  {
+   "symbol": "WS",
+   "body": " \n\t{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":100},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":4}}}}],\"error\":null}}\n ",
+   "request": {
+    "path": "/WS.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 4,
+   "rejected": false
+  },
+  {
+   "symbol": "DUPKEY",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":100},\"events\":{\"dividends\":{\"b\":{\"amount\":1,\"date\":1793080800},\"a\":{\"amount\":0.1,\"date\":1793080800},\"b\":{\"amount\":0.2,\"date\":1793080800}}}}]}}",
+   "request": {
+    "path": "/DUPKEY.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0.30000000000000004,
+   "rejected": false
+  },
+  {
+   "symbol": "HUGEPRICE",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":1e400},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":1}}}}]}}",
+   "request": {
+    "path": "/HUGEPRICE.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "TINYPRICE",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":5e-324},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":1}}}}]}}",
+   "request": {
+    "path": "/TINYPRICE.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": "Infinity",
+   "rejected": false
+  },
+  {
+   "symbol": "HUGEAMOUNT",
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":10},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":1e400}}}}]}}",
+   "request": {
+    "path": "/HUGEAMOUNT.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": "Infinity",
+   "rejected": false
+  },
+  {
+   "symbol": "HTTP404",
+   "status": 404,
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":100},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":4}}}}],\"error\":null}}",
+   "request": {
+    "path": "/HTTP404.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "HTTP429",
+   "status": 429,
+   "body": "Too Many Requests",
+   "request": {
+    "path": "/HTTP429.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "HTTP302",
+   "status": 302,
+   "body": "moved",
+   "request": {
+    "path": "/HTTP302.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  },
+  {
+   "symbol": "HTTP201",
+   "status": 201,
+   "body": "{\"chart\":{\"result\":[{\"meta\":{\"regularMarketPrice\":100},\"events\":{\"dividends\":{\"1792994400\":{\"amount\":4}}}}],\"error\":null}}",
+   "request": {
+    "path": "/HTTP201.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 4,
+   "rejected": false
+  },
+  {
+   "symbol": "NETERR",
+   "network_error": true,
+   "request": {
+    "path": "/NETERR.NS?range=1y&interval=1mo&events=div",
+    "headers": {
+     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+     "Accept": "application/json"
+    }
+   },
+   "yield": 0,
+   "rejected": false
+  }
+ ],
+ "yields": [
+  {
+   "concurrency": 6,
+   "symbols": [
+    "RELIANCE",
+    "",
+    "M&M",
+    "RELIANCE",
+    "RELIANCE",
+    "M&M",
+    "BAJAJ-AUTO",
+    "L&T FIN",
+    "ÉTOILE*(x)!~'",
+    "A/B?C#D%E+F=G",
+    "SUMORDER",
+    "OLD",
+    "DATESTR",
+    "AMTSTR",
+    "PREV",
+    "PRICENULL",
+    "PRICE0",
+    "PRICENEG",
+    "PRICESTR",
+    "PRICESTR0",
+    "PRICEBAD",
+    "PRICEARR",
+    "PRICEARR2",
+    "PRICEARR0",
+    "PRICEOBJ",
+    "PRICETRUE",
+    "NOEVENTS",
+    "EVENTSNULL",
+    "DIVNULL",
+    "DIVARR",
+    "DIVSTR",
+    "DIVNUM",
+    "NORESULT",
+    "NULLRESULT",
+    "RESULTOBJ",
+    "RESULTSTR",
+    "RESULT0",
+    "NOCHART",
+    "CHARTARR",
+    "NULLJSON",
+    "NUMJSON",
+    "STRJSON",
+    "BADJSON",
+    "TRAILING",
+    "EMPTYBODY",
+    "BOM",
+    "WS",
+    "DUPKEY",
+    "HUGEPRICE",
+    "TINYPRICE",
+    "HUGEAMOUNT",
+    "HTTP404",
+    "HTTP429",
+    "HTTP302",
+    "HTTP201",
+    "NETERR"
+   ],
+   "result": {
+    "RELIANCE": 0.3899220155968806,
+    "M&M": 0.7004498149285442,
+    "BAJAJ-AUTO": 0.8888888888888888,
+    "L&T FIN": 0,
+    "ÉTOILE*(x)!~'": 1.0101010101010102,
+    "A/B?C#D%E+F=G": 3,
+    "SUMORDER": 20.85714285714286,
+    "OLD": 2,
+    "DATESTR": 5,
+    "AMTSTR": 0,
+    "PREV": 1,
+    "PRICENULL": 1,
+    "PRICE0": 0,
+    "PRICENEG": 0,
+    "PRICESTR": 1.6,
+    "PRICESTR0": 0,
+    "PRICEBAD": "NaN",
+    "PRICEARR": 1.6,
+    "PRICEARR2": "NaN",
+    "PRICEARR0": 0,
+    "PRICEOBJ": "NaN",
+    "PRICETRUE": 400,
+    "NOEVENTS": 0,
+    "EVENTSNULL": 0,
+    "DIVNULL": 0,
+    "DIVARR": 1,
+    "DIVSTR": 0,
+    "DIVNUM": 0,
+    "NORESULT": 0,
+    "NULLRESULT": 0,
+    "RESULTOBJ": 2,
+    "RESULTSTR": 0,
+    "RESULT0": 0,
+    "NOCHART": 0,
+    "CHARTARR": 0,
+    "NULLJSON": 0,
+    "NUMJSON": 0,
+    "STRJSON": 0,
+    "BADJSON": 0,
+    "TRAILING": 0,
+    "EMPTYBODY": 0,
+    "BOM": 4,
+    "WS": 4,
+    "DUPKEY": 0.30000000000000004,
+    "HUGEPRICE": 0,
+    "HTTP404": 0,
+    "HTTP429": 0,
+    "HTTP302": 0,
+    "NETERR": 0,
+    "TINYPRICE": "Infinity",
+    "HUGEAMOUNT": "Infinity",
+    "HTTP201": 4
+   },
+   "requests": [
+    "/%C3%89TOILE*(x)!~'.NS?range=1y&interval=1mo&events=div",
+    "/A%2FB%3FC%23D%25E%2BF%3DG.NS?range=1y&interval=1mo&events=div",
+    "/AMTSTR.NS?range=1y&interval=1mo&events=div",
+    "/BADJSON.NS?range=1y&interval=1mo&events=div",
+    "/BAJAJ-AUTO.NS?range=1y&interval=1mo&events=div",
+    "/BOM.NS?range=1y&interval=1mo&events=div",
+    "/CHARTARR.NS?range=1y&interval=1mo&events=div",
+    "/DATESTR.NS?range=1y&interval=1mo&events=div",
+    "/DIVARR.NS?range=1y&interval=1mo&events=div",
+    "/DIVNULL.NS?range=1y&interval=1mo&events=div",
+    "/DIVNUM.NS?range=1y&interval=1mo&events=div",
+    "/DIVSTR.NS?range=1y&interval=1mo&events=div",
+    "/DUPKEY.NS?range=1y&interval=1mo&events=div",
+    "/EMPTYBODY.NS?range=1y&interval=1mo&events=div",
+    "/EVENTSNULL.NS?range=1y&interval=1mo&events=div",
+    "/HTTP201.NS?range=1y&interval=1mo&events=div",
+    "/HTTP302.NS?range=1y&interval=1mo&events=div",
+    "/HTTP404.NS?range=1y&interval=1mo&events=div",
+    "/HTTP429.NS?range=1y&interval=1mo&events=div",
+    "/HUGEAMOUNT.NS?range=1y&interval=1mo&events=div",
+    "/HUGEPRICE.NS?range=1y&interval=1mo&events=div",
+    "/L%26T%20FIN.NS?range=1y&interval=1mo&events=div",
+    "/M%26M.NS?range=1y&interval=1mo&events=div",
+    "/M%26M.NS?range=1y&interval=1mo&events=div",
+    "/NETERR.NS?range=1y&interval=1mo&events=div",
+    "/NOCHART.NS?range=1y&interval=1mo&events=div",
+    "/NOEVENTS.NS?range=1y&interval=1mo&events=div",
+    "/NORESULT.NS?range=1y&interval=1mo&events=div",
+    "/NULLJSON.NS?range=1y&interval=1mo&events=div",
+    "/NULLRESULT.NS?range=1y&interval=1mo&events=div",
+    "/NUMJSON.NS?range=1y&interval=1mo&events=div",
+    "/OLD.NS?range=1y&interval=1mo&events=div",
+    "/PREV.NS?range=1y&interval=1mo&events=div",
+    "/PRICE0.NS?range=1y&interval=1mo&events=div",
+    "/PRICEARR.NS?range=1y&interval=1mo&events=div",
+    "/PRICEARR0.NS?range=1y&interval=1mo&events=div",
+    "/PRICEARR2.NS?range=1y&interval=1mo&events=div",
+    "/PRICEBAD.NS?range=1y&interval=1mo&events=div",
+    "/PRICENEG.NS?range=1y&interval=1mo&events=div",
+    "/PRICENULL.NS?range=1y&interval=1mo&events=div",
+    "/PRICEOBJ.NS?range=1y&interval=1mo&events=div",
+    "/PRICESTR.NS?range=1y&interval=1mo&events=div",
+    "/PRICESTR0.NS?range=1y&interval=1mo&events=div",
+    "/PRICETRUE.NS?range=1y&interval=1mo&events=div",
+    "/RELIANCE.NS?range=1y&interval=1mo&events=div",
+    "/RELIANCE.NS?range=1y&interval=1mo&events=div",
+    "/RELIANCE.NS?range=1y&interval=1mo&events=div",
+    "/RESULT0.NS?range=1y&interval=1mo&events=div",
+    "/RESULTOBJ.NS?range=1y&interval=1mo&events=div",
+    "/RESULTSTR.NS?range=1y&interval=1mo&events=div",
+    "/STRJSON.NS?range=1y&interval=1mo&events=div",
+    "/SUMORDER.NS?range=1y&interval=1mo&events=div",
+    "/TINYPRICE.NS?range=1y&interval=1mo&events=div",
+    "/TRAILING.NS?range=1y&interval=1mo&events=div",
+    "/WS.NS?range=1y&interval=1mo&events=div"
+   ]
+  },
+  {
+   "concurrency": 1,
+   "symbols": [
+    "RELIANCE",
+    "",
+    "M&M",
+    "RELIANCE",
+    "RELIANCE",
+    "M&M",
+    "BAJAJ-AUTO",
+    "L&T FIN",
+    "ÉTOILE*(x)!~'",
+    "A/B?C#D%E+F=G",
+    "SUMORDER",
+    "OLD",
+    "DATESTR",
+    "AMTSTR",
+    "PREV",
+    "PRICENULL",
+    "PRICE0",
+    "PRICENEG",
+    "PRICESTR",
+    "PRICESTR0",
+    "PRICEBAD",
+    "PRICEARR",
+    "PRICEARR2",
+    "PRICEARR0",
+    "PRICEOBJ",
+    "PRICETRUE",
+    "NOEVENTS",
+    "EVENTSNULL",
+    "DIVNULL",
+    "DIVARR",
+    "DIVSTR",
+    "DIVNUM",
+    "NORESULT",
+    "NULLRESULT",
+    "RESULTOBJ",
+    "RESULTSTR",
+    "RESULT0",
+    "NOCHART",
+    "CHARTARR",
+    "NULLJSON",
+    "NUMJSON",
+    "STRJSON",
+    "BADJSON",
+    "TRAILING",
+    "EMPTYBODY",
+    "BOM",
+    "WS",
+    "DUPKEY",
+    "HUGEPRICE",
+    "TINYPRICE",
+    "HUGEAMOUNT",
+    "HTTP404",
+    "HTTP429",
+    "HTTP302",
+    "HTTP201",
+    "NETERR"
+   ],
+   "result": {
+    "RELIANCE": 0.3899220155968806,
+    "M&M": 0.7004498149285442,
+    "BAJAJ-AUTO": 0.8888888888888888,
+    "L&T FIN": 0,
+    "ÉTOILE*(x)!~'": 1.0101010101010102,
+    "A/B?C#D%E+F=G": 3,
+    "SUMORDER": 20.85714285714286,
+    "OLD": 2,
+    "DATESTR": 5,
+    "AMTSTR": 0,
+    "PREV": 1,
+    "PRICENULL": 1,
+    "PRICE0": 0,
+    "PRICENEG": 0,
+    "PRICESTR": 1.6,
+    "PRICESTR0": 0,
+    "PRICEBAD": "NaN",
+    "PRICEARR": 1.6,
+    "PRICEARR2": "NaN",
+    "PRICEARR0": 0,
+    "PRICEOBJ": "NaN",
+    "PRICETRUE": 400,
+    "NOEVENTS": 0,
+    "EVENTSNULL": 0,
+    "DIVNULL": 0,
+    "DIVARR": 1,
+    "DIVSTR": 0,
+    "DIVNUM": 0,
+    "NORESULT": 0,
+    "NULLRESULT": 0,
+    "RESULTOBJ": 2,
+    "RESULTSTR": 0,
+    "RESULT0": 0,
+    "NOCHART": 0,
+    "CHARTARR": 0,
+    "NULLJSON": 0,
+    "NUMJSON": 0,
+    "STRJSON": 0,
+    "BADJSON": 0,
+    "TRAILING": 0,
+    "EMPTYBODY": 0,
+    "BOM": 4,
+    "WS": 4,
+    "DUPKEY": 0.30000000000000004,
+    "HUGEPRICE": 0,
+    "TINYPRICE": "Infinity",
+    "HUGEAMOUNT": "Infinity",
+    "HTTP404": 0,
+    "HTTP429": 0,
+    "HTTP302": 0,
+    "HTTP201": 4,
+    "NETERR": 0
+   },
+   "requests": [
+    "/%C3%89TOILE*(x)!~'.NS?range=1y&interval=1mo&events=div",
+    "/A%2FB%3FC%23D%25E%2BF%3DG.NS?range=1y&interval=1mo&events=div",
+    "/AMTSTR.NS?range=1y&interval=1mo&events=div",
+    "/BADJSON.NS?range=1y&interval=1mo&events=div",
+    "/BAJAJ-AUTO.NS?range=1y&interval=1mo&events=div",
+    "/BOM.NS?range=1y&interval=1mo&events=div",
+    "/CHARTARR.NS?range=1y&interval=1mo&events=div",
+    "/DATESTR.NS?range=1y&interval=1mo&events=div",
+    "/DIVARR.NS?range=1y&interval=1mo&events=div",
+    "/DIVNULL.NS?range=1y&interval=1mo&events=div",
+    "/DIVNUM.NS?range=1y&interval=1mo&events=div",
+    "/DIVSTR.NS?range=1y&interval=1mo&events=div",
+    "/DUPKEY.NS?range=1y&interval=1mo&events=div",
+    "/EMPTYBODY.NS?range=1y&interval=1mo&events=div",
+    "/EVENTSNULL.NS?range=1y&interval=1mo&events=div",
+    "/HTTP201.NS?range=1y&interval=1mo&events=div",
+    "/HTTP302.NS?range=1y&interval=1mo&events=div",
+    "/HTTP404.NS?range=1y&interval=1mo&events=div",
+    "/HTTP429.NS?range=1y&interval=1mo&events=div",
+    "/HUGEAMOUNT.NS?range=1y&interval=1mo&events=div",
+    "/HUGEPRICE.NS?range=1y&interval=1mo&events=div",
+    "/L%26T%20FIN.NS?range=1y&interval=1mo&events=div",
+    "/M%26M.NS?range=1y&interval=1mo&events=div",
+    "/M%26M.NS?range=1y&interval=1mo&events=div",
+    "/NETERR.NS?range=1y&interval=1mo&events=div",
+    "/NOCHART.NS?range=1y&interval=1mo&events=div",
+    "/NOEVENTS.NS?range=1y&interval=1mo&events=div",
+    "/NORESULT.NS?range=1y&interval=1mo&events=div",
+    "/NULLJSON.NS?range=1y&interval=1mo&events=div",
+    "/NULLRESULT.NS?range=1y&interval=1mo&events=div",
+    "/NUMJSON.NS?range=1y&interval=1mo&events=div",
+    "/OLD.NS?range=1y&interval=1mo&events=div",
+    "/PREV.NS?range=1y&interval=1mo&events=div",
+    "/PRICE0.NS?range=1y&interval=1mo&events=div",
+    "/PRICEARR.NS?range=1y&interval=1mo&events=div",
+    "/PRICEARR0.NS?range=1y&interval=1mo&events=div",
+    "/PRICEARR2.NS?range=1y&interval=1mo&events=div",
+    "/PRICEBAD.NS?range=1y&interval=1mo&events=div",
+    "/PRICENEG.NS?range=1y&interval=1mo&events=div",
+    "/PRICENULL.NS?range=1y&interval=1mo&events=div",
+    "/PRICEOBJ.NS?range=1y&interval=1mo&events=div",
+    "/PRICESTR.NS?range=1y&interval=1mo&events=div",
+    "/PRICESTR0.NS?range=1y&interval=1mo&events=div",
+    "/PRICETRUE.NS?range=1y&interval=1mo&events=div",
+    "/RELIANCE.NS?range=1y&interval=1mo&events=div",
+    "/RELIANCE.NS?range=1y&interval=1mo&events=div",
+    "/RELIANCE.NS?range=1y&interval=1mo&events=div",
+    "/RESULT0.NS?range=1y&interval=1mo&events=div",
+    "/RESULTOBJ.NS?range=1y&interval=1mo&events=div",
+    "/RESULTSTR.NS?range=1y&interval=1mo&events=div",
+    "/STRJSON.NS?range=1y&interval=1mo&events=div",
+    "/SUMORDER.NS?range=1y&interval=1mo&events=div",
+    "/TINYPRICE.NS?range=1y&interval=1mo&events=div",
+    "/TRAILING.NS?range=1y&interval=1mo&events=div",
+    "/WS.NS?range=1y&interval=1mo&events=div"
+   ]
+  },
+  {
+   "concurrency": 2,
+   "symbols": [
+    "RELIANCE",
+    "",
+    "M&M",
+    "RELIANCE",
+    "RELIANCE",
+    "M&M",
+    "BAJAJ-AUTO",
+    "L&T FIN",
+    "ÉTOILE*(x)!~'",
+    "A/B?C#D%E+F=G",
+    "SUMORDER",
+    "OLD",
+    "DATESTR",
+    "AMTSTR",
+    "PREV",
+    "PRICENULL",
+    "PRICE0",
+    "PRICENEG",
+    "PRICESTR",
+    "PRICESTR0",
+    "PRICEBAD",
+    "PRICEARR",
+    "PRICEARR2",
+    "PRICEARR0",
+    "PRICEOBJ",
+    "PRICETRUE",
+    "NOEVENTS",
+    "EVENTSNULL",
+    "DIVNULL",
+    "DIVARR",
+    "DIVSTR",
+    "DIVNUM",
+    "NORESULT",
+    "NULLRESULT",
+    "RESULTOBJ",
+    "RESULTSTR",
+    "RESULT0",
+    "NOCHART",
+    "CHARTARR",
+    "NULLJSON",
+    "NUMJSON",
+    "STRJSON",
+    "BADJSON",
+    "TRAILING",
+    "EMPTYBODY",
+    "BOM",
+    "WS",
+    "DUPKEY",
+    "HUGEPRICE",
+    "TINYPRICE",
+    "HUGEAMOUNT",
+    "HTTP404",
+    "HTTP429",
+    "HTTP302",
+    "HTTP201",
+    "NETERR"
+   ],
+   "result": {
+    "RELIANCE": 0.3899220155968806,
+    "M&M": 0.7004498149285442,
+    "BAJAJ-AUTO": 0.8888888888888888,
+    "L&T FIN": 0,
+    "ÉTOILE*(x)!~'": 1.0101010101010102,
+    "A/B?C#D%E+F=G": 3,
+    "SUMORDER": 20.85714285714286,
+    "OLD": 2,
+    "DATESTR": 5,
+    "AMTSTR": 0,
+    "PREV": 1,
+    "PRICENULL": 1,
+    "PRICE0": 0,
+    "PRICENEG": 0,
+    "PRICESTR": 1.6,
+    "PRICESTR0": 0,
+    "PRICEBAD": "NaN",
+    "PRICEARR": 1.6,
+    "PRICEARR2": "NaN",
+    "PRICEARR0": 0,
+    "PRICEOBJ": "NaN",
+    "PRICETRUE": 400,
+    "NOEVENTS": 0,
+    "EVENTSNULL": 0,
+    "DIVNULL": 0,
+    "DIVARR": 1,
+    "DIVSTR": 0,
+    "DIVNUM": 0,
+    "NORESULT": 0,
+    "NULLRESULT": 0,
+    "RESULTOBJ": 2,
+    "RESULTSTR": 0,
+    "RESULT0": 0,
+    "NOCHART": 0,
+    "CHARTARR": 0,
+    "NULLJSON": 0,
+    "NUMJSON": 0,
+    "STRJSON": 0,
+    "BADJSON": 0,
+    "TRAILING": 0,
+    "EMPTYBODY": 0,
+    "BOM": 4,
+    "WS": 4,
+    "DUPKEY": 0.30000000000000004,
+    "HUGEPRICE": 0,
+    "TINYPRICE": "Infinity",
+    "HUGEAMOUNT": "Infinity",
+    "HTTP404": 0,
+    "HTTP429": 0,
+    "HTTP302": 0,
+    "NETERR": 0,
+    "HTTP201": 4
+   },
+   "requests": [
+    "/%C3%89TOILE*(x)!~'.NS?range=1y&interval=1mo&events=div",
+    "/A%2FB%3FC%23D%25E%2BF%3DG.NS?range=1y&interval=1mo&events=div",
+    "/AMTSTR.NS?range=1y&interval=1mo&events=div",
+    "/BADJSON.NS?range=1y&interval=1mo&events=div",
+    "/BAJAJ-AUTO.NS?range=1y&interval=1mo&events=div",
+    "/BOM.NS?range=1y&interval=1mo&events=div",
+    "/CHARTARR.NS?range=1y&interval=1mo&events=div",
+    "/DATESTR.NS?range=1y&interval=1mo&events=div",
+    "/DIVARR.NS?range=1y&interval=1mo&events=div",
+    "/DIVNULL.NS?range=1y&interval=1mo&events=div",
+    "/DIVNUM.NS?range=1y&interval=1mo&events=div",
+    "/DIVSTR.NS?range=1y&interval=1mo&events=div",
+    "/DUPKEY.NS?range=1y&interval=1mo&events=div",
+    "/EMPTYBODY.NS?range=1y&interval=1mo&events=div",
+    "/EVENTSNULL.NS?range=1y&interval=1mo&events=div",
+    "/HTTP201.NS?range=1y&interval=1mo&events=div",
+    "/HTTP302.NS?range=1y&interval=1mo&events=div",
+    "/HTTP404.NS?range=1y&interval=1mo&events=div",
+    "/HTTP429.NS?range=1y&interval=1mo&events=div",
+    "/HUGEAMOUNT.NS?range=1y&interval=1mo&events=div",
+    "/HUGEPRICE.NS?range=1y&interval=1mo&events=div",
+    "/L%26T%20FIN.NS?range=1y&interval=1mo&events=div",
+    "/M%26M.NS?range=1y&interval=1mo&events=div",
+    "/M%26M.NS?range=1y&interval=1mo&events=div",
+    "/NETERR.NS?range=1y&interval=1mo&events=div",
+    "/NOCHART.NS?range=1y&interval=1mo&events=div",
+    "/NOEVENTS.NS?range=1y&interval=1mo&events=div",
+    "/NORESULT.NS?range=1y&interval=1mo&events=div",
+    "/NULLJSON.NS?range=1y&interval=1mo&events=div",
+    "/NULLRESULT.NS?range=1y&interval=1mo&events=div",
+    "/NUMJSON.NS?range=1y&interval=1mo&events=div",
+    "/OLD.NS?range=1y&interval=1mo&events=div",
+    "/PREV.NS?range=1y&interval=1mo&events=div",
+    "/PRICE0.NS?range=1y&interval=1mo&events=div",
+    "/PRICEARR.NS?range=1y&interval=1mo&events=div",
+    "/PRICEARR0.NS?range=1y&interval=1mo&events=div",
+    "/PRICEARR2.NS?range=1y&interval=1mo&events=div",
+    "/PRICEBAD.NS?range=1y&interval=1mo&events=div",
+    "/PRICENEG.NS?range=1y&interval=1mo&events=div",
+    "/PRICENULL.NS?range=1y&interval=1mo&events=div",
+    "/PRICEOBJ.NS?range=1y&interval=1mo&events=div",
+    "/PRICESTR.NS?range=1y&interval=1mo&events=div",
+    "/PRICESTR0.NS?range=1y&interval=1mo&events=div",
+    "/PRICETRUE.NS?range=1y&interval=1mo&events=div",
+    "/RELIANCE.NS?range=1y&interval=1mo&events=div",
+    "/RELIANCE.NS?range=1y&interval=1mo&events=div",
+    "/RELIANCE.NS?range=1y&interval=1mo&events=div",
+    "/RESULT0.NS?range=1y&interval=1mo&events=div",
+    "/RESULTOBJ.NS?range=1y&interval=1mo&events=div",
+    "/RESULTSTR.NS?range=1y&interval=1mo&events=div",
+    "/STRJSON.NS?range=1y&interval=1mo&events=div",
+    "/SUMORDER.NS?range=1y&interval=1mo&events=div",
+    "/TINYPRICE.NS?range=1y&interval=1mo&events=div",
+    "/TRAILING.NS?range=1y&interval=1mo&events=div",
+    "/WS.NS?range=1y&interval=1mo&events=div"
+   ]
+  },
+  {
+   "concurrency": 0,
+   "symbols": [
+    "RELIANCE",
+    "",
+    "M&M",
+    "RELIANCE",
+    "RELIANCE",
+    "M&M",
+    "BAJAJ-AUTO",
+    "L&T FIN",
+    "ÉTOILE*(x)!~'",
+    "A/B?C#D%E+F=G",
+    "SUMORDER",
+    "OLD",
+    "DATESTR",
+    "AMTSTR",
+    "PREV",
+    "PRICENULL",
+    "PRICE0",
+    "PRICENEG",
+    "PRICESTR",
+    "PRICESTR0",
+    "PRICEBAD",
+    "PRICEARR",
+    "PRICEARR2",
+    "PRICEARR0",
+    "PRICEOBJ",
+    "PRICETRUE",
+    "NOEVENTS",
+    "EVENTSNULL",
+    "DIVNULL",
+    "DIVARR",
+    "DIVSTR",
+    "DIVNUM",
+    "NORESULT",
+    "NULLRESULT",
+    "RESULTOBJ",
+    "RESULTSTR",
+    "RESULT0",
+    "NOCHART",
+    "CHARTARR",
+    "NULLJSON",
+    "NUMJSON",
+    "STRJSON",
+    "BADJSON",
+    "TRAILING",
+    "EMPTYBODY",
+    "BOM",
+    "WS",
+    "DUPKEY",
+    "HUGEPRICE",
+    "TINYPRICE",
+    "HUGEAMOUNT",
+    "HTTP404",
+    "HTTP429",
+    "HTTP302",
+    "HTTP201",
+    "NETERR"
+   ],
+   "result": {},
+   "requests": []
+  },
+  {
+   "concurrency": -1,
+   "symbols": [
+    "RELIANCE",
+    "",
+    "M&M",
+    "RELIANCE",
+    "RELIANCE",
+    "M&M",
+    "BAJAJ-AUTO",
+    "L&T FIN",
+    "ÉTOILE*(x)!~'",
+    "A/B?C#D%E+F=G",
+    "SUMORDER",
+    "OLD",
+    "DATESTR",
+    "AMTSTR",
+    "PREV",
+    "PRICENULL",
+    "PRICE0",
+    "PRICENEG",
+    "PRICESTR",
+    "PRICESTR0",
+    "PRICEBAD",
+    "PRICEARR",
+    "PRICEARR2",
+    "PRICEARR0",
+    "PRICEOBJ",
+    "PRICETRUE",
+    "NOEVENTS",
+    "EVENTSNULL",
+    "DIVNULL",
+    "DIVARR",
+    "DIVSTR",
+    "DIVNUM",
+    "NORESULT",
+    "NULLRESULT",
+    "RESULTOBJ",
+    "RESULTSTR",
+    "RESULT0",
+    "NOCHART",
+    "CHARTARR",
+    "NULLJSON",
+    "NUMJSON",
+    "STRJSON",
+    "BADJSON",
+    "TRAILING",
+    "EMPTYBODY",
+    "BOM",
+    "WS",
+    "DUPKEY",
+    "HUGEPRICE",
+    "TINYPRICE",
+    "HUGEAMOUNT",
+    "HTTP404",
+    "HTTP429",
+    "HTTP302",
+    "HTTP201",
+    "NETERR"
+   ],
+   "result": {},
+   "requests": []
+  },
+  {
+   "concurrency": 100,
+   "symbols": [
+    "RELIANCE",
+    "",
+    "M&M",
+    "RELIANCE",
+    "RELIANCE",
+    "M&M",
+    "BAJAJ-AUTO",
+    "L&T FIN",
+    "ÉTOILE*(x)!~'",
+    "A/B?C#D%E+F=G",
+    "SUMORDER",
+    "OLD",
+    "DATESTR",
+    "AMTSTR",
+    "PREV",
+    "PRICENULL",
+    "PRICE0",
+    "PRICENEG",
+    "PRICESTR",
+    "PRICESTR0",
+    "PRICEBAD",
+    "PRICEARR",
+    "PRICEARR2",
+    "PRICEARR0",
+    "PRICEOBJ",
+    "PRICETRUE",
+    "NOEVENTS",
+    "EVENTSNULL",
+    "DIVNULL",
+    "DIVARR",
+    "DIVSTR",
+    "DIVNUM",
+    "NORESULT",
+    "NULLRESULT",
+    "RESULTOBJ",
+    "RESULTSTR",
+    "RESULT0",
+    "NOCHART",
+    "CHARTARR",
+    "NULLJSON",
+    "NUMJSON",
+    "STRJSON",
+    "BADJSON",
+    "TRAILING",
+    "EMPTYBODY",
+    "BOM",
+    "WS",
+    "DUPKEY",
+    "HUGEPRICE",
+    "TINYPRICE",
+    "HUGEAMOUNT",
+    "HTTP404",
+    "HTTP429",
+    "HTTP302",
+    "HTTP201",
+    "NETERR"
+   ],
+   "result": {
+    "HTTP404": 0,
+    "HTTP429": 0,
+    "HTTP302": 0,
+    "NETERR": 0,
+    "RELIANCE": 0.3899220155968806,
+    "M&M": 0.7004498149285442,
+    "BAJAJ-AUTO": 0.8888888888888888,
+    "L&T FIN": 0,
+    "ÉTOILE*(x)!~'": 1.0101010101010102,
+    "A/B?C#D%E+F=G": 3,
+    "SUMORDER": 20.85714285714286,
+    "OLD": 2,
+    "DATESTR": 5,
+    "AMTSTR": 0,
+    "PREV": 1,
+    "PRICENULL": 1,
+    "PRICE0": 0,
+    "PRICENEG": 0,
+    "PRICESTR": 1.6,
+    "PRICESTR0": 0,
+    "PRICEBAD": "NaN",
+    "PRICEARR": 1.6,
+    "PRICEARR2": "NaN",
+    "PRICEARR0": 0,
+    "PRICEOBJ": "NaN",
+    "PRICETRUE": 400,
+    "NOEVENTS": 0,
+    "EVENTSNULL": 0,
+    "DIVNULL": 0,
+    "DIVARR": 1,
+    "DIVSTR": 0,
+    "DIVNUM": 0,
+    "NORESULT": 0,
+    "NULLRESULT": 0,
+    "RESULTOBJ": 2,
+    "RESULTSTR": 0,
+    "RESULT0": 0,
+    "NOCHART": 0,
+    "CHARTARR": 0,
+    "NULLJSON": 0,
+    "NUMJSON": 0,
+    "STRJSON": 0,
+    "BADJSON": 0,
+    "TRAILING": 0,
+    "EMPTYBODY": 0,
+    "BOM": 4,
+    "WS": 4,
+    "DUPKEY": 0.30000000000000004,
+    "HUGEPRICE": 0,
+    "TINYPRICE": "Infinity",
+    "HUGEAMOUNT": "Infinity",
+    "HTTP201": 4
+   },
+   "requests": [
+    "/%C3%89TOILE*(x)!~'.NS?range=1y&interval=1mo&events=div",
+    "/A%2FB%3FC%23D%25E%2BF%3DG.NS?range=1y&interval=1mo&events=div",
+    "/AMTSTR.NS?range=1y&interval=1mo&events=div",
+    "/BADJSON.NS?range=1y&interval=1mo&events=div",
+    "/BAJAJ-AUTO.NS?range=1y&interval=1mo&events=div",
+    "/BOM.NS?range=1y&interval=1mo&events=div",
+    "/CHARTARR.NS?range=1y&interval=1mo&events=div",
+    "/DATESTR.NS?range=1y&interval=1mo&events=div",
+    "/DIVARR.NS?range=1y&interval=1mo&events=div",
+    "/DIVNULL.NS?range=1y&interval=1mo&events=div",
+    "/DIVNUM.NS?range=1y&interval=1mo&events=div",
+    "/DIVSTR.NS?range=1y&interval=1mo&events=div",
+    "/DUPKEY.NS?range=1y&interval=1mo&events=div",
+    "/EMPTYBODY.NS?range=1y&interval=1mo&events=div",
+    "/EVENTSNULL.NS?range=1y&interval=1mo&events=div",
+    "/HTTP201.NS?range=1y&interval=1mo&events=div",
+    "/HTTP302.NS?range=1y&interval=1mo&events=div",
+    "/HTTP404.NS?range=1y&interval=1mo&events=div",
+    "/HTTP429.NS?range=1y&interval=1mo&events=div",
+    "/HUGEAMOUNT.NS?range=1y&interval=1mo&events=div",
+    "/HUGEPRICE.NS?range=1y&interval=1mo&events=div",
+    "/L%26T%20FIN.NS?range=1y&interval=1mo&events=div",
+    "/M%26M.NS?range=1y&interval=1mo&events=div",
+    "/M%26M.NS?range=1y&interval=1mo&events=div",
+    "/NETERR.NS?range=1y&interval=1mo&events=div",
+    "/NOCHART.NS?range=1y&interval=1mo&events=div",
+    "/NOEVENTS.NS?range=1y&interval=1mo&events=div",
+    "/NORESULT.NS?range=1y&interval=1mo&events=div",
+    "/NULLJSON.NS?range=1y&interval=1mo&events=div",
+    "/NULLRESULT.NS?range=1y&interval=1mo&events=div",
+    "/NUMJSON.NS?range=1y&interval=1mo&events=div",
+    "/OLD.NS?range=1y&interval=1mo&events=div",
+    "/PREV.NS?range=1y&interval=1mo&events=div",
+    "/PRICE0.NS?range=1y&interval=1mo&events=div",
+    "/PRICEARR.NS?range=1y&interval=1mo&events=div",
+    "/PRICEARR0.NS?range=1y&interval=1mo&events=div",
+    "/PRICEARR2.NS?range=1y&interval=1mo&events=div",
+    "/PRICEBAD.NS?range=1y&interval=1mo&events=div",
+    "/PRICENEG.NS?range=1y&interval=1mo&events=div",
+    "/PRICENULL.NS?range=1y&interval=1mo&events=div",
+    "/PRICEOBJ.NS?range=1y&interval=1mo&events=div",
+    "/PRICESTR.NS?range=1y&interval=1mo&events=div",
+    "/PRICESTR0.NS?range=1y&interval=1mo&events=div",
+    "/PRICETRUE.NS?range=1y&interval=1mo&events=div",
+    "/RELIANCE.NS?range=1y&interval=1mo&events=div",
+    "/RELIANCE.NS?range=1y&interval=1mo&events=div",
+    "/RELIANCE.NS?range=1y&interval=1mo&events=div",
+    "/RESULT0.NS?range=1y&interval=1mo&events=div",
+    "/RESULTOBJ.NS?range=1y&interval=1mo&events=div",
+    "/RESULTSTR.NS?range=1y&interval=1mo&events=div",
+    "/STRJSON.NS?range=1y&interval=1mo&events=div",
+    "/SUMORDER.NS?range=1y&interval=1mo&events=div",
+    "/TINYPRICE.NS?range=1y&interval=1mo&events=div",
+    "/TRAILING.NS?range=1y&interval=1mo&events=div",
+    "/WS.NS?range=1y&interval=1mo&events=div"
+   ]
+  }
+ ]
+}

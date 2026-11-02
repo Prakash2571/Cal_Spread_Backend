@@ -33,7 +33,7 @@ can send a real order.
   broker-screen mark of open positions.
 - If the option lot differs from the future lot, the underlying is skipped.
 - The ATM window is centred on the future's mid price, with the same hysteresis and
-  minimum re-centre interval as Box.
+  minimum re-centre interval configured by `SYNTH_ATM_HYSTERESIS` and `SYNTH_WINDOW_MIN_INTERVAL_MS`.
 
 ## Paper trading
 
@@ -42,7 +42,7 @@ can send a real order.
   over NEW books (default 2). A confirmation needs a leg's book version to change, so
   a quiet tick or a settings change confirms nothing, and one flickering book cannot
   open a position;
-- at most one open position per underlying (also enforced by a unique Mongo index), and
+- at most one open position per underlying (also enforced by a PostgreSQL unique partial index), and
   `SYNTH_REENTRY_COOLDOWN_MS` after an underlying's last close;
 - at most **max open trades** in total. It is set on the page (any whole number, `0` = no
   limit, the default) and saved. Lowering it never closes a position; it only stops new
@@ -69,7 +69,7 @@ book was recorded show "not recorded".
 An ELIGIBLE row that is not entered carries `entry_blocked` with the reason. The row of
 a held position shows status `OPEN`.
 
-**Exit**: Box's rules, on the same quantities. `entry edge` = lock × quantity (the gross
+**Exit**: the retained convergence/profit rules, on the same quantities. `entry edge` = lock × quantity (the gross
 if held to expiry). `gross now` = closing all three legs at the touch. `remaining edge` =
 entry edge − gross now. `net` = gross now − entry charges − exit charges at those prices.
 
@@ -96,7 +96,7 @@ entry edge − gross now. `net` = gross now − entry charges − exit charges a
   is never subscribed on the new socket. The switch's own reload re-links the positions.
 
 **Margin**: right after entry, and off the fill path, the three legs are sent together
-to the ACTIVE broker's basket-margin calculator, the same one Box uses:
+to the ACTIVE broker's basket-margin calculator:
 - Zerodha: `/margins/basket`;
 - Dhan: `/margincalculator/multi`, or a flagged per-leg sum if that fails.
 
@@ -135,47 +135,38 @@ to LTP (price move only). Charges are shown beside P&L, and "net" figures are la
 after charges. The day strip shows the open mark at LTP, the open net if closed now at the
 touch, today's realised net, and the day net.
 
-## Token budget: sharing Box's lane
+## Token budget: dedicated options feed
 
-Tokens ride the **Box market-data lane** under the `scanner` owner
-(`ActiveBrokerManager.setSyntheticTokens`), refcounted apart from Box's `strategy` owner.
+Tokens ride the isolated options-feed lane under the `scanner` owner
+(`Registry.SetSyntheticTokens`). Browser/Fair Value subscriptions use the separate futures
+lane. Synthetic owns its quote store; one lane cannot refresh the other's books.
 
-| Box scanner | Synthetic budget |
-|---|---|
-| running | `SYNTH_MAX_TOKENS` (750) |
-| stopped | `SYNTH_MAX_TOKENS` + (`BOX_MAX_SUBSCRIBED_TOKENS` − tokens Box still holds for its open positions), up to 2950 by default |
-
-Both are capped at `SYNTH_LANE_TOKEN_LIMIT` minus Box's reservation (its whole budget
-while it runs). Box always has priority. `index.ts` calls `yieldToBox()` synchronously
-before Box's token set goes upstream, so when Box starts the synthetic scanner drops its
-lowest-priority windows first (indices are kept longest) and the socket never exceeds the
-limit. When Box stops, the freed budget is picked up within a few seconds. Open positions'
-legs (3 tokens each) are reserved first and never dropped.
-
-Box only receives lane ticks for tokens it holds (`SubscriptionCoordinator.owns`), so the
-scanner's books never enter Box's quote store or liveness clock. Books go into the
-scanner's own `BoxQuoteStore`.
+With `SYNTH_SHARE_BOX_BUDGET=true`, the budget is `SYNTH_MAX_TOKENS` (750) plus the
+retained shared capacity (2200 by default), capped by `SYNTH_LANE_TOKEN_LIMIT` (3000).
+The legacy `BOX_DEDICATED_MARKET_FEED` and `BOX_MAX_SUBSCRIBED_TOKENS` names configure
+that extra capacity. There is no Box scanner or Box position reserving it. Open-position
+legs (3 tokens each) are reserved first and never dropped. Legacy diagnostic JSON names
+remain compatible; the UI presents them as extra options-feed capacity.
 
 ## Architecture
 
-`src/synthetic/`:
-- `math.ts`: pure pricing, universe, exit rules, settlement and day P&L.
-- `config.ts`: `SYNTH_*` settings, see `CONFIGURATION.md`.
-- `engine.ts`: one loop driving discovery (running) and monitoring (open positions).
-- `model.ts`, `repository.ts`: `synth_trades` on the Box connection.
-- `routes.ts`: HTTP routes.
+`internal/synthetic/`:
+- `math.go`: pure pricing, universe, exit rules, settlement and day P&L.
+- `config.go`: `SYNTH_*` settings, see `CONFIGURATION.md`.
+- `engine.go`, `runtime.go`: discovery/monitoring and ordered asynchronous effects.
+- `repository.go`: PostgreSQL trade/settings persistence.
+- `routes.go`: HTTP routes and SSE.
 
-Persistence (`synth_trades`, Box connection): one document per trade, `status`
+Persistence (`synth_trades` in PostgreSQL): one row per trade, `status`
 `open|closed|deleted`. The unique partial index `synth_open_one_per_underlying` allows one open
-position per underlying. `autoIndex` is off: the index is created and read back at boot
-(`ensureReady`), the way the Box reservation store does it. Until that succeeds, entries
-are paused with `paper_blocked_reason: "unsafe_index"`, while open positions are still
-monitored and closed. Closing is a single `$set` guarded on `status: "open"`, so two
-racing closes can never both land. A close that loses that race, or an insert rejected as
-a duplicate, is reconciled with the stored row. Without MongoDB the scanner still detects,
-but it does not paper-trade (`paper_blocked_reason: "no_db"`), like Box.
+position per underlying. The migrated index is verified at boot. Until that succeeds,
+entries are paused with `paper_blocked_reason: "unsafe_index"`, while open positions are
+still monitored and closed. Closing updates a row guarded on `status='open'`, so two
+racing closes cannot both land; a losing close or duplicate insert is reconciled with
+the stored row. Without PostgreSQL the scanner still detects but does not paper-trade
+(`paper_blocked_reason: "no_db"`).
 
-Settings (`synth_settings`, Box connection, one row per key like `box_settings`): the
+Settings (`synth_settings` in PostgreSQL, one row per key): the
 entry gate, safety buffer and max open trades. They are changed on the page and saved in
 one write. If the save fails, the change is rolled back and reported (503). A saved value
 overrides the env default at boot, and paper entries wait until saved settings are loaded.
@@ -204,8 +195,7 @@ OPEN row, then the best row per underlying. The status counts always cover every
 ## Known modelling gaps
 
 - Paper fills assume all three legs fill at the observed touch at once. Real execution
-  has inter-leg latency and legging risk. Live execution would need Box's durable
-  gateway (hedge-first order, reservations, three-leg basket margin, partial-fill unwind).
+  has inter-leg latency and legging risk; no real-order transport is included in this service.
 - Futures margin financing is not included.
 - Exercise STT and physical-delivery charges at expiry are not modelled. `EXPIRED` trades
   use the entry-time unwind estimate instead.

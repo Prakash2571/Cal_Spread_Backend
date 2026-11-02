@@ -1,9 +1,10 @@
 # CalSpread backend workflow
 
-Follow `/home/prakash/Work/WORKFLOW.md`. The application source lives in `src/`;
-the paired frontend is `../Cal_Spread/`. Build with `npm run build`; tests import
-the checked `dist/` output. Keep analytics off execution paths and use the active
-broker's providers, subscription coordinator and existing admin role validation.
-Do not deploy or arm live execution as part of analytics work.
+Follow `/home/prakash/Work/WORKFLOW.md`. The Go source lives in `cmd/` and `internal/`;
+the paired React frontend is `../Cal_Spread/`. Build with `make build`; verify with
+`TEST_DATABASE_URL=<local test database> make check` (required PostgreSQL and race tests).
+Use the active broker's providers, subscription coordinator and existing admin role
+validation. Local PostgreSQL setup is `make db-start`. No broker order-placement
+transport exists; do not add deployment operations to local migration work.
 
-Current cross-repository task: `tasks/2026-10-03-fair-value/`.
+Current cross-repository task: `tasks/2026-10-27-go-postgres-migration/`.

@@ -1,0 +1,536 @@
+{
+  "reference_commit": "1ea1d958ebf5c4a0fc673d786f5ee9638bdffa8d",
+  "fair_value_cases": 42,
+  "shared_cases": 290,
+  "totals": {
+    "COVERED": 250,
+    "PORTED": 78,
+    "N/A": 4
+  },
+  "suites": [
+    {
+      "file": "tests/fairValue/auth.test.mjs",
+      "sha256": "328a22b4bf7f9cfff88063ff0e1196b30291467fba20661bcd10faab7ffd6a61",
+      "titles": [
+        "router-wide full-admin authorization covers valuation/settings/history/export and SSE"
+      ]
+    },
+    {
+      "file": "tests/fairValue/hardening.test.mjs",
+      "sha256": "be95702194f6727fb09286c89a62c117ea1aba3bd93ea3ec81633e01b3da3b79",
+      "titles": [
+        "strict configuration rejects unknown/prototype/nonfinite settings and normalizes source timestamps",
+        "tiny ATM variance is stable and zero-vol ATM vega is its one-sided limit",
+        "incoherent pairs and duplicate instruments never enter smile calibration",
+        "analytics yields before a protective subscription and cannot evict shared execution tokens",
+        "broker-neutral fanout retention never consults Kite credentials or opens an inactive socket",
+        "HTTP role revoked during asynchronous analytics returns 403 without result data",
+        "recent snapshot remains explicitly addressable across publication; changed namespace drops all private current state",
+        "history obeys explicit byte/count/age ceilings"
+      ]
+    },
+    {
+      "file": "tests/fairValue/independent.test.mjs",
+      "sha256": "2f647a7e56520013b9b27281547873b3019a4c025023b07453eb2f4dc37f3db8",
+      "titles": [
+        "leave-one-strike-out removes both quotes before forwards and fitting, reprices the target",
+        "leave-one-strike-out returns insufficient data for sparse slices and supported-range endpoints",
+        "sensitivity reports the exact scenario range with documented nonstatistical assumptions"
+      ]
+    },
+    {
+      "file": "tests/fairValue/market.test.mjs",
+      "sha256": "370fc561dad61514516b4891ac07d0644c57c1ac5fcb8835e762e4c54263a0c4",
+      "titles": [
+        "log discount interpolation, D>1, flat assumption and unavailable curve coverage",
+        "quote cleaning rejects stale, crossed, wide, invalid depth and incoherent cross-sections",
+        "robust multi-pair forward rejects an outlier and exposes interval diagnostics",
+        "both target-strike quotes are excluded from forward and insufficient data is explicit",
+        "matching-expiry futures only; verified continuous/discrete carry and events before expiry",
+        "exact timestamp metadata and verified policy, no weekday or silently hardcoded time"
+      ]
+    },
+    {
+      "file": "tests/fairValue/maturity.test.mjs",
+      "sha256": "5a186e3d6e37e8397c1a601882f8752ceaa5f29f0ac0334fac43f0ab4dc62932",
+      "titles": [
+        "maturity interpolation evaluates both slices at identical k and interpolates total variance",
+        "listed contracts retain actual IDs/lots; hypothetical strike interpolation and invalid input boundaries",
+        "crossing maturity variance curves invalidates the relevant interpolation region without silent repair",
+        "research opt-in is necessary and distance/negative-forward-variance limits are enforced",
+        "unsupported carry, dividends and corporate actions cannot silently use event-insensitive maturity interpolation"
+      ]
+    },
+    {
+      "file": "tests/fairValue/pipeline.test.mjs",
+      "sha256": "7b9cde380277fd73cb614b3b51af38afa0662206c7ea7fa45743a6fadcc9bdbb",
+      "titles": [
+        "listed-expiry pipeline preserves snapshot identity and per-unit/lot/IV units",
+        "unverified date-only expiry returns unavailable reasons, never a guessed weekday/time",
+        "worker publication is immutable, atomic and cannot cross feed generations",
+        "a stale worker result is discarded and exceptions leave analytics outside execution",
+        "actual worker timeout/crash only rejects bounded analytics jobs"
+      ]
+    },
+    {
+      "file": "tests/fairValue/pricing.test.mjs",
+      "sha256": "7a2fd11653b5e2ff0f946923c5f3f7bb6b15c60f555a716232d7bc9ddc95b6db",
+      "titles": [
+        "independent known Black-Scholes price (Hull example) and precise normal tails",
+        "nonuniform strike grid parity, price bounds, negative rates, deep ITM/OTM",
+        "zero variance and exact ACT/365F expiry time; settlement is distinguished",
+        "IV round trips across puts/calls and maturity, decimal percent units",
+        "IV explicit failures, lower/upper bounds, low vega and bounded expansion",
+        "frozen Greeks agree with independent central price bumps and explicitly scaled units",
+        "invalid strike/forward/discount/variance/style never produce a price"
+      ]
+    },
+    {
+      "file": "tests/fairValue/service.test.mjs",
+      "sha256": "12ec80e0f4e699f7bef959d4f027c3c79c97a08aa9837d4c8b44412ed080e19f",
+      "titles": [
+        "admin HTTP workflow: publish, calculate, independent cache, history, pause, disable and failure isolation"
+      ]
+    },
+    {
+      "file": "tests/fairValue/storage.test.mjs",
+      "sha256": "76d436eea8d59cc892120bb3f99e05597ca448aa81f25fda24751100d851e738",
+      "titles": [
+        "unconfigured Mongo is explicitly unavailable; no fabricated persistence success"
+      ]
+    },
+    {
+      "file": "tests/fairValue/svi.test.mjs",
+      "sha256": "d4e4393bc6427608bfe89e3f8107c3fdab59a7c1c298f2ac35d0074f8c52c019",
+      "titles": [
+        "analytic SVI derivatives and g match independent finite-difference evaluation",
+        "Gatheral-Jacquier / Vogt counterexample satisfies basic constraints but fails butterfly diagnostics",
+        "bounded multi-start SVI fits known smile prices reproducibly with validated support",
+        "sparse or poorly spread SVI data returns labelled validated interpolation or unavailable",
+        "price validation detects actual-spacing nonuniform-strike convexity violation"
+      ]
+    },
+    {
+      "file": "tests/box/adminToken.test.mjs",
+      "sha256": "e2b7ea0ce7dea9aa34d445a01668bfd673a4ce98528ea607974f6a68087638bc",
+      "titles": [
+        "a token is a non-empty string",
+        "a token carries at least 128 bits of entropy",
+        "successive tokens differ",
+        "1000 tokens are all distinct",
+        "tokens are URL and header safe with no escaping",
+        "a token embeds NO timestamp",
+        "output is not obviously biased"
+      ]
+    },
+    {
+      "file": "tests/box/boundedCache.test.mjs",
+      "sha256": "295641d3735b2cdd07ef5ec275b7a64cb7ad031a984daf5ef8dda3f7a7e15402",
+      "titles": [
+        "a fresh value is returned",
+        "an expired entry is DELETED, not merely skipped",
+        "the entry count NEVER exceeds the cap, however many unique keys arrive",
+        "eviction is oldest-first",
+        "re-setting a key refreshes its eviction position",
+        "expired entries are swept before anything live is evicted",
+        "a missing key is undefined and does not create an entry",
+        "clear() empties the cache",
+        "a cap below one is coerced to one rather than disabling the cache"
+      ]
+    },
+    {
+      "file": "tests/box/brokerIdentity.test.mjs",
+      "sha256": "3de21098315153aec4bc1efeacb6e92a05104f2bec7eb4708db542113ef4b16e",
+      "titles": [
+        "the broker id set is exactly zerodha and dhan",
+        "the legacy broker is zerodha",
+        "brokerOf resolves an absent, null or unknown broker to zerodha",
+        "brokerOf preserves an explicitly recorded broker",
+        "isBrokerId accepts only the two known ids",
+        "parseBrokerId returns null for unknown input rather than defaulting",
+        "brokerLabel gives the compact badge text the UI shows"
+      ]
+    },
+    {
+      "file": "tests/box/dhanActiveNoKite.test.mjs",
+      "sha256": "8fb7e57fbb613e36ccd5c51f1d84245dee02aba1ac10ef27094334404542b2cf",
+      "titles": [
+        "active broker is dhan with an authenticated session and NO Kite session",
+        "the instrument universe loads from DHAN, never touching kite.getInstruments",
+        "board-shaped tokens belong to the DHAN namespace",
+        "REST quotes come from DHAN and are keyed by the INTERNAL token",
+        "Dhan REST quotes carry executable bid/ask depth",
+        "SSE subscriptions reach DHAN and create ZERO Kite subscriptions",
+        "the strategy's tokens also route to Dhan only",
+        "browser and strategy SHARE a token without duplicating the upstream subscription",
+        "a KITE token is REJECTED while Dhan is active",
+        "a DHAN token is accepted while Dhan is active",
+        "token assertion is permissive only while the universe is UNLOADED",
+        "market data reports ready without any Zerodha session",
+        "feed health is LIVE only when connected AND subscribed AND ticking",
+        "a connected socket with NOTHING subscribed is not reported as LIVE",
+        "with ZERODHA active, a live Dhan session does NOT drive subscriptions"
+      ]
+    },
+    {
+      "file": "tests/box/dhanBoardJoin.test.mjs",
+      "sha256": "0c193a6c31361496ca3b185d554a5e449c734f17cf3764431164f2b653318314",
+      "titles": [
+        "contract suffixes strip back to the bare underlying",
+        "real NSE symbols are never corrupted by suffix stripping",
+        "hyphenated underlyings survive contract stripping",
+        "option contract suffixes strip the strike as well",
+        "underlying keys normalize whitespace and case",
+        "futures resolve their underlying from UNDERLYING_SECURITY_ID",
+        "BHEL's stock future normalizes to the expected internal shape",
+        "BHEL's equity row normalizes to the expected internal shape",
+        "FIVE real underlyings produce FIVE board cards, not one",
+        "every known symbol passes every stage",
+        "an unmatched underlying is REPORTED, not silently dropped",
+        "checkKnownSymbols names the FIRST failing stage",
+        "index futures group even without an NSE equity row",
+        "an index future keeps the UNDERLYING symbol, not the index's trading symbol",
+        "futures and options get distinct Kite-shaped segments",
+        "long-dated contracts are excluded and cannot reach the board",
+        "TEST scrips never reach the board even when otherwise well-formed",
+        "internal token round-trips through the whole identity chain"
+      ]
+    },
+    {
+      "file": "tests/box/dhanFeedDecoder.test.mjs",
+      "sha256": "96745af8a49e6813e0b4f740728aeea73105383ca20169521747c2b783e67b69",
+      "titles": [
+        "decodes a TICKER packet",
+        "a zero last-trade-time stays ABSENT rather than becoming epoch 0",
+        "decodes a QUOTE packet including its OHLC block",
+        "decodes an OI packet",
+        "decodes a PREV_CLOSE packet",
+        "decodes a FULL packet: price, OI, volume, OHLC and the depth ladder",
+        "zero-priced depth levels are DROPPED, not reported as ₹0 liquidity",
+        "decodes SEVERAL packets from one frame",
+        "an UNKNOWN response code is skipped by its declared length, sparing its neighbours",
+        "a TRUNCATED packet is reported and does not throw",
+        "a packet whose declared length is too short for its type is reported",
+        "a non-positive declared length stops the walk instead of looping forever",
+        "an empty frame is a heartbeat, not an error",
+        "a frame shorter than the header is reported",
+        "a server DISCONNECT packet is surfaced with its code",
+        "an unknown segment code yields a null segment rather than a wrong one",
+        "toTick uses executable bid/ask and NEVER invents an exchange timestamp",
+        "toTick reports a missing side as 0 rather than guessing a price",
+        "production Dhan frame handling marks FULL authoritative and retained partial depth non-authoritative"
+      ]
+    },
+    {
+      "file": "tests/box/dhanMarginAndIp.test.mjs",
+      "sha256": "5d4345cd28f3faf171fddf4c1fbe1496a296fe90f5cf0d28d77610f484c8be60",
+      "titles": [
+        "a hedge-adjusted total is read from any of Dhan's spellings",
+        "span, exposure, F&O and hedge benefit are preserved when present",
+        "a payload wrapped in `data` is unwrapped",
+        "an UNREADABLE total returns null, so the caller falls back rather than recording zero",
+        "a zero or negative total is NOT a credible four-leg requirement",
+        "the multi-margin request sends its legs under `scripList`",
+        "dhanClientId is sent ONCE at the top level, never repeated per leg",
+        "the netting flags are always explicit, and default to false",
+        "the body carries exactly Dhan's four fields and nothing more",
+        "an unreadable payload is described by FIELD NAME, never by value",
+        "the MULTI-ORDER endpoint is preferred over per-leg margins",
+        "all FOUR box legs are sent in one request",
+        "BUY/SELL direction is preserved per leg",
+        "the MARGIN (carry-forward) product is used, never INTRADAY",
+        "the REAL per-leg price is preferred over the order price",
+        "a zero-priced leg is never sent, because Dhan rejects one",
+        "the hedge-adjusted total is returned, with span/exposure/benefit preserved",
+        "the multi total is used even though it is FAR below the per-leg sum",
+        "a FAILED multi call falls back to the per-leg sum, clearly labelled",
+        "the fallback is CONSERVATIVE — it can never understate the requirement",
+        "an unreadable multi response falls back rather than recording zero",
+        "when NOTHING can be priced the result is `unavailable`, not zero margin",
+        "Zerodha still uses its own basket API, labelled kite_basket",
+        "with NO configured IP, readiness falls back to the manual declaration",
+        "with nothing configured at all, it FAILS CLOSED",
+        "a configured IP that MATCHES Dhan's primary verifies and becomes ready",
+        "a configured IP matching the SECONDARY also verifies",
+        "a MISMATCHED IP blocks trading and names both sides",
+        "a configured IP that has NOT been verified yet is NOT ready",
+        "an UNREACHABLE verification call fails closed",
+        "verification without a Dhan session fails closed",
+        "the manual flag remains an override that can still BLOCK a verified IP",
+        "readiness on the manual flag alone is reported as weaker evidence",
+        "IPv4 addresses are found under Dhan's dashboard-style ipAddress1/2 keys",
+        "IPv4 addresses are found under primaryIP/secondaryIP keys",
+        "a `data`-wrapped payload is scanned",
+        "an array of addresses is scanned",
+        "NA, empty and null slots are skipped, never treated as addresses",
+        "non-IP strings are not mistaken for addresses",
+        "duplicates are collapsed",
+        "the scan is bounded and safe on odd payloads",
+        "verification MATCHES against Dhan's dashboard-style key names",
+        "an EMPTY whitelist is reported differently from a mismatch",
+        "a genuine mismatch lists what Dhan actually has"
+      ]
+    },
+    {
+      "file": "tests/box/dhanSupport.test.mjs",
+      "sha256": "2794669e4c04ecd33e28423d0b9f7a1c36c233be110ca444a5132a76fa38f46d",
+      "titles": [
+        "internal exchanges translate to Dhan segments",
+        "an index resolves to IDX_I regardless of exchange",
+        "an unknown exchange returns null rather than guessing a segment",
+        "segment names and binary codes round-trip",
+        "Dhan segments map back to Zerodha-style internal exchange labels",
+        "an internal token folds in the SEGMENT so security ids cannot collide",
+        "an internal token round-trips back to (segment, securityId)",
+        "token derivation is STABLE, so positions adopted at boot still match",
+        "an unrecognisable token yields null rather than a wrong instrument",
+        "CSV splitting respects quoted commas",
+        "expiry formats normalize to ISO, and garbage yields empty rather than a wrong date",
+        "Dhan instrument classes map to Kite's CE/PE/FUT vocabulary",
+        "the instrument master parses into the internal Instrument shape",
+        "the master parser maps by column NAME, so an added column is harmless",
+        "a master with no SECURITY_ID column throws instead of returning an empty universe",
+        "malformed rows are skipped, not fatal",
+        "expiry parses from ms, seconds and ISO strings",
+        "an unparseable expiry is null, meaning UNKNOWN",
+        "an UNKNOWN expiry is NOT treated as expired",
+        "a stated past expiry IS expired, and a future one is not",
+        "a redacted session NEVER contains the access token",
+        "401/403 normalize to an auth error that is NOT retried",
+        "429 normalizes to a rate-limit error that IS retryable for reads",
+        "a 4xx is DEFINITIVE but a 429 is not — the write-safety distinction",
+        "5xx and network failures are retryable for reads",
+        "Dhan's COLUMN-wise candles transpose into rows",
+        "candles come back oldest-first, matching Kite's ordering",
+        "a candle with a bad timestamp is dropped rather than dated to 1970",
+        "missing columns become 0 rather than undefined",
+        "long ranges chunk, because Dhan bounds intraday request spans",
+        "a range within the limit is a single chunk",
+        "exchange TEST scrips are excluded from the universe",
+        "implausibly long-dated derivatives are excluded",
+        "EQUITY and INDEX rows are NOT expiry-filtered",
+        "the parse report records what was found and why rows were skipped",
+        "the report NAMES missing columns rather than silently reading them empty",
+        "the report samples REAL F&O futures, which is what the board needs"
+      ]
+    },
+    {
+      "file": "tests/box/indexSpot.test.mjs",
+      "sha256": "12c609e61587ce1cc55da51a0693c9258f9c26ec98d7e574789a35bd7ef4282d",
+      "titles": [
+        "DHAN's index spot resolves from the underlying symbol",
+        "ZERODHA's index spot still resolves to the curated name",
+        "the CURATED name wins when both are present",
+        "every mapped index underlying resolves under BOTH naming conventions",
+        "an index underlying with NO spot row at all resolves to null",
+        "a non-index underlying is NEVER matched against an index instrument",
+        "candidates are the curated name then the underlying, deduplicated",
+        "the index reaches the board under DHAN's naming",
+        "the index reaches the board under ZERODHA's naming",
+        "a missing index spot is reported as a MAPPING problem, not a missing equity"
+      ]
+    },
+    {
+      "file": "tests/box/localCharges.test.mjs",
+      "sha256": "63c75818d1cc45b56f90e6598606e82e7aeeb7f23d50fdb0c35e20eacf743458",
+      "titles": [
+        "a SELL option leg is charged STT on the premium (rounded to the rupee); a BUY leg is not",
+        "STT rounding is centralised in roundStt and honours the mode flag",
+        "brokerage is a flat ₹20 per order and GST is 18% of (brokerage+exchange+SEBI)",
+        "IPFT is modelled as ₹ per crore of premium and folded into the exchange head",
+        "a leg total equals the sum of its rounded heads",
+        "a group total equals the sum of its legs, and each head aggregates",
+        "the round trip reverses every side and projects the exit at the entry fills",
+        "environment overrides feed straight through to the rate card",
+        "the shipped rate card matches the rates in force (post 1 April 2026)",
+        "the rate card is versioned so old results stay interpretable",
+        "no charge head is ever negative, and IPFT is now actually billed"
+      ]
+    },
+    {
+      "file": "tests/box/marketDataLanes.test.mjs",
+      "sha256": "efc5f280c8ce4d1e7789d57ed65af662a890fd617c026e8a2c90132ee2a5a2ca",
+      "titles": [
+        "T1: the futures and box subscription domains stay isolated",
+        "T2: a futures token never becomes box-owned",
+        "T3: a box token never pollutes the futures coordinator",
+        "the SAME token in both lanes is refcounted independently",
+        "within one lane, refcounting still prevents a duplicate upstream subscription",
+        "T4: a broker switch resets BOTH lanes",
+        "T6: each lane replays only its OWN tokens after a reconnect",
+        "there are exactly two lanes, and they are named not boolean",
+        "lane stats appear per-lane in the coordinator's own summary",
+        "T27: the tick-rate counter stays bounded under a high tick rate",
+        "T26: thousands of box subscriptions remain bounded and correct"
+      ]
+    },
+    {
+      "file": "tests/box/marketDataTransport.test.mjs",
+      "sha256": "572cf58f8c698e59753a4ac35b4c8e32d02001d3ec59d06bf0b6ff1919cc68c7",
+      "titles": [
+        "a full board's token list is accepted in a body",
+        "token lists are deduplicated",
+        "only positive integers are accepted",
+        "a numeric STRING is rejected rather than coerced",
+        "a non-array, empty, or oversized body is rejected",
+        "the token limit comfortably exceeds today's board",
+        "a session round-trips the whole board",
+        "session ids are opaque, unguessable and unique",
+        "the SSE path for a session is tiny regardless of token count",
+        "an unknown session is not_found, so the client mints a new one",
+        "a session SURVIVES repeated resolves, so EventSource can reconnect",
+        "a session with a LIVE connection is never reaped",
+        "an idle session is reaped after its TTL",
+        "closing one of two connections keeps the session alive",
+        "a session from a previous GENERATION is refused",
+        "a session from a different BROKER is refused",
+        "a refused session is dropped, not left to be retried forever",
+        "a broker switch drops every session",
+        "the store is BOUNDED, since unauthenticated callers can create sessions",
+        "eviction never kills a session with a live connection",
+        "stats report sessions, connections and tokens",
+        "two browser leases with OVERLAPPING tokens subscribe upstream ONCE",
+        "releasing one lease keeps tokens another lease still wants",
+        "a DOUBLE release cannot unsubscribe another client's tokens",
+        "a browser lease does not disturb the scanner's tokens",
+        "a full board lease reports a browser subscription count > 0"
+      ]
+    },
+    {
+      "file": "tests/box/shutdown.test.mjs",
+      "sha256": "80ff6f08a96b16a2dcb88c9631b67141ac0dc130c3ddaa63c773cdc7d70b74d2",
+      "titles": [
+        "a second signal does NOT run cleanup twice",
+        "repeated calls after completion still do not re-run steps",
+        "inProgress flips as soon as shutdown begins",
+        "steps run strictly in the declared order",
+        "an async step is awaited before the next begins",
+        "a failing step does NOT prevent later steps",
+        "every step failing still reaches the end and reports each one",
+        "a rejected promise is handled like a thrown error",
+        "a non-Error throw is still recorded",
+        "a hung step does not hang shutdown forever",
+        "the timeout reports which steps did not finish",
+        "finishing inside the deadline is not a timeout",
+        "a step that throws is NOT by itself a failed shutdown",
+        "the signal name and duration are reported",
+        "an empty step list is a clean no-op"
+      ]
+    },
+    {
+      "file": "tests/box/singleBroker.test.mjs",
+      "sha256": "18761346577639a3ba48aa0c50ea53ea03453e2cf7a1ac6ea54022940faff2b7",
+      "titles": [
+        "the default active broker is zerodha",
+        "Dhan is reported as not configured when its env vars are absent",
+        "switching to an UNCONFIGURED broker is refused",
+        "a switch with NO exposure succeeds and moves the active broker",
+        "a safe switch TEARS DOWN the old broker before bringing up the new one",
+        "re-selecting the CURRENT broker is an idempotent no-op success",
+        "while ZERODHA is active, subscriptions go to the Kite hub only",
+        "while DHAN is active, subscriptions do NOT touch the Kite hub",
+        "Zerodha health has no static-IP concept, reported as null not false",
+        "Dhan is not trading_ready without a session, even with a static IP",
+        "a missing static IP is surfaced as an explicit operator problem",
+        "session state is never derived from admin authentication",
+        "the snapshot reports the active broker plus its session and health"
+      ]
+    },
+    {
+      "file": "tests/box/subscriptionCoordinator.test.mjs",
+      "sha256": "86873d5550fea336f905106bad048580568b7fbde06ee1b4268cda78fbad023f",
+      "titles": [
+        "a first acquire subscribes upstream exactly once",
+        "TWO SSE clients with overlapping tokens subscribe each token once",
+        "disconnecting ONE client keeps tokens the other still wants",
+        "disconnecting the LAST client releases the remaining tokens",
+        "a Box scanner token SURVIVES an SSE disconnect",
+        "refcounts are tracked per owner class",
+        "a repeated token within ONE lease counts once",
+        "a double release is harmless",
+        "setOwnerTokens diffs a moving window without flapping shared tokens",
+        "setOwnerTokens does not disturb another owner's holdings",
+        "resetForBrokerSwitch drops everything and issues NO upstream unsubscribe",
+        "after a reset, re-registering subscribes cleanly in the new namespace",
+        "stats report per-owner token counts",
+        "invalid tokens are ignored rather than subscribed"
+      ]
+    },
+    {
+      "file": "tests/box/tickerHubLifecycle.test.mjs",
+      "sha256": "3c923ceadbec8c62a6f248a3d4c56b186cb995ed38d89e41fd66e16311dd3a74",
+      "titles": [
+        "TickerHub emits every socket generation and ignores old warmth"
+      ]
+    },
+    {
+      "file": "tests/box/tokenRouteAuth.test.mjs",
+      "sha256": "747ec19dc6c83b7749e475d85b1218dfaa5bf8839370ca867bb94d3522ce11e7",
+      "titles": [
+        "an UNSET secret disables the route, it never grants access",
+        "an unset secret is not_configured even when the caller sends nothing",
+        "a missing or empty passcode is forbidden",
+        "the exact passcode is accepted",
+        "the configured secret is trimmed, the supplied one is NOT",
+        "near-miss passcodes are refused",
+        "comparison tolerates length differences without throwing",
+        "the header wins over the query string",
+        "the query string is used when no header is present",
+        "a repeated header takes the first value, never a joined string",
+        "a non-string query value is ignored rather than coerced",
+        "end to end: only the real passcode from either source is accepted"
+      ]
+    },
+    {
+      "file": "tests/box/trackedTimers.test.mjs",
+      "sha256": "41daa59a5723a7af05ff2661d341bc0e6fef832159f8ca916a60c4b993715de0",
+      "titles": [
+        "trackInterval returns the handle unchanged",
+        "clearing stops the timers and empties the registry",
+        "clearing twice is safe and reports nothing the second time",
+        "clearing an empty registry is a no-op"
+      ]
+    },
+    {
+      "file": "tests/box/math.test.mjs",
+      "sha256": "859e0fe2a3637eba153658b41a3e9f2a485e13ad6486da1bc9880ada4d326bd3",
+      "titles": [
+        "1. the monitored window is the ATM strike plus three either side",
+        "2. never more than seven strikes, however long the chain",
+        "ATM is the strike closest to spot, and the strike step is the median gap",
+        "the ATM window only re-centres once the spot clears the hysteresis band"
+      ]
+    },
+    {
+      "file": "tests/box/migrationFixtures.test.mjs",
+      "sha256": "88502dd5188fc2fac008c81ee9929363f7017bfc3c4da0e6d1b6fdbaf1941ae8",
+      "titles": [
+        "charges.json: 2 case(s) match the current implementation"
+      ]
+    },
+    {
+      "file": "tests/box/depthReadiness.test.mjs",
+      "sha256": "7b0f09e882c805f1077e1a29b7130bd656cd1fb885c02bdaaaf17c2f9ca13496",
+      "titles": [
+        "first LTP-only option tick does not create or notify an executable book",
+        "LTP-only packet after a book cannot refresh its time, version, or listeners",
+        "Dhan retained ladders on a partial packet do not refresh executable storage",
+        "authoritative empty depth invalidates the old book and notifies dependents",
+        "legacy explicit ladders remain authoritative and malformed levels are dropped",
+        "one-sided books support only the relevant reducing side",
+        "generation invalidation clears readiness and an LTP packet cannot warm it",
+        "Zerodha provenance is true only for full packets"
+      ]
+    },
+    {
+      "file": "tests/box/serialize.test.mjs",
+      "sha256": "f1ee95f31de77dec6db53edec441b7c7d86fc4b57fd1d9d5d92e5fc3c313060a",
+      "titles": [
+        "the quote store stamps books with their receive time and ages them out",
+        "a depthless tick must not refresh a good book's timestamp",
+        "executable books can only enter the store through WebSocket ticks",
+        "the spot store tracks the underlying value used to place the ATM window"
+      ]
+    }
+  ]
+}
