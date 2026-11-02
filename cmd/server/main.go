@@ -1,6 +1,6 @@
 // Command server is the Cal_Spread backend: the Go port of src/index.ts's process shell.
 // It loads .env (dotenv/config), reads the configuration from the environment (the same
-// variable names), listens on PORT (default 3001) on every interface, runs the boot
+// variable names), listens on PORT (default 3001; optional HOST, all interfaces by default), runs the boot
 // chain while serving, and on SIGINT/SIGTERM runs the graceful shutdown
 // (SHUTDOWN_TIMEOUT_MS, default 12 s) and exits 0, or 1 when it timed out.
 package main
@@ -36,7 +36,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// app.listen(PORT): all interfaces, plain HTTP.
+	// Plain HTTP; blank HOST preserves Node's all-interface listener.
 	l, err := net.Listen("tcp", net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)))
 	if err != nil {
 		log.Printf("[FATAL] listen: %v", err)

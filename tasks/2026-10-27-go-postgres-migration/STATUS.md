@@ -1,20 +1,43 @@
 # Status: Cal_Spread backend Node → Go, MongoDB/Redis → PostgreSQL (Box removed)
 State: Doing
 Updated: 2026-11-02
-Next action: Verify and commit the staged reference checkpoint, then retire the Node backend/generators, verify the standalone Go process and implement real-Go frontend HTTP/browser integration before final checks and both approved main pushes.
-Blockers: none; frontend removal/build/37 unit tests are complete
+Next action: Review/stage the intended final backend/frontend changes, commit and push both mains (backend first), then inspect their remote CI and record publication receipts.
+Blockers: none; frontend build/37 tests, six real-Go HTTP groups and 12 Firefox workflow groups passed
 WIP override: none
 Task: `2026-10-27-go-postgres-migration` · Project: Cal_Spread_Backend · Plan: [PLAN.md](PLAN.md)
 
 ## Current milestone
-The Go service is implemented: `cmd/server` plus 30 tested packages, including frozen-reference validation.
+The Go service is implemented: `cmd/server` plus 30 tested internal packages, including frozen-reference validation.
+The real-process `cmd/server` tests are now a 31st tested package; `cmd/verifyfixture` is verification-only.
 All 83 non-Box routes are served; `/api/box/*` is gone. The retained-suite audit is complete.
 The full required PostgreSQL/race suite and standalone build passed before Node retirement.
 Frontend Box removal and build/37 unit tests also passed. Fresh local PostgreSQL setup and Go CI are implemented.
-Remaining: Node/tooling retirement, standalone-process and real-Go browser verification, final deep review/docs,
-and both approved main pushes. No data import or EC2 deployment is required.
+Node/tooling retirement, standalone-process verification and real-Go browser workflows are complete.
+Final deep review and local checks are complete. Remaining: approved final commits/main pushes and remote CI receipts.
+No data import or EC2 deployment is required.
 
 ## Resumed and completed on 2026-11-02
+- Final post-retirement check passed with read-only module files: build/vet/format/module verification, all 31
+  tested packages with race detector/required PostgreSQL and standalone binary build. Public `make db-start`
+  repeated without resetting data and `make db-status` verified the repository-owned loopback cluster.
+  Deliverable summary: `outputs/2026-11-02-go-postgres-migration.md`; final publication remains pending.
+- Final transport review added standalone behavioral checks for historical priority/FIFO/pacing, watchdog ownership
+  and queued cancellation; Dhan transient/read retry caps, Retry-After ceiling, per-attempt deadline, cancelled
+  backoff and request-start pacing. Ten repeated race-enabled runs passed without changing those implementations.
+- Paired frontend integration is verified: 37 unit tests/build, six real-Go HTTP groups and 12 Firefox 157.0
+  workflow groups. Actual admin form, board/Calendar/Broker/Synthetic and Fair Value workflows pass against Go/PG;
+  390px mobile containment, JSON download, private-data revocation and zero public/trade valuation requests verified.
+  Frontend local/auth docs and paired Go/PostgreSQL CI updated; returned to this backend's final-review stage.
+- Standalone Go process checks now verify clean-environment dotenv startup, memory-only/full/trade auth behavior,
+  SIGINT/SIGTERM exit, all 18 PostgreSQL tables/five migrations and admin/risk-free-rate restoration across restart.
+  Deeper review reproduced a pending admin-session write lost at shutdown (closed pool). Session persistence is now
+  owned/drained after HTTP handlers and before PostgreSQL close; the deterministic regression passes.
+  `cmd/verifyfixture` builds/vets with race support: actual App/Chi/PostgreSQL, loopback-only generated broker prices,
+  real authorization and isolated disposable test schema. Frontend-stage runtime verification follows.
+- Reference checkpoint committed on main as `8de7ca5`; not pushed. The Node backend, package/lock/tsconfig,
+  Node/PM2 deploy script, original Node tests, source-dependent generators/checker and Box-only docs are now retired.
+  All 39 retained JSON fixtures are byte-identical to that checkpoint and SHA-256-pinned; Go checks cover fixture
+  integrity and Fair Value documentation as well as all original retained cases. Post-retirement full checks passed.
 - 2026-11-02 final-continuation milestone: fresh repository-owned PostgreSQL started on 55472 with empty `calspread`
   and separate `calspread_test`. `scratch/go-migration/check.sh env TEST_DATABASE_URL='postgres://calspread@127.0.0.1:55472/calspread_test?sslmode=disable' make check && scratch/go-migration/check.sh make build` passed: build/vet/format/module verification and all 30 tested packages with race/required PostgreSQL checks; standalone `outputs/calspread` built and ignored by Git.
 - `go mod tidy` and `go mod verify` succeeded after the approved workspace-local pinned dependency fetch; unused
@@ -62,11 +85,11 @@ The 2026-10-28 run cut off synthetic and captures (the Kiro session received SIG
 from their on-disk state on 2026-10-29.
 
 ## How to run the Go service locally
-`scratch/go-migration/check.sh go build -o scratch/go-migration/tmp/server/bin/server ./cmd/server`, then run the binary
-from a directory with a `.env` (same names as Node): `KITE_API_KEY`, `KITE_API_SECRET` (required, as in Node), `ADMIN_SECRET`,
-`FRONTEND_URL`, `PORT` (default 3001), optional `DATABASE_URL` (without it: memory-only, as Node without MongoDB/Redis).
-Run with the same `TZ` as the Node service (history routes and the Dhan expiry fallback use local time).
-`scratch/go-migration/tmp/server/e2e.sh` does this on loopback with dead proxies.
+Use the current README: `make db-start`, copy `.env.example` to `.env` and fill the server credentials, then
+`make build` and `./outputs/calspread`. Local PostgreSQL is 127.0.0.1:55472; HTTP example is 127.0.0.1:3001.
+Kite app key/secret remain required by the startup contract. Use Asia/Kolkata for local-date compatibility.
+`make check` requires the separate test database; `cmd/server/main_test.go` replaces the historical scratch
+process smoke script. Real-Go HTTP/browser commands are in the paired frontend README.
 
 ## Decisions taken (Node's real behaviour, checked)
 - 2026-10-29 Ids: a 12-character id is **400** ("Invalid trade id."), not 404. The pinned mongoose 8.24.4 calls bson
@@ -139,10 +162,10 @@ Every package: `config`, `jsx`, `db` (+ migrations 0001-0005), `dbtest`, `kv`, `
   wire format and slow-peer tests; `brokers/dhan` decoder (786 frames, 21,452 packets), `toTick` (51), frame merge (10
   streams), helpers (617), scrip master (48 masters), feed lifecycle (85 steps), margin (55).
 
-## Known test gaps (not blocking; listed so nobody assumes otherwise)
-- The shared Kite historical gate (pacing 350 ms, priorities, 20 s watchdog) has no unit test of its own; captures tests
-  its priority path.
-- Dhan REST read retry and pacing are not golden-tested (goldens ran with `DHAN_MAX_READ_ATTEMPTS=1`, `DHAN_MIN_INTERVAL_MS=0`).
+## Verification scope notes
+- The shared Kite historical gate now has dedicated priority/FIFO/pacing, watchdog-ownership and cancellation tests.
+- Dhan REST retry/deadline/pacing now has dedicated loopback behavioral tests. Original goldens keep their unchanged
+  `DHAN_MAX_READ_ATTEMPTS=1`, `DHAN_MIN_INTERVAL_MS=0` setup; the additional operational tests cover production policy.
 - The Synthetic golden runs on a deterministic test scheduler; the production runtime is covered by route, callback and
   stress tests.
 - The Dhan `OnSessionLost` and box-lane hooks in `internal/app` are tested by the registry goldens, not end to end.
@@ -190,13 +213,21 @@ Every package: `config`, `jsx`, `db` (+ migrations 0001-0005), `dbtest`, `kv`, `
 - Removed: `dhan.HTTP.Write`, the single-attempt POST/PUT/DELETE path that only the Node order endpoints used. No caller in Go.
 
 ## Remaining implementation/verification
-Retire Node source/package/deploy scripts and source-dependent golden generators after the reference checkpoint;
-verify the standalone process and retained frontend workflows against Go; finish current docs and deep review;
-commit/push both verified mains. Existing test goldens stay unchanged. Import/deployment tools are out of scope.
+Commit/push both verified mains and inspect remote CI. Node retirement, source-independent goldens, standalone lifecycle/restart and real-Go
+frontend workflows are implemented/verified. Existing test goldens stay unchanged. Import/deployment tools are out of scope.
 
 ## Checks
 | When | Command / check | Result |
 |------|-----------------|--------|
+| 2026-11-02 final post-retirement | `scratch/go-migration/check.sh make db-start && scratch/go-migration/check.sh make db-status` | exit 0; repeated start preserves existing fresh cluster/databases, owned PostgreSQL accepting loopback connections on 55472 |
+| 2026-11-02 final post-retirement | `scratch/go-migration/check.sh env TEST_DATABASE_URL='postgres://calspread@127.0.0.1:55472/calspread_test?sslmode=disable' GOFLAGS=-mod=readonly TZ=Asia/Kolkata make check && scratch/go-migration/check.sh env GOFLAGS=-mod=readonly make build` | exit 0; build/vet/format/module gate, all 31 tested packages with race/required PostgreSQL, standalone binary built |
+| 2026-11-02 final post-retirement | `git diff --exit-code -- go.mod go.sum && git diff --exit-code 8de7ca5 -- 'internal/**/testdata/*.json' && git diff --check` | exit 0; locked modules and all 39 reference JSON fixtures unchanged; clean whitespace |
+| 2026-11-02 final transport review | `scratch/go-migration/check.sh go test -race -count=10 -timeout 180s -run 'TestHistorical\|TestReadRetryBudget\|TestHTTPDeadline\|TestHTTPPaces' ./internal/kite ./internal/brokers/dhan` | exit 0; ten repeated runs of priority/FIFO/pacing/watchdog/cancellation and Dhan retry/deadline/backoff tests |
+| 2026-11-02 process/drain review | `scratch/go-migration/check.sh env TEST_DATABASE_URL='postgres://calspread@127.0.0.1:55472/calspread_test?sslmode=disable' REQUIRE_DB_TESTS=1 go test -race -count=1 -timeout 180s ./internal/app ./internal/auth ./cmd/server` | exit 0 after the owned session-write drain and test log-buffer correction; app/auth and real standalone process/restart checks pass |
+| 2026-11-02 process/drain review | `go test -race -count=1 -run TestShutdownDrainsPendingAdminSessionBeforeClosingPostgres ./internal/app` through the wrapper with required local PostgreSQL | failed on inherited code: database closed while session save was held, then save failed with closed pool; fixed and covered by passing checks above |
+| 2026-11-02 fixture build | `scratch/go-migration/check.sh go build -race -trimpath -o scratch/go-migration/tmp/verifyfixture ./cmd/verifyfixture && scratch/go-migration/check.sh go vet ./cmd/verifyfixture ./cmd/server ./internal/app ./internal/auth` | exit 0; new verification-only fixture builds/vets without Node or new dependencies |
+| 2026-11-02 Node retirement | `scratch/go-migration/check.sh env TEST_DATABASE_URL='postgres://calspread@127.0.0.1:55472/calspread_test?sslmode=disable' TZ=Asia/Kolkata make check && git diff --exit-code 8de7ca5 -- 'internal/**/testdata/*.json' && git diff --check` | exit 0; all 30 tested packages pass with race/required PostgreSQL after source removal; all 39 retained JSON fixtures unchanged, clean whitespace |
+| 2026-11-02 Node retirement | source/tests/backend `*.mjs` file inventory | no remaining TypeScript runtime, original Node tests or Node scripts; scratch remains intact/ignored |
 | 2026-11-02 reference checkpoint | `scratch/go-migration/check.sh env TEST_DATABASE_URL='postgres://calspread@127.0.0.1:55472/calspread_test?sslmode=disable' TZ=Asia/Kolkata make check && scratch/go-migration/check.sh make build` | exit 0; build/vet/format/module verification, all 30 tested packages with required PostgreSQL and race detector, standalone binary built |
 | 2026-11-02 reference checkpoint | `git diff --cached --stat`, `git diff --cached --numstat --summary`, staged setup/config/CI review and private-key/token signature scan of `internal/` | intended Go/fixture/task/setup files only; charge fixture is a 100% rename, no scratch/binary/input files staged; no private-key/token signatures found |
 | 2026-11-02 12:07 | `bin/work status` from `/home/prakash/Work` | exit 0; WIP 1 of 2 Doing. The helper sees only the CAl parent, not its nested repositories; CAL task states were updated and checked directly. Existing CAl/env_home index warnings remain. |
@@ -246,7 +277,10 @@ commit/push both verified mains. Existing test goldens stay unchanged. Import/de
 | not run | Node build / `npm test` (no backend `node_modules`, no `dist/`) | reference values come from Node 22 type-stripping imports of `src/*.ts` |
 | pending | frontend real-Go HTTP/browser workflows | Box removal and frontend build/37 unit tests passed; replace the source-dependent Node browser fixture |
 
-## How to work (commands)
+## Historical verification-tooling notes (reference checkpoint only)
+Current setup/checks are in README/Makefile and the paired frontend README. The commands below record the original
+pre-retirement verification environment; Node source/generators and their dependencies must be recovered from Git
+history in a separate scratch checkout for deliberate reference regeneration.
 - All tools run through `scratch/go-migration/check.sh <cmd>` from the repo root (offline Go 1.25 + Node 22 + PostgreSQL 18).
 - Own PostgreSQL: data dir `scratch/go-migration/pgdata`, port 55471, `TEST_DATABASE_URL` is set by the wrapper. It stops
   when the Kiro session that started it ends (smart shutdowns on 10-27 19:32, 10-28 19:50, 10-29 19:29). Start it if down:
@@ -258,6 +292,9 @@ commit/push both verified mains. Existing test goldens stay unchanged. Import/de
 - Write files and run `go test` in separate steps. Go modules are pinned by hand in `go.mod` (offline); do not run `go get`.
 
 ## Reconciliation notes
+- 2026-11-02 final: Node source/test/generator retirement and module tidy are complete. Earlier reconciliation notes
+  below describe their then-untracked state and the old unused godotenv/copy-of-go.sum blocker; those are resolved.
+  Only intended final migration files are pending commit, with reference checkpoint `8de7ca5` already on local main.
 - 2026-11-02 continuation: all Go source/fixtures and local setup/docs/CI are now staged, not untracked. Two inherited
   inventory whitespace issues found by `git diff --cached --check` were trimmed/restaged. Top-level scope/progress
   notes were reconciled with the approved no-import/no-deployment scope and completed worker/liveness fixes.

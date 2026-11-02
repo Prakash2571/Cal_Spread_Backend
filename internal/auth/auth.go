@@ -59,6 +59,7 @@ type Sessions struct {
 	// background runs persistence work off the request path. Tests replace it with a
 	// synchronous call.
 	background func(func())
+	pending    sync.WaitGroup
 }
 
 // NewSessions returns an empty table. store and now may be nil.
@@ -70,7 +71,38 @@ func NewSessions(store Persistence, now func() time.Time) *Sessions {
 }
 
 // SetBackground replaces how persistence calls are scheduled (tests).
-func (s *Sessions) SetBackground(f func(func())) { s.background = f }
+func (s *Sessions) SetBackground(f func(func())) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.background = f
+}
+
+func (s *Sessions) persist(f func()) {
+	s.mu.Lock()
+	background := s.background
+	s.pending.Add(1)
+	s.mu.Unlock()
+	background(func() {
+		defer s.pending.Done()
+		f()
+	})
+}
+
+// WaitForWrites drains owned session persistence after HTTP/stream handlers have
+// stopped issuing work, before the application closes the shared database pool.
+func (s *Sessions) WaitForWrites(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.pending.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // GenerateToken returns 32 CSPRNG bytes as unpadded base64url: 43 characters of
 // [A-Za-z0-9_-], safe in a header, a query string and a URL path without encoding.
@@ -91,7 +123,7 @@ func (s *Sessions) Mint(role Role) string {
 	s.m[token] = session{expiryMs: expiry, role: role}
 	s.mu.Unlock()
 	if s.store != nil {
-		s.background(func() {
+		s.persist(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			if err := s.store.SaveAdminSession(ctx, token, role, expiry); err != nil {
@@ -116,7 +148,7 @@ func (s *Sessions) Role(token string) Role {
 		// Only a token we knew has a persisted row worth deleting; rows for tokens that
 		// expired while the process was down are purged by the janitor.
 		if ok && s.store != nil {
-			s.background(func() {
+			s.persist(func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 				if err := s.store.DeleteAdminSession(ctx, token); err != nil {

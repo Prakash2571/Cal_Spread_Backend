@@ -216,17 +216,18 @@ or REST quote-polling loop is added. Only bounded spare subscription capacity is
 used. LTP-only packets cannot freshen retained bid/ask books. Existing market-data
 and execution state remains owned by its respective consumers.
 
-CPU fitting runs in worker threads (one by default, maximum two), with bounded
-memory, queue and wall-clock time. Input/config/metadata and UTC quote timestamps
+CPU fitting runs in Go worker goroutines (one by default, maximum two), with bounded
+inputs, queue and response deadlines. There is no per-worker heap cap, and a timed-out
+goroutine finishes in the background with its late result discarded. Input/config/metadata and UTC quote timestamps
 are captured immutably. Publication atomically swaps one complete result after
 checking input ID, broker generation, feed generation and configuration version.
 An old-generation result is discarded. A failed/poison worker affects analytics
 only. No execution/exit/reconciliation lock is held.
 
-New Mongo collections `fair_value_settings` and `fair_value_snapshots` reuse the
-existing app connection. History is rate-limited, count- and age-bounded and
-retains model/config versions, diagnostics, source data and input IDs. No Mongo
-configuration means explicitly memory-only storage. Analytics can be disabled
+PostgreSQL tables `fair_value_settings` and `fair_value_snapshots` reuse the
+existing app pool. History is rate-limited, count- and age-bounded and
+retains model/config versions, diagnostics, source data and input IDs. No usable
+`DATABASE_URL` means explicitly memory-only storage. Analytics can be disabled
 independently and is disabled by default; pause releases its subscriptions.
 
 ## Maturity interpolation and hypothetical valuation

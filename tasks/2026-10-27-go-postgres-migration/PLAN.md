@@ -53,7 +53,7 @@ Kept, moved out of `src/box/` into neutral Go packages, because other features u
   charges. Env names stay: `BOX_BROKERAGE_PER_ORDER`, `BOX_BROKERAGE_MAX_PCT`, `BOX_STT_SELL_PCT`,
   `BOX_STT_ROUND_NEAREST_RUPEE`, `BOX_EXCHANGE_TXN_PCT`, `BOX_IPFT_PER_CRORE`, `BOX_IPFT_PCT`, `BOX_SEBI_PCT`,
   `BOX_STAMP_DUTY_BUY_PCT`, `BOX_GST_PCT`, `BOX_STT_TYPE`, `BOX_CHARGE_RATE_VERSION`.
-  `migration-fixtures/box/charges.json` stays as the rate-card golden check.
+  Original `migration-fixtures/box/charges.json` is retained unchanged at `internal/ratecard/testdata/charges.json`.
 - `box/math.ts`: `strikeStepOf`, `selectStrikeWindow`, `shouldRecentreWindow` (Synthetic strike windows).
 - `box/brokerContext.ts` provider types: market data (`BoxRestQuote`, `BoxMarketDataProvider`) and margins
   (`BoxMarginOrder`, `BoxMarginSource`, `BoxBasketMargin`, `BoxMarginProvider`), used by the registry and Synthetic.
@@ -67,9 +67,8 @@ Kept, moved out of `src/box/` into neutral Go packages, because other features u
   idle values, so the broker panel and Synthetic pages work unchanged.
 
 Frontend (`../Cal_Spread`): remove the Box page, Box tab and Box API calls (approved 2026-11-02).
-Shared pieces the other pages import: `BrokerBadge` (from
-`BoxBroker.tsx`, used by BrokerPanel, Synthetic, SynthPositions), plus `ChargeOriginTag`/`BoxChargeOrigin` (used by
-ExecutionBreakdown).
+`BrokerBadge` was extracted from `BoxBroker.tsx` into neutral `BrokerBadge.tsx` for BrokerPanel/Synthetic/SynthPositions.
+The unused Box-only ExecutionBreakdown/charge-origin wrapper was removed; shared Synthetic CSS and order-side type remain.
 
 ## Phases
 0. Inventory → `inventory/`: `api.md`, `storage.md`, `brokers.md` (done); `analytics.md` (Fair Value, Synthetic,

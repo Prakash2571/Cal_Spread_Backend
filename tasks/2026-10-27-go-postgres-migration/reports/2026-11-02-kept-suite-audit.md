@@ -1,6 +1,8 @@
 # Kept Node suites → Go coverage audit, resumed 2026-11-02
 
-Source: Node HEAD `1ea1d95`, the unchanged `tests/` files, and [inventory/tests.md](../inventory/tests.md).
+Source: original Node commit `1ea1d958ebf5c4a0fc673d786f5ee9638bdffa8d`, its unchanged `tests/` files at audit time,
+and [inventory/tests.md](../inventory/tests.md). Source/tests and generator tooling are preserved in Git history;
+the current Go tests use frozen metadata and checked goldens independently of the retired runtime.
 This resumes Kiro's 2026-10-30 work, including its 25 later `node_*test.go` files. The previous status did not record those ports.
 
 All **332 kept/conditional cases** are listed by their original titles: **42 Fair Value + 290 shared cases**.
@@ -9,8 +11,10 @@ All **332 kept/conditional cases** are listed by their original titles: **42 Fai
 `N/A` means the complete case tests a JavaScript-only mechanism or a conditional Box-only wrapper with no retained caller.
 Parts of otherwise applicable cases that do not translate are explained in Notes. Dropped Box-only cases are excluded.
 
-The report's references and case accounting are checked by `check-suite-coverage.mjs`. That check verifies completeness
-and that the named Go tests exist; manual assertion review and the actual Go test run provide behavioral evidence.
+The report's references and case accounting are checked by
+`internal/parity/coverage_test.go::TestEveryRetainedReferenceCaseHasAnAuditedGoTest` (formerly the Node freezer/checker
+at reference checkpoint `8de7ca5`). That check verifies completeness and that the named Go tests exist;
+manual assertion review and the actual Go test run provide behavioral evidence.
 Final full-module verification is recorded in [STATUS.md](../STATUS.md).
 
 ## Evidence file references

@@ -339,14 +339,15 @@ func (a *App) stopSchedulers(ctx context.Context) error {
 
 // finishWrites waits for the writes still running in the background before the pool
 // closes: Synthetic's store and margin work, the Kite-session and risk-free-rate queue
-// (core.Dispose also ends route work still in flight), and the calendar ledger.
-func (a *App) finishWrites(context.Context) error {
+// (core.Dispose also ends route work still in flight), the calendar ledger and
+// admin-session saves/deletes. HTTP and stream handlers have already stopped.
+func (a *App) finishWrites(ctx context.Context) error {
 	if !a.synth.WaitIdle(synthIdleWait) {
 		a.logf("[shutdown] Synthetic background work still running after %v.", synthIdleWait)
 	}
 	a.core.Dispose()
 	a.calendar.Stop()
-	return nil
+	return a.sessions.WaitForWrites(ctx)
 }
 
 // waitTimeout waits for wg up to d and reports whether it finished.

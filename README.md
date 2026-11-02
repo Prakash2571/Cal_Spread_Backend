@@ -7,7 +7,8 @@ feature and its order-placement transports have been removed.
 
 ## Local setup: start fresh
 
-Requirements: **Go 1.25.x**, **PostgreSQL 18** client/server tools on `PATH`, and
+Requirements: **Go 1.25.x**, **PostgreSQL 18** client/server tools on `PATH`, a C
+compiler for race-enabled verification, and
 the frontend's Node/npm toolchain. PostgreSQL is local; no data import is required.
 
 From this repository:
@@ -61,6 +62,8 @@ database/race checks.
 
 The paired frontend runs `npm run build` and `npm test`. Its real-Go HTTP/browser
 verification workflow is documented in the frontend README.
+The verification-only `cmd/verifyfixture` serves the actual app with generated loopback
+broker data and an isolated PostgreSQL test schema; it is not part of the server entry point.
 
 ## Retained functionality
 
@@ -111,7 +114,8 @@ compatibility; they do not enable a Box scanner or live broker order placement.
 - `internal/db/migrations/`: embedded schema migrations; `internal/kv/`: expiring cache.
 - `internal/{core,calendar,analytics,captures,synthetic,fairvalue}/`: retained services.
 - `internal/{kite,hub,brokers,marketdata}/`: providers, transports, lanes and SSE.
-- `internal/parity/testdata/`: pinned original route, shutdown and retained-suite specifications.
+- `internal/parity/testdata/`: pinned original route, shutdown, retained-suite and golden SHA-256 specifications.
+- [`docs/REFERENCE_PROVENANCE.md`](docs/REFERENCE_PROVENANCE.md): verified checkpoint and original-source/generator provenance.
 - [`docs/THIRD_PARTY.md`](docs/THIRD_PARTY.md): numerical implementation attribution.
 
 Migration evidence and intended contract differences are recorded in
@@ -122,7 +126,7 @@ implementation; current runtime/setup instructions are this README and the Go gu
 ## Process lifecycle
 
 SIGINT/SIGTERM stop discovery/workers, close HTTP connections, stop schedulers/feeds,
-flush analytics, finish bounded background writes and close PostgreSQL last. Shutdown
+flush analytics, finish bounded background writes (including admin-session saves/deletes) and close PostgreSQL last. Shutdown
 defaults to 12 seconds; a timeout exits nonzero. Persisted paper positions remain
 available for adoption on the next boot. The source retains the previous capture boot
 ordering; the next broker login triggers post-login capture/backfill reconciliation.

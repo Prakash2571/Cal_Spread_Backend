@@ -1,9 +1,31 @@
 # Go Migration Boundaries
 
-Architectural map for the planned Go rewrite. **Documentation only — no Go code yet, and
-no TypeScript is reorganised to match it.** It is derived from the seams that already
-exist in the working Node backend, so the rewrite follows real boundaries rather than
-imagined ones.
+## Implemented Go service
+
+The current entry point is `cmd/server/main.go`. `internal/app` assembles the service,
+owns its boot/shutdown order and injects broker/data collaborators for loopback tests.
+
+| Package | Responsibility |
+|---|---|
+| `internal/config`, `server`, `httpx`, `auth` | Environment, Chi middleware, HTTP contracts and persisted roles/sessions |
+| `internal/db`, `store`, `kv` | Embedded PostgreSQL migrations, durable settings/sessions and expiring analytics cache |
+| `internal/kite`, `hub`, `brokers/{dhan,registry}` | Broker REST/feed providers, switching, tick fanout and two isolated lanes |
+| `internal/brokers`, `marketdata` | Subscription ownership, broker namespaces and browser SSE sessions |
+| `internal/core`, `calendar` | Board/history/rate routes, Calendar paper records, margins, charges and ledgers |
+| `internal/analytics`, `captures` | Chain/OI frames, cache write-behind, hourly/EOD captures and backfills |
+| `internal/synthetic`, `fairvalue` | Synthetic paper scanner and full-admin option analytics/models/workers |
+| `internal/market`, `quotes`, `ratecard`, `boundedcache`, `jsx`, `lifecycle` | Shared types/math/cache/lifecycle helpers |
+| `internal/parity` | Frozen original suite/route/shutdown metadata, audit references and fixture integrity |
+
+PostgreSQL is the only database/cache backend. Box routes/storage and every order-placement
+transport are removed. Shared rate-card, quote-store, strike-window and lane-budget behavior
+remain for Synthetic. The approved scope is in the migration PLAN; setup is in README.
+
+## Historical pre-removal proposal
+
+The original architectural proposal below predates the user's removal of Box and
+replacement of MongoDB/Redis. It is preserved as reference only: its package names,
+storage/execution proposals and TypeScript paths do not describe the current runtime.
 
 ## Guiding principle
 
