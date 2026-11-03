@@ -35,7 +35,7 @@ func Mount(r chi.Router, deps RouteDeps) {
 	if h.spotMap == nil {
 		h.spotMap = map[string]string{}
 	}
-	// The Dhan login and session routes share ONE bucket: each spends the app credentials.
+	// Credential operations share one rate-limit bucket.
 	authLimit := httpx.NewLimiter(5*time.Minute, 20, "Too many Dhan authentication attempts. Please wait a few minutes.", deps.Now)
 	switchLimit := httpx.NewLimiter(time.Minute, 10, "Too many broker switch attempts. Slow down.", deps.Now)
 	tokenLimit := httpx.NewLimiter(time.Minute, 30, "Too many token requests. Slow down.", deps.Now)
@@ -49,6 +49,8 @@ func Mount(r chi.Router, deps RouteDeps) {
 
 	r.Post("/api/dhan/login", authLimit.Wrap(full(h.dhanLogin)))
 	r.Post("/api/dhan/session", authLimit.Wrap(full(h.dhanSession)))
+	r.Post("/api/dhan/login/broker", authLimit.Wrap(full(h.fetchBrokerToken)))
+	r.Post("/api/dhan/token", authLimit.Wrap(full(h.pasteDhanToken)))
 	r.Get("/api/dhan/status", admin(h.dhanStatus))
 	r.Post("/api/dhan/verify-ip", full(h.verifyIP))
 	r.Get("/api/dhan/instruments/diagnostics", full(h.instrumentDiagnostics))
@@ -172,21 +174,24 @@ func (h *routes) dhanSession(w http.ResponseWriter, r *http.Request) {
 }
 
 type dhanStatusResponse struct {
-	Broker             string         `json:"broker"`
-	Active             bool           `json:"active"`
-	Configured         bool           `json:"configured"`
-	Authenticated      bool           `json:"authenticated"`
-	TokenExpired       bool           `json:"token_expired"`
-	TokenExpiresAt     *int64         `json:"token_expires_at"`
-	DataReady          bool           `json:"data_ready"`
-	TradingReady       bool           `json:"trading_ready"`
-	StaticIPConfigured *bool          `json:"static_ip_configured"`
-	StaticIP           StaticIPState  `json:"static_ip"`
-	FeedConnected      bool           `json:"feed_connected"`
-	FeedAgeMs          *int64         `json:"feed_age_ms"`
-	Problems           []string       `json:"problems"`
-	Instruments        int            `json:"instruments"`
-	Session            *dhan.Redacted `json:"session"`
+	Broker             string             `json:"broker"`
+	Active             bool               `json:"active"`
+	Configured         bool               `json:"configured"`
+	Authenticated      bool               `json:"authenticated"`
+	TokenExpired       bool               `json:"token_expired"`
+	TokenExpiresAt     *int64             `json:"token_expires_at"`
+	DataReady          bool               `json:"data_ready"`
+	TradingReady       bool               `json:"trading_ready"`
+	StaticIPConfigured *bool              `json:"static_ip_configured"`
+	StaticIP           StaticIPState      `json:"static_ip"`
+	FeedConnected      bool               `json:"feed_connected"`
+	FeedAgeMs          *int64             `json:"feed_age_ms"`
+	Problems           []string           `json:"problems"`
+	Instruments        int                `json:"instruments"`
+	Session            *dhan.Redacted     `json:"session"`
+	BrokerLogin        *BrokerLoginStatus `json:"broker_login,omitempty"`
+	Source             string             `json:"source,omitempty"`
+	Persisted          *bool              `json:"persisted,omitempty"`
 }
 
 func (h *routes) dhanStatus(w http.ResponseWriter, r *http.Request) {
@@ -195,12 +200,32 @@ func (h *routes) dhanStatus(w http.ResponseWriter, r *http.Request) {
 	h.reg.EnsureDhanStaticIPVerified(ctx)
 	health := h.reg.HealthFor(brokers.Dhan)
 	stored := h.reg.loadStoredDhanSession()
+	if stored != nil && stored.Source != "" && stored.DhanClientID != jsTrim(h.reg.get("DHAN_CLIENT_ID")) {
+		stored = nil
+	}
 	var session *dhan.Redacted
 	if stored != nil {
 		red := redact(stored, h.reg.now())
 		session = &red
 	}
 	_, configured, _ := h.reg.DhanCredentials()
+	token, expiry, meta := h.reg.dhanSession()
+	source := ""
+	var persisted *bool
+	if meta != nil && meta.source != "" {
+		source = meta.source
+		p := h.reg.dhanTokenPersistenceEnabled() && stored != nil && token != nil && stored.AccessToken == *token
+		persisted = &p
+		if token == nil {
+			session = nil
+		} else if session == nil {
+			red := redact(&DhanSessionRecord{DhanClientID: meta.clientID, DhanClientName: meta.clientName,
+				DhanClientUcc: meta.clientUcc, GivenPowerOfAttorney: meta.powerOfAttorney, ExpiryTime: expiry,
+				LoginDate: meta.loginDay, LoginAt: time.UnixMilli(meta.loginAt)}, h.reg.now())
+			session = &red
+		}
+	}
+	w.Header().Set("Cache-Control", "no-store")
 	httpx.JSON(w, http.StatusOK, dhanStatusResponse{
 		Broker:             "dhan",
 		Active:             h.reg.ActiveBroker() == brokers.Dhan,
@@ -217,7 +242,53 @@ func (h *routes) dhanStatus(w http.ResponseWriter, r *http.Request) {
 		Problems:           health.Problems,
 		Instruments:        h.reg.dhanInstruments.Size(),
 		Session:            session,
+		BrokerLogin:        h.reg.BrokerLoginStatus(),
+		Source:             source,
+		Persisted:          persisted,
 	})
+}
+
+func (r *Registry) dhanTokenPersistenceEnabled() bool {
+	p, ok := r.store.(*PGStore)
+	return ok && p.enabled()
+}
+
+func (h *routes) fetchBrokerToken(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	session, err := h.reg.FetchBrokerToken(r.Context())
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	h.writeTokenSession(w, session)
+}
+
+func (h *routes) pasteDhanToken(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	token, ok := httpx.BodyObject(r)["accessToken"].(string)
+	if !ok || strings.TrimSpace(token) == "" {
+		httpx.Error(w, http.StatusBadRequest, "Paste a Dhan access token.")
+		return
+	}
+	session, err := h.reg.SetManualDhanToken(r.Context(), token)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	h.writeTokenSession(w, session)
+}
+
+func (h *routes) writeTokenSession(w http.ResponseWriter, session SessionState) {
+	httpx.JSON(w, http.StatusOK, struct {
+		OK             bool       `json:"ok"`
+		Authenticated  bool       `json:"authenticated"`
+		Broker         brokers.ID `json:"broker"`
+		ClientID       *string    `json:"client_id"`
+		ClientName     *string    `json:"client_name"`
+		TokenExpiresAt *int64     `json:"token_expires_at"`
+		Persisted      bool       `json:"persisted"`
+	}{true, session.Authenticated, h.reg.ActiveBroker(), session.ClientID, session.ClientName,
+		session.TokenExpiresAt, h.reg.dhanTokenPersistenceEnabled()})
 }
 
 func redact(s *DhanSessionRecord, now time.Time) dhan.Redacted {

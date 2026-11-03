@@ -21,6 +21,7 @@ type DhanSessionRecord struct {
 	LoginAt    time.Time
 	LoginDate  string // IST YYYY-MM-DD
 	UpdatedAt  time.Time
+	Source     string // BROKER_LOGIN or MANUAL; empty for pre-token-service sessions
 }
 
 // ActiveBrokerRecord is the persisted broker selection (table active_broker).
@@ -73,8 +74,8 @@ func (s *PGStore) SaveDhanSession(ctx context.Context, rec DhanSessionRecord) er
 	now := s.now()
 	_, err := s.Pool.Exec(ctx, `
 		insert into dhan_session (id, access_token, dhan_client_id, dhan_client_name, dhan_client_ucc,
-			given_power_of_attorney, expiry_time, login_at, login_date, updated_at)
-		values ('current', $1, $2, $3, $4, $5, $6, $7, $8, $7)
+			given_power_of_attorney, expiry_time, login_at, login_date, updated_at, token_source)
+		values ('current', $1, $2, $3, $4, $5, $6, $7, $8, $7, $9)
 		on conflict (id) do update set
 			access_token = excluded.access_token,
 			dhan_client_id = excluded.dhan_client_id,
@@ -84,9 +85,10 @@ func (s *PGStore) SaveDhanSession(ctx context.Context, rec DhanSessionRecord) er
 			expiry_time = excluded.expiry_time,
 			login_at = excluded.login_at,
 			login_date = excluded.login_date,
-			updated_at = excluded.updated_at`,
+			updated_at = excluded.updated_at,
+			token_source = excluded.token_source`,
 		rec.AccessToken, rec.DhanClientID, rec.DhanClientName, rec.DhanClientUcc,
-		rec.GivenPowerOfAttorney, rec.ExpiryTime, now, rec.LoginDate)
+		rec.GivenPowerOfAttorney, rec.ExpiryTime, now, rec.LoginDate, rec.Source)
 	return err
 }
 
@@ -98,10 +100,10 @@ func (s *PGStore) LoadDhanSession(ctx context.Context) (*DhanSessionRecord, erro
 	var rec DhanSessionRecord
 	err := s.Pool.QueryRow(ctx, `
 		select access_token, dhan_client_id, dhan_client_name, dhan_client_ucc,
-			given_power_of_attorney, expiry_time, login_at, login_date, updated_at
+			given_power_of_attorney, expiry_time, login_at, login_date, updated_at, token_source
 		from dhan_session where id = 'current'`).Scan(
 		&rec.AccessToken, &rec.DhanClientID, &rec.DhanClientName, &rec.DhanClientUcc,
-		&rec.GivenPowerOfAttorney, &rec.ExpiryTime, &rec.LoginAt, &rec.LoginDate, &rec.UpdatedAt)
+		&rec.GivenPowerOfAttorney, &rec.ExpiryTime, &rec.LoginAt, &rec.LoginDate, &rec.UpdatedAt, &rec.Source)
 	if db.NoRows(err) {
 		return nil, nil
 	}

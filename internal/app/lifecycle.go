@@ -84,7 +84,7 @@ func (a *App) Start(ctx context.Context) {
 	}{
 		{"restore the Zerodha session", func() { a.core.RestoreKiteSession(ctx) }},
 		{"restore the active broker", func() { a.reg.Restore(ctx) }},
-		{"start the active broker runtime", func() { a.reg.StartActiveRuntime(ctx) }},
+		{"start the active broker runtime", func() { a.reg.StartActiveRuntime(ctx); a.reg.StartDhanTokenService() }},
 		{"restore admin sessions", func() { a.restoreAdminSessions(ctx) }},
 		{"restore the risk-free rate", func() { a.core.RestoreRfRate(ctx) }},
 		{"hourly capture scheduler, backfill and day review", a.captures.StartHourly},
@@ -265,6 +265,11 @@ func (a *App) Shutdown(ctx context.Context, signal string) lifecycle.Result {
 	if cancel != nil {
 		cancel()
 	}
+	tokenStopCtx, tokenStopCancel := context.WithTimeout(ctx, bootStopWait)
+	if err := a.reg.StopDhanTokenService(tokenStopCtx); err != nil {
+		a.logf("[shutdown] token-service worker did not stop: %v", err)
+	}
+	tokenStopCancel()
 	if bootDone != nil {
 		select {
 		case <-bootDone:

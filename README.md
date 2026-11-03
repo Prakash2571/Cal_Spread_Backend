@@ -32,13 +32,29 @@ The server applies its embedded SQL migrations on startup. The example binds HTT
 to **127.0.0.1:3001**. Browse the frontend at **http://127.0.0.1:5173** and set its
 `VITE_API_BASE_URL=http://127.0.0.1:3001` (origin only, no `/api` suffix).
 Configure the Kite app redirect as
-`http://127.0.0.1:5173/zerodha/verify`; Dhan uses `/dhan/verify`.
+`http://127.0.0.1:5173/zerodha/verify`. Dhan uses the shared token service and
+does not require a browser login/redirect.
 
 An existing local PostgreSQL can also be used by setting `DATABASE_URL` in `.env`.
 Without a usable database the server retains its memory-only fallbacks and reports
 persistence-dependent features as unavailable. No broker session is invented at boot.
 Kite app credentials remain required by the preserved startup contract; a broker
 session is established through the full-admin login workflow.
+
+### Automatic Dhan access tokens
+
+As in Live Index Algo, env_home logs the Dhan account in and this backend fetches
+and saves its token. Set `DHAN_CLIENT_ID`, `BROKER_LOGIN_URL`,
+`BROKER_LOGIN_CF_CLIENT_ID`, `BROKER_LOGIN_CF_CLIENT_SECRET` and
+`DHAN_TOKEN_API_SEED` in the backend `.env`; `AUTO_LOGIN_TIME` defaults to **08:30 IST**.
+Tokens restore from PostgreSQL after restart and refresh automatically within the
+daily window. Fetch status and failures are visible in **Broker → Dhan**.
+
+For recovery, use **Fetch token now** or **Paste access token → Use token** in that
+panel. Pasting also works without the service configured and verifies the token's
+account before saving. A working pasted fallback is kept until expiry; clearing a
+token pauses automatic fetching for that IST day. Service credentials stay on the
+server. See [the token configuration and retry contract](docs/CONFIGURATION.md#dhan-automatic-token-flow).
 
 ## Verification
 
@@ -100,7 +116,8 @@ broker data and an isolated PostgreSQL test schema; it is not part of the server
   independent refits, sensitivity scenarios, exports, history and bounded workers.
   See [the mathematical/configuration guide](docs/FAIR_VALUE.md).
 
-The retained API consists of **83 non-Box route registrations**. Unknown routes,
+The API consists of **83 retained non-Box routes plus two full-admin Dhan
+token-service/paste routes**. Unknown routes,
 including `/api/box/*`, return 404. Shared historical `BOX_*` charge/feed-budget
 environment names and a few legacy diagnostic JSON names remain for contract
 compatibility; they do not enable a Box scanner or live broker order placement.

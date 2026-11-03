@@ -204,7 +204,7 @@ func TestStandaloneServerLifecycleAndPostgresRestart(t *testing.T) {
 		if err := pool.QueryRow(ctx, "select count(*) from admin_sessions where id=$1", token).Scan(&sessions); err != nil {
 			t.Fatal(err)
 		}
-		if migrations != 5 || tables != 18 || sessions != 1 {
+		if migrations != 6 || tables != 18 || sessions != 1 {
 			t.Fatalf("persisted schema/session: migrations=%d tables=%d sessions=%d", migrations, tables, sessions)
 		}
 		restarted := startServer(t, binary, u.String())

@@ -130,6 +130,10 @@ type Deps struct {
 	NewLaneFeed   func(opts kite.ZerodhaFeedOptions) LaneFeed
 	KiteConnect   ticker.ConnectFunc
 	KiteTickerURL string
+	// BrokerLoginHTTPClient replaces only the shared token-service transport in tests.
+	BrokerLoginHTTPClient *http.Client
+	// BrokerLoginSleep substitutes the wait for a fresh token-API code in tests.
+	BrokerLoginSleep func(context.Context, time.Duration) error
 }
 
 // Hooks are what the rest of the service plugs into the registry, attached once the
@@ -178,6 +182,7 @@ type dhanMeta struct {
 	powerOfAttorney bool
 	loginDay        string
 	loginAt         int64
+	source          string
 }
 
 type ipVerdict struct {
@@ -207,10 +212,11 @@ type Registry struct {
 	// warm-up, session-lost handling), so tests can wait for them.
 	bg sync.WaitGroup
 
-	sessMu     sync.Mutex
-	dhanToken  *string
-	dhanExpiry *int64
-	dhanMeta   *dhanMeta
+	sessMu      sync.Mutex
+	dhanToken   *string
+	dhanExpiry  *int64
+	dhanMeta    *dhanMeta
+	brokerLogin *brokerLoginController
 
 	mu               sync.Mutex
 	hooks            Hooks
@@ -248,6 +254,7 @@ func New(deps Deps) *Registry {
 		r.hub = noHub{}
 	}
 	r.get = func(k string) string { v, _ := r.lookup(k); return v }
+	r.brokerLogin = newBrokerLoginController(r.get, deps.BrokerLoginHTTPClient)
 	r.state.Store(&brokerState{active: brokers.Zerodha, gen: 1})
 	r.lastTickAt.Store(noTick)
 
@@ -498,7 +505,7 @@ func (r *Registry) ensureDhanFeed() *dhanLane {
 					h.Publish()
 				}
 			},
-			OnSessionLost: func(reason string) { r.background(func() { r.onDhanSessionLost(reason) }) },
+			OnSessionLost: func(reason string) { r.background(func() { r.onDhanFeedSessionLost(lane, reason) }) },
 			Resolve:       r.dhanInstruments.Identify,
 			DepthLevel:    5,
 		})
@@ -527,7 +534,7 @@ func (r *Registry) ensureBoxDhanFeed() *dhanLane {
 					h.OnBoxLaneConnection(connected)
 				}
 			},
-			OnSessionLost: func(reason string) { r.background(func() { r.onDhanSessionLost(reason) }) },
+			OnSessionLost: func(reason string) { r.background(func() { r.onDhanFeedSessionLost(lane, reason) }) },
 			Resolve:       r.dhanInstruments.Identify,
 			DepthLevel:    5,
 		})
@@ -804,7 +811,7 @@ type Snapshot struct {
 // Snapshot is the status-endpoint diagnostics.
 func (r *Registry) Snapshot() Snapshot {
 	st := r.state.Load()
-	_, credsOK, _ := dhan.ReadCredentials(r.get)
+	_, credsOK, _ := r.DhanCredentials()
 	r.mu.Lock()
 	var source *market.MarginSource
 	if r.lastMarginSource != nil {

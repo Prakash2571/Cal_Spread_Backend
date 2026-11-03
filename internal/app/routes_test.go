@@ -144,6 +144,13 @@ func TestRouteInventoryMatchesNodeWithoutBox(t *testing.T) {
 		method, path, _ := strings.Cut(r, " ")
 		listed[method+" "+normalise(path)] = true
 	}
+	// New token-service and paste routes extend the retained, frozen route contract.
+	for _, route := range []string{"POST /api/dhan/login/broker", "POST /api/dhan/token"} {
+		if !mounted[route] {
+			t.Errorf("token route is not mounted: %s", route)
+		}
+		listed[route] = true
+	}
 	for k := range mounted {
 		if !listed[k] {
 			extra = append(extra, k)

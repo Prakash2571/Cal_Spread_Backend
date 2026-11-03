@@ -3,6 +3,7 @@ package registry
 import (
 	"context"
 	"log"
+	"time"
 
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/auth"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/brokers"
@@ -16,7 +17,7 @@ import (
 func (r *Registry) SwitchBlockers(target brokers.ID) []auth.Blocker {
 	blockers := []auth.Blocker{}
 	if target == brokers.Dhan {
-		if _, ok, reason := dhan.ReadCredentials(r.get); !ok {
+		if _, ok, reason := r.DhanCredentials(); !ok {
 			blockers = append(blockers, auth.Blocker{Reason: "broker_not_configured", Detail: reason})
 		}
 	}
@@ -185,6 +186,10 @@ func (r *Registry) Restore(ctx context.Context) {
 	if session == nil {
 		return
 	}
+	// Token-service/paste records must never be restored into another configured account.
+	if session.Source != "" && session.DhanClientID != jsTrim(r.get("DHAN_CLIENT_ID")) {
+		return
+	}
 	if dhan.IsTokenExpired(session.ExpiryTime, r.nowMs()) {
 		sctx, cancel = storeCtx()
 		_ = r.store.ClearDhanSession(sctx)
@@ -203,7 +208,13 @@ func (r *Registry) Restore(ctx context.Context) {
 		powerOfAttorney: session.GivenPowerOfAttorney,
 		loginDay:        session.LoginDate,
 		loginAt:         loginAt,
+		source:          session.Source,
 	})
+	if session.Source == "BROKER_LOGIN" {
+		r.brokerLogin.mu.Lock()
+		r.brokerLogin.fetchedAt = time.UnixMilli(loginAt)
+		r.brokerLogin.mu.Unlock()
+	}
 }
 
 // StartActiveRuntime brings the active broker's runtime up at boot, in dependency order:

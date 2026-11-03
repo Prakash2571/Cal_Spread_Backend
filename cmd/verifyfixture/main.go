@@ -29,6 +29,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/app"
+	"github.com/Prakash2571/Cal_Spread_Backend/internal/brokerlogin"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/brokers/registry"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/config"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/db"
@@ -43,13 +44,15 @@ const calendarID = "0123456789abcdef01234567"
 const syntheticID = "0123456789abcdef01234568"
 
 type fixture struct {
-	rows     []market.Instrument
-	expiries []time.Time
-	byToken  map[int64]market.Instrument
-	bySymbol map[string]int64
-	mu       sync.Mutex
-	requests map[string]int
-	blocked  atomic.Int64
+	rows           []market.Instrument
+	expiries       []time.Time
+	byToken        map[int64]market.Instrument
+	bySymbol       map[string]int64
+	mu             sync.Mutex
+	requests       map[string]int
+	blocked        atomic.Int64
+	tokenAvailable atomic.Bool
+	tokenRequests  atomic.Int64
 }
 
 func newFixture() *fixture {
@@ -125,6 +128,17 @@ func (f *fixture) upstream(w http.ResponseWriter, r *http.Request) {
 		success(w, map[string]any{"access_token": "loopback-fixture-session", "user_id": "FIXTURE", "user_name": "Local generated market"})
 	case r.URL.Path == "/user/profile":
 		success(w, map[string]any{"user_id": "FIXTURE", "user_name": "Local generated market"})
+	case r.URL.Path == "/profile":
+		token := r.Header.Get("access-token")
+		if token != "loopback-pasted-dhan-token" && token != "loopback-service-dhan-token" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"errorMessage": "Invalid generated fixture token"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"dhanClientId": "1100001", "tokenValidity": time.Now().Add(24 * time.Hour).UnixMilli()})
+	case r.URL.Path == "/scrip-master.csv":
+		w.Header().Set("Content-Type", "text/csv")
+		_, _ = fmt.Fprintf(w, "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,SYMBOL_NAME,UNDERLYING_SECURITY_ID,LOT_SIZE,TICK_SIZE,EXPIRY_DATE\nNSE,D,1000,FUTSTK,TEST-FUT,1,50,0.05,%s\n", f.expiries[0].Format("2006-01-02"))
 	case strings.HasPrefix(r.URL.Path, "/quote"):
 		quotes := map[string]any{}
 		for _, key := range r.URL.Query()["i"] {
@@ -159,6 +173,31 @@ func (f *fixture) upstream(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "unavailable in loopback fixture", 503)
 	}
+}
+
+// Generated env_home token API, served only on a local TLS listener. The browser
+// can exercise service failure -> manual fallback -> service recovery against App.
+func (f *fixture) tokenService(w http.ResponseWriter, r *http.Request) {
+	f.tokenRequests.Add(1)
+	var request map[string]string
+	if r.Method != "POST" || r.URL.Path != "/api/v1/token" || json.NewDecoder(r.Body).Decode(&request) != nil || len(request) != 2 || request["client_id"] != "1100001" ||
+		r.Header.Get("CF-Access-Client-Id") != "loopback-fixture-cf-id" || r.Header.Get("CF-Access-Client-Secret") != "loopback-fixture-cf-secret" {
+		http.Error(w, "invalid generated token request", http.StatusBadRequest)
+		return
+	}
+	code, _ := brokerlogin.CodeAt("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", time.Now())
+	if request["totp"] != code {
+		http.Error(w, "invalid generated token code", http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if !f.tokenAvailable.Load() {
+		w.Header().Set("Retry-After", "300")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "no_token_yet"})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"client_id": "1100001", "access_token": "loopback-service-dhan-token", "expires_in": 86400})
 }
 
 type feed struct {
@@ -278,6 +317,8 @@ func run() error {
 	f := newFixture()
 	upstream := httptest.NewServer(http.HandlerFunc(f.upstream))
 	defer upstream.Close()
+	tokenService := httptest.NewTLSServer(http.HandlerFunc(f.tokenService))
+	defer tokenService.Close()
 	transport := &http.Transport{DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 		host, _, err := net.SplitHostPort(address)
 		if err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
@@ -288,6 +329,11 @@ func run() error {
 	}}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
+	tokenClient := tokenService.Client()
+	tokenTransport := tokenClient.Transport.(*http.Transport).Clone()
+	tokenTransport.DialContext = transport.DialContext
+	defer tokenTransport.CloseIdleConnections()
+	tokenClient.Transport = tokenTransport
 	curve, policy := fvtest.CurveObject(), fvtest.ExpiryPolicyObject()
 	stamp := model.ISOString(float64(time.Now().UnixMilli()))
 	curve.Set("as_of", stamp)
@@ -300,11 +346,15 @@ func run() error {
 	patch.Set("history_interval_ms", 10000.0)
 	env := map[string]string{"KITE_API_KEY": "loopback-fixture-key", "KITE_API_SECRET": "loopback-fixture-secret",
 		"ADMIN_SECRET": "loopback-fixture-admin", "ACCESS_SECRET": "loopback-fixture-trade", "FRONTEND_URL": *frontend,
-		"FAIR_VALUE_ENABLED": "true", "FAIR_VALUE_CONFIG_JSON": string(jsjson.Marshal(patch))}
+		"DHAN_CLIENT_ID": "1100001", "BROKER_LOGIN_URL": tokenService.URL,
+		"BROKER_LOGIN_CF_CLIENT_ID": "loopback-fixture-cf-id", "BROKER_LOGIN_CF_CLIENT_SECRET": "loopback-fixture-cf-secret",
+		"DHAN_TOKEN_API_SEED": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+		"FAIR_VALUE_ENABLED":  "true", "FAIR_VALUE_CONFIG_JSON": string(jsjson.Marshal(patch))}
 	a, err := app.New(config.Load(config.MapGetter(env)), app.Options{Pool: pool,
 		LookupEnv:   func(key string) (string, bool) { value, ok := env[key]; return value, ok },
 		KiteAPIRoot: upstream.URL, KiteLoginRoot: upstream.URL, KiteHTTPClient: client, TickerConnect: f.connect,
 		KiteTickerURL: "ws://127.0.0.1:1", YahooChartRoot: upstream.URL, YahooHTTPClient: client,
+		BrokerLoginHTTPClient: tokenClient,
 		Dhan: registry.DhanConfig{APIRoot: upstream.URL, AuthRoot: upstream.URL, FeedURL: "ws://127.0.0.1:1",
 			ScripMasterURLs: []string{upstream.URL + "/scrip-master.csv"}, HTTPClient: client}})
 	if err != nil {
@@ -318,6 +368,18 @@ func run() error {
 	// App's actual middleware/routes. No authentication or valuations are stubbed here.
 	api := a.Handler()
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && r.URL.Path == "/__fixture/token-service" {
+			var request struct {
+				Available bool `json:"available"`
+			}
+			if json.NewDecoder(r.Body).Decode(&request) != nil {
+				http.Error(w, "invalid fixture control", 400)
+				return
+			}
+			f.tokenAvailable.Store(request.Available)
+			_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+			return
+		}
 		if r.URL.Path == "/__fixture" {
 			f.mu.Lock()
 			defer f.mu.Unlock()
@@ -325,7 +387,7 @@ func run() error {
 			_ = json.NewEncoder(w).Encode(map[string]any{"runtime": "go-chi-postgres", "generated_market": true,
 				"underlying": "TEST", "calendar_id": calendarID, "synthetic_id": syntheticID,
 				"calculator_expiry": f.expiries[0].AddDate(0, 0, 10).UTC().Add(330 * time.Minute).Format("2006-01-02T15:04"),
-				"requests":          f.requests, "blocked_outbound": f.blocked.Load()})
+				"requests":          f.requests, "blocked_outbound": f.blocked.Load(), "token_requests": f.tokenRequests.Load()})
 			return
 		}
 		f.mu.Lock()

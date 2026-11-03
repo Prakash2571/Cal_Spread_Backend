@@ -104,9 +104,14 @@ func (r *Registry) setDhanSession(token *string, expiry *int64, meta *dhanMeta) 
 	r.sessMu.Unlock()
 }
 
-// DhanCredentials is readDhanCredentials (ok false with the reason when incomplete).
+// Token-based Dhan sessions need only the account identity. App credentials belong
+// to the separate consent endpoints, not to broker selection or market-data readiness.
 func (r *Registry) DhanCredentials() (creds dhan.AppCredentials, ok bool, reason string) {
-	return dhan.ReadCredentials(r.get)
+	creds.ClientID = jsTrim(r.get("DHAN_CLIENT_ID"))
+	if creds.ClientID == "" {
+		return creds, false, "Dhan is not configured: DHAN_CLIENT_ID missing."
+	}
+	return creds, true, ""
 }
 
 func (r *Registry) authOptions() dhan.AuthOptions {
@@ -165,6 +170,13 @@ func (r *Registry) CompleteDhanLogin(ctx context.Context, tokenID string) (Sessi
 		log.Printf("[Dhan] failed to persist the session: %v", err)
 	}
 
+	r.restartDhanRuntime(ctx, false)
+	return r.SessionFor(brokers.Dhan), nil
+}
+
+// restartDhanRuntime restores each lane's own subscriptions on the new token.
+// Token-service/paste replacements recycle both sockets, including Synthetic's lane.
+func (r *Registry) restartDhanRuntime(ctx context.Context, bothLanes bool) {
 	// Warm the universe now so the first scan is not waiting on a multi-MB CSV.
 	r.background(func() {
 		if _, err := r.dhanInstruments.Load(context.Background(), false); err != nil {
@@ -177,11 +189,18 @@ func (r *Registry) CompleteDhanLogin(ctx context.Context, tokenID string) (Sessi
 	r.mu.Lock()
 	old := r.dhanFeed
 	r.dhanFeed = nil
+	var oldBox *dhanLane
+	if bothLanes {
+		oldBox, r.boxDhanFeed = r.boxDhanFeed, nil
+	}
 	r.mu.Unlock()
 	if old != nil {
 		log.Printf("[Broker] recycling the Dhan feed onto the new access token")
 		old.stop()
 		r.lastTickAt.Store(noTick)
+	}
+	if oldBox != nil {
+		oldBox.stop()
 	}
 
 	// Establishing a session is the first moment the static IP can be checked.
@@ -207,7 +226,6 @@ func (r *Registry) CompleteDhanLogin(ctx context.Context, tokenID string) (Sessi
 			h.Publish()
 		}
 	}
-	return r.SessionFor(brokers.Dhan), nil
 }
 
 // LogoutDhan drops the Dhan session and everything derived from it: token, feed (the
@@ -215,9 +233,22 @@ func (r *Registry) CompleteDhanLogin(ctx context.Context, tokenID string) (Sessi
 func (r *Registry) LogoutDhan(ctx context.Context) {
 	r.opMu.Lock()
 	defer r.opMu.Unlock()
+	r.brokerLogin.mu.Lock()
+	r.brokerLogin.pausedDay = jsx.IstDayKey(r.now())
+	r.brokerLogin.mu.Unlock()
+	_, _, meta := r.dhanSession()
 	r.setDhanSession(nil, nil, nil)
 	if f := r.currentDhanFeed(); f != nil {
 		f.stop()
+	}
+	if meta != nil && meta.source != "" {
+		r.mu.Lock()
+		box := r.boxDhanFeed
+		r.boxDhanFeed = nil
+		r.mu.Unlock()
+		if box != nil {
+			box.stop()
+		}
 	}
 	r.dhanInstruments.Clear()
 	sctx, cancel := storeCtx()
@@ -234,13 +265,42 @@ func (r *Registry) LogoutDhan(ctx context.Context) {
 	}
 }
 
-// onDhanSessionLost handles a session that died mid-flight (an auth close of either
-// Dhan socket): fail closed. Only the futures feed is stopped, as in Node.
+// A stopped, superseded feed must not clear a token installed while its callback
+// was queued. Credential changes and the ownership check share opMu.
+func (r *Registry) onDhanFeedSessionLost(lane *dhanLane, reason string) {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	r.mu.Lock()
+	current := lane == r.dhanFeed || lane == r.boxDhanFeed
+	r.mu.Unlock()
+	if current {
+		r.onDhanSessionLost(reason)
+	}
+}
+
+// onDhanSessionLost handles a session that died mid-flight: fail closed. Token-based
+// sessions stop both Dhan lanes; legacy consent sessions keep their original behavior.
 func (r *Registry) onDhanSessionLost(reason string) {
 	log.Printf("[Dhan] session lost: %s", reason)
 	r.sessMu.Lock()
+	token, meta := r.dhanToken, r.dhanMeta
 	r.dhanToken, r.dhanExpiry = nil, nil
 	r.sessMu.Unlock()
+	if meta != nil && meta.source != "" {
+		r.brokerLogin.mu.Lock()
+		if token != nil {
+			r.brokerLogin.rejectedToken = *token
+		}
+		r.brokerLogin.lastErr = "Dhan rejected the saved token. Fetch a new token or paste a fallback."
+		r.brokerLogin.mu.Unlock()
+		r.mu.Lock()
+		box := r.boxDhanFeed
+		r.boxDhanFeed = nil
+		r.mu.Unlock()
+		if box != nil {
+			box.stop()
+		}
+	}
 	if f := r.currentDhanFeed(); f != nil {
 		f.stop()
 	}
@@ -406,7 +466,7 @@ func (r *Registry) DhanStaticIPState() StaticIPState {
 // DhanProblems is computeDhanProblems: every operator-facing Dhan problem, in order.
 func (r *Registry) DhanProblems() []string {
 	problems := []string{}
-	if _, ok, reason := dhan.ReadCredentials(r.get); !ok {
+	if _, ok, reason := r.DhanCredentials(); !ok {
 		problems = append(problems, reason)
 	}
 	token, expiry, _ := r.dhanSession()

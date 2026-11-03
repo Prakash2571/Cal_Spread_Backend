@@ -78,7 +78,8 @@ type Options struct {
 	TickerConnect ticker.ConnectFunc
 	KiteTickerURL string
 	// Dhan points the Dhan integration at other hosts.
-	Dhan registry.DhanConfig
+	Dhan                  registry.DhanConfig
+	BrokerLoginHTTPClient *http.Client
 	// YahooChartRoot and YahooHTTPClient replace the dividend-yield endpoint.
 	YahooChartRoot  string
 	YahooHTTPClient *http.Client
@@ -188,13 +189,14 @@ func New(cfg config.Config, opts Options) (*App, error) {
 	})
 
 	a.reg = registry.New(registry.Deps{
-		Kite:          kc,
-		Hub:           a.hub,
-		Store:         &registry.PGStore{Pool: a.pool},
-		Lookup:        a.lookup,
-		Dhan:          opts.Dhan,
-		KiteConnect:   opts.TickerConnect,
-		KiteTickerURL: opts.KiteTickerURL,
+		Kite:                  kc,
+		Hub:                   a.hub,
+		Store:                 &registry.PGStore{Pool: a.pool},
+		Lookup:                a.lookup,
+		Dhan:                  opts.Dhan,
+		KiteConnect:           opts.TickerConnect,
+		KiteTickerURL:         opts.KiteTickerURL,
+		BrokerLoginHTTPClient: opts.BrokerLoginHTTPClient,
 	})
 	reg := a.reg
 	history := reg.HistoryProvider()

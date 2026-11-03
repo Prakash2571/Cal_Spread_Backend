@@ -543,6 +543,20 @@ func (rp *replay) compare(i int, step goldenStep, got, want goldenResult) {
 	t := rp.t
 	t.Helper()
 	where := fmt.Sprintf("step %d (%s)", i, describe(step))
+	// Broker readiness now needs only DHAN_CLIENT_ID. The original consent endpoints
+	// still enforce their own app credentials; pin only the intended readiness-text change.
+	if step.Op == "req" && step.Path != "/api/dhan/login" && step.Path != "/api/dhan/session" && want.Body != nil {
+		body := strings.ReplaceAll(*want.Body,
+			"Dhan is not configured: DHAN_CLIENT_ID, DHAN_API_KEY, DHAN_API_SECRET missing.",
+			"Dhan is not configured: DHAN_CLIENT_ID missing.")
+		want.Body = &body
+	}
+	if (step.Op == "health" || step.Op == "snapshot") && want.Value != nil {
+		value := strings.ReplaceAll(*want.Value,
+			"Dhan is not configured: DHAN_CLIENT_ID, DHAN_API_KEY, DHAN_API_SECRET missing.",
+			"Dhan is not configured: DHAN_CLIENT_ID missing.")
+		want.Value = &value
+	}
 	if step.Op == "db" {
 		var node map[string]any
 		if want.Value == nil || json.Unmarshal([]byte(*want.Value), &node) != nil {

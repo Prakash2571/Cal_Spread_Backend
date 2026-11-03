@@ -335,10 +335,10 @@ func TestBrokerControlActor(t *testing.T) {
 	if err := pool.QueryRow(ctx, `select selected_by from active_broker`).Scan(&by); err != nil || by != "admin" {
 		t.Fatalf("selected_by %q %v", by, err)
 	}
-	u.env.unset("DHAN_API_SECRET")
+	u.env.unset("DHAN_CLIENT_ID")
 	r := bc.SwitchBroker(ctx, brokers.Dhan, auth.RoleFull)
 	if r.OK || len(r.Blockers) != 1 || r.Blockers[0].Reason != "broker_not_configured" ||
-		r.Blockers[0].Detail != "Dhan is not configured: DHAN_API_SECRET missing." {
+		r.Blockers[0].Detail != "Dhan is not configured: DHAN_CLIENT_ID missing." {
 		t.Fatalf("blocked switch %+v", r)
 	}
 }

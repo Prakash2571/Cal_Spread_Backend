@@ -29,9 +29,11 @@ missing/unreachable test database into failure rather than a skip.
 | Setting | Default | Meaning |
 |---|---|---|
 | `KITE_API_KEY`, `KITE_API_SECRET` | required | Kite app credentials, required by startup contract |
-| `DHAN_CLIENT_ID`, `DHAN_API_KEY`, `DHAN_API_SECRET` | empty | Dhan app credentials; empty keeps Dhan unconfigured |
-| `DHAN_REDIRECT_URL` | frontend /dhan/verify | Configured consent redirect; match the Dhan app |
-| `DHAN_POSTBACK_URL` | empty | Optional retained postback logging endpoint configuration |
+| `DHAN_CLIENT_ID` | empty | Dhan account identity for automatic token fetching and validated pasting |
+| `BROKER_LOGIN_URL` | empty | Shared env_home HTTPS origin, with no path/query; empty disables automatic fetching |
+| `BROKER_LOGIN_CF_CLIENT_ID`, `BROKER_LOGIN_CF_CLIENT_SECRET` | empty | This engine's Cloudflare Access service-token credentials |
+| `DHAN_TOKEN_API_SEED` | empty | Account's base32 token-API seed from env_home, not its Dhan login TOTP seed |
+| `AUTO_LOGIN_TIME` | 08:30 | IST daily gate for all automatic startup, missing-token, refresh and recovery requests |
 | `DHAN_DATA_ENABLED` | true | Dhan market-data access gate |
 | `DHAN_HTTP_TIMEOUT_MS` | 8000 | REST request deadline |
 | `DHAN_MIN_INTERVAL_MS` | 120 | Minimum REST request spacing |
@@ -43,6 +45,42 @@ missing/unreachable test database into failure rather than a skip.
 The Dhan binary feed uses its supported five-level FULL packets. Removed Dhan order
 and charge-calculator settings are not runtime options. Broker capability diagnostics
 remain distinct from Synthetic's paper-trading/data readiness.
+
+### Dhan automatic token flow
+
+Configure `DHAN_CLIENT_ID` plus the four broker-login values above in the backend's
+private `.env`. No service credential belongs in a `VITE_*` variable. The backend
+validates the service configuration at startup; invalid settings appear in the
+Broker panel and leave the paste-token fallback available.
+
+After `AUTO_LOGIN_TIME` every day, including weekends, the backend fetches a missing
+token, a token expiring today, or one with under five minutes left. A fresh saved
+token is restored/reused after a restart. It validates active tokens with Dhan every
+five minutes and recovers rejected ones within the same daily gate. Each token API
+request sends only `{client_id, totp}` with the Cloudflare service-token headers,
+uses a named user agent and a 20-second timeout, rejects redirects and limits the
+reply to 64 KiB. A used TOTP code is retried once after the next 30-second step.
+
+Transient failures honour `Retry-After` with at least a one-minute gap. A prolonged `no_token_yet` failure surfaces
+an operator-recovery message after 30 minutes while scheduled retries continue. Wrong
+credentials, Cloudflare refusals and `not_configured` stop automatic fetching until
+the operator corrects the configuration and requests **Fetch token now** (restart
+after editing `.env`). A token API lockout also blocks explicit fetching until its
+retry window ends. **Fetch token now** otherwise overrides the daily schedule.
+
+Full-admin frontend controls use `POST /api/dhan/login/broker` to fetch and
+`POST /api/dhan/token` with `{accessToken}` to paste. A pasted token is validated
+with Dhan's profile endpoint and matched to `DHAN_CLIENT_ID` before installation.
+Its stated/JWT expiry is retained; a healthy manual fallback is kept until it nears
+expiry rather than immediately overwritten by an automatic fetch. Both token paths
+save the session/source to PostgreSQL and recycle both Dhan feed lanes on a changed
+token. Without PostgreSQL the session is explicitly reported as memory-only.
+
+**Clear token** removes the saved token and pauses automatic fetching for the rest
+of the IST day; an explicit fetch or successful paste resumes the session. Status
+contains only account, expiry, source and safe fetch/error metadata, never service
+credentials or the access token. The frontend Dhan consent/redirect flow is removed;
+the older backend consent endpoints remain compatible for existing callers.
 
 ## Capture and analytics
 
