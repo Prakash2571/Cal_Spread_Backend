@@ -1,6 +1,7 @@
 # CalSpread automatic Dhan tokens
 
-Implemented locally in `Cal_Spread_Backend` and the paired `Cal_Spread` frontend.
+Implemented and published to GitHub main in `Cal_Spread_Backend` and the paired
+`Cal_Spread` frontend.
 
 ## Behavior
 
@@ -30,6 +31,14 @@ Actual service fetching was not run: private values belong on the operator's ser
 The user authorized publication of these changes to both GitHub main branches.
 Publication receipts are recorded in `tasks/2026-11-03-broker-login-token/STATUS.md`.
 
+## GitHub publication — 2026-11-03
+
+- Backend: [cb409be](https://github.com/Prakash2571/Cal_Spread_Backend/commit/cb409be2caaa84fb60c47478617b3be3d30a0626), pushed to main.
+- Frontend: [4749fd0](https://github.com/Prakash2571/Cal_Spread/commit/4749fd0e5dabb4efa1d9e6c7125cf94b4aee6d90), pushed to main after the backend.
+- Backend [CI 41612009137](https://github.com/Prakash2571/Cal_Spread_Backend/actions/runs/41612009137): **success**; build/vet/format, required PostgreSQL/race, locked modules and server artifact passed.
+- Frontend [CI 41612028944](https://github.com/Prakash2571/Cal_Spread/actions/runs/41612028944): **success**; locked frontend build/unit and actual-Go/PostgreSQL integration passed.
+- Both `git push origin main` commands exited 0 and their worktrees were clean/matched origin/main after publication. Receipt updates are documentation-only.
+
 ## Verification — 2026-11-03
 
 - Backend `make check` through `scratch/go-migration/check.sh`, with the local test database,
@@ -51,4 +60,4 @@ Publication receipts are recorded in `tasks/2026-11-03-broker-login-token/STATUS
 Jev skill/current docs were followed; `TYPESAFE_API_KEY` was unavailable, so no Jev call
 was sent. Session spend: US$0.00. Scheduling/authentication/token decisions are explicit code.
 
-Suggested Git checkpoint after review: `Add automatic Dhan token fetching and paste fallback`.
+Runtime publication and CI verification are complete; server configuration/rollout is the operator's next step.

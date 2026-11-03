@@ -1,9 +1,9 @@
 # CalSpread automatic Dhan access tokens — status
 
-State: Doing
+State: Done
 Updated: 2026-11-03
 Blockers: none for the verified local implementation
-Next action: Commit the reviewed changes in both repositories, push the backend then frontend to GitHub main, and verify their CI runs.
+Next action: None for GitHub publication. Configure the documented private server values and verify the real token-service fetch during the operator's separately managed rollout.
 WIP override: none
 
 ## Discovery
@@ -78,10 +78,20 @@ WIP override: none
 `.env.example`, `docs/CONFIGURATION.md`, `../Cal_Spread/src/BrokerPanel.tsx`,
 `../Cal_Spread/src/App.tsx`, `../Cal_Spread/src/api.ts`.
 
-## GitHub publication in progress
+## GitHub publication receipt — 2026-11-03
 
 - User explicitly authorized pushing both repositories to GitHub main on 2026-11-03.
 - `git status --short --branch && git diff --stat && git diff --check && git log --oneline -10 && git remote -v`: exit 0 in each repository; only the intended token-service changes are pending, both branches are main and track their corresponding GitHub origin/main.
 - `git fetch origin main && git status --short --branch && git log --oneline HEAD..origin/main && git diff`: exit 0 in each repository; remote mains still match the starting baselines. Full tracked diffs reviewed; no rebase or merge is needed.
 - `gh auth status`: exit 0; GitHub authentication is available for publication.
 - Frontend CI uses backend main for the actual-Go integration, so backend publication precedes frontend publication. Local runtime checks already passed above; subsequent edits are publication records only.
+- Reviewed/staged only the intended files; `git diff --cached --check` passed in both repositories. The private-host/key signature scan returned no matches; `.env`, token caches, compiled output and scratch fixtures are not staged.
+- Backend `git commit -m "Fetch Dhan tokens from shared login service"`: exit 0, runtime `cb409be2caaa84fb60c47478617b3be3d30a0626`.
+- Frontend `git commit -m "Replace Dhan login with token-service controls"`: exit 0, runtime `4749fd0e5dabb4efa1d9e6c7125cf94b4aee6d90`.
+- `git push origin main && git status --short --branch && git rev-parse origin/main`: exit 0 in backend then frontend; both clean and matched GitHub origin/main immediately after their pushes.
+- `gh run list --branch main --commit <runtime SHA> --workflow ci.yml --event push --json databaseId,headSha,status,conclusion,url`: exit 0 in each repository. The matching runtime runs were found and verified below.
+- Backend runtime: [cb409be](https://github.com/Prakash2571/Cal_Spread_Backend/commit/cb409be2caaa84fb60c47478617b3be3d30a0626), published to main.
+- Frontend runtime: [4749fd0](https://github.com/Prakash2571/Cal_Spread/commit/4749fd0e5dabb4efa1d9e6c7125cf94b4aee6d90), published to main after the backend.
+- Backend `gh run watch 41612009137 --interval 10 --exit-status && gh run view 41612009137 --json headSha,status,conclusion,url,jobs`: exit 0; [CI 41612009137](https://github.com/Prakash2571/Cal_Spread_Backend/actions/runs/41612009137) completed **success**, matched runtime cb409be, and every build/vet/format/race/PostgreSQL/module/artifact step passed.
+- Frontend `gh run watch 41612028944 --interval 10 --exit-status && gh run view 41612028944 --json headSha,status,conclusion,url,jobs`: exit 0; [CI 41612028944](https://github.com/Prakash2571/Cal_Spread/actions/runs/41612028944) completed **success**, matched runtime 4749fd0, and locked build/unit/actual-Go PostgreSQL integration passed against published backend main.
+- Publication is complete. The follow-up receipt commit changes this status and the report only; verified runtime source remains cb409be/4749fd0.
