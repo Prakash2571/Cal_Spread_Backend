@@ -15,9 +15,11 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/brokerlogin"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/brokers"
+	"github.com/Prakash2571/Cal_Spread_Backend/internal/db"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/dbtest"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/server"
 )
@@ -40,7 +42,12 @@ type tokenTestService struct {
 
 func newTokenRig(t *testing.T, store Store, specs map[string][]httpSpec) (*unitRig, *tokenTestService) {
 	t.Helper()
-	u := newUnitRig(t, store, specs)
+	return newTokenRigWithEnv(t, store, specs, nil)
+}
+
+func newTokenRigWithEnv(t *testing.T, store Store, specs map[string][]httpSpec, extra map[string]string) (*unitRig, *tokenTestService) {
+	t.Helper()
+	u := newUnitRigWithEnv(t, store, specs, extra)
 	u.env.unset("DHAN_API_KEY")
 	u.env.unset("DHAN_API_SECRET")
 	service := &tokenTestService{}
@@ -84,6 +91,127 @@ func newTokenRig(t *testing.T, store Store, specs map[string][]httpSpec) (*unitR
 		}
 	})
 	return u, service
+}
+
+func TestFetchedTokenRestoresAcrossFreshRegistryAndPool(t *testing.T) {
+	for _, tc := range []struct {
+		name, fallback, savedBroker string
+		initial, restored           brokers.ID
+		expired                     bool
+	}{
+		{name: "fresh Dhan", initial: brokers.Dhan, restored: brokers.Dhan},
+		{name: "saved Dhan", savedBroker: "dhan", initial: brokers.Dhan, restored: brokers.Dhan},
+		{name: "saved Zerodha", savedBroker: "zerodha", initial: brokers.Dhan, restored: brokers.Zerodha},
+		{name: "saved Dhan overrides Zerodha fallback", fallback: "zerodha", savedBroker: "dhan", initial: brokers.Zerodha, restored: brokers.Dhan},
+		{name: "expired token", initial: brokers.Dhan, restored: brokers.Dhan, expired: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := dbtest.New(t)
+			store := &PGStore{Pool: pool}
+			u, service := newTokenRigWithEnv(t, store, nil, map[string]string{"DEFAULT_BROKER": tc.fallback})
+			u.clock.ms.Store(time.Date(2026, 11, 3, 8, 30, 0, 0, tokenIST).UnixMilli())
+			store.Now = u.clock.Now
+			if u.reg.ActiveBroker() != tc.initial || u.reg.Generation() != 1 {
+				t.Fatal("fresh registry did not use the expected initial broker/generation")
+			}
+			if tc.savedBroker != "" {
+				if _, err := pool.Exec(ctx, `insert into active_broker (id, broker, generation) values ('current', $1, 7)`, tc.savedBroker); err != nil {
+					t.Fatal(err)
+				}
+			}
+			u.reg.Restore(ctx)
+			u.reg.brokerPass(ctx)
+			u.settle()
+			saved, err := store.LoadDhanSession(ctx)
+			if err != nil || saved == nil || saved.Source != "BROKER_LOGIN" || service.calls.Load() != 1 || u.reg.ActiveBroker() != tc.restored {
+				t.Fatal("automatic fetch did not save the token independently of broker selection")
+			}
+
+			// Stop the old runtime and close its database connections. A new registry
+			// and new pool must restore entirely from PostgreSQL, not shared memory.
+			u.reg.StopFeeds()
+			u.settle()
+			if err := u.reg.StopDhanTokenService(ctx); err != nil {
+				t.Fatal(err)
+			}
+			connectionConfig := pool.Config().Copy()
+			pool.Close()
+			connections, err := pgxpool.NewWithConfig(ctx, connectionConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reopened := &db.Pool{Pool: connections}
+			t.Cleanup(reopened.Close)
+			freshStore := &PGStore{Pool: reopened}
+			fresh, freshService := newTokenRigWithEnv(t, freshStore, nil, map[string]string{"DEFAULT_BROKER": tc.fallback})
+			restartAt := u.clock.Now().Add(time.Minute)
+			if tc.expired {
+				restartAt = u.clock.Now().Add(25 * time.Hour)
+			}
+			fresh.clock.ms.Store(restartAt.UnixMilli())
+			freshStore.Now = fresh.clock.Now
+			fresh.reg.Restore(ctx)
+			if fresh.reg.ActiveBroker() != tc.restored || (tc.savedBroker != "" && fresh.reg.Generation() != 7) {
+				t.Fatal("saved selection/generation did not restore ahead of the fallback")
+			}
+			if tc.expired {
+				if fresh.reg.SessionFor(brokers.Dhan).Authenticated {
+					t.Fatal("expired token restored as usable")
+				}
+				if record, err := freshStore.LoadDhanSession(ctx); err != nil || record != nil {
+					t.Fatal("expired token was not removed from PostgreSQL")
+				}
+				fresh.reg.brokerPass(ctx)
+				fresh.settle()
+				if freshService.calls.Load() != 1 || !fresh.reg.SessionFor(brokers.Dhan).Authenticated {
+					t.Fatal("restart with an expired token did not recover within the automatic window")
+				}
+				return
+			}
+			token, expiry, meta := fresh.reg.dhanSession()
+			fetchedAt := fresh.reg.BrokerLoginStatus().LastFetchedAt
+			if token == nil || *token != saved.AccessToken || expiry == nil || saved.ExpiryTime == nil || *expiry != *saved.ExpiryTime ||
+				meta == nil || meta.source != saved.Source || meta.clientID != saved.DhanClientID || meta.loginDay != saved.LoginDate ||
+				fetchedAt == nil || *fetchedAt != saved.LoginAt.UnixMilli() || !fresh.reg.SessionFor(brokers.Dhan).Authenticated {
+				t.Fatal("token/account/source/expiry/login metadata did not survive a fresh runtime")
+			}
+			fresh.reg.StartActiveRuntime(ctx)
+			fresh.reg.brokerPass(ctx)
+			fresh.settle()
+			if freshService.calls.Load() != 0 {
+				t.Fatal("restart unnecessarily fetched another fresh token")
+			}
+		})
+	}
+}
+
+func TestFetchedTokenWithoutPostgresIsReportedMemoryOnlyAndDoesNotRestore(t *testing.T) {
+	ctx := context.Background()
+	u, _ := newTokenRigWithEnv(t, nil, nil, map[string]string{"DEFAULT_BROKER": ""})
+	if _, err := u.reg.FetchBrokerToken(ctx); err != nil {
+		t.Fatal(err)
+	}
+	u.settle()
+	handler := server.New(server.Options{}, func(router chi.Router) {
+		Mount(router, RouteDeps{Registry: u.reg, Sessions: newSessions(t, u.clock)})
+	})
+	req := httptest.NewRequest("GET", "/api/dhan/status", nil)
+	req.Header.Set("x-admin-token", "full-token")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	var status struct {
+		Authenticated bool  `json:"authenticated"`
+		Persisted     *bool `json:"persisted"`
+	}
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &status) != nil || !status.Authenticated || status.Persisted == nil || *status.Persisted {
+		t.Fatal("memory-only token was not explicitly reported as unpersisted")
+	}
+	fresh, _ := newTokenRigWithEnv(t, nil, nil, map[string]string{"DEFAULT_BROKER": ""})
+	fresh.reg.Restore(ctx)
+	if fresh.reg.ActiveBroker() != brokers.Dhan || fresh.reg.SessionFor(brokers.Dhan).Authenticated {
+		t.Fatal("a fresh memory-only runtime invented a saved Dhan token")
+	}
 }
 
 func TestAutomaticTokenWindowSaveAndRestore(t *testing.T) {

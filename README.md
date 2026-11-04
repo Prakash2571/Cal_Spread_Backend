@@ -44,7 +44,9 @@ session is established through the full-admin login workflow.
 ### Automatic Dhan access tokens
 
 As in Live Index Algo, env_home logs the Dhan account in and this backend fetches
-and saves its token. Set `DHAN_CLIENT_ID`, `BROKER_LOGIN_URL`,
+and saves its token. **Dhan is the fresh-start default** (`DEFAULT_BROKER=dhan`);
+a broker selection already saved in PostgreSQL takes precedence after a restart.
+Set `DHAN_CLIENT_ID`, `BROKER_LOGIN_URL`,
 `BROKER_LOGIN_CF_CLIENT_ID`, `BROKER_LOGIN_CF_CLIENT_SECRET` and
 `DHAN_TOKEN_API_SEED` in the backend `.env`; `AUTO_LOGIN_TIME` defaults to **08:30 IST**.
 Tokens restore from PostgreSQL after restart and refresh automatically within the

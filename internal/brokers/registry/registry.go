@@ -237,8 +237,9 @@ type Registry struct {
 	history          *HistoryProvider
 }
 
-// New builds the registry: Zerodha active, generation 1, no Dhan session, nothing
-// connected. Call Restore and StartActiveRuntime at boot.
+// New builds the registry: Dhan active by default, generation 1, no Dhan session,
+// nothing connected. DEFAULT_BROKER changes the fresh-start fallback; Restore adopts
+// a saved selection before StartActiveRuntime brings its session back up at boot.
 func New(deps Deps) *Registry {
 	if deps.Lookup == nil {
 		deps.Lookup = os.LookupEnv
@@ -255,7 +256,11 @@ func New(deps Deps) *Registry {
 	}
 	r.get = func(k string) string { v, _ := r.lookup(k); return v }
 	r.brokerLogin = newBrokerLoginController(r.get, deps.BrokerLoginHTTPClient)
-	r.state.Store(&brokerState{active: brokers.Zerodha, gen: 1})
+	initial := brokers.Dhan
+	if configured, ok := brokers.Parse(r.get("DEFAULT_BROKER")); ok {
+		initial = configured
+	}
+	r.state.Store(&brokerState{active: initial, gen: 1})
 	r.lastTickAt.Store(noTick)
 
 	httpCfg := dhan.HTTPConfigFromEnv(r.get)

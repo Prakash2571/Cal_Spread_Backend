@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Prakash2571/Cal_Spread_Backend/internal/brokers"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/config"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/db"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/jsx"
@@ -199,6 +200,29 @@ func TestBootAndShutdownWithoutDatabase(t *testing.T) {
 		t.Errorf("boot + shutdown took %v", took)
 	}
 	h.waitGoroutines(3)
+}
+
+func TestBootDefaultsToDhanWithoutSavedSelection(t *testing.T) {
+	for _, withDatabase := range []bool{false, true} {
+		name := "memory-only"
+		if withDatabase {
+			name = "PostgreSQL"
+		}
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, harnessOptions{db: withDatabase, env: map[string]string{"DEFAULT_BROKER": "", "DHAN_CLIENT_ID": "1100001"}})
+			h.app.Start(context.Background())
+			if h.app.reg.ActiveBroker() != brokers.Dhan || h.app.reg.Generation() != 1 || h.app.reg.ActiveSession().Authenticated {
+				t.Fatal("fresh backend did not boot on Dhan without inventing a session")
+			}
+			full := h.fullToken()
+			expect(t, "default broker in admin status", h.do("GET", "/api/admin/status", full, ""),
+				200, `{"authenticated":true,"role":"full","broker":"dhan"}`)
+			status := h.do("GET", "/api/status", "", "")
+			if status.status != 200 || !strings.Contains(status.body, `"broker":"dhan"`) || !strings.Contains(status.body, `"broker_authenticated":false`) {
+				t.Fatalf("fresh Dhan runtime status: %d %s", status.status, status.body)
+			}
+		})
+	}
 }
 
 // TestShutdownBeforeStart stops the service before the boot chain ran: Start is then a

@@ -172,6 +172,9 @@ func runReplay(t *testing.T, g routesGolden, sc goldenScenario, served *atomic.B
 		t.Fatalf("%d steps but %d results", len(sc.Steps), len(sc.Results))
 	}
 	rp := &replay{t: t, sc: sc, clock: newClock(sc.StartMs), env: newEnv(sc.Env), rec: &recorder{}}
+	// The pinned Node recordings start on Zerodha; keep that scenario premise
+	// explicit while the production fresh-start fallback is Dhan.
+	rp.env.set("DEFAULT_BROKER", "zerodha")
 	rp.kite = &fakeKite{rec: rp.rec, rows: g.KiteRows}
 	rp.hub = &fakeHub{rec: rp.rec}
 	if sc.Kite != nil {

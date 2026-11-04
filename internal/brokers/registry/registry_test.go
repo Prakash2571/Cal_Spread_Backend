@@ -90,6 +90,7 @@ func (ff *feedFactory) get(i int) *fakeDhanFeed {
 }
 
 var testCreds = map[string]string{
+	"DEFAULT_BROKER": "zerodha", // historical Node cases begin on Zerodha explicitly
 	"DHAN_CLIENT_ID": "1100001", "DHAN_API_KEY": "k", "DHAN_API_SECRET": "s",
 	"DHAN_MIN_INTERVAL_MS": "0", "DHAN_MAX_READ_ATTEMPTS": "1",
 }
@@ -107,11 +108,19 @@ type unitRig struct {
 
 func newUnitRig(t *testing.T, store Store, specs map[string][]httpSpec) *unitRig {
 	t.Helper()
+	return newUnitRigWithEnv(t, store, specs, nil)
+}
+
+func newUnitRigWithEnv(t *testing.T, store Store, specs map[string][]httpSpec, extra map[string]string) *unitRig {
+	t.Helper()
 	dhan.SetLogger(func(string, ...any) {})
 	t.Cleanup(func() { dhan.SetLogger(nil) })
 	rec := &recorder{}
 	tok := "kite-token"
 	u := &unitRig{rec: rec, feeds: &feedFactory{rec: rec}, clock: newClock(1_793_167_200_000), env: newEnv(testCreds)}
+	for key, value := range extra {
+		u.env.set(key, value)
+	}
 	u.kite = &fakeKite{rec: rec, token: &tok}
 	u.hub = &fakeHub{rec: rec}
 	u.dhan = newFakeDhan(t, specs, nil)

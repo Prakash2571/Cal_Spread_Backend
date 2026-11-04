@@ -53,10 +53,15 @@ func processEnvironment(dir string) []string {
 
 func startServer(t *testing.T, binary, database string) *runningServer {
 	t.Helper()
+	return startServerWithEnv(t, binary, database, "")
+}
+
+func startServerWithEnv(t *testing.T, binary, database, extraEnv string) *runningServer {
+	t.Helper()
 	dir := t.TempDir()
 	env := "HOST=127.0.0.1\nPORT=0\nKITE_API_KEY=process-fixture-key\nKITE_API_SECRET=process-fixture-secret\n" +
 		"ADMIN_SECRET=process-fixture-admin\nACCESS_SECRET=process-fixture-trade\nFRONTEND_URL=http://127.0.0.1:5173\n" +
-		"DATABASE_URL=" + database + "\n"
+		"DATABASE_URL=" + database + "\n" + extraEnv
 	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(env), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -163,6 +168,9 @@ func TestStandaloneServerLifecycleAndPostgresRestart(t *testing.T) {
 		if got := s.request(t, "GET", "/", "", "", 200); got != `{"status":"ok","authenticated":false,"hint":"Visit /api/login to authenticate with Zerodha."}` {
 			t.Fatalf("health response: %s", got)
 		}
+		if status := s.request(t, "GET", "/api/status", "", "", 200); !strings.Contains(status, `"broker":"dhan"`) {
+			t.Fatalf("fresh standalone backend did not default to Dhan: %s", status)
+		}
 		s.request(t, "GET", "/api/box/status", "", "", 404)
 		s.request(t, "GET", "/api/fair-value/status", "", "", 403)
 		token := s.login(t, "/api/admin/verify", "process-fixture-admin")
@@ -214,6 +222,58 @@ func TestStandaloneServerLifecycleAndPostgresRestart(t *testing.T) {
 		waitProcess(t, func() bool {
 			return restarted.request(t, "GET", "/api/rf/current", "", "", 200) == `{"rf":7.25}`
 		})
+		restarted.stop(t, syscall.SIGTERM)
+	})
+	t.Run("Dhan-token-and-saved-selection-restart", func(t *testing.T) {
+		pool := dbtest.New(t)
+		ctx := context.Background()
+		expiry := time.Now().Add(time.Hour).UnixMilli()
+		// Restore an inactive Dhan token while Zerodha is explicitly selected.
+		// No real broker feed or REST call is needed by this standalone process.
+		if _, err := pool.Exec(ctx, `insert into active_broker (id, broker, generation) values ('current', 'zerodha', 7)`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `insert into dhan_session (id, access_token, dhan_client_id, expiry_time, login_date, token_source)
+			values ('current', 'process-fixture-dhan-token', '1100001', $1, '2026-11-04', 'BROKER_LOGIN')`, expiry); err != nil {
+			t.Fatal(err)
+		}
+		u, err := url.Parse(os.Getenv("TEST_DATABASE_URL"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		query := u.Query()
+		query.Set("search_path", pool.Config().ConnConfig.RuntimeParams["search_path"])
+		u.RawQuery = query.Encode()
+		check := func(s *runningServer, token string) {
+			var status struct {
+				Active, Authenticated, Persisted bool
+				Source                           string
+				TokenExpiresAt                   int64 `json:"token_expires_at"`
+			}
+			waitProcess(t, func() bool {
+				if !strings.Contains(s.request(t, "GET", "/api/admin/status", token, "", 200), `"role":"full"`) {
+					return false
+				}
+				body := s.request(t, "GET", "/api/dhan/status", token, "", 200)
+				if json.Unmarshal([]byte(body), &status) != nil || strings.Contains(body, "process-fixture-dhan-token") {
+					t.Fatal("invalid or unredacted Dhan restart status")
+				}
+				return status.Authenticated
+			})
+			if status.Active || !status.Persisted || status.Source != "BROKER_LOGIN" || status.TokenExpiresAt != expiry {
+				t.Fatal("persisted Dhan token/source/expiry did not restore independently of selection")
+			}
+			body := s.request(t, "GET", "/api/broker/status", token, "", 200)
+			if !strings.Contains(body, `"broker":"zerodha"`) || !strings.Contains(body, `"generation":7`) {
+				t.Fatal("saved broker selection/generation was replaced by the fresh-start default")
+			}
+		}
+		first := startServerWithEnv(t, binary, u.String(), "DHAN_CLIENT_ID=1100001\n")
+		token := first.login(t, "/api/admin/verify", "process-fixture-admin")
+		check(first, token)
+		first.stop(t, syscall.SIGTERM)
+		restarted := startServerWithEnv(t, binary, u.String(), "DHAN_CLIENT_ID=1100001\n")
+		check(restarted, token)
 		restarted.stop(t, syscall.SIGTERM)
 	})
 	t.Run("missing-Kite-credentials", func(t *testing.T) {

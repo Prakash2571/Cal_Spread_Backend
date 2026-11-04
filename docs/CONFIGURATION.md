@@ -28,6 +28,7 @@ missing/unreachable test database into failure rather than a skip.
 
 | Setting | Default | Meaning |
 |---|---|---|
+| `DEFAULT_BROKER` | dhan | Fresh-start broker (`dhan` or `zerodha`); a saved PostgreSQL selection takes precedence |
 | `KITE_API_KEY`, `KITE_API_SECRET` | required | Kite app credentials, required by startup contract |
 | `DHAN_CLIENT_ID` | empty | Dhan account identity for automatic token fetching and validated pasting |
 | `BROKER_LOGIN_URL` | empty | Shared env_home HTTPS origin, with no path/query; empty disables automatic fetching |
@@ -52,6 +53,11 @@ Configure `DHAN_CLIENT_ID` plus the four broker-login values above in the backen
 private `.env`. No service credential belongs in a `VITE_*` variable. The backend
 validates the service configuration at startup; invalid settings appear in the
 Broker panel and leave the paste-token fallback available.
+
+Dhan is the default when no broker selection has been saved. A previously selected
+broker restores from PostgreSQL, even if it differs from `DEFAULT_BROKER`. Fetching
+or pasting a Dhan token preserves that selection; choose Dhan in the Broker panel
+to switch an existing saved Zerodha installation.
 
 After `AUTO_LOGIN_TIME` every day, including weekends, the backend fetches a missing
 token, a token expiring today, or one with under five minutes left. A fresh saved

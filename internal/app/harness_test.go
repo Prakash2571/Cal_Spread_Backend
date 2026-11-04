@@ -227,6 +227,7 @@ func newHarness(t *testing.T, o harnessOptions) *harness {
 		}
 	}
 	env := map[string]string{
+		"DEFAULT_BROKER":  "zerodha", // explicit starting broker for retained Kite cases
 		"KITE_API_KEY":    "test-api-key",
 		"KITE_API_SECRET": "test-api-secret",
 		"ADMIN_SECRET":    testAdminSecret,
