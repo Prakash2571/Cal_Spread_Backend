@@ -84,3 +84,9 @@ The owned local PostgreSQL process was stopped after verification with its data
 retained. This receipt changes documentation only. To activate the fix on the
 live page, run `/home/calspread/Cal_Spread_Backend/scripts/deploy.sh` on the VM as
 `calspread`, then inspect the chart frame/baseline responses after recovery.
+
+The receipt commit's CI subsequently caught an inherited test-only race in
+`TestMemoryOnlyWithoutCache`'s shared log collector. Its writes/read snapshot are
+now synchronized: 50 race-enabled repetitions and the full required 32-package
+suite/build passed again. Publication/current-main CI for that test-only correction
+is the remaining verification step; the Dhan runtime remains the tested feature.

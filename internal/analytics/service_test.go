@@ -900,6 +900,7 @@ func TestMemoryOnlyWithoutCache(t *testing.T) {
 	clk := &testClock{}
 	clk.set(istT(2026, 10, 27, 10, 0, 57))
 	var logs []string
+	var logMu sync.Mutex
 	timers := &fakeTimers{}
 	s := New(Deps{
 		Instruments:    func(context.Context) ([]market.Instrument, error) { return uni, nil },
@@ -907,7 +908,11 @@ func TestMemoryOnlyWithoutCache(t *testing.T) {
 		CaptureAllowed: allow,
 		Now:            clk.now,
 		AfterFunc:      timers.afterFunc,
-		Logf:           func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) },
+		Logf: func(f string, a ...any) {
+			logMu.Lock()
+			defer logMu.Unlock()
+			logs = append(logs, fmt.Sprintf(f, a...))
+		},
 	})
 	s.prevClose = &PrevClose{ForDay: "2026-10-27", Expiry: "2026-10-27", Complete: true, Tokens: map[int64]OiLtp{}}
 	s.WarmLoad(context.Background())
@@ -925,13 +930,16 @@ func TestMemoryOnlyWithoutCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	disabled := 0
-	for _, l := range logs {
+	logMu.Lock()
+	capturedLogs := append([]string(nil), logs...)
+	logMu.Unlock()
+	for _, l := range capturedLogs {
 		if strings.HasPrefix(l, "[Cache] DATABASE_URL not set") {
 			disabled++
 		}
 	}
 	if disabled != 1 {
-		t.Fatalf("disabled notice logged %d times: %q", disabled, logs)
+		t.Fatalf("disabled notice logged %d times: %q", disabled, capturedLogs)
 	}
 	s.Start()
 	if got := timers.pending(); js(got) != "[60000,1800000]" { // no flush-retry timer; 10:00:57 re-arms a minute on

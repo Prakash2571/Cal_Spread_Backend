@@ -1,8 +1,8 @@
 # Status: Restore analytics history with Dhan active
 
-State: Done
+State: Doing
 Updated: 2026-11-04
-Next action: On the VM as calspread, run /home/calspread/Cal_Spread_Backend/scripts/deploy.sh, then verify option/futures frame and baseline endpoints have recovered data.
+Next action: Commit and push the verified existing-test log synchronization, watch current main CI, then publish the completion/rollout receipt.
 Blockers: none
 WIP override: none
 
@@ -16,8 +16,10 @@ ZerodhaCaptureGate and direct Kite quotes, preventing Dhan capture/backfill.
 All analytics paths now follow Dhan's providers when active; native
 record/backfill/baseline, cache restoration and namespace fencing are implemented.
 The required local suite/build/module checks passed. Runtime 13a0ab8 is published
-on GitHub main; matching CI 41808216441 completed successfully. Implementation
-and GitHub verification are complete; the live VM rollout is the next action.
+on GitHub main; matching feature CI 41808216441 completed successfully. The
+receipt commit's CI 41808832910 exposed a race in the existing memory-only test's
+shared log slice. Its collector is now synchronized; current-main verification
+is in progress before the operator's live VM rollout.
 
 ## Completed
 
@@ -63,6 +65,12 @@ and GitHub verification are complete; the live VM rollout is the next action.
   PostgreSQL/race tests, module sync, standalone binary and artifact upload succeeded.
 - Confirmed zero leftover test schemas and stopped the owned local PostgreSQL
   process; cluster data and authorized tool/cache directories remain in scratch.
+- Current-main receipt CI exposed an inherited test-only race: the memory-only
+  test's Logf callback appended to one slice from capture/backfill goroutines
+  without a mutex. Synchronized collection and its snapshot read; application
+  runtime source is unchanged by this correction.
+- The corrected memory-only test passed 50 race-enabled repetitions, and the
+  complete required backend suite/build passed again for all 32 tested packages.
 
 ## Checks
 
@@ -89,6 +97,10 @@ and GitHub verification are complete; the live VM rollout is the next action.
 | 2026-11-04 | `gh run list --branch main --commit 13a0ab8aa1d7c23e00cab2d585aea90504032f04 --workflow ci.yml --event push --json databaseId,headSha,status,conclusion,url` | Exit 0; matching run 41808216441 found in progress. |
 | 2026-11-04 | `gh run watch 41808216441 --interval 20 --exit-status && gh run view 41808216441 --json headSha,status,conclusion,url,jobs` | Exit 0; completed success, exact runtime SHA matched, every required check/build/module/artifact step successful. |
 | 2026-11-04 | `bash scratch/dhan-default-check/check.sh psql --no-psqlrc 'postgres://calspread@127.0.0.1:55472/calspread_test?sslmode=disable' --set=ON_ERROR_STOP=1 --command "select count(*) as remaining_test_schemas from pg_namespace where nspname ~ '^t_[0-9a-f]{12}$'" && bash scratch/dhan-default-check/check.sh make db-stop && git diff --check` | Exit 0; zero leftover disposable schemas, owned PostgreSQL stopped with data retained, clean receipt whitespace. |
+| 2026-11-04 | `gh run watch 41808832910 --interval 20 --exit-status && gh run view 41808832910 --json headSha,status,conclusion,url,jobs` | Failed: receipt main b1df3c1 CI completed failure, so the chained view did not run. |
+| 2026-11-04 | `gh run view 41808832910 --json headSha,status,conclusion,url,jobs` and `gh run view 41808832910 --log-failed` | Exit 0; isolated race at service_test.go:910 in TestMemoryOnlyWithoutCache's unsynchronized log slice, called concurrently by capture and cold-start backfill. Other packages including the Dhan App/registry checks passed. |
+| 2026-11-04 | `bash scratch/dhan-default-check/check.sh env GOPROXY=off go test -race -count=50 -timeout 120s -run '^TestMemoryOnlyWithoutCache$' ./internal/analytics && bash scratch/dhan-default-check/check.sh gofmt -d internal/analytics/service_test.go && git diff --check` | Exit 0; all 50 memory-only race repetitions passed, no formatting/whitespace issues. |
+| 2026-11-04 | `bash scratch/dhan-default-check/check.sh make db-start && bash scratch/dhan-default-check/check.sh env GOPROXY=off TEST_DATABASE_URL='postgres://calspread@127.0.0.1:55472/calspread_test?sslmode=disable' make check && bash scratch/dhan-default-check/check.sh env GOPROXY=off make build && git diff --check` | Exit 0; owned database resumed, required full 32-package PostgreSQL/race/build/vet/format/module suite and standalone binary passed after the collector correction. |
 
 ## Publication and rollout
 
