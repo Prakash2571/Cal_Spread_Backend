@@ -72,4 +72,15 @@ Startup restores/reconstructs Dhan history; the existing page polls its frame an
 baseline APIs. If broker history is unavailable, charts need completed live
 buckets, and delta charts need adjacent valid buckets.
 
-GitHub publication and matching CI verification are the current next action.
+## GitHub publication
+
+Runtime [13a0ab8](https://github.com/Prakash2571/Cal_Spread_Backend/commit/13a0ab8aa1d7c23e00cab2d585aea90504032f04)
+is published on backend main. The normal push succeeded with a clean worktree;
+[matching GitHub CI 41808216441](https://github.com/Prakash2571/Cal_Spread_Backend/actions/runs/41808216441)
+completed **success** on that exact runtime. Required PostgreSQL/race, build/vet/format,
+module-file sync and standalone binary/artifact checks all passed.
+
+The owned local PostgreSQL process was stopped after verification with its data
+retained. This receipt changes documentation only. To activate the fix on the
+live page, run `/home/calspread/Cal_Spread_Backend/scripts/deploy.sh` on the VM as
+`calspread`, then inspect the chart frame/baseline responses after recovery.
