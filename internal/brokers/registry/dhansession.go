@@ -175,8 +175,9 @@ func (r *Registry) CompleteDhanLogin(ctx context.Context, tokenID string) (Sessi
 }
 
 // restartDhanRuntime restores each lane's own subscriptions on the new token.
-// Token-service/paste replacements recycle both sockets, including Synthetic's lane.
+// Token-service/paste replacements recycle browser, Synthetic and Spike sockets.
 func (r *Registry) restartDhanRuntime(ctx context.Context, bothLanes bool) {
+	r.recycleSpikeFeed()
 	// Warm the universe now so the first scan is not waiting on a multi-MB CSV.
 	r.background(func() {
 		if _, err := r.dhanInstruments.Load(context.Background(), false); err != nil {
@@ -225,6 +226,7 @@ func (r *Registry) restartDhanRuntime(ctx context.Context, bothLanes bool) {
 		if h := r.getHooks(); h.Publish != nil {
 			h.Publish()
 		}
+		r.replaySpikeFeed()
 		if h := r.getHooks(); h.OnRuntimeReady != nil {
 			h.OnRuntimeReady()
 		}
@@ -241,6 +243,7 @@ func (r *Registry) LogoutDhan(ctx context.Context) {
 	r.brokerLogin.mu.Unlock()
 	_, _, meta := r.dhanSession()
 	r.setDhanSession(nil, nil, nil)
+	r.recycleSpikeFeed()
 	if f := r.currentDhanFeed(); f != nil {
 		f.stop()
 	}
@@ -274,7 +277,7 @@ func (r *Registry) onDhanFeedSessionLost(lane *dhanLane, reason string) {
 	r.opMu.Lock()
 	defer r.opMu.Unlock()
 	r.mu.Lock()
-	current := lane == r.dhanFeed || lane == r.boxDhanFeed
+	current := lane == r.dhanFeed || lane == r.boxDhanFeed || lane == r.spikeDhanFeed
 	r.mu.Unlock()
 	if current {
 		r.onDhanSessionLost(reason)
@@ -282,8 +285,9 @@ func (r *Registry) onDhanFeedSessionLost(lane *dhanLane, reason string) {
 }
 
 // onDhanSessionLost handles a session that died mid-flight: fail closed. Token-based
-// sessions stop both Dhan lanes; legacy consent sessions keep their original behavior.
+// sessions stop every Dhan lane; legacy consent sessions keep their original behavior.
 func (r *Registry) onDhanSessionLost(reason string) {
+	r.recycleSpikeFeed()
 	log.Printf("[Dhan] session lost: %s", reason)
 	r.sessMu.Lock()
 	token, meta := r.dhanToken, r.dhanMeta

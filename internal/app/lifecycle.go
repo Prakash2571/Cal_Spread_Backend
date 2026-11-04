@@ -94,6 +94,11 @@ func (a *App) Start(ctx context.Context) {
 			a.analyticsStarted = true
 			a.mu.Unlock()
 		}},
+		{"Spike boot", func() {
+			if err := a.spike.Start(ctx); err != nil {
+				a.logf("[Spike] boot: %v", err)
+			}
+		}},
 		{"Synthetic boot", func() { a.background(a.synth.Boot, "[Synthetic] boot failed: %v") }},
 		{"Fair Value boot", func() { a.background(a.fv.Boot, "[Fair Value] boot failed: %v") }},
 	}
@@ -228,7 +233,7 @@ func (a *App) shutdownSteps() []lifecycle.Step {
 	}
 	return []lifecycle.Step{
 		// Detection only; it ends its SSE streams so the HTTP drain is not held open.
-		step(stepSynthetic, func(context.Context) error { a.synth.Dispose(); return nil }),
+		step(stepSynthetic, func(ctx context.Context) error { a.synth.Dispose(); return a.spike.Stop(ctx) }),
 		step(stepFairValue, func(context.Context) error { a.fv.Dispose(); return nil }),
 		step(stepHTTP, a.stopHTTP),
 		step(stepSchedulers, a.stopSchedulers),

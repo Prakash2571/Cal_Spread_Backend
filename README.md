@@ -95,7 +95,7 @@ broker data and an isolated PostgreSQL test schema; it is not part of the server
 - Exactly one active broker, Zerodha or Dhan, with persisted session restoration,
   broker switching and token-namespace invalidation.
 - Cached instrument masters, F&O board/stock lookups, REST quote seeds, Dhan
-  binary feeds, refcounted subscriptions and two isolated market-data lanes.
+  binary feeds, refcounted browser/Synthetic lanes and a dedicated Spike chain lane.
 - Session-backed SSE avoids large token-list URLs; reconnects keep the session,
   broker/generation changes invalidate it, and slow clients are bounded.
 - Futures-lane liveness is tracked independently of analytics scanners.
@@ -113,7 +113,12 @@ broker data and an isolated PostgreSQL test schema; it is not part of the server
   OI frames and retained straddle/spot history. PostgreSQL backs cache write-behind,
   TTL expiry and shutdown flushing; bounded in-process read caches remain in memory.
 
-### Synthetic and Fair Value
+### Spike, Synthetic and Fair Value
+
+- **Spike** continuously monitors Dhan NIFTY/SENSEX minimum CE+PE straddles and
+  leg-VWAP sums, with separate 1m/5m/30m/1h charts, exact rolling-30-minute 5%
+  crossover entries, one-lot fourth-OTM paper spreads and manual exit P&L.
+  It reuses existing configuration; see [the Spike guide](docs/SPIKE.md).
 
 - **Synthetic** retains ATM ±1/2/3 same-expiry conversion/reversal pricing,
   one-lot paper entries/exits, saved controls, fill evidence, margins, day P&L,
@@ -124,7 +129,7 @@ broker data and an isolated PostgreSQL test schema; it is not part of the server
   See [the mathematical/configuration guide](docs/FAIR_VALUE.md).
 
 The API consists of **83 retained non-Box routes plus two full-admin Dhan
-token-service/paste routes**. Unknown routes,
+token-service/paste routes and five authenticated Spike routes**. Unknown routes,
 including `/api/box/*`, return 404. Shared historical `BOX_*` charge/feed-budget
 environment names and a few legacy diagnostic JSON names remain for contract
 compatibility; they do not enable a Box scanner or live broker order placement.
@@ -136,7 +141,7 @@ compatibility; they do not enable a Box scanner or live broker order placement.
 - `cmd/server/`: environment, listener and signal handling.
 - `internal/app/`: wiring, boot, hooks and ordered shutdown.
 - `internal/db/migrations/`: embedded schema migrations; `internal/kv/`: expiring cache.
-- `internal/{core,calendar,analytics,captures,synthetic,fairvalue}/`: retained services.
+- `internal/{core,calendar,analytics,captures,synthetic,fairvalue,spike}/`: application services.
 - `internal/{kite,hub,brokers,marketdata}/`: providers, transports, lanes and SSE.
 - `internal/parity/testdata/`: pinned original route, shutdown, retained-suite and golden SHA-256 specifications.
 - [`docs/REFERENCE_PROVENANCE.md`](docs/REFERENCE_PROVENANCE.md): verified checkpoint and original-source/generator provenance.

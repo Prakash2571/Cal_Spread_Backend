@@ -170,7 +170,9 @@ type Hooks struct {
 	OnSessionLost func(broker brokers.ID, reason string)
 	// OnRuntimeReady reconciles broker-neutral consumers after a selection or a
 	// new active session. It must enqueue work and return promptly.
-	OnRuntimeReady func()
+	OnRuntimeReady    func()
+	OnSpikeTicks      func([]market.Tick)
+	OnSpikeConnection func(bool)
 }
 
 type brokerState struct {
@@ -227,6 +229,7 @@ type Registry struct {
 	hooks            Hooks
 	dhanFeed         *dhanLane
 	boxDhanFeed      *dhanLane
+	spikeDhanFeed    *dhanLane
 	boxLaneFeed      LaneFeed
 	lastMarginSource *market.MarginSource
 	ip               ipVerdict
@@ -235,11 +238,12 @@ type Registry struct {
 	dhanClient      *dhan.Client
 	dhanInstruments *dhan.InstrumentStore
 
-	subscriptions    *brokers.Coordinator
-	boxSubscriptions *brokers.Coordinator
-	instruments      *InstrumentProvider
-	quotes           *QuoteProvider
-	history          *HistoryProvider
+	subscriptions      *brokers.Coordinator
+	boxSubscriptions   *brokers.Coordinator
+	spikeSubscriptions *brokers.Coordinator
+	instruments        *InstrumentProvider
+	quotes             *QuoteProvider
+	history            *HistoryProvider
 }
 
 // New builds the registry: Dhan active by default, generation 1, no Dhan session,
@@ -286,6 +290,7 @@ func New(deps Deps) *Registry {
 	// only then touches the ACTIVE broker's socket for that lane.
 	r.subscriptions = brokers.NewCoordinator(laneTransport{r, brokers.LaneFutures}, brokers.LaneFutures)
 	r.boxSubscriptions = brokers.NewCoordinator(laneTransport{r, brokers.LaneBox}, brokers.LaneBox)
+	r.spikeSubscriptions = brokers.NewCoordinator(spikeTransport{r}, spikeLane)
 	r.instruments = &InstrumentProvider{r: r, caches: map[brokers.ID]*instrumentCache{},
 		generationAt: map[brokers.ID]int64{}, inFlight: map[brokers.ID]*instrumentLoad{}}
 	r.quotes = &QuoteProvider{r: r}
@@ -603,6 +608,7 @@ func (r *Registry) currentDhanFeed() *dhanLane {
 // (the next use builds fresh ones under the new generation); the futures Dhan feed is
 // kept, stopped but restartable, as in Node.
 func (r *Registry) stopAllLanes() {
+	r.recycleSpikeFeed()
 	r.mu.Lock()
 	futDhan, boxLane, boxDhan := r.dhanFeed, r.boxLaneFeed, r.boxDhanFeed
 	r.boxLaneFeed, r.boxDhanFeed = nil, nil
@@ -644,7 +650,7 @@ func (r *Registry) StopFeeds() { r.stopAllLanes() }
 // flushFeeds waits until every queued Dhan feed operation has run (tests).
 func (r *Registry) flushFeeds() {
 	r.mu.Lock()
-	lanes := []*dhanLane{r.dhanFeed, r.boxDhanFeed}
+	lanes := []*dhanLane{r.dhanFeed, r.boxDhanFeed, r.spikeDhanFeed}
 	r.mu.Unlock()
 	for _, l := range lanes {
 		if l != nil {

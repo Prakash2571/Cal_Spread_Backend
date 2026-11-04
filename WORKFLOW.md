@@ -7,4 +7,4 @@ Use the active broker's providers, subscription coordinator and existing admin r
 validation. Local PostgreSQL setup is `make db-start`. No broker order-placement
 transport exists; do not add deployment operations to local migration work.
 
-Current cross-repository task: `tasks/2026-11-03-broker-login-token/`.
+Current cross-repository task: `tasks/2026-11-04-spike-paper-straddles/`.

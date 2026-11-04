@@ -49,6 +49,12 @@ type Tick struct {
 	// ExchangeTS is the exchange timestamp in epoch ms (one-second resolution on Kite);
 	// nil when the packet carried none.
 	ExchangeTS *int64 `json:"exchange_ts,omitempty"`
+	// Broker-native metadata for headless strategies; legacy browser tick JSON
+	// stays unchanged. Dhan average traded price is that contract's day VWAP.
+	AveragePrice   *float64           `json:"-"`
+	PriceUpdated   *bool              `json:"-"`
+	AverageUpdated *bool              `json:"-"`
+	Namespace      *brokers.Namespace `json:"-"`
 }
 
 // RestQuote is the minimal REST quote the strategies use.

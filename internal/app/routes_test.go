@@ -151,6 +151,12 @@ func TestRouteInventoryMatchesNodeWithoutBox(t *testing.T) {
 		}
 		listed[route] = true
 	}
+	for _, route := range []string{"GET /api/spike/status", "GET /api/spike/series", "POST /api/spike/paper", "POST /api/spike/trades/{}/close", "GET /api/spike/stream"} {
+		if !mounted[route] {
+			t.Errorf("Spike route is not mounted: %s", route)
+		}
+		listed[route] = true
+	}
 	for k := range mounted {
 		if !listed[k] {
 			extra = append(extra, k)

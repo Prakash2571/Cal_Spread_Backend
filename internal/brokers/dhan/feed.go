@@ -71,14 +71,15 @@ type FeedOptions struct {
 
 // FeedState is the accumulated per-instrument state a partial packet is merged into.
 type FeedState struct {
-	Token      int64
-	LastPrice  float64
-	ClosePrice float64
-	OI         float64
-	Volume     float64
-	Bids       []market.DepthLevel
-	Asks       []market.DepthLevel
-	ReceivedAt int64
+	Token        int64
+	LastPrice    float64
+	ClosePrice   float64
+	OI           float64
+	Volume       float64
+	AveragePrice float64 `json:"-"`
+	Bids         []market.DepthLevel
+	Asks         []market.DepthLevel
+	ReceivedAt   int64
 }
 
 // ToTick is toTick: accumulated state → Tick. Best bid/ask come from the ladders (0
@@ -110,6 +111,7 @@ func ToTick(state FeedState, depthUpdated bool) market.Tick {
 		Bids:         bids,
 		Asks:         asks,
 		DepthUpdated: &du,
+		AveragePrice: &state.AveragePrice,
 	}
 }
 
@@ -529,7 +531,12 @@ func (f *Feed) handleFrameLocked(buf []byte, now int64) {
 		f.subscribed[token] = struct{}{}
 		merged := f.mergeLocked(token, p, now)
 		// Provenance comes from THIS packet, never from the merged state.
-		ticks = append(ticks, ToTick(*merged, p.Bids != nil || p.Asks != nil))
+		tick := ToTick(*merged, p.Bids != nil || p.Asks != nil)
+		priceUpdated := p.LastPrice != nil
+		tick.PriceUpdated = &priceUpdated
+		averageUpdated := p.AveragePrice != nil
+		tick.AverageUpdated = &averageUpdated
+		ticks = append(ticks, tick)
 	}
 	if len(ticks) == 0 {
 		return
@@ -600,6 +607,9 @@ func (f *Feed) mergeLocked(token int64, p *Packet, now int64) *FeedState {
 	}
 	if p.Volume != nil {
 		next.Volume = float64(*p.Volume)
+	}
+	if p.AveragePrice != nil {
+		next.AveragePrice = *p.AveragePrice
 	}
 	// An empty ladder on a FULL packet is a real observation and overwrites.
 	if p.Bids != nil {

@@ -29,6 +29,7 @@ var wantBoot = []string{
 	"restore the risk-free rate",
 	"hourly capture scheduler, backfill and day review",
 	"analytics warm load and capture schedulers",
+	"Spike boot",
 	"Synthetic boot",
 	"Fair Value boot",
 }

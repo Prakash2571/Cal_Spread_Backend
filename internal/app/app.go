@@ -41,6 +41,7 @@ import (
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/market"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/marketdata"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/server"
+	"github.com/Prakash2571/Cal_Spread_Backend/internal/spike"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/store"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/synthetic"
 )
@@ -82,6 +83,7 @@ type Options struct {
 	BrokerLoginHTTPClient *http.Client
 	// AnalyticsNow replaces only the analytics clock for deterministic HTTP checks.
 	AnalyticsNow func() time.Time
+	SpikeNow     func() time.Time // deterministic strategy time in loopback checks
 	// YahooChartRoot and YahooHTTPClient replace the dividend-yield endpoint.
 	YahooChartRoot  string
 	YahooHTTPClient *http.Client
@@ -113,6 +115,7 @@ type App struct {
 	calendar  *calendar.Service
 	captures  *captures.Service
 	synth     *synthetic.Engine
+	spike     *spike.Engine
 	fv        *fairvalue.Engine
 	fvRows    *fvInstruments
 
@@ -321,6 +324,14 @@ func New(cfg config.Config, opts Options) (*App, error) {
 	})
 	a.hub.AddTickListener(a.fv.IngestTicks)
 	a.hub.AddConnectionListener(func(bool) { a.fv.Invalidate() })
+	a.spike = spike.New(spike.Deps{
+		Namespace: reg.Namespace,
+		Ready: func() bool {
+			return !reg.Switching() && reg.ActiveBroker() == brokers.Dhan && reg.MarketData().IsAuthenticated()
+		},
+		Instruments: c.AllInstruments, SetTokens: reg.SetSpikeTokens,
+		Store: &spike.Store{Pool: a.pool}, Now: opts.SpikeNow,
+	})
 
 	// brokerManager.attach(): the teardown hooks a switch needs, plus the constructor
 	// callbacks whose consumers exist only now.
@@ -336,6 +347,7 @@ func New(cfg config.Config, opts Options) (*App, error) {
 		InvalidateBooks: func() {
 			a.note("hook: invalidate books")
 			a.analytics.InvalidateNamespace()
+			a.spike.Invalidate()
 			a.synth.InvalidateNamespace()
 			a.fv.InvalidateNamespace()
 		},
@@ -353,7 +365,9 @@ func New(cfg config.Config, opts Options) (*App, error) {
 			a.note("hook: session lost")
 			a.synth.Stop()
 		},
-		OnRuntimeReady: a.analytics.OnBrokerReady,
+		OnRuntimeReady:    func() { a.analytics.OnBrokerReady(); a.spike.OnRuntimeReady() },
+		OnSpikeTicks:      a.spike.OnTicks,
+		OnSpikeConnection: a.spike.OnConnection,
 	})
 
 	a.handler = server.New(server.Options{FrontendOrigin: cfg.FrontendURL}, a.mounts()...)
@@ -411,6 +425,7 @@ func (a *App) mounts() []func(chi.Router) {
 		(&auth.Routes{Sessions: sessions, AdminSecret: a.cfg.AdminSecret, AccessSecret: a.cfg.AccessSecret, Brokers: a.reg}).Mount,
 		a.analytics.Mount,
 		a.calendar.Mount,
+		func(r chi.Router) { spike.Mount(r, a.spike, sessions) },
 		func(r chi.Router) { synthetic.Register(r, a.synth, synthetic.RouteDeps{Role: sessions.Role}) },
 		func(r chi.Router) {
 			fairvalue.Mount(r, fairvalue.RouteDeps{Engine: a.fv, IsFullAdmin: func(t string) bool { return sessions.Role(t) == auth.RoleFull }})

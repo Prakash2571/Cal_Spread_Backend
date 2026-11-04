@@ -53,10 +53,13 @@ type fixture struct {
 	blocked        atomic.Int64
 	tokenAvailable atomic.Bool
 	tokenRequests  atomic.Int64
+	spikeStage     atomic.Int64
+	spikeAt        atomic.Int64
 }
 
 func newFixture() *fixture {
 	f := &fixture{byToken: map[int64]market.Instrument{}, bySymbol: map[string]int64{}, requests: map[string]int{}}
+	f.initSpike()
 	now := time.Now().UTC()
 	first := time.Date(now.Year(), now.Month(), 20, 10, 0, 0, 0, time.UTC)
 	if !first.After(now.Add(24 * time.Hour)) {
@@ -115,6 +118,12 @@ func success(w http.ResponseWriter, data any) {
 
 func (f *fixture) upstream(w http.ResponseWriter, r *http.Request) {
 	switch {
+	case r.URL.Path == "/spike-feed":
+		f.spikeFeed(w, r)
+	case r.URL.Path == "/marketfeed/quote":
+		f.spikeMarketQuote(w, r)
+	case r.URL.Path == "/charts/intraday" || r.URL.Path == "/charts/historical":
+		_ = json.NewEncoder(w).Encode(map[string]any{"timestamp": []int{}, "close": []float64{}, "open_interest": []int{}})
 	case r.URL.Path == "/instruments":
 		w.Header().Set("Content-Type", "text/csv")
 		out := csv.NewWriter(w)
@@ -138,7 +147,7 @@ func (f *fixture) upstream(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"dhanClientId": "1100001", "tokenValidity": time.Now().Add(24 * time.Hour).UnixMilli()})
 	case r.URL.Path == "/scrip-master.csv":
 		w.Header().Set("Content-Type", "text/csv")
-		_, _ = fmt.Fprintf(w, "EXCH_ID,SEGMENT,SECURITY_ID,INSTRUMENT,SYMBOL_NAME,UNDERLYING_SECURITY_ID,LOT_SIZE,TICK_SIZE,EXPIRY_DATE\nNSE,D,1000,FUTSTK,TEST-FUT,1,50,0.05,%s\n", f.expiries[0].Format("2006-01-02"))
+		_, _ = fmt.Fprint(w, f.spikeMaster())
 	case strings.HasPrefix(r.URL.Path, "/quote"):
 		quotes := map[string]any{}
 		for _, key := range r.URL.Query()["i"] {
@@ -345,7 +354,8 @@ func run() error {
 	patch.Set("forward_interpolation", "log_carry_assumption")
 	patch.Set("history_interval_ms", 10000.0)
 	env := map[string]string{"KITE_API_KEY": "loopback-fixture-key", "KITE_API_SECRET": "loopback-fixture-secret",
-		"ADMIN_SECRET": "loopback-fixture-admin", "ACCESS_SECRET": "loopback-fixture-trade", "FRONTEND_URL": *frontend,
+		"DEFAULT_BROKER": "zerodha", // retained board/valuation workflows explicitly begin here
+		"ADMIN_SECRET":   "loopback-fixture-admin", "ACCESS_SECRET": "loopback-fixture-trade", "FRONTEND_URL": *frontend,
 		"DHAN_CLIENT_ID": "1100001", "BROKER_LOGIN_URL": tokenService.URL,
 		"BROKER_LOGIN_CF_CLIENT_ID": "loopback-fixture-cf-id", "BROKER_LOGIN_CF_CLIENT_SECRET": "loopback-fixture-cf-secret",
 		"DHAN_TOKEN_API_SEED": "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
@@ -355,7 +365,8 @@ func run() error {
 		KiteAPIRoot: upstream.URL, KiteLoginRoot: upstream.URL, KiteHTTPClient: client, TickerConnect: f.connect,
 		KiteTickerURL: "ws://127.0.0.1:1", YahooChartRoot: upstream.URL, YahooHTTPClient: client,
 		BrokerLoginHTTPClient: tokenClient,
-		Dhan: registry.DhanConfig{APIRoot: upstream.URL, AuthRoot: upstream.URL, FeedURL: "ws://127.0.0.1:1",
+		SpikeNow:              func() time.Time { return time.UnixMilli(f.spikeAt.Load()) },
+		Dhan: registry.DhanConfig{APIRoot: upstream.URL, AuthRoot: upstream.URL, FeedURL: spikeFeedURL(upstream.URL),
 			ScripMasterURLs: []string{upstream.URL + "/scrip-master.csv"}, HTTPClient: client}})
 	if err != nil {
 		return err
@@ -363,11 +374,27 @@ func run() error {
 	if err := f.seed(pool); err != nil {
 		return err
 	}
+	if err := f.seedSpike(pool); err != nil {
+		return err
+	}
 	a.Start(context.Background())
 	// Inspectable verification metadata; every application request still goes through
 	// App's actual middleware/routes. No authentication or valuations are stubbed here.
 	api := a.Handler()
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && r.URL.Path == "/__fixture/spike" {
+			var request struct {
+				Stage int `json:"stage"`
+			}
+			if json.NewDecoder(r.Body).Decode(&request) != nil || request.Stage < 0 || request.Stage > 3 {
+				http.Error(w, "invalid stage", 400)
+				return
+			}
+			f.spikeStage.Store(int64(request.Stage))
+			f.spikeAt.Add(60_000)
+			_ = json.NewEncoder(w).Encode(map[string]any{"stage": request.Stage, "t": f.spikeAt.Load()})
+			return
+		}
 		if r.Method == "POST" && r.URL.Path == "/__fixture/token-service" {
 			var request struct {
 				Available bool `json:"available"`

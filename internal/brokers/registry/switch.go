@@ -70,6 +70,7 @@ func (r *Registry) SwitchTo(ctx context.Context, target brokers.ID, actor string
 		//    tokens belong to the outgoing namespace), and every browser stream session
 		ft, fl := r.subscriptions.ResetForBrokerSwitch()
 		bt, bl := r.boxSubscriptions.ResetForBrokerSwitch()
+		r.spikeSubscriptions.ResetForBrokerSwitch()
 		log.Printf("[Broker] %d futures + %d box subscription(s) cleared (%d lease(s))", ft, bt, fl+bl)
 		if hooks.DropMarketDataSessions != nil {
 			if n := hooks.DropMarketDataSessions(); n > 0 {
