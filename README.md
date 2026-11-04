@@ -148,5 +148,11 @@ defaults to 12 seconds; a timeout exits nonzero. Persisted paper positions remai
 available for adoption on the next boot. The source retains the previous capture boot
 ordering; the next broker login triggers post-login capture/backfill reconciliation.
 
-This migration is prepared and verified for local use. EC2 deployment is handled by
-the repository owner; the old Node/PM2 deployment script is retired.
+For the VM deployment at `https://calspread.online`, see
+[`deploy/README.md`](deploy/README.md) for the Nginx, Certbot, systemd and PostgreSQL
+configuration, service commands and update procedure. The old Node/PM2 deployment
+script is retired.
+
+To rebuild and deploy both checkouts on the configured VM, run
+`./scripts/deploy.sh` as `calspread`. It checks the production database, restarts
+the Go service, reloads Nginx and verifies HTTPS.
