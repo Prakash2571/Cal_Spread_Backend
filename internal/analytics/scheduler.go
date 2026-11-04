@@ -144,9 +144,51 @@ func (s *Service) armFlushRetry() {
 // backfill → futures backfill → previous close → coarsening → flush run in sequence on a
 // goroutine. Not market-hours gated. The hourly/EOD backfills are the captures package's.
 func (s *Service) OnKiteLogin() {
-	optFrom := s.oiBackfillFromMs(s.nowMs())
-	futFrom := s.futOiBackfillFromMs(s.nowMs())
+	s.startRecovery(true)
+}
+
+// OnBrokerReady reconciles the active broker after a selection or token change.
+// Boot already runs the cold-start chain; repeated ready events coalesce.
+func (s *Service) OnBrokerReady() {
+	s.startRecovery(false)
+}
+
+func (s *Service) startRecovery(force bool) {
+	s.syncNamespace()
+	s.mu.Lock()
+	if s.stopped || (!s.started && !force) {
+		s.mu.Unlock()
+		return
+	}
+	if s.recoveryRunning {
+		s.recoveryAgain = true
+		s.mu.Unlock()
+		return
+	}
+	s.recoveryRunning = true
+	s.mu.Unlock()
 	s.goAsync(func(ctx context.Context) {
+		defer func() {
+			s.mu.Lock()
+			s.recoveryRunning = false
+			again := s.recoveryAgain
+			s.recoveryAgain = false
+			s.mu.Unlock()
+			if again {
+				s.OnBrokerReady()
+			}
+		}()
+		s.mu.Lock()
+		warm := s.scopeWarm
+		s.mu.Unlock()
+		if !warm {
+			s.WarmLoad(ctx)
+		}
+		if s.checkOperation(ctx) != nil {
+			return
+		}
+		optFrom := s.oiBackfillFromMs(s.nowMs())
+		futFrom := s.futOiBackfillFromMs(s.nowMs())
 		s.captureOptionOi(ctx)
 		s.captureFuturesOi(ctx)
 		s.backfillOiFrames(ctx, &optFrom)

@@ -225,6 +225,9 @@ func (r *Registry) restartDhanRuntime(ctx context.Context, bothLanes bool) {
 		if h := r.getHooks(); h.Publish != nil {
 			h.Publish()
 		}
+		if h := r.getHooks(); h.OnRuntimeReady != nil {
+			h.OnRuntimeReady()
+		}
 	}
 }
 

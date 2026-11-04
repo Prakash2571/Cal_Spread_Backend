@@ -66,6 +66,7 @@ type flushBatch struct {
 func (s *Service) cacheEnabled() bool { return s.d.Cache != nil && s.d.Cache.Enabled() }
 
 func (s *Service) pendingForLocked(key string, ttlSec int64, maxFields int) *pendingHash {
+	key = s.cacheKeyLocked(key)
 	p, ok := s.pendingHash.Get(key)
 	if !ok {
 		p = &pendingHash{entries: newOmap[string, any](), stale: newOmap[string, struct{}](), ttlSec: ttlSec, maxFields: maxFields}
@@ -106,7 +107,7 @@ func (s *Service) queuePlainWriteLocked(key string, value any, ttlSec int64) {
 	if !s.cacheEnabled() {
 		return
 	}
-	s.pendingPlain.Set(key, plainWrite{value: value, ttlSec: ttlSec})
+	s.pendingPlain.Set(s.cacheKeyLocked(key), plainWrite{value: value, ttlSec: ttlSec})
 }
 
 func (s *Service) hasPendingLocked() bool { return s.pendingHash.Len() > 0 || s.pendingPlain.Len() > 0 }
@@ -349,7 +350,7 @@ func (s *Service) requeueFailedWritesLocked(hashes *omap[string, *pendingHash], 
 		for _, f := range fields[:over] {
 			p.entries.Delete(f)
 		}
-		s.logf("[Cache] %s: dropped %d buffered buckets (cache unreachable; they stay recoverable from Kite).", key, over)
+		s.logf("[Cache] %s: dropped %d buffered buckets (cache unreachable; they stay recoverable from %s).", key, over, s.historySource())
 	}
 }
 

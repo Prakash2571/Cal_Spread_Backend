@@ -26,8 +26,16 @@ func (q *QuoteProvider) QuotesByToken(ctx context.Context, tokens []int64) ([]ma
 	if len(tokens) == 0 {
 		return []market.Tick{}, nil
 	}
-	if q.r.ActiveBroker() == brokers.Dhan {
-		return q.dhanQuotes(ctx, tokens), nil
+	namespace, err := q.r.namespaceFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if namespace.Broker == brokers.Dhan {
+		quotes := q.dhanQuotes(ctx, tokens)
+		if _, err := q.r.namespaceFor(ctx); err != nil {
+			return nil, err
+		}
+		return quotes, nil
 	}
 	return q.kiteQuotes(ctx, tokens)
 }

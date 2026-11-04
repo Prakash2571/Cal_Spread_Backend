@@ -50,8 +50,11 @@ type InstrumentProvider struct {
 // share one fetch, a forced call always starts its own. The Dhan path goes through the
 // Dhan master's own one-hour cache, so force does not force a Dhan re-download.
 func (p *InstrumentProvider) Load(ctx context.Context, force bool) ([]market.Instrument, error) {
-	broker := p.r.ActiveBroker()
-	generation := p.r.Generation()
+	namespace, err := p.r.namespaceFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	broker, generation := namespace.Broker, namespace.Generation
 	now := p.r.nowMs()
 
 	p.mu.Lock()

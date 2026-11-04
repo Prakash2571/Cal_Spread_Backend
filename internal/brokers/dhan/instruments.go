@@ -26,6 +26,9 @@ type Instrument struct {
 	DhanSegment    Segment `json:"dhan_segment"`
 	// DhanUnderlyingSecurityID is the underlying's security id (option-chain calls).
 	DhanUnderlyingSecurityID *int64 `json:"dhan_underlying_security_id"`
+	// Keep the native chart class before normalizing it to CE/PE/FUT. It is
+	// transport metadata, not an additional frontend instrument field.
+	DhanInstrumentClass string `json:"-"`
 }
 
 const tokenSegmentBase = 1_000_000_000
@@ -463,6 +466,7 @@ func parseScripMaster(csv string, now time.Time, loc *time.Location) ([]Instrume
 			DhanSecurityID:           securityID,
 			DhanSegment:              segment,
 			DhanUnderlyingSecurityID: underlying,
+			DhanInstrumentClass:      jsUpper(instrumentRaw),
 		}
 		out = append(out, inst)
 

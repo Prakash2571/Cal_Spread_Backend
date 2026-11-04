@@ -1,6 +1,6 @@
 // Package analytics is the NIFTY option/futures open-interest analytics of src/index.ts:
 // the once-a-minute chain capture, the multi-timeframe OI frames (1m/5m/15m/1h) with
-// their gap-aware Kite backfill and coarsening, the per-token chain snapshots behind the
+// their gap-aware active-broker backfill and coarsening, the per-token chain snapshots behind the
 // chain's OI change columns, the previous-session close baseline, and the six public
 // routes that serve them (/api/option-chain, /api/option-oi-baseline, /api/option-prev-close,
 // /api/option-oi-series, /api/option-oi-frame, /api/futures-oi-frame).
@@ -64,9 +64,8 @@ type Deps struct {
 	// Instruments is getAllInstrumentsCached(): the ACTIVE broker's instrument universe
 	// (brokerManager.instrumentProvider.load()). The slice is treated as read-only.
 	Instruments func(ctx context.Context) ([]market.Instrument, error)
-	// QuoteFull is kite.getQuoteFull: Zerodha REST /quote for "EXCHANGE:TRADINGSYMBOL"
-	// identifiers. The captures and the previous-close spot reference call Kite directly,
-	// as in Node, whatever the active broker (they are gated by CaptureAllowed).
+	// QuoteFull is the active broker's price/OI/close/trade-time snapshot for
+	// "EXCHANGE:TRADINGSYMBOL" identifiers, in the shared internal FullQuote shape.
 	QuoteFull func(ctx context.Context, ids []string) ([]kite.FullQuote, error)
 	// Historical is history.getHistorical (brokers/history.ts, routed to the active
 	// broker); the analytics always ask with kite.Background priority.
@@ -76,11 +75,14 @@ type Deps struct {
 	// QuotesByToken is brokerManager.quoteProvider.quotesByToken (the active broker's REST
 	// quote), used only for the option-chain spot. Nil means the spot is 0.
 	QuotesByToken func(ctx context.Context, tokens []int64) ([]market.Tick, error)
-	// CaptureAllowed is zerodhaCaptureAllowed(what); see ZerodhaCaptureGate. Nil means no
+	// CaptureAllowed is the active broker's data readiness. Nil means no
 	// capture or backfill ever runs.
 	CaptureAllowed func(what string) bool
 	// MarketData is the readiness behind requireMarketData. Nil means always ready.
 	MarketData func() Readiness
+	// Namespace is the active broker and token generation, read atomically.
+	// When configured, state/cache ownership and asynchronous reads are fenced.
+	Namespace func() brokers.Namespace
 	// SendError is index.ts sendError. Nil uses DefaultSendError(KiteAuthFailed).
 	SendError func(w http.ResponseWriter, err error)
 	// KiteAuthFailed is called by the default SendError for a KiteError 401/403 (Node
@@ -107,7 +109,14 @@ type Service struct {
 	d     Deps
 	extra map[string]bool
 
-	mu sync.Mutex
+	mu                             sync.Mutex
+	scope                          operationScope
+	scopeCtx                       context.Context
+	scopeCancel                    context.CancelFunc
+	scopeWarm                      bool
+	backfillOwners                 map[*bool]uint64
+	prevCloseOwner                 uint64
+	recoveryRunning, recoveryAgain bool
 
 	// optionOiDay: today's per-token samples for the nearest expiry (memory only).
 	day *oiDay
@@ -161,7 +170,7 @@ type Service struct {
 	onFlushOps func(ops []cacheOp)
 }
 
-// New builds the service. Nothing runs until WarmLoad/Start (or Boot) and OnKiteLogin.
+// New builds the service. Work starts through Boot and active-broker ready events.
 func New(d Deps) *Service {
 	if d.Now == nil {
 		d.Now = time.Now
@@ -185,7 +194,7 @@ func New(d Deps) *Service {
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Service{
+	s := &Service{
 		d:              d,
 		extra:          extra,
 		futKnown:       newOmap[string, FutContract](),
@@ -196,7 +205,10 @@ func New(d Deps) *Service {
 		ttlRefreshedAt: map[string]int64{},
 		ctx:            ctx,
 		cancel:         cancel,
+		backfillOwners: map[*bool]uint64{},
 	}
+	s.syncNamespace()
+	return s
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
@@ -214,7 +226,7 @@ func (s *Service) nowMs() int64 { return s.d.Now().UnixMilli() }
 
 func (s *Service) logf(format string, args ...any) { s.d.Logf(format, args...) }
 
-// captureAllowed is zerodhaCaptureAllowed(what).
+// captureAllowed checks the configured data-readiness gate.
 func (s *Service) captureAllowed(what string) bool {
 	if s.d.CaptureAllowed == nil {
 		return false
@@ -225,45 +237,81 @@ func (s *Service) captureAllowed(what string) bool {
 // goAsync is `void (async () => …)()`: f runs on its own goroutine with the service
 // context. Nothing starts once the service is stopped.
 func (s *Service) goAsync(f func(ctx context.Context)) {
+	ctx, _, cleanup, valid := s.beginOperation(s.ctx)
+	if !valid {
+		return
+	}
 	s.mu.Lock()
 	if s.stopped {
 		s.mu.Unlock()
+		cleanup()
 		return
 	}
 	s.wg.Add(1)
 	s.mu.Unlock()
 	go func() {
 		defer s.wg.Done()
-		f(s.ctx)
+		defer cleanup()
+		// Run cleanup/deferred ownership handling even if this scope was
+		// superseded before dispatch. Each reader rejects the stale context.
+		f(ctx)
 	}()
 }
 
 func (s *Service) instruments(ctx context.Context) ([]market.Instrument, error) {
+	if err := s.checkOperation(ctx); err != nil {
+		return nil, err
+	}
 	if s.d.Instruments == nil {
 		return nil, nil
 	}
-	return s.d.Instruments(ctx)
+	rows, err := s.d.Instruments(ctx)
+	if err == nil {
+		err = s.checkOperation(ctx)
+	}
+	return rows, err
 }
 
 func (s *Service) quoteFull(ctx context.Context, ids []string) ([]kite.FullQuote, error) {
+	if err := s.checkOperation(ctx); err != nil {
+		return nil, err
+	}
 	if s.d.QuoteFull == nil {
 		return nil, errNotConfigured("QuoteFull")
 	}
-	return s.d.QuoteFull(ctx, ids)
+	quotes, err := s.d.QuoteFull(ctx, ids)
+	if err == nil {
+		err = s.checkOperation(ctx)
+	}
+	return quotes, err
 }
 
 func (s *Service) historical(ctx context.Context, token int64, from, to, interval string) ([]kite.ClosePoint, error) {
+	if err := s.checkOperation(ctx); err != nil {
+		return nil, err
+	}
 	if s.d.Historical == nil {
 		return nil, errNotConfigured("Historical")
 	}
-	return s.d.Historical(ctx, token, from, to, interval, kite.Background)
+	rows, err := s.d.Historical(ctx, token, from, to, interval, kite.Background)
+	if err == nil {
+		err = s.checkOperation(ctx)
+	}
+	return rows, err
 }
 
 func (s *Service) historicalOiSeries(ctx context.Context, token int64, from, to, interval string) ([]kite.OISeriesPoint, error) {
+	if err := s.checkOperation(ctx); err != nil {
+		return nil, err
+	}
 	if s.d.HistoricalOiSeries == nil {
 		return nil, errNotConfigured("HistoricalOiSeries")
 	}
-	return s.d.HistoricalOiSeries(ctx, token, from, to, interval, kite.Background)
+	rows, err := s.d.HistoricalOiSeries(ctx, token, from, to, interval, kite.Background)
+	if err == nil {
+		err = s.checkOperation(ctx)
+	}
+	return rows, err
 }
 
 type notConfigured string

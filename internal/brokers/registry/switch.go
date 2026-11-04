@@ -122,6 +122,9 @@ func (r *Registry) SwitchTo(ctx context.Context, target brokers.ID, actor string
 	}()
 
 	// 10. publish fresh runtime state
+	if hooks.OnRuntimeReady != nil {
+		hooks.OnRuntimeReady()
+	}
 	if hooks.Publish != nil {
 		hooks.Publish()
 	}

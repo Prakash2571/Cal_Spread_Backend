@@ -143,6 +143,35 @@ func mergeWarmLoadedSnaps(list []*ChainSnapshot, loaded []*ChainSnapshot) ([]*Ch
 	return list, added
 }
 
+// Historical OI/close candles also supply minute baselines after a cold start.
+// Existing live samples win; snapshots retain their own broker namespace.
+func (s *Service) mergeHistoricalSnapshotsLocked(snapshots []*ChainSnapshot, now int64) {
+	minuteHave, hourHave := map[int64]bool{}, map[int64]bool{}
+	for _, snapshot := range s.chainMin {
+		minuteHave[snapshot.T] = true
+	}
+	for _, snapshot := range s.chainHour {
+		hourHave[snapshot.T] = true
+	}
+	for _, snapshot := range snapshots {
+		if snapshot.T > now || isPreOpenBucket(snapshot.T) {
+			continue
+		}
+		if snapshot.T >= now-chainMinuteRetentionMs && !minuteHave[snapshot.T] {
+			s.chainMin = upsertSnapshot(s.chainMin, snapshot)
+			s.queueHashFieldLocked(chainMinuteKey(istDayKey(snapshot.T)), snapshot.T, snapshot,
+				(chainMinuteRetentionMs+redisTTLSlackMs)/1000, maxBufferedSnapshotFields)
+		}
+		hourEnd := bucketEndMs(snapshot.T, hourMs)
+		if hourEnd <= now && hourEnd >= now-chainHourRetentionMs && !hourHave[hourEnd] {
+			hour := &ChainSnapshot{T: hourEnd, Expiry: snapshot.Expiry, Tokens: snapshot.Tokens}
+			s.chainHour = upsertSnapshot(s.chainHour, hour)
+			s.queueHashFieldLocked(chainHourKey(istDayKey(hourEnd)), hourEnd, hour,
+				(chainHourRetentionMs+redisTTLSlackMs)/1000, maxBufferedSnapshotFields)
+		}
+	}
+}
+
 // snapshotPrevCloseLocked keeps the outgoing day's last reading per token as forDay's
 // baseline, unless the index never moved that day (a holiday-like session).
 func (s *Service) snapshotPrevCloseLocked(prev *oiDay, forDay string) {

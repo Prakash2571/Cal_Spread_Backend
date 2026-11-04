@@ -186,6 +186,9 @@ type harnessOptions struct {
 	seed func(t *testing.T, pool *db.Pool)
 	// kite replaces the fake Kite REST handler.
 	kite http.HandlerFunc
+	// dhan replaces the unavailable Dhan REST/master fixture.
+	dhan         http.HandlerFunc
+	analyticsNow func() time.Time
 }
 
 type harness struct {
@@ -213,7 +216,11 @@ func newHarness(t *testing.T, o harnessOptions) *harness {
 		kiteHandler = o.kite
 	}
 	h.kite = newFakeHTTP(t, kiteHandler)
-	h.dhan = newFakeHTTP(t, unavailableHandler)
+	dhanHandler := unavailableHandler
+	if o.dhan != nil {
+		dhanHandler = o.dhan
+	}
+	h.dhan = newFakeHTTP(t, dhanHandler)
 	h.yahoo = newFakeHTTP(t, unavailableHandler)
 	t.Cleanup(func() {
 		h.kite.srv.Close()
@@ -263,6 +270,7 @@ func newHarness(t *testing.T, o harnessOptions) *harness {
 		},
 		YahooChartRoot:  h.yahoo.srv.URL,
 		YahooHTTPClient: &http.Client{Transport: newTransport()},
+		AnalyticsNow:    o.analyticsNow,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

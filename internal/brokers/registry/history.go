@@ -40,7 +40,16 @@ func dhanInterval(interval string) string {
 // HistoryProvider is history.ts: the Kite historical methods' signatures and shapes,
 // routed to the active broker on every call. Dhan ignores the priority (its pacing is
 // the transport's serial chain).
-type HistoryProvider struct{ r *Registry }
+type HistoryProvider struct {
+	r      *Registry
+	native bool
+}
+
+// ForAnalytics retains Dhan's native class, exact intraday time bounds and
+// upstream errors. Legacy historical callers retain their compatibility contract.
+func (h *HistoryProvider) ForAnalytics() *HistoryProvider {
+	return &HistoryProvider{r: h.r, native: true}
+}
 
 func (h *HistoryProvider) isDhan() bool { return h.r.ActiveBroker() == brokers.Dhan }
 
@@ -65,7 +74,12 @@ func (h *HistoryProvider) GetHistoricalFull(ctx context.Context, token int64, fr
 
 // GetHistorical is kite.GetHistorical: {t, close}.
 func (h *HistoryProvider) GetHistorical(ctx context.Context, token int64, from, to, interval string, prio kite.HistoricalPriority) ([]kite.ClosePoint, error) {
-	if !h.isDhan() {
+	namespace, err := h.r.namespaceFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = brokers.WithNamespace(ctx, namespace)
+	if namespace.Broker != brokers.Dhan {
 		return h.r.deps.Kite.GetHistorical(ctx, token, from, to, interval, defaultPrio(prio))
 	}
 	rows, err := h.dhanCandles(ctx, token, from, to, interval)
@@ -98,7 +112,12 @@ func (h *HistoryProvider) GetHistoricalOi(ctx context.Context, token int64, from
 
 // GetHistoricalOiSeries is kite.GetHistoricalOiSeries: {t, close, oi}.
 func (h *HistoryProvider) GetHistoricalOiSeries(ctx context.Context, token int64, from, to, interval string, prio kite.HistoricalPriority) ([]kite.OISeriesPoint, error) {
-	if !h.isDhan() {
+	namespace, err := h.r.namespaceFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx = brokers.WithNamespace(ctx, namespace)
+	if namespace.Broker != brokers.Dhan {
 		return h.r.deps.Kite.GetHistoricalOiSeries(ctx, token, from, to, interval, defaultPrio(prio))
 	}
 	rows, err := h.dhanCandles(ctx, token, from, to, interval)
@@ -179,6 +198,9 @@ func sliceUTF16(s string, n int) string {
 // failures are logged and the partial series returned; the only error is the
 // RangeError of an unparseable intraday date, as in Node.
 func (h *HistoryProvider) dhanCandles(ctx context.Context, token int64, from, to, interval string) ([]kite.HistoricalCandle, error) {
+	if h.native {
+		return h.nativeDhanCandles(ctx, token, from, to, interval)
+	}
 	_, _ = h.r.dhanInstruments.Load(ctx, false)
 	target, ok := h.dhanTarget(token)
 	if !ok {

@@ -81,6 +81,12 @@ var errStrikeUndefined = errors.New("Cannot read properties of undefined (readin
 // optionChain is GET /api/option-chain/:underlying: the CE/PE tokens of a band of strikes
 // around the ATM of one expiry.
 func (s *Service) optionChain(w http.ResponseWriter, r *http.Request) {
+	s.syncNamespace()
+	ctx, _, cleanup, valid := s.beginOperation(r.Context())
+	if valid {
+		defer cleanup()
+		r = r.WithContext(ctx)
+	}
 	raw, ok := pathParam(w, r, "underlying")
 	if !ok {
 		return
@@ -243,6 +249,7 @@ type baselineResponse struct {
 // oiBaseline is GET /api/option-oi-baseline/:underlying: per-token OI and LTP as of
 // `minutes` ago from today's chain snapshots (nothing rather than a too-recent one).
 func (s *Service) oiBaseline(w http.ResponseWriter, r *http.Request) {
+	s.syncNamespace()
 	if _, ok := pathParam(w, r, "underlying"); !ok {
 		return
 	}
@@ -269,6 +276,7 @@ func (s *Service) oiBaseline(w http.ResponseWriter, r *http.Request) {
 // prevCloseRoute is GET /api/option-prev-close/:underlying: today's baseline as stored,
 // or an empty one when it is missing or from another day.
 func (s *Service) prevCloseRoute(w http.ResponseWriter, r *http.Request) {
+	s.syncNamespace()
 	if _, ok := pathParam(w, r, "underlying"); !ok {
 		return
 	}
@@ -299,6 +307,7 @@ type seriesPoint struct {
 // oiSeries is GET /api/option-oi-series/:underlying: today's per-capture totals over the
 // pinned window (every strike before it is pinned) and the per-sample ATM straddle.
 func (s *Service) oiSeries(w http.ResponseWriter, r *http.Request) {
+	s.syncNamespace()
 	if _, ok := pathParam(w, r, "underlying"); !ok {
 		return
 	}
@@ -375,6 +384,7 @@ func frameQuery(r *http.Request) int {
 
 // oiFrame is GET /api/option-oi-frame/:underlying: a frame's completed buckets.
 func (s *Service) oiFrame(w http.ResponseWriter, r *http.Request) {
+	s.syncNamespace()
 	if _, ok := pathParam(w, r, "underlying"); !ok {
 		return
 	}
@@ -400,6 +410,7 @@ func (s *Service) oiFrame(w http.ResponseWriter, r *http.Request) {
 // futuresOiFrame is GET /api/futures-oi-frame/:underlying: a futures frame's completed
 // buckets plus every contract they (or the current capture) cover, sorted by expiry.
 func (s *Service) futuresOiFrame(w http.ResponseWriter, r *http.Request) {
+	s.syncNamespace()
 	if _, ok := pathParam(w, r, "underlying"); !ok {
 		return
 	}

@@ -168,6 +168,9 @@ type Hooks struct {
 	// OnSessionLost runs when the active Dhan session dies (index.ts onSessionLost:
 	// Synthetic.Stop).
 	OnSessionLost func(broker brokers.ID, reason string)
+	// OnRuntimeReady reconciles broker-neutral consumers after a selection or a
+	// new active session. It must enqueue work and return promptly.
+	OnRuntimeReady func()
 }
 
 type brokerState struct {
@@ -212,11 +215,13 @@ type Registry struct {
 	// warm-up, session-lost handling), so tests can wait for them.
 	bg sync.WaitGroup
 
-	sessMu      sync.Mutex
-	dhanToken   *string
-	dhanExpiry  *int64
-	dhanMeta    *dhanMeta
-	brokerLogin *brokerLoginController
+	sessMu             sync.Mutex
+	dhanToken          *string
+	dhanExpiry         *int64
+	dhanMeta           *dhanMeta
+	brokerLogin        *brokerLoginController
+	analyticsQuoteGate chan struct{}
+	analyticsQuoteAt   time.Time // owned by analyticsQuoteGate
 
 	mu               sync.Mutex
 	hooks            Hooks
@@ -256,6 +261,7 @@ func New(deps Deps) *Registry {
 	}
 	r.get = func(k string) string { v, _ := r.lookup(k); return v }
 	r.brokerLogin = newBrokerLoginController(r.get, deps.BrokerLoginHTTPClient)
+	r.analyticsQuoteGate = make(chan struct{}, 1)
 	initial := brokers.Dhan
 	if configured, ok := brokers.Parse(r.get("DEFAULT_BROKER")); ok {
 		initial = configured

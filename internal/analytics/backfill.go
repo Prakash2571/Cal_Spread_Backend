@@ -9,7 +9,7 @@ import (
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/jsx"
 )
 
-// The gap detectors and the Kite reconstruction of the frames (index.ts :4467-4800,
+// The gap detectors and active-broker reconstruction of the frames (index.ts :4467-4800,
 // :4950-5118).
 
 const (
@@ -114,7 +114,7 @@ func (s *Service) partialRepairFromMsLocked(pts []*OiAggPoint, cfg frameCfg, ret
 		s.partialRepairs[key] = repairMark{n: seen.n + 1, at: now}
 	} else {
 		s.partialRepairs[key] = repairMark{n: 1, at: now}
-		s.logf("[OptionOI] %dm frame has an incomplete bucket at %s — reconstructing it again from Kite.", cfg.IntervalMin, isoMs(oldest.T))
+		s.logf("[OptionOI] %dm frame has an incomplete bucket at %s — reconstructing it again from %s.", cfg.IntervalMin, isoMs(oldest.T), s.historySource())
 	}
 	return from, true
 }
@@ -153,7 +153,7 @@ func (s *Service) missingHeadMsLocked(family string, oldest int64, cfg frameCfg,
 func minuteKey(t string) string { return sliceUTF16(t, 16) }
 
 // beginBackfill sets a single-flight flag after the capture gate passed.
-func (s *Service) beginBackfill(flag *bool, what string) bool {
+func (s *Service) beginBackfill(flag *bool, what string, scope operationScope) bool {
 	s.mu.Lock()
 	running := *flag
 	s.mu.Unlock()
@@ -162,27 +162,35 @@ func (s *Service) beginBackfill(flag *bool, what string) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if *flag {
+	if *flag || !s.scopeCurrentLocked(scope) {
 		return false
 	}
 	*flag = true
+	s.backfillOwners[flag] = scope.epoch
 	return true
 }
 
-func (s *Service) endBackfill(flag *bool) {
+func (s *Service) endBackfill(flag *bool, scope operationScope) {
 	s.mu.Lock()
-	*flag = false
+	if s.backfillOwners[flag] == scope.epoch {
+		*flag = false
+	}
 	s.mu.Unlock()
 }
 
-// backfillOiFrames reconstructs the option frames from Kite minute candles from the
+// backfillOiFrames reconstructs the option frames from the active broker's minute candles from the
 // earliest still-missing time (fromOverride when the caller snapshotted it before a
 // capture), using the CURRENT nearest expiry's strikes.
 func (s *Service) backfillOiFrames(ctx context.Context, fromOverride *int64) {
-	if !s.beginBackfill(&s.oiBackfillRunning, "option-OI frame backfill") {
+	ctx, scope, cleanup, valid := s.beginOperation(ctx)
+	if !valid {
 		return
 	}
-	defer s.endBackfill(&s.oiBackfillRunning)
+	defer cleanup()
+	if !s.beginBackfill(&s.oiBackfillRunning, "option-OI frame backfill", scope) {
+		return
+	}
+	defer s.endBackfill(&s.oiBackfillRunning, scope)
 	fail := func(err error) {
 		s.logf("[OptionOI] frame backfill failed: %s", errText(err))
 	}
@@ -263,6 +271,9 @@ func (s *Service) backfillOiFrames(ctx context.Context, fromOverride *int64) {
 		}
 		mOi := map[string]float64{}
 		mClose := map[string]float64{}
+		if len(candles) == 0 && s.d.Namespace != nil {
+			unfetched.Set(tok, struct{}{})
+		}
 		for _, c := range candles {
 			k := minuteKey(c.T)
 			mOi[k] = c.OI
@@ -288,13 +299,20 @@ func (s *Service) backfillOiFrames(ctx context.Context, fromOverride *int64) {
 	lastOi := map[int64]float64{}
 	lastClose := map[int64]float64{}
 	var perMinute []OiAggPoint
+	var snapshots []*ChainSnapshot
+	orderedTokens := jsTokenOrder(append([]int64(nil), sel.meta.keys...))
 	dayWindows := map[string]strikeWindow{}
+	lastDay := ""
 	for _, mk := range sortedMins {
 		spot, _ := spotByMin.Get(mk)
 		if !(spot > 0) {
 			continue
 		}
 		dayKey := sliceUTF16(mk, 10)
+		if s.d.Namespace != nil && dayKey != lastDay {
+			lastOi, lastClose = map[int64]float64{}, map[int64]float64{}
+			lastDay = dayKey
+		}
 		win, ok := dayWindows[dayKey]
 		if !ok {
 			pinned := pinStrikeWindow(l.strikes, spot)
@@ -328,7 +346,8 @@ func (s *Service) backfillOiFrames(ctx context.Context, fromOverride *int64) {
 				return false
 			}
 			_, fetched := oiByToken[tok]
-			return !fetched || unfetched.Has(tok)
+			_, seeded := lastOi[tok]
+			return !fetched || unfetched.Has(tok) || (s.d.Namespace != nil && !seeded)
 		}
 		var totalCe, totalPe float64
 		missing := 0
@@ -362,13 +381,32 @@ func (s *Service) backfillOiFrames(ctx context.Context, fromOverride *int64) {
 				T: t, TotalCe: totalCe, TotalPe: totalPe, Straddle: straddle, Spot: spot,
 				HasWLo: true, WLo: win.lo, HasWHi: true, WHi: win.hi, Partial: missing > 0,
 			})
+			if s.d.Namespace != nil {
+				snapshot := &ChainSnapshot{T: candleEndMs(t, minuteMs), Expiry: sel.expiry}
+				for _, tok := range orderedTokens {
+					// Seed every fetched token, including outside the totals window.
+					sumOi(tok, true)
+					closeOf(tok, true)
+					if lastOi[tok] > 0 && !unfetched.Has(tok) {
+						snapshot.Tokens = append(snapshot.Tokens, snapTok{Token: tok, OI: lastOi[tok], LTP: lastClose[tok]})
+					}
+				}
+				if len(snapshot.Tokens) > 0 {
+					snapshots = append(snapshots, snapshot)
+				}
+			}
 		}
 	}
 
 	s.mu.Lock()
+	if !s.scopeCurrentLocked(scope) {
+		s.mu.Unlock()
+		return
+	}
 	for i := range frames {
 		s.mergeOiFrameLocked(i, perMinute)
 	}
+	s.mergeHistoricalSnapshotsLocked(snapshots, now)
 	s.mu.Unlock()
 	partialMins := 0
 	for _, p := range perMinute {
@@ -386,10 +424,15 @@ func (s *Service) backfillOiFrames(ctx context.Context, fromOverride *int64) {
 // backfillFutOiFrames reconstructs the futures frames; any failed contract aborts the
 // whole run (a zeroed leg would be frozen into the frames).
 func (s *Service) backfillFutOiFrames(ctx context.Context, fromOverride *int64) {
-	if !s.beginBackfill(&s.futBackfillRunning, "futures-OI frame backfill") {
+	ctx, scope, cleanup, valid := s.beginOperation(ctx)
+	if !valid {
 		return
 	}
-	defer s.endBackfill(&s.futBackfillRunning)
+	defer cleanup()
+	if !s.beginBackfill(&s.futBackfillRunning, "futures-OI frame backfill", scope) {
+		return
+	}
+	defer s.endBackfill(&s.futBackfillRunning, scope)
 	fail := func(err error) {
 		s.logf("[FuturesOI] frame backfill failed: %s", errText(err))
 	}
@@ -409,6 +452,10 @@ func (s *Service) backfillFutOiFrames(ctx context.Context, fromOverride *int64) 
 		return
 	}
 	s.mu.Lock()
+	if !s.scopeCurrentLocked(scope) {
+		s.mu.Unlock()
+		return
+	}
 	sel := s.niftyMonthlyFuturesLocked(all, istDayKey(s.nowMs()))
 	if sel == nil {
 		s.mu.Unlock()
@@ -444,22 +491,34 @@ func (s *Service) backfillFutOiFrames(ctx context.Context, fromOverride *int64) 
 	mins := tsByMin.Keys()
 	jsSortStrings(mins)
 	var perMinute []FutOiPoint
+	lastDay := ""
 	for _, mk := range mins {
-		legs := make([]FutOiLeg, len(sel.contracts))
-		for i, c := range sel.contracts {
+		if s.d.Namespace != nil && sliceUTF16(mk, 10) != lastDay {
+			lastOi, lastLtp = map[string]float64{}, map[string]float64{}
+			lastDay = sliceUTF16(mk, 10)
+		}
+		legs := make([]FutOiLeg, 0, len(sel.contracts))
+		for _, c := range sel.contracts {
 			if v, ok := byExpiry[c.Expiry][mk]; ok {
 				lastOi[c.Expiry] = v.oi
 				lastLtp[c.Expiry] = v.close
 			}
-			legs[i] = FutOiLeg{Expiry: c.Expiry, OI: lastOi[c.Expiry], LTP: lastLtp[c.Expiry]}
+			if _, seeded := lastOi[c.Expiry]; !seeded && s.d.Namespace != nil {
+				continue
+			}
+			legs = append(legs, FutOiLeg{Expiry: c.Expiry, OI: lastOi[c.Expiry], LTP: lastLtp[c.Expiry]})
 		}
 		stamp, _ := tsByMin.Get(mk)
-		if t, ok := parseCandleTime(stamp, nil); ok {
+		if t, ok := parseCandleTime(stamp, nil); ok && len(legs) > 0 {
 			perMinute = append(perMinute, FutOiPoint{T: t, Legs: legs})
 		}
 	}
 
 	s.mu.Lock()
+	if !s.scopeCurrentLocked(scope) {
+		s.mu.Unlock()
+		return
+	}
 	for i := range frames {
 		s.mergeFutOiFrameLocked(i, perMinute)
 	}

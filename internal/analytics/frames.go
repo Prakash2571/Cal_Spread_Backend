@@ -411,8 +411,8 @@ func (s *Service) coarsenFramesLocked() {
 		opt := s.coarsenOiFrameLocked(i, src, now)
 		fut := s.coarsenFutOiFrameLocked(i, src, now)
 		if opt > 0 || fut > 0 {
-			s.logf("[OptionOI] Derived %d option and %d futures %s bucket(s) from the %s frame (no Kite calls).",
-				opt, fut, cfg.Key, frames[src].Key)
+			s.logf("[OptionOI] Derived %d option and %d futures %s bucket(s) from the %s frame (no %s calls).",
+				opt, fut, cfg.Key, frames[src].Key, s.historySource())
 		}
 	}
 }

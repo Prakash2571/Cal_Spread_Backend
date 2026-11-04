@@ -52,6 +52,11 @@ Set `DHAN_CLIENT_ID`, `BROKER_LOGIN_URL`,
 Tokens restore from PostgreSQL after restart and refresh automatically within the
 daily window. Fetch status and failures are visible in **Broker → Dhan**.
 
+**Options Analytics also follows Dhan:** option/futures OI captures, ATM-straddle
+history, minute/day comparison baselines and historical backfills use its data
+providers. Successful token fetching/pasting triggers history recovery after boot.
+Analytics history is persisted in separate broker namespaces and restored on restart.
+
 For recovery, use **Fetch token now** or **Paste access token → Use token** in that
 panel. Pasting also works without the service configured and verifies the token's
 account before saving. A working pasted fallback is kept until expiry; clearing a

@@ -90,6 +90,24 @@ the older backend consent endpoints remain compatible for existing callers.
 
 ## Capture and analytics
 
+The Options Analytics page follows the active broker (`DEFAULT_BROKER=dhan` on
+fresh starts). Dhan live quotes supply price, OI, previous close and trade-time
+metadata; minute/day history requests use its native INDEX/OPTIDX/FUTIDX classes
+and exact IST time bounds. Option/futures 1m, 5m, 15m and 1h frames, ATM-straddle
+history and chain comparison baselines no longer require a Zerodha session.
+
+Startup restores the current broker's PostgreSQL analytics cache. A successful
+active token fetch/paste or broker selection starts a coalesced capture/backfill
+recovery chain. Dhan keys use the `analytics:dhan:` namespace, leaving retained
+Zerodha keys separate. Background operations are tied to their broker/generation;
+a switch cancels old readers and prevents their responses from entering new stores.
+
+Historical minute OI/close candles also reconstruct minute/hour chain snapshots,
+so comparison columns can recover from available broker history after restart.
+Unavailable OI/candles stay missing/partial rather than being treated as known zero.
+If no historical data is available, charts need completed live capture buckets;
+OI-change charts require adjacent valid buckets in the selected timeframe.
+
 | Setting | Default | Meaning |
 |---|---|---|
 | `EXTRA_SESSION_DAYS` | empty | Comma-separated IST YYYY-MM-DD trading sessions on weekends |

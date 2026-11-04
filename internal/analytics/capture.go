@@ -5,13 +5,14 @@ import (
 	"math"
 	"sort"
 
+	"github.com/Prakash2571/Cal_Spread_Backend/internal/brokers"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/jsx"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/kite"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/market"
 )
 
 // The once-a-minute captures and the previous-close baseline (index.ts :3572-3965,
-// :4802-5019). All of them are Zerodha-only (CaptureAllowed).
+// :4802-5019). They follow the active broker and its data-readiness gate.
 
 // niftySel is niftyNearestExpiryOptions' result.
 type niftySel struct {
@@ -128,6 +129,11 @@ func (s *Service) noteMarketClosedLocked(what, stamp string) {
 // day cache, feeds the frames and the chain snapshots, and asks for the previous-close
 // backfill when today has no baseline yet.
 func (s *Service) captureOptionOi(ctx context.Context) {
+	ctx, scope, cleanup, valid := s.beginOperation(ctx)
+	if !valid {
+		return
+	}
+	defer cleanup()
 	if !s.captureAllowed("option-OI capture") {
 		return
 	}
@@ -145,6 +151,10 @@ func (s *Service) captureOptionOi(ctx context.Context) {
 	day := istDayKey(s.nowMs())
 
 	s.mu.Lock()
+	if !s.scopeCurrentLocked(scope) {
+		s.mu.Unlock()
+		return
+	}
 	if s.day == nil || s.day.day != day || s.day.expiry != sel.expiry {
 		if s.day != nil && s.day.day != day && s.day.expiry == sel.expiry {
 			s.snapshotPrevCloseLocked(s.day, day)
@@ -162,11 +172,33 @@ func (s *Service) captureOptionOi(ctx context.Context) {
 	qmap := quoteMap(quotes)
 
 	s.mu.Lock()
+	if !s.scopeCurrentLocked(scope) {
+		s.mu.Unlock()
+		return
+	}
 	stamp := ""
 	if q, ok := qmap[store.spotToken]; ok {
 		stamp = q.LastTradeTime
 	}
-	if quoteDay(stamp, s.nowMs()) == 0 {
+	traded := quoteDay(stamp, s.nowMs())
+	if scope.namespace.Broker == brokers.Dhan {
+		// Indices do not themselves trade. Use the option contracts' known
+		// timestamps, rather than treating an index placeholder as a holiday.
+		traded = -1
+		for _, tok := range store.meta.keys {
+			if q, ok := qmap[tok]; ok {
+				day := quoteDay(q.LastTradeTime, s.nowMs())
+				if day == 1 {
+					traded = 1
+					break
+				}
+				if day == 0 {
+					traded, stamp = 0, q.LastTradeTime
+				}
+			}
+		}
+	}
+	if traded == 0 {
 		s.noteMarketClosedLocked(niftyUnderlying+" spot", stamp)
 		s.mu.Unlock()
 		return
@@ -179,7 +211,7 @@ func (s *Service) captureOptionOi(ctx context.Context) {
 		if len(arr) > 0 {
 			prev = &arr[len(arr)-1]
 		}
-		if !ok && prev == nil {
+		if !ok && (prev == nil || (s.d.Namespace != nil && prev.ltp <= 0)) {
 			unseeded[tok] = true
 		}
 		smp := oiSample{t: now}
@@ -268,6 +300,11 @@ func (s *Service) rememberFutContractsLocked(contracts []FutContract) {
 // captureFuturesOi snapshots the 3 nearest NIFTY futures' OI and LTP into every frame;
 // a leg with no positive value carries its last known one forward.
 func (s *Service) captureFuturesOi(ctx context.Context) {
+	ctx, scope, cleanup, valid := s.beginOperation(ctx)
+	if !valid {
+		return
+	}
+	defer cleanup()
 	if !s.captureAllowed("futures-OI capture") {
 		return
 	}
@@ -278,6 +315,10 @@ func (s *Service) captureFuturesOi(ctx context.Context) {
 		return
 	}
 	s.mu.Lock()
+	if !s.scopeCurrentLocked(scope) {
+		s.mu.Unlock()
+		return
+	}
 	sel := s.niftyMonthlyFuturesLocked(all, istDayKey(s.nowMs()))
 	if sel == nil {
 		s.mu.Unlock()
@@ -295,6 +336,9 @@ func (s *Service) captureFuturesOi(ctx context.Context) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.scopeCurrentLocked(scope) {
+		return
+	}
 	stamp := ""
 	if q, ok := qmap[sel.contracts[0].Token]; ok {
 		stamp = q.LastTradeTime
@@ -309,10 +353,13 @@ func (s *Service) captureFuturesOi(ctx context.Context) {
 			prevByExpiry[l.Expiry] = l
 		}
 	}
-	legs := make([]FutOiLeg, len(sel.contracts))
-	for i, c := range sel.contracts {
+	legs := make([]FutOiLeg, 0, len(sel.contracts))
+	for _, c := range sel.contracts {
 		q, ok := qmap[c.Token]
 		p, hasP := prevByExpiry[c.Expiry]
+		if !ok && !hasP && s.d.Namespace != nil {
+			continue
+		}
 		leg := FutOiLeg{Expiry: c.Expiry}
 		if ok && q.OI > 0 {
 			leg.OI = q.OI
@@ -324,9 +371,11 @@ func (s *Service) captureFuturesOi(ctx context.Context) {
 		} else if hasP {
 			leg.LTP = p.LTP
 		}
-		legs[i] = leg
+		legs = append(legs, leg)
 	}
-	s.appendFutOiFrameLiveLocked(now, legs)
+	if len(legs) > 0 {
+		s.appendFutOiFrameLiveLocked(now, legs)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -336,7 +385,7 @@ const prevCloseMaxAttempts = 4
 
 // tryBeginPrevCloseBackfill is the synchronous head of backfillPrevClose: the IST day is
 // read, the single-flight flag and the capture gate are checked and the flag is set.
-func (s *Service) tryBeginPrevCloseBackfill() (today string, ok bool) {
+func (s *Service) tryBeginPrevCloseBackfill(scope operationScope) (today string, ok bool) {
 	today = istDayKey(s.nowMs())
 	s.mu.Lock()
 	running := s.prevCloseBackfillRunning
@@ -346,40 +395,53 @@ func (s *Service) tryBeginPrevCloseBackfill() (today string, ok bool) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.prevCloseBackfillRunning {
+	if s.prevCloseBackfillRunning || !s.scopeCurrentLocked(scope) {
 		return today, false
 	}
 	s.prevCloseBackfillRunning = true
+	s.prevCloseOwner = scope.epoch
 	return today, true
 }
 
 // voidBackfillPrevClose is `void backfillPrevClose()`.
 func (s *Service) voidBackfillPrevClose() {
-	today, ok := s.tryBeginPrevCloseBackfill()
+	ctx, scope, cleanup, valid := s.beginOperation(s.ctx)
+	if !valid {
+		return
+	}
+	today, ok := s.tryBeginPrevCloseBackfill(scope)
 	if !ok {
+		cleanup()
 		return
 	}
 	s.mu.Lock()
 	if s.stopped {
 		s.prevCloseBackfillRunning = false
 		s.mu.Unlock()
+		cleanup()
 		return
 	}
 	s.wg.Add(1)
 	s.mu.Unlock()
 	go func() {
 		defer s.wg.Done()
-		s.runPrevCloseBackfill(s.ctx, today)
+		defer cleanup()
+		s.runPrevCloseBackfill(ctx, today, scope)
 	}()
 }
 
 // backfillPrevClose is `await backfillPrevClose()`.
 func (s *Service) backfillPrevClose(ctx context.Context) {
-	today, ok := s.tryBeginPrevCloseBackfill()
+	ctx, scope, cleanup, valid := s.beginOperation(ctx)
+	if !valid {
+		return
+	}
+	defer cleanup()
+	today, ok := s.tryBeginPrevCloseBackfill(scope)
 	if !ok {
 		return
 	}
-	s.runPrevCloseBackfill(ctx, today)
+	s.runPrevCloseBackfill(ctx, today, scope)
 }
 
 type dayCandle = kite.OISeriesPoint
@@ -398,10 +460,12 @@ func lastPrevSession(candles []dayCandle, today string) *dayCandle {
 // jsFalsyNum is `!n` for a number.
 func jsFalsyNum(n float64) bool { return n == 0 || math.IsNaN(n) }
 
-func (s *Service) runPrevCloseBackfill(ctx context.Context, today string) {
+func (s *Service) runPrevCloseBackfill(ctx context.Context, today string, scope operationScope) {
 	defer func() {
 		s.mu.Lock()
-		s.prevCloseBackfillRunning = false
+		if s.prevCloseOwner == scope.epoch {
+			s.prevCloseBackfillRunning = false
+		}
 		s.mu.Unlock()
 	}()
 	fail := func(err error) {
@@ -418,6 +482,10 @@ func (s *Service) runPrevCloseBackfill(ctx context.Context, today string) {
 	}
 
 	s.mu.Lock()
+	if !s.scopeCurrentLocked(scope) {
+		s.mu.Unlock()
+		return
+	}
 	var have *PrevClose
 	if s.prevClose != nil && s.prevClose.ForDay == today {
 		have = s.prevClose
@@ -541,6 +609,10 @@ func (s *Service) runPrevCloseBackfill(ctx context.Context, today string) {
 	}
 	pc := &PrevClose{ForDay: today, ClosedOn: label, Expiry: sel.expiry, Complete: failed == 0, Tokens: tokens, Order: jsTokenOrder(order)}
 	s.mu.Lock()
+	if !s.scopeCurrentLocked(scope) {
+		s.mu.Unlock()
+		return
+	}
 	s.prevClose = pc
 	s.persistPrevCloseLocked()
 	s.mu.Unlock()

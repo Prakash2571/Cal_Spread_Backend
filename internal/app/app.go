@@ -80,6 +80,8 @@ type Options struct {
 	// Dhan points the Dhan integration at other hosts.
 	Dhan                  registry.DhanConfig
 	BrokerLoginHTTPClient *http.Client
+	// AnalyticsNow replaces only the analytics clock for deterministic HTTP checks.
+	AnalyticsNow func() time.Time
 	// YahooChartRoot and YahooHTTPClient replace the dividend-yield endpoint.
 	YahooChartRoot  string
 	YahooHTTPClient *http.Client
@@ -233,15 +235,17 @@ func New(cfg config.Config, opts Options) (*App, error) {
 
 	a.analytics = analytics.New(analytics.Deps{
 		Instruments:        c.AllInstruments,
-		QuoteFull:          kc.GetQuoteFull,
-		Historical:         history.GetHistorical,
-		HistoricalOiSeries: history.GetHistoricalOiSeries,
+		QuoteFull:          quotes.GetQuoteFull,
+		Historical:         history.ForAnalytics().GetHistorical,
+		HistoricalOiSeries: history.ForAnalytics().GetHistoricalOiSeries,
 		QuotesByToken:      quotes.QuotesByToken,
-		CaptureAllowed:     analytics.ZerodhaCaptureGate(reg.ActiveBroker, kc.HasSession, log.Printf),
+		CaptureAllowed:     func(string) bool { return !reg.Switching() && reg.ActiveHealth().DataReady },
 		MarketData:         a.analyticsReadiness,
+		Namespace:          reg.Namespace,
 		SendError:          c.SendError,
 		Cache:              a.cache,
 		ExtraSessionDays:   cfg.ExtraSessionDays,
+		Now:                opts.AnalyticsNow,
 	})
 
 	a.calendar = calendar.New(calendar.Deps{
@@ -331,6 +335,7 @@ func New(cfg config.Config, opts Options) (*App, error) {
 		},
 		InvalidateBooks: func() {
 			a.note("hook: invalidate books")
+			a.analytics.InvalidateNamespace()
 			a.synth.InvalidateNamespace()
 			a.fv.InvalidateNamespace()
 		},
@@ -348,6 +353,7 @@ func New(cfg config.Config, opts Options) (*App, error) {
 			a.note("hook: session lost")
 			a.synth.Stop()
 		},
+		OnRuntimeReady: a.analytics.OnBrokerReady,
 	})
 
 	a.handler = server.New(server.Options{FrontendOrigin: cfg.FrontendURL}, a.mounts()...)
@@ -464,8 +470,10 @@ func (a *App) onFeedTokenRejected() {
 // onKiteLogin is triggerPostLoginBackfill: the hourly and EOD backfills, then the
 // option-OI chain (captures, backfills, previous close, coarsening, flush).
 func (a *App) onKiteLogin() {
-	a.captures.PostLogin()
-	a.analytics.OnKiteLogin()
+	if a.reg.ActiveBroker() == brokers.Zerodha {
+		a.captures.PostLogin()
+		a.analytics.OnKiteLogin()
+	}
 }
 
 func (a *App) note(event string) {

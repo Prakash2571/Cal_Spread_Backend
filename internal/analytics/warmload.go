@@ -18,7 +18,7 @@ func (s *Service) logCacheStatus() {
 	s.warnedDisabled = true
 	s.mu.Unlock()
 	if !warned {
-		s.logf("[Cache] DATABASE_URL not set — analytics caches are in-memory only and will be rebuilt from Kite after every restart.")
+		s.logf("[Cache] DATABASE_URL not set — analytics caches are in-memory only and will be rebuilt from %s after every restart.", s.historySource())
 	}
 }
 
@@ -33,6 +33,7 @@ func (s *Service) cacheReadable() bool {
 // cannot be read. Fields are returned in ascending numeric order (Redis gave no order;
 // only duplicate stamps could make it matter).
 func (s *Service) hgetAll(ctx context.Context, key string) []string {
+	key = s.cacheReadKey(ctx, key)
 	if !s.cacheReadable() {
 		return nil
 	}
@@ -65,6 +66,7 @@ func (s *Service) hgetAll(ctx context.Context, key string) []string {
 
 // getRaw is redis getJson's transport half.
 func (s *Service) getRaw(ctx context.Context, key string) (string, bool) {
+	key = s.cacheReadKey(ctx, key)
 	if !s.cacheReadable() {
 		return "", false
 	}
@@ -88,6 +90,18 @@ func (s *Service) ping(ctx context.Context) bool {
 // WarmLoad restores every persisted cache, keeping anything already in memory (a login
 // during the load may have captured newer readings), then derives the coarse frames.
 func (s *Service) WarmLoad(ctx context.Context) {
+	ctx, scope, cleanup, valid := s.beginOperation(ctx)
+	if !valid {
+		return
+	}
+	defer cleanup()
+	defer func() {
+		s.mu.Lock()
+		if s.scopeCurrentLocked(scope) {
+			s.scopeWarm = true
+		}
+		s.mu.Unlock()
+	}()
 	s.logCacheStatus()
 	if !s.cacheEnabled() {
 		return
@@ -107,6 +121,10 @@ func (s *Service) WarmLoad(ctx context.Context) {
 			}
 		}
 		s.mu.Lock()
+		if !s.scopeCurrentLocked(scope) {
+			s.mu.Unlock()
+			return
+		}
 		loaded += mergeWarmLoaded(&s.oiFrames[i], opt, oiStamp)
 		s.mu.Unlock()
 
@@ -117,6 +135,10 @@ func (s *Service) WarmLoad(ctx context.Context) {
 			}
 		}
 		s.mu.Lock()
+		if !s.scopeCurrentLocked(scope) {
+			s.mu.Unlock()
+			return
+		}
 		loaded += mergeWarmLoaded(&s.futFrames[i], fut, futStamp)
 		s.mu.Unlock()
 	}
@@ -124,6 +146,10 @@ func (s *Service) WarmLoad(ctx context.Context) {
 	if raw, ok := s.getRaw(ctx, "futcontracts"); ok {
 		if cs, ok := decodeContracts(raw); ok {
 			s.mu.Lock()
+			if !s.scopeCurrentLocked(scope) {
+				s.mu.Unlock()
+				return
+			}
 			for _, c := range cs {
 				s.futKnown.Set(c.Expiry, c)
 			}
@@ -134,9 +160,13 @@ func (s *Service) WarmLoad(ctx context.Context) {
 	if raw, ok := s.getRaw(ctx, "prevclose"); ok {
 		if prev, ok := decodePrevClose(raw); ok && prev.ForDay == istDayKey(s.nowMs()) {
 			s.mu.Lock()
+			if !s.scopeCurrentLocked(scope) {
+				s.mu.Unlock()
+				return
+			}
 			s.prevClose = prev
 			s.mu.Unlock()
-			s.logf("[Cache] Restored previous-close baseline (%d tokens from %s) — no Kite backfill needed.", len(prev.Order), prev.ClosedOn)
+			s.logf("[Cache] Restored previous-close baseline (%d tokens from %s) — no %s backfill needed.", len(prev.Order), prev.ClosedOn, s.historySource())
 		}
 	}
 
@@ -147,6 +177,10 @@ func (s *Service) WarmLoad(ctx context.Context) {
 		}
 	}
 	s.mu.Lock()
+	if !s.scopeCurrentLocked(scope) {
+		s.mu.Unlock()
+		return
+	}
 	s.chainMin, _ = mergeWarmLoadedSnaps(s.chainMin, minute)
 	s.mu.Unlock()
 	for d := int64(0); d <= 4; d++ {
@@ -158,6 +192,10 @@ func (s *Service) WarmLoad(ctx context.Context) {
 			}
 		}
 		s.mu.Lock()
+		if !s.scopeCurrentLocked(scope) {
+			s.mu.Unlock()
+			return
+		}
 		s.chainHour, _ = mergeWarmLoadedSnaps(s.chainHour, hour)
 		s.mu.Unlock()
 	}
