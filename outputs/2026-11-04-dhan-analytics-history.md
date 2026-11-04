@@ -88,5 +88,7 @@ live page, run `/home/calspread/Cal_Spread_Backend/scripts/deploy.sh` on the VM 
 The receipt commit's CI subsequently caught an inherited test-only race in
 `TestMemoryOnlyWithoutCache`'s shared log collector. Its writes/read snapshot are
 now synchronized: 50 race-enabled repetitions and the full required 32-package
-suite/build passed again. Publication/current-main CI for that test-only correction
-is the remaining verification step; the Dhan runtime remains the tested feature.
+suite/build passed again. Correction `5f7ef23` is published on main, and its
+[CI 41810069980](https://github.com/Prakash2571/Cal_Spread_Backend/actions/runs/41810069980)
+completed **success**. The Dhan executable implementation remains `13a0ab8`;
+the VM deployment command above is the remaining operator action.

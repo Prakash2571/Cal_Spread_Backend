@@ -1,8 +1,8 @@
 # Status: Restore analytics history with Dhan active
 
-State: Doing
+State: Done
 Updated: 2026-11-04
-Next action: Commit and push the verified existing-test log synchronization, watch current main CI, then publish the completion/rollout receipt.
+Next action: On the VM as calspread, run /home/calspread/Cal_Spread_Backend/scripts/deploy.sh, then verify recovered option/futures frame and baseline data.
 Blockers: none
 WIP override: none
 
@@ -18,8 +18,9 @@ record/backfill/baseline, cache restoration and namespace fencing are implemente
 The required local suite/build/module checks passed. Runtime 13a0ab8 is published
 on GitHub main; matching feature CI 41808216441 completed successfully. The
 receipt commit's CI 41808832910 exposed a race in the existing memory-only test's
-shared log slice. Its collector is now synchronized; current-main verification
-is in progress before the operator's live VM rollout.
+shared log slice. The synchronized collector is published as 5f7ef23; its matching
+CI 41810069980 completed successfully. Implementation/publication verification is
+complete before the operator's live VM rollout.
 
 ## Completed
 
@@ -71,6 +72,10 @@ is in progress before the operator's live VM rollout.
   runtime source is unchanged by this correction.
 - The corrected memory-only test passed 50 race-enabled repetitions, and the
   complete required backend suite/build passed again for all 32 tested packages.
+- Published test-only correction 5f7ef23 through the canonical repository .git URL
+  after the configured bare-URL push returned remote internal-server errors.
+- Verified exact correction/main CI 41810069980 completed success, including all
+  PostgreSQL/race/module/build/artifact steps. Runtime implementation remains 13a0ab8.
 
 ## Checks
 
@@ -101,12 +106,19 @@ is in progress before the operator's live VM rollout.
 | 2026-11-04 | `gh run view 41808832910 --json headSha,status,conclusion,url,jobs` and `gh run view 41808832910 --log-failed` | Exit 0; isolated race at service_test.go:910 in TestMemoryOnlyWithoutCache's unsynchronized log slice, called concurrently by capture and cold-start backfill. Other packages including the Dhan App/registry checks passed. |
 | 2026-11-04 | `bash scratch/dhan-default-check/check.sh env GOPROXY=off go test -race -count=50 -timeout 120s -run '^TestMemoryOnlyWithoutCache$' ./internal/analytics && bash scratch/dhan-default-check/check.sh gofmt -d internal/analytics/service_test.go && git diff --check` | Exit 0; all 50 memory-only race repetitions passed, no formatting/whitespace issues. |
 | 2026-11-04 | `bash scratch/dhan-default-check/check.sh make db-start && bash scratch/dhan-default-check/check.sh env GOPROXY=off TEST_DATABASE_URL='postgres://calspread@127.0.0.1:55472/calspread_test?sslmode=disable' make check && bash scratch/dhan-default-check/check.sh env GOPROXY=off make build && git diff --check` | Exit 0; owned database resumed, required full 32-package PostgreSQL/race/build/vet/format/module suite and standalone binary passed after the collector correction. |
+| 2026-11-04 | `git commit -m "Synchronize analytics test log collection"` after status/diff/recent-history/staged-diff review | Exit 0; intended test/report/status correction committed as 5f7ef23. |
+| 2026-11-04 | Three normal `git push origin main` attempts | Failed with GitHub remote Internal Server Error; branch remained ahead of origin/main. GitHub public status reported operational; branch API still showed b1df3c1. |
+| 2026-11-04 | `git push https://github.com/Prakash2571/Cal_Spread_Backend.git HEAD:main` | Exit 0; canonical URL published 5f7ef23 as a normal fast-forward. No force or Git configuration change. |
+| 2026-11-04 | `git fetch origin main && git status --short --branch && git rev-parse HEAD origin/main && gh run list --branch main --commit 5f7ef2352fb5bb551e197a85f3f2015edfc2b367 --workflow ci.yml --event push --json databaseId,headSha,status,conclusion,url` | Exit 0; clean worktree and HEAD/origin/main match 5f7ef23; matching CI 41810069980 found in progress. |
+| 2026-11-04 | `gh run watch 41810069980 --interval 20 --exit-status && gh run view 41810069980 --json headSha,status,conclusion,url,jobs` | Exit 0; completed success on exact 5f7ef23 SHA, every required check/module/build/artifact step successful. |
 
 ## Publication and rollout
 
 - Runtime: [13a0ab8](https://github.com/Prakash2571/Cal_Spread_Backend/commit/13a0ab8aa1d7c23e00cab2d585aea90504032f04), published on main.
 - [CI 41808216441](https://github.com/Prakash2571/Cal_Spread_Backend/actions/runs/41808216441)
   completed success on the published runtime.
+- Test collector correction: `5f7ef23`, with successful
+  [CI 41810069980](https://github.com/Prakash2571/Cal_Spread_Backend/actions/runs/41810069980).
 - This follow-up receipt changes only STATUS/report documentation; executable
   source remains the verified 13a0ab8 runtime.
 - VM rollout: as `calspread`, run `/home/calspread/Cal_Spread_Backend/scripts/deploy.sh`.
