@@ -154,5 +154,7 @@ configuration, service commands and update procedure. The old Node/PM2 deploymen
 script is retired.
 
 To rebuild and deploy both checkouts on the configured VM, run
-`./scripts/deploy.sh` as `calspread`. It checks the production database, restarts
-the Go service, reloads Nginx and verifies HTTPS.
+`./scripts/deploy.sh` as `calspread`, with both checkouts clean and on `main`.
+It pulls backend `main` and builds Go, checks the production database, pulls
+frontend `main` and builds the UI, restarts the Go service, reloads Nginx and
+verifies HTTPS.

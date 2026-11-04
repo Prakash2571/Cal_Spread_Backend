@@ -2,7 +2,13 @@
 # Build and update the existing calspread.online VM deployment.
 set -Eeuo pipefail
 
-backend_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# Run an in-memory copy so pulling this script cannot change code mid-execution.
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    script_path="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
+    exec bash -c "$(< "$script_path")" "$script_path" "$@"
+fi
+
+backend_dir="$(cd -- "$(dirname -- "$0")/.." && pwd -P)"
 frontend_dir="${CALSPREAD_FRONTEND_DIR:-$(dirname -- "$backend_dir")/Cal_Spread}"
 site_origin='https://calspread.online'
 production_env='/etc/calspread/calspread.env'
@@ -14,6 +20,20 @@ frontend_changed=0
 
 log() { printf '\n[deploy] %s\n' "$*"; }
 fail() { printf '\n[deploy] ERROR: %s\n' "$*" >&2; exit 1; }
+check_checkout() {
+    local repo=$1
+    [[ "$(git -C "$repo" rev-parse --show-toplevel)" == "$repo" ]] ||
+        fail "Expected a Git checkout at $repo"
+    [[ "$(git -C "$repo" branch --show-current)" == main ]] ||
+        fail "Checkout must be on main: $repo"
+    [[ -z "$(git -C "$repo" status --porcelain)" ]] ||
+        fail "Checkout has uncommitted changes; commit or stash them first: $repo"
+}
+pull_main() {
+    check_checkout "$1"
+    git -C "$1" pull --ff-only --no-rebase --no-autostash origin main ||
+        fail "Could not fast-forward $1 from origin/main; resolve the Git error and retry."
+}
 cleanup() {
     local result=$?
     trap - EXIT INT TERM
@@ -42,10 +62,11 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 [[ $(id -un) == calspread ]] || fail 'Run this script as calspread; it uses sudo for service operations.'
-for tool in go npm python3 psql curl sudo flock tar; do
+for tool in git go npm python3 psql curl sudo flock tar; do
     command -v "$tool" >/dev/null || fail "Required command is missing: $tool"
 done
 [[ -f "$frontend_dir/package-lock.json" ]] || fail "Frontend checkout not found: $frontend_dir"
+frontend_dir="$(cd -- "$frontend_dir" && pwd -P)"
 [[ -x "$binary" && -f "$webroot/index.html" ]] || fail 'Initial VM deployment is missing; see deploy/README.md.'
 # This VM permits passwordless commands; sudo -v can still demand a password.
 sudo -n true 2>/dev/null || sudo -v
@@ -55,10 +76,15 @@ exec 9>"$backend_dir/scratch/deploy.lock"
 flock -n 9 || fail 'Another deployment is already running.'
 stage="$(mktemp -d "$backend_dir/scratch/deploy.XXXXXX")"
 
-log '1/6 Building the Go backend.'
+check_checkout "$backend_dir"
+check_checkout "$frontend_dir"
+log '1/8 Pulling backend main from GitHub.'
+pull_main "$backend_dir"
+
+log '2/8 Building the Go backend.'
 (cd "$backend_dir" && go build -trimpath -o "$stage/calspread" ./cmd/server)
 
-log '2/6 Starting PostgreSQL and checking the production database connection.'
+log '3/8 Starting PostgreSQL and checking the production database connection.'
 sudo -n systemctl start postgresql
 sudo -n -u calspread python3 - "$production_env" <<'PY'
 import os, re, subprocess, sys, time
@@ -114,7 +140,10 @@ for attempt in range(5):
     time.sleep(1)
 PY
 
-log '3/6 Installing locked frontend dependencies and building the production UI.'
+log '4/8 Pulling frontend main from GitHub.'
+pull_main "$frontend_dir"
+
+log '5/8 Installing locked frontend dependencies and building the production UI.'
 (cd "$frontend_dir" && npm ci --no-audit --no-fund &&
     VITE_API_BASE_URL="$site_origin" npm run build)
 python3 - "$frontend_dir/dist" "$site_origin" <<'PY'
@@ -128,12 +157,12 @@ if not entry or sys.argv[2] not in (root / entry[1].lstrip('/')).read_text():
 print('Frontend production API origin: OK')
 PY
 
-log '4/6 Checking Nginx before activating the build.'
+log '6/8 Checking Nginx before activating the build.'
 sudo -n nginx -t
 cp -- "$binary" "$stage/previous-backend"
 cp -- "$webroot/index.html" "$stage/previous-index.html"
 
-log '5/6 Installing the backend, restarting systemd, and checking database initialization.'
+log '7/8 Installing the backend, restarting systemd, and checking database initialization.'
 sudo -n install -m 0755 "$stage/calspread" "$binary.next"
 backend_changed=1
 sudo -n mv -f "$binary.next" "$binary"
@@ -164,7 +193,7 @@ then
     fail 'The backend did not initialize PostgreSQL persistence; inspect journalctl -u calspread.'
 fi
 
-log '6/6 Publishing frontend assets, reloading Nginx, and checking HTTPS.'
+log '8/8 Publishing frontend assets, reloading Nginx, and checking HTTPS.'
 # Keep older hashed assets for browsers holding a previous page. Publish index last.
 tar -C "$frontend_dir/dist" --exclude='./index.html' -cf - . |
     sudo -n tar --no-same-owner -C "$webroot" -xf -

@@ -68,24 +68,31 @@ data.
 
 ## Rebuild and publish updates
 
-Run as `calspread`, after updating the desired checkouts:
+Run as `calspread`; both checkouts must be clean and on `main`:
 
 ```bash
 cd /home/calspread/Cal_Spread_Backend
 ./scripts/deploy.sh
 ```
 
-The script builds Go, starts/checks PostgreSQL using the production configuration,
-installs locked frontend dependencies, builds the UI with the production API
-origin, validates Nginx, installs/restarts the backend, verifies that PostgreSQL
+The script pulls backend `origin/main`, builds Go, starts/checks PostgreSQL using
+the production configuration, pulls frontend `origin/main`, installs locked
+frontend dependencies, builds the UI with the production API origin, validates
+Nginx, installs/restarts the backend, verifies that PostgreSQL
 persistence initialized, publishes the frontend, reloads Nginx, and checks the
 live HTTPS frontend, JavaScript and API. A lock prevents concurrent deployments.
 It restores the previous backend and frontend entry page if activation checks
 fail; older hashed assets remain available. Database migrations are not rolled
 back, so back up the database before updates containing schema changes.
 
+Git pulls use `--ff-only --no-rebase --no-autostash`; dirty checkouts, a branch
+other than `main`, divergent history, or a failed pull stop deployment. Local
+commits and changes are preserved. Pulls require the `calspread` user's existing
+GitHub access. The script runs an in-memory copy so a backend pull cannot replace
+the code being executed; changes to the deploy script take effect on the next run.
+
 It uses the installed systemd/Nginx configuration and existing certificates;
-it does not overwrite production credentials or run Git pulls. The default
+it does not overwrite production credentials. The default
 frontend checkout is `../Cal_Spread`. Override it when needed:
 
 ```bash
