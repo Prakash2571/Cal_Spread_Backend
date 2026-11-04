@@ -80,6 +80,13 @@ The CI-equivalent `go mod tidy` and module-file diff check also completed with
 ## Publication
 
 User authorized pushing the completed backend changes to GitHub main on
-2026-11-04. Local verification is complete. Remote main advanced during the check
-to `f01ccf2` (deployment-script/docs update); its reviewed changes are being
-incorporated before publication and matching CI verification.
+2026-11-04. Runtime [890edf1](https://github.com/Prakash2571/Cal_Spread_Backend/commit/890edf1b9a89aad9908b10d1f1eb259e2b2b114b)
+is published on main. It includes the reviewed deployment-script/docs update
+`f01ccf2` in its history. The normal push succeeded and the worktree was clean;
+matching [GitHub CI 41799017588](https://github.com/Prakash2571/Cal_Spread_Backend/actions/runs/41799017588)
+completed **success** on that exact runtime commit. Required PostgreSQL/race,
+build/vet/format, module-file sync and standalone binary/artifact checks all passed.
+
+The owned local PostgreSQL process was stopped after verification; its cluster
+data and downloaded tools/caches are retained in scratch. This follow-up receipt
+changes documentation only; executable source remains `890edf1`.
