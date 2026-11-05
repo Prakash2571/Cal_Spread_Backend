@@ -1,8 +1,8 @@
 # Status: Spike — NIFTY/SENSEX minimum-straddle paper spreads
 
-State: Doing
-Updated: 2026-11-04
-Next action: Commit/push the reviewed backend feature, verify its matching CI, then publish the frontend and verify its matching CI; record receipts and stop owned PostgreSQL.
+State: Done
+Updated: 2026-11-05
+Next action: Operator: run /home/calspread/Cal_Spread_Backend/scripts/deploy.sh as calspread on the configured VM with both checkouts clean/on main, then open https://calspread.online/spike with full/trade access.
 Blockers: none
 WIP override: none
 
@@ -12,7 +12,10 @@ Task: `2026-11-04-spike-paper-straddles` · Projects: Cal_Spread_Backend + Cal_S
 
 Clean starting baselines were backend 1586c24 and frontend 4749fd0. Implementation,
 Jev-assisted corrections, final local verification and delivery reports are complete;
-source publication and matching CI remain.
+both features are published on main. Backend 214576b / CI 41838824663 and frontend
+0020608 / CI 41839351873 have matching completed/success results, reconfirmed
+2026-11-05. Final publication receipts identify those verified implementation heads.
+The repository-owned PostgreSQL is stopped; caches/data/browser/Jev evidence remain.
 The user requested the Spike feature, primary fourth-OTM paper spreads only,
 separate premium/VWAP charts and no unnecessary environment variables. The 5%
 reference is any earlier straddle price within a rolling 30-minute lookback.
@@ -34,7 +37,7 @@ reference is any earlier straddle price within a rolling 30-minute lookback.
   restart behavior, permissions and controls without new environment settings.
 - Real Dhan binary-feed HTTP integration passed for both index entries, timeframes,
   one-lot sizes, manual exit/P&L and persisted paper control.
-- Required complete backend suite/build passed for all 33 tested packages.
+- Required complete backend suite/build passed for all 34 tested packages.
 - Browser verification uses separate fresh fixtures to keep the real 150/minute
   API limit intact. A parallel attempt exposed Firefox's shared BiDi 9222 port;
   browser runs are sequential. Spike's navigation-close EventSource log
@@ -48,7 +51,7 @@ reference is any earlier straddle price within a rolling 30-minute lookback.
   existing Go/PostgreSQL tooling and locked caches can be reused.
 - Jev's first seven-question review returned HTTP 200 on jev-1.14.0. It identified
   desktop-axis clipping (0.80 true) and missing explicit downward-rule lookback
-  (0.13 that stated); mobile clipping was unsettled (0.51) and needs measured bounds.
+  (0.13 that stated); mobile clipping was unsettled (0.51), resolved by measured bounds.
   Separate charts (1.00), mobile paper-only label (0.98), crossover timing (0.94)
   and delayed-confirmation negative case (0.09) matched their intended propositions.
 - Measured browser bounds reproduced Jev's desktop finding on all four rightmost
@@ -71,6 +74,11 @@ reference is any earlier straddle price within a rolling 30-minute lookback.
   and real-Go HTTP workflow passed after this correction.
 - Saved final implementation/verification report and actual Jev response/usage
   receipt in the two repositories' outputs, with exact-payload hashes/paths.
+- Published both features with passing matching CI and finalized completion/rollout
+  records. No additional API calls were needed; Jev spend remains US$0.000684390.
+- On resume the owned PostgreSQL was already stopped. Stop exited 0; status's
+  expected no-server result confirms it. The last successful SQL inspection found
+  zero non-system test schemas; retained work/data were not cleaned.
 
 ## Checks
 
@@ -109,6 +117,14 @@ reference is any earlier straddle price within a rolling 30-minute lookback.
 | 2026-11-04 | Backend `bash scratch/dhan-default-check/check.sh psql -h 127.0.0.1 -p 55472 -U calspread -d calspread_test -At -c "select nspname from pg_namespace where nspname not in ('public', 'information_schema') and nspname not like 'pg_%' order by nspname"` | Exit 0; no rows, zero non-system test schemas left. |
 | 2026-11-04 | Both repository status/log/diff checks; env/locked/frozen-file guards; `gh workflow list` | Exit 0; only intended Spike files; workflow authentication available. No source commits yet. |
 | 2026-11-04 | Frontend `node --input-type=module -e` artifact-integrity assertions against both retained exact requests/results and the output receipt | Exit 0; request SHA-256s, complete returned responses, unchanged question wording, 16,295 input/306 free output tokens, price and remaining budget reconciled. No API call. |
+| 2026-11-04 | Backend `git commit -m "Add Spike minimum-straddle paper trading" && git push origin main` | Exit 0; feature 214576bfdc8ef0c565a01e9850d675a2e8e8fed8 fast-forward published, 33 intended files. |
+| 2026-11-04 | Backend `gh run list --repo Prakash2571/Cal_Spread_Backend --workflow ci.yml --branch main --commit "$(git rev-parse HEAD)" --limit 5 --json databaseId,headSha,status,conclusion,url,name` then `gh run watch 41838824663 --repo Prakash2571/Cal_Spread_Backend --exit-status --interval 10` | Exit 0; matching head 214576b, CI success. Run: https://github.com/Prakash2571/Cal_Spread_Backend/actions/runs/41838824663. |
+| 2026-11-04 | Frontend `git commit -m "Add Spike monitor and paper spread controls" && git push origin main` | Exit 0; feature 0020608012a178d1f27186998f08caac7fe61d7b fast-forward published, 11 intended files. |
+| 2026-11-04 | Frontend `gh run watch 41839351873 --repo Prakash2571/Cal_Spread --exit-status --interval 10` | Exit 0; matching source CI success: https://github.com/Prakash2571/Cal_Spread/actions/runs/41839351873. |
+| 2026-11-05 | Both repos `git status --short --branch && git fetch origin main && git rev-parse HEAD origin/main && git log --oneline -10` | Exit 0; remote/local source heads still equal 214576b and 0020608. Backend has the intended in-progress status update; frontend clean. |
+| 2026-11-05 | `gh run view 41838824663 --repo Prakash2571/Cal_Spread_Backend --json headSha,status,conclusion,url,name` and `gh run view 41839351873 --repo Prakash2571/Cal_Spread --json headSha,status,conclusion,url,name` | Both exit 0; exact feature heads, completed/success reconfirmed. |
+| 2026-11-05 | Attempted owned PostgreSQL SQL schema count before stop/status | Failed connection refused; later commands in that initial && chain did not run. Cluster was already stopped; the zero-schema claim is from the successful 2026-11-04 inspection. |
+| 2026-11-05 | `bash scratch/dhan-default-check/check.sh make db-stop && bash scratch/dhan-default-check/check.sh make db-status` | Stop exit 0: already stopped. Status pg_ctl exit 3 / make exit 2: no server running, the expected stopped-state result. Data/tools/evidence retained. |
 
 ## Jev budget and evidence
 
@@ -130,11 +146,14 @@ reference is any earlier straddle price within a rolling 30-minute lookback.
 - internal/app/app.go, lifecycle.go
 - internal/db/migrations/
 - ../Cal_Spread/src/App.tsx, LineChart.tsx, api.ts, styles.css
+- outputs/2026-11-04-spike-paper-straddles.md
+- ../Cal_Spread/outputs/2026-11-04-spike-jev-review.json
+- ../Cal_Spread/outputs/2026-11-05-spike-publication.md
 
 ## Reconciliation notes
 
 - Earlier Dhan analytics work is complete and published; Spike is a separate
-  cross-repository feature with one Doing task record for workspace WIP.
+  cross-repository feature, now completed, using one task record for workspace WIP.
 - The user clarified 5% versus prior straddle values, rather than a 5% distance
   from VWAP; the implementation must follow that clarification.
 - The user described chart separation when asked about VWAP. The explicit baseline
@@ -148,3 +167,6 @@ reference is any earlier straddle price within a rolling 30-minute lookback.
 - Both project WORKFLOW task pointers still named the completed token-login task;
   updated them to the active Spike cross-repository record. README now identifies
   the additional dedicated lane accurately.
+- 2026-11-05 resume found frontend publication/CI complete while notes still listed
+  staging/publishing as next. Reconciled both exact heads and CI through live Git/GH.
+  PostgreSQL was already stopped; no restart was needed for receipt finalization.

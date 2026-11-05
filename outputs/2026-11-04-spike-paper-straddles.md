@@ -1,8 +1,8 @@
 # Spike — implementation, Jev review and verification
 
-Date: 2026-11-04 · Task: `2026-11-04-spike-paper-straddles`
+Date: 2026-11-04 · Finalized: 2026-11-05 · Task: `2026-11-04-spike-paper-straddles`
 
-## Delivered locally
+## Delivered and published
 
 - `/spike` navigation/page for NIFTY and SENSEX with separate premium/VWAP plots,
   1m/5m/30m/1h history, live values, paper controls, positions and manual P&L.
@@ -47,7 +47,7 @@ Total usage: **16,295 input / 306 free output tokens**, estimated
 US$0.01 allowance. Zero retries or unknown usage. The unavailable SDK was handled
 with the live-documented HTTP API from a scratch TypeScript script.
 
-[Actual Jev response/usage receipt](../../Cal_Spread/outputs/2026-11-04-spike-jev-review.json)
+[Actual Jev response/usage receipt](https://github.com/Prakash2571/Cal_Spread/blob/0020608012a178d1f27186998f08caac7fe61d7b/outputs/2026-11-04-spike-jev-review.json)
 includes request hashes and local exact-payload/assets paths. Arithmetic, date
 comparisons, minimum selection, fills and P&L are implemented/tested in code.
 
@@ -102,26 +102,45 @@ scroll width 378. Browser fixtures must run sequentially to avoid Firefox BiDi
 port sharing. The narrowly recognized navigation cancellation follows verification
 that the actual snapshot stream opened and delivered frames.
 
-Evidence retained under frontend `scratch/go-integration/`:
+Evidence retained under the frontend repository:
 
-- `spike-browser-L4L9a0/`: final Spike workflow/report/screenshots used by Jev recheck.
-- `browser-r0uIlH/`: final existing-workflow regression/report/screenshots.
+- `scratch/go-integration/spike-browser-L4L9a0/`: final Spike workflow/report/screenshots used by Jev recheck.
+- `scratch/go-integration/browser-r0uIlH/`: final existing-workflow regression/report/screenshots.
 - `scratch/jev-spike-review/{baseline,revised}/`: exact TypeSafe requests/results,
   prepared PNGs and image/hash manifests, relative to frontend root.
 
-The final PostgreSQL inspection found **zero non-system test schemas**.
-Tool caches, PostgreSQL data, compiled output and browser evidence are retained.
+The 2026-11-04 final PostgreSQL inspection found **zero non-system test schemas**.
+On resuming 2026-11-05, the repository-owned cluster was already stopped. The
+stop command exited 0 (already stopped); status reported `pg_ctl: no server running`
+(pg_ctl 3 / make 2, the expected stopped-state result). A new SQL count could not
+run against the stopped server. Tool caches, PostgreSQL data, compiled output and
+browser evidence are retained.
 
 ## Publication
 
 Both remote mains were fetched before publication and still matched the clean
-baselines: backend `1586c24`, frontend `4749fd0`. Source publication and matching
-GitHub CI are the remaining step; this section will record their actual results.
+baselines: backend `1586c24`, frontend `4749fd0`. Backend published first; frontend
+then verified against the paired backend main.
+
+| Repository | Published feature | Matching CI |
+|---|---|---|
+| Backend | [214576bfdc8ef0c565a01e9850d675a2e8e8fed8](https://github.com/Prakash2571/Cal_Spread_Backend/commit/214576bfdc8ef0c565a01e9850d675a2e8e8fed8) | [41838824663 — success](https://github.com/Prakash2571/Cal_Spread_Backend/actions/runs/41838824663) |
+| Frontend | [0020608012a178d1f27186998f08caac7fe61d7b](https://github.com/Prakash2571/Cal_Spread/commit/0020608012a178d1f27186998f08caac7fe61d7b) | [41839351873 — success](https://github.com/Prakash2571/Cal_Spread/actions/runs/41839351873) |
+
+Normal fast-forward pushes succeeded. `gh run watch ... --exit-status --interval 10`
+exited 0 for both source runs. On 2026-11-05, fresh `git fetch origin main`,
+`git rev-parse HEAD origin/main` and `gh run view ... --json headSha,status,conclusion,url,name`
+reconfirmed exact source heads and both completed/success conclusions.
+
+Frontend [publication receipt](https://github.com/Prakash2571/Cal_Spread/blob/main/outputs/2026-11-05-spike-publication.md)
+and backend task status record completion and the rollout action. Later receipt
+commits contain documentation only; the feature verification above identifies the
+tested implementation commits explicitly.
 
 ## Operator rollout
 
-After both verified mains are published, run the existing configured VM script as
-`calspread`, with both VM checkouts clean/on main:
+Run the existing configured VM script as `calspread`, with both VM checkouts
+clean/on main:
 
 ```bash
 /home/calspread/Cal_Spread_Backend/scripts/deploy.sh
