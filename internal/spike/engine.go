@@ -63,6 +63,9 @@ type Engine struct {
 	views          map[string]IndexView
 	previous       map[string]Sample
 	windows        map[string]*priceWindow
+	armed          map[string]*armedState
+	spotTokens     map[int64]string
+	spots          map[string]spotHistory
 	forming        map[string]Bar
 	chartVWAP      map[string]*chartVWAPAccumulator
 	bars           map[string]map[int64]Bar
@@ -85,6 +88,7 @@ func New(d Deps) *Engine {
 		universes: map[string]universe{}, wanted: map[int64]bool{}, quotes: map[int64]quote{}, views: map[string]IndexView{},
 		previous: map[string]Sample{}, windows: map[string]*priceWindow{}, forming: map[string]Bar{}, bars: map[string]map[int64]Bar{},
 		chartVWAP: map[string]*chartVWAPAccumulator{},
+		armed: map[string]*armedState{}, spotTokens: map[int64]string{}, spots: map[string]spotHistory{},
 		pendingBars: map[string]Bar{}, open: map[string]Trade{}, pending: map[string]string{}, closed: []Trade{},
 		refresh: make(chan struct{}, 1), candidates: make(chan candidate, 2), watchers: map[uint64]chan Snapshot{}}
 	for _, symbol := range Symbols {
@@ -163,9 +167,27 @@ func (e *Engine) run() {
 	}
 }
 
+func (e *Engine) resetArmedAndSpotLocked() {
+	e.armed = map[string]*armedState{}
+	e.spots = map[string]spotHistory{}
+}
+
+func sameSpotTokens(a, b map[int64]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for token, symbol := range a {
+		if b[token] != symbol {
+			return false
+		}
+	}
+	return true
+}
+
 func (e *Engine) OnRuntimeReady() {
 	e.mu.Lock()
 	e.quotes, e.previous = map[int64]quote{}, map[string]Sample{}
+	e.resetArmedAndSpotLocked()
 	e.updateMarksLocked(e.now())
 	e.mu.Unlock()
 	select {
@@ -244,12 +266,14 @@ func (e *Engine) reconcile(parent context.Context) error {
 			}
 		}
 		e.quotes, e.previous = map[int64]quote{}, map[string]Sample{}
+		e.resetArmedAndSpotLocked()
 		e.mu.Unlock()
 	}
 	if !e.dataReady() {
 		e.mu.Lock()
 		e.active, e.connected, e.namespace = false, false, namespace
 		e.quotes, e.previous, e.pending = map[int64]quote{}, map[string]Sample{}, map[string]string{}
+		e.resetArmedAndSpotLocked()
 		for _, symbol := range Symbols {
 			view := e.views[symbol]
 			view.Note = "Waiting for active Dhan session"
@@ -270,7 +294,11 @@ func (e *Engine) reconcile(parent context.Context) error {
 		return err
 	}
 	universes := buildUniverses(all, dayKey(now))
+	spotTokens := resolveSpotTokens(all)
 	wanted := map[int64]bool{}
+	for token := range spotTokens {
+		wanted[token] = true
+	}
 	for _, u := range universes {
 		for _, row := range append(append([]market.Instrument{}, u.Calls...), u.Puts...) {
 			wanted[row.InstrumentToken] = true
@@ -290,7 +318,12 @@ func (e *Engine) reconcile(parent context.Context) error {
 	}
 	if e.namespace != namespace {
 		e.quotes, e.previous, e.pending = map[int64]quote{}, map[string]Sample{}, map[string]string{}
+		e.resetArmedAndSpotLocked()
 	}
+	if !sameSpotTokens(e.spotTokens, spotTokens) {
+		e.resetArmedAndSpotLocked()
+	}
+	e.spotTokens = spotTokens
 	e.namespace, e.active, e.universes, e.wanted, e.lastError = namespace, true, universes, wanted, ""
 	for _, symbol := range Symbols {
 		u, view := universes[symbol], e.views[symbol]
@@ -320,6 +353,7 @@ func (e *Engine) Invalidate() {
 	e.mu.Lock()
 	e.active, e.connected = false, false
 	e.quotes, e.previous, e.pending = map[int64]quote{}, map[string]Sample{}, map[string]string{}
+	e.resetArmedAndSpotLocked()
 	e.publishLocked()
 	e.mu.Unlock()
 	e.OnRuntimeReady()
@@ -330,6 +364,7 @@ func (e *Engine) OnConnection(connected bool) {
 	e.connected = connected
 	if !connected {
 		e.quotes, e.previous = map[int64]quote{}, map[string]Sample{}
+		e.resetArmedAndSpotLocked()
 		e.updateMarksLocked(e.now())
 	}
 	e.publishLocked()
@@ -343,10 +378,20 @@ func (e *Engine) OnTicks(ticks []market.Tick) {
 	if e.stopped || !e.active || !e.connected || e.namespace != namespace || namespace.Broker != brokers.Dhan || e.day != dayKey(now) {
 		return
 	}
+	optionUpdate := false
 	for _, tick := range ticks {
 		if !e.wanted[tick.Token] || (tick.Namespace != nil && *tick.Namespace != namespace) {
 			continue
 		}
+		if symbol, isSpot := e.spotTokens[tick.Token]; isSpot {
+			if tick.PriceUpdated == nil || *tick.PriceUpdated {
+				history := e.spots[symbol]
+				history.add(spotSample{T: now, Price: tick.LastPrice})
+				e.spots[symbol] = history
+			}
+			continue
+		}
+		optionUpdate = true
 		q := e.quotes[tick.Token]
 		if (tick.PriceUpdated == nil || *tick.PriceUpdated) && tick.LastPrice > 0 && finite(tick.LastPrice) {
 			q.LTP, q.PriceAt = tick.LastPrice, now
@@ -376,7 +421,7 @@ func (e *Engine) OnTicks(ticks []market.Tick) {
 	}
 	e.completeBarsLocked(now, false)
 	e.updateMarksLocked(now)
-	if !marketOpen(now) {
+	if !marketOpen(now) || !optionUpdate {
 		return
 	}
 	for _, symbol := range Symbols {
@@ -416,7 +461,7 @@ func (e *Engine) evaluateLocked(symbol string, now int64) {
 		at := now
 		view.RecordingSince = &at
 	}
-	view.Note = "Monitoring exact crossovers"
+	view.Note = "Monitoring for +5% arming"
 	if sample.VWAP <= 0 {
 		view.Note = "Waiting for both leg volume-weighted average prices"
 	}
@@ -425,28 +470,52 @@ func (e *Engine) evaluateLocked(symbol string, now int64) {
 		window = &priceWindow{}
 		e.windows[symbol] = window
 	}
-	if signal, ok := Qualify(e.previous[symbol], sample, window.References(now)); ok {
-		view.Signal = &signal
-		view.Note = "5% move and VWAP crossover qualified"
-		if !e.paper {
-			view.Note = "Signal observed; paper entries paused"
-		} else if !e.dbEnabled() {
-			view.Note = "Paper entry needs PostgreSQL"
-		} else if _, open := e.open[symbol]; open {
-			view.Note = "Signal observed; primary paper spread already open"
-		} else if e.pending[symbol] == "" {
-			short, hedge, exists := hedgeFor(u, *minimum, signal.Direction)
-			if !exists {
-				view.Note = "Qualified signal has no fourth-OTM hedge"
-			} else if trade, err := e.tradeAtCrossLocked(symbol, short, hedge, signal, now); err != nil {
-				view.Note = err.Error()
-			} else {
-				select {
-				case e.candidates <- candidate{trade, e.namespace}:
-					e.pending[symbol] = trade.ID
-					view.Note = "Saving one-lot paper spread"
-				default:
-					view.Note = "Paper entry queue is busy"
+	history := e.spots[symbol]
+	history.prune(now)
+	e.spots[symbol] = history
+	_, open := e.open[symbol]
+	if open || e.pending[symbol] != "" {
+		delete(e.armed, symbol)
+		view.Note = "Primary paper spread already open or pending"
+	} else {
+		prior := e.armed[symbol]
+		state, triggered := advanceArmed(prior, e.previous[symbol], sample, window.References(now))
+		if state == nil {
+			delete(e.armed, symbol)
+		} else {
+			if prior == nil {
+				state.Baseline = history.atOrBefore(state.ArmedAt)
+			}
+			e.armed[symbol] = state
+			view.Note = "Armed after +5%; waiting for price-driven downward VWAP cross"
+		}
+		if triggered != nil {
+			direction, note := attributeUnderlyingDirection(triggered.Baseline, history.atOrBefore(now), triggered.ArmedAt, now)
+			view.Note = note
+			if direction != "" {
+				signal := Signal{Direction: direction, T: now, Reference: triggered.Reference.Premium, ReferenceAt: triggered.Reference.T,
+					MovePct: (sample.Premium/triggered.Reference.Premium - 1) * 100, Premium: sample.Premium, VWAP: sample.VWAP}
+				view.Signal = &signal
+				view.Note = "Armed downward VWAP cross attributed to underlying move"
+				if !e.paper {
+					view.Note = "Signal observed; paper entries paused"
+				} else if !e.dbEnabled() {
+					view.Note = "Paper entry needs PostgreSQL"
+				} else {
+					short, hedge, exists := crossSideLegs(u, *minimum, signal.Direction)
+					if !exists {
+						view.Note = "Qualified signal has no fourth-OTM hedge"
+					} else if trade, err := e.tradeAtCrossLocked(symbol, short, hedge, signal, now); err != nil {
+						view.Note = err.Error()
+					} else {
+						select {
+						case e.candidates <- candidate{trade, e.namespace}:
+							e.pending[symbol] = trade.ID
+							view.Note = "Saving one-lot paper spread"
+						default:
+							view.Note = "Paper entry queue is busy"
+						}
+					}
 				}
 			}
 		}
@@ -508,6 +577,7 @@ func (e *Engine) enter(cand candidate) {
 	}
 	if valid && !already && err == nil {
 		e.open[cand.Trade.Symbol] = cand.Trade
+		delete(e.armed, cand.Trade.Symbol)
 		view := e.views[cand.Trade.Symbol]
 		view.Note = "Primary one-lot paper spread open"
 		e.views[cand.Trade.Symbol] = view

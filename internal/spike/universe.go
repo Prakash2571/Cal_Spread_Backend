@@ -54,18 +54,33 @@ func buildUniverses(all []market.Instrument, day string) map[string]universe {
 	return result
 }
 
-func hedgeFor(u universe, selected pair, direction string) (market.Instrument, market.Instrument, bool) {
-	short, options, step := selected.CE, u.Calls, HedgeSteps
-	if direction == "PUT_CREDIT" {
-		short, options, step = selected.PE, u.Puts, -HedgeSteps
-	}
-	for i, option := range options {
-		if option.InstrumentToken == short.InstrumentToken {
-			at := i + step
-			if at >= 0 && at < len(options) {
-				return short, options[at], true
+// crossSideLegs counts listed strikes strictly above/below the selected ATM
+// strike on the opposite option side; missing intermediate strikes are allowed.
+func crossSideLegs(u universe, selected pair, direction string) (market.Instrument, market.Instrument, bool) {
+	var short market.Instrument
+	var options []market.Instrument
+	switch direction {
+	case ShortPELongCE:
+		short, options = selected.PE, u.Calls
+		count := 0
+		for _, option := range options {
+			if option.Strike > short.Strike {
+				count++
+				if count == HedgeSteps {
+					return short, option, true
+				}
 			}
-			break
+		}
+	case ShortCELongPE:
+		short, options = selected.CE, u.Puts
+		count := 0
+		for i := len(options) - 1; i >= 0; i-- {
+			if options[i].Strike < short.Strike {
+				count++
+				if count == HedgeSteps {
+					return short, options[i], true
+				}
+			}
 		}
 	}
 	return short, market.Instrument{}, false

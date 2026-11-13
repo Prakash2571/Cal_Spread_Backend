@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -75,6 +76,42 @@ func testTicks(rows []market.Instrument, namespace brokers.Namespace, stage int)
 	return ticks
 }
 
+// Keep chart fixtures unchanged; entry fixtures exercise arm then down-cross
+// with rising NIFTY spot and falling SENSEX spot independently.
+func entryTestInstruments() []market.Instrument {
+	return append(testInstruments(),
+		market.Instrument{InstrumentToken: 13, Name: "NIFTY", Tradingsymbol: "NIFTY", InstrumentType: "INDEX", Exchange: "INDICES", Segment: "INDICES"},
+		market.Instrument{InstrumentToken: 51, Name: "SENSEX", Tradingsymbol: "SENSEX", InstrumentType: "INDEX", Exchange: "INDICES", Segment: "INDICES"})
+}
+
+func entryTestTicks(rows []market.Instrument, namespace brokers.Namespace, stage int) []market.Tick {
+	ticks := testTicks(rows, namespace, 0)
+	for i, row := range rows {
+		price := ticks[i].LastPrice
+		if row.InstrumentType == "INDEX" {
+			price = []float64{23850, 23850, 23860, 23850, 23860}[stage]
+			if row.Name == "SENSEX" {
+				price = []float64{80000, 80000, 79990, 80000, 79990}[stage]
+			}
+		} else if row.Name == "NIFTY" && row.Strike == 23850 {
+			price = 60
+			if row.InstrumentType == "PE" {
+				price = []float64{40, 46, 44, 46, 44}[stage]
+			}
+		} else if row.Name == "SENSEX" && row.Strike == 80000 {
+			price = 40
+			if row.InstrumentType == "CE" {
+				price = []float64{60, 66, 64, 66, 64}[stage]
+			}
+		}
+		average := 52.5
+		ticks[i].LastPrice, ticks[i].AveragePrice = price, &average
+		ticks[i].Bid, ticks[i].Ask = price-.5, price+.5
+		ticks[i].Bids[0].Price, ticks[i].Asks[0].Price = price-.5, price+.5
+	}
+	return ticks
+}
+
 func waitOpen(t *testing.T, engine *Engine, count int) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
@@ -91,7 +128,7 @@ func TestBothIndexesSelectMinimumAndPaperTradeOneLotUntilManualClose(t *testing.
 	clock := &fakeClock{}
 	clock.ms.Store(time.Date(2026, 11, 4, 10, 0, 10, 0, ist).UnixMilli())
 	namespace := brokers.Namespace{Broker: brokers.Dhan, Generation: 1}
-	rows := testInstruments()
+	rows := entryTestInstruments()
 	deps := Deps{Namespace: func() brokers.Namespace { return namespace }, Ready: func() bool { return true },
 		Instruments: func(context.Context) ([]market.Instrument, error) { return rows, nil }, Store: &Store{Pool: pool}, Now: clock.Now}
 	engine := New(deps)
@@ -104,7 +141,7 @@ func TestBothIndexesSelectMinimumAndPaperTradeOneLotUntilManualClose(t *testing.
 		if stage > 0 {
 			clock.ms.Add(60_000)
 		}
-		engine.OnTicks(testTicks(rows, namespace, stage))
+		engine.OnTicks(entryTestTicks(rows, namespace, stage))
 	}
 	waitOpen(t, engine, 2)
 	var nifty, sensex Trade
@@ -115,13 +152,13 @@ func TestBothIndexesSelectMinimumAndPaperTradeOneLotUntilManualClose(t *testing.
 			sensex = trade
 		}
 	}
-	if nifty.Quantity != 75 || nifty.LotSize != 75 || nifty.Direction != "CALL_CREDIT" || nifty.Hedge.Strike-nifty.Short.Strike != 200 ||
-		sensex.Quantity != 20 || sensex.Direction != "PUT_CREDIT" || sensex.Short.Strike-sensex.Hedge.Strike != 400 {
+	if nifty.Quantity != 75 || nifty.LotSize != 75 || nifty.Direction != ShortPELongCE || nifty.Hedge.Strike-nifty.Short.Strike != 200 ||
+		sensex.Quantity != 20 || sensex.Direction != ShortCELongPE || sensex.Short.Strike-sensex.Hedge.Strike != 400 {
 		t.Fatalf("one-lot fourth-strike spreads were wrong: %+v %+v", nifty, sensex)
 	}
 	for stage := 3; stage <= 4; stage++ {
 		clock.ms.Add(1000)
-		engine.OnTicks(testTicks(rows, namespace, stage))
+		engine.OnTicks(entryTestTicks(rows, namespace, stage))
 	}
 	if len(engine.Snapshot().Open) != 2 {
 		t.Fatal("an already-open primary spread duplicated on another signal")
@@ -129,8 +166,8 @@ func TestBothIndexesSelectMinimumAndPaperTradeOneLotUntilManualClose(t *testing.
 	clock.ms.Add(1000)
 	depth, updated := true, true
 	engine.OnTicks([]market.Tick{
-		{Token: nifty.Short.Token, LastPrice: 63.5, PriceUpdated: &updated, Namespace: &namespace, DepthUpdated: &depth,
-			Bid: 63, Ask: 64, Bids: []market.DepthLevel{{Price: 63, Qty: 1000}}, Asks: []market.DepthLevel{{Price: 64, Qty: 1000}}},
+		{Token: nifty.Short.Token, LastPrice: 41.5, PriceUpdated: &updated, Namespace: &namespace, DepthUpdated: &depth,
+			Bid: 41, Ask: 42, Bids: []market.DepthLevel{{Price: 41, Qty: 1000}}, Asks: []market.DepthLevel{{Price: 42, Qty: 1000}}},
 		{Token: nifty.Hedge.Token, LastPrice: 18.5, PriceUpdated: &updated, Namespace: &namespace, DepthUpdated: &depth,
 			Bid: 18, Ask: 19, Bids: []market.DepthLevel{{Price: 18, Qty: 1000}}, Asks: []market.DepthLevel{{Price: 19, Qty: 1000}}},
 	})
@@ -163,33 +200,33 @@ func TestDataGapsAndWrongNamespaceCannotOpenPaperTrades(t *testing.T) {
 	namespace := brokers.Namespace{Broker: brokers.Dhan, Generation: 1}
 	var current atomic.Pointer[brokers.Namespace]
 	current.Store(&namespace)
-	rows := testInstruments()
+	rows := entryTestInstruments()
 	engine := New(Deps{Namespace: func() brokers.Namespace { return *current.Load() }, Ready: func() bool { return true },
 		Instruments: func(context.Context) ([]market.Instrument, error) { return rows, nil }, Store: &Store{Pool: pool}, Now: clock.Now})
 	_ = engine.Start(context.Background())
 	t.Cleanup(func() { _ = engine.Stop(context.Background()) })
 	engine.OnConnection(true)
-	engine.OnTicks(testTicks(rows, namespace, 0))
+	engine.OnTicks(entryTestTicks(rows, namespace, 0))
 	clock.ms.Add(WindowMs + 1)
-	engine.OnTicks(testTicks(rows, namespace, 2))
+	engine.OnTicks(entryTestTicks(rows, namespace, 2))
 	if len(engine.Snapshot().Open) != 0 {
 		t.Fatal("a 30m gap created a crossover trade")
 	}
 	engine.Invalidate()
 	next := brokers.Namespace{Broker: brokers.Dhan, Generation: 2}
 	current.Store(&next)
-	engine.OnTicks(testTicks(rows, brokers.Namespace{Broker: brokers.Dhan, Generation: 1}, 2))
+	engine.OnTicks(entryTestTicks(rows, brokers.Namespace{Broker: brokers.Dhan, Generation: 1}, 2))
 	if len(engine.Snapshot().Open) != 0 {
 		t.Fatal("old-generation data opened a position")
 	}
 }
 
-func TestInvalidUpdatedAverageCannotQualifyUsingAnOlderVWAP(t *testing.T) {
+func TestInvalidUpdatedAverageCannotTriggerUsingAnOlderVWAP(t *testing.T) {
 	for _, invalid := range []float64{0, math.NaN()} {
 		clock := &fakeClock{}
 		clock.ms.Store(time.Date(2026, 11, 4, 10, 0, 0, 0, ist).UnixMilli())
 		namespace := brokers.Namespace{Broker: brokers.Dhan, Generation: 1}
-		rows := testInstruments()
+		rows := entryTestInstruments()
 		engine := New(Deps{Namespace: func() brokers.Namespace { return namespace }, Ready: func() bool { return true },
 			Instruments: func(context.Context) ([]market.Instrument, error) { return rows, nil }, Now: clock.Now})
 		t.Cleanup(func() { _ = engine.Stop(context.Background()) })
@@ -199,7 +236,7 @@ func TestInvalidUpdatedAverageCannotQualifyUsingAnOlderVWAP(t *testing.T) {
 		engine.OnConnection(true)
 		for stage := 0; stage <= 2; stage++ {
 			clock.ms.Add(1000)
-			ticks := testTicks(rows, namespace, stage)
+			ticks := entryTestTicks(rows, namespace, stage)
 			if stage == 2 {
 				for i, row := range rows {
 					if row.Name == "NIFTY" && row.Strike == 23850 && row.InstrumentType == "CE" {
@@ -225,7 +262,7 @@ func TestUnreadableEntrySizeIsSkippedRatherThanFilledAfterTheCross(t *testing.T)
 	clock.ms.Store(time.Date(2026, 11, 4, 10, 0, 0, 0, ist).UnixMilli())
 	namespace := brokers.Namespace{Broker: brokers.Dhan, Generation: 1}
 	rows := []market.Instrument{}
-	for _, row := range testInstruments() {
+	for _, row := range entryTestInstruments() {
 		if row.Name == "NIFTY" {
 			rows = append(rows, row)
 		}
@@ -239,10 +276,10 @@ func TestUnreadableEntrySizeIsSkippedRatherThanFilledAfterTheCross(t *testing.T)
 	engine.OnConnection(true)
 	for stage := 0; stage <= 2; stage++ {
 		clock.ms.Add(1000)
-		ticks := testTicks(rows, namespace, stage)
+		ticks := entryTestTicks(rows, namespace, stage)
 		if stage == 2 {
 			for i, row := range rows {
-				if row.Strike == 23850 && row.InstrumentType == "CE" {
+				if row.Strike == 23850 && row.InstrumentType == "PE" {
 					ticks[i].Bids[0].Qty = math.NaN()
 				}
 			}
@@ -256,7 +293,7 @@ func TestUnreadableEntrySizeIsSkippedRatherThanFilledAfterTheCross(t *testing.T)
 		t.Fatal("qualified crossover queued a fill without readable one-lot size")
 	}
 	clock.ms.Add(1000)
-	engine.OnTicks(testTicks(rows, namespace, 2))
+	engine.OnTicks(entryTestTicks(rows, namespace, 2))
 	engine.mu.Lock()
 	queued = len(engine.pending)
 	engine.mu.Unlock()
@@ -265,7 +302,7 @@ func TestUnreadableEntrySizeIsSkippedRatherThanFilledAfterTheCross(t *testing.T)
 	}
 	for _, stage := range []int{1, 2} {
 		clock.ms.Add(1000)
-		engine.OnTicks(testTicks(rows, namespace, stage))
+		engine.OnTicks(entryTestTicks(rows, namespace, stage))
 	}
 	waitOpen(t, engine, 1)
 }
@@ -275,7 +312,7 @@ func TestMalformedClosingDepthLeavesThePaperPositionOpen(t *testing.T) {
 	clock := &fakeClock{}
 	clock.ms.Store(time.Date(2026, 11, 4, 10, 0, 0, 0, ist).UnixMilli())
 	namespace := brokers.Namespace{Broker: brokers.Dhan, Generation: 1}
-	rows := testInstruments()
+	rows := entryTestInstruments()
 	engine := New(Deps{Namespace: func() brokers.Namespace { return namespace }, Ready: func() bool { return true },
 		Instruments: func(context.Context) ([]market.Instrument, error) { return rows, nil }, Store: &Store{Pool: pool}, Now: clock.Now})
 	if err := engine.Start(context.Background()); err != nil {
@@ -285,7 +322,7 @@ func TestMalformedClosingDepthLeavesThePaperPositionOpen(t *testing.T) {
 	engine.OnConnection(true)
 	for stage := 0; stage <= 2; stage++ {
 		clock.ms.Add(1000)
-		engine.OnTicks(testTicks(rows, namespace, stage))
+		engine.OnTicks(entryTestTicks(rows, namespace, stage))
 	}
 	waitOpen(t, engine, 2)
 	nifty := engine.Snapshot().Open[0]
@@ -301,7 +338,7 @@ func TestMalformedClosingDepthLeavesThePaperPositionOpen(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			clock.ms.Add(1000)
-			ticks := testTicks(rows, namespace, 2)
+			ticks := entryTestTicks(rows, namespace, 2)
 			for i := range ticks {
 				if ticks[i].Token == nifty.Short.Token {
 					tc.mutate(&ticks[i])
@@ -318,7 +355,7 @@ func TestMalformedClosingDepthLeavesThePaperPositionOpen(t *testing.T) {
 		})
 	}
 	clock.ms.Add(1000)
-	engine.OnTicks(testTicks(rows, namespace, 2))
+	engine.OnTicks(entryTestTicks(rows, namespace, 2))
 	if _, err := engine.Close(context.Background(), nifty.ID); err != nil {
 		t.Fatalf("fresh restored book could not manually close: %v", err)
 	}
@@ -935,5 +972,218 @@ func TestVolumeUpdatesRequirePacketProvenanceAndNonnegativeFiniteReading(t *test
 				t.Fatalf("volume=%v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// No worker or database: exercise the real tick -> arm -> attribute path while
+// keeping entry candidates available for inspection and avoiding timing races.
+func newRuleTestEngine(t *testing.T) (*Engine, *fakeClock, []market.Instrument) {
+	t.Helper()
+	clock := &fakeClock{}
+	clock.ms.Store(time.Date(2026, 11, 4, 10, 0, 0, 0, ist).UnixMilli())
+	rows := entryTestInstruments()
+	namespace := brokers.Namespace{Broker: brokers.Dhan, Generation: 1}
+	var subscribed []int64
+	engine := New(Deps{Namespace: func() brokers.Namespace { return namespace }, Ready: func() bool { return true },
+		Instruments: func(context.Context) ([]market.Instrument, error) { return rows, nil }, Now: clock.Now,
+		SetTokens: func(tokens []int64) { subscribed = append([]int64{}, tokens...) }})
+	t.Cleanup(engine.cancel)
+	if err := engine.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(subscribed) != len(rows) || !engine.wanted[13] || !engine.wanted[51] || engine.spotTokens[13] != "NIFTY" || engine.spotTokens[51] != "SENSEX" {
+		t.Fatalf("spot tokens did not join wanted/SetTokens: %v, %+v", subscribed, engine.spotTokens)
+	}
+	engine.OnConnection(true)
+	return engine, clock, rows
+}
+
+func TestSpotTicksAreSeparateAndNonWantedOrWrongNamespaceTicksAreDropped(t *testing.T) {
+	engine, clock, rows := newRuleTestEngine(t)
+	engine.OnTicks(entryTestTicks(rows, engine.namespace, 0))
+	before := engine.previous["NIFTY"]
+	clock.ms.Add(1000)
+	no := false
+	wrong := brokers.Namespace{Broker: brokers.Dhan, Generation: 2}
+	engine.OnTicks([]market.Tick{
+		{Token: 13, LastPrice: 24000, Namespace: &engine.namespace},
+		{Token: 13, LastPrice: 25000, PriceUpdated: &no},
+		{Token: 51, LastPrice: 1, Namespace: &wrong},
+		{Token: 999, LastPrice: 1},
+	})
+	if !reflect.DeepEqual(before, engine.previous["NIFTY"]) || engine.spots["NIFTY"].atOrBefore(clock.ms.Load()).Price != 24000 || engine.spots["SENSEX"].atOrBefore(clock.ms.Load()).Price != 80000 {
+		t.Fatal("spot-only/foreign ticks changed pair evaluation or refreshed spot without provenance")
+	}
+	for _, token := range []int64{13, 51, 999} {
+		if _, exists := engine.quotes[token]; exists {
+			t.Fatalf("non-option token %d entered option quotes", token)
+		}
+	}
+}
+
+func TestTriggerConsumesArmForUpDownFlatAndUnavailableSpot(t *testing.T) {
+	for _, tc := range []struct {
+		name, direction, note string
+		spot                  float64
+		omit                  bool
+	}{
+		{"up", ShortPELongCE, "PostgreSQL", 23860, false},
+		{"down", ShortCELongPE, "PostgreSQL", 23840, false},
+		{"flat", "", "underlying was flat", 23850, false},
+		{"missing", "", "spot was unavailable", 0, true},
+		{"invalid", "", "spot was unavailable", math.NaN(), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine, clock, rows := newRuleTestEngine(t)
+			for stage := 0; stage <= 2; stage++ {
+				clock.ms.Add(1000)
+				ticks := entryTestTicks(rows, engine.namespace, stage)
+				filtered := []market.Tick{}
+				for _, tick := range ticks {
+					if tick.Token == 13 {
+						if tc.omit {
+							continue
+						}
+						if stage == 2 {
+							tick.LastPrice = tc.spot
+						}
+					}
+					filtered = append(filtered, tick)
+				}
+				engine.OnTicks(filtered)
+				if stage == 1 && engine.armed["NIFTY"] == nil {
+					t.Fatal("+5% did not arm before cross")
+				}
+			}
+			view := engine.views["NIFTY"]
+			if engine.armed["NIFTY"] != nil || !strings.Contains(view.Note, tc.note) {
+				t.Fatalf("arm not consumed or wrong note: %+v, %+v", engine.armed, view)
+			}
+			if tc.direction == "" {
+				if view.Signal != nil {
+					t.Fatal("flat/unavailable spot produced a direction")
+				}
+			} else if view.Signal == nil || view.Signal.Direction != tc.direction || view.Signal.VWAP != 105 {
+				t.Fatalf("wrong attribution or signal VWAP: %+v", view)
+			}
+		})
+	}
+}
+
+func TestSpotHistoryBaselineIsAtOrBeforeArmingAndPruned(t *testing.T) {
+	const now = int64(10_000_000)
+	h := spotHistory{}
+	h.add(spotSample{T: now - spotHistoryMs - 1, Price: 90})
+	h.add(spotSample{T: now - 1000, Price: 100})
+	h.add(spotSample{T: now + 1, Price: 101})
+	if len(h) != 2 || h.atOrBefore(now).Price != 100 || h.atOrBefore(now-2000).T != 0 {
+		t.Fatalf("wrong baseline or unpruned old sample: %+v", h)
+	}
+	h.add(spotSample{T: now + 1, Price: 102})
+	if len(h) != 2 || h.atOrBefore(now+1).Price != 102 {
+		t.Fatal("same-millisecond latest spot did not win")
+	}
+	engine, clock, rows := newRuleTestEngine(t)
+	engine.OnTicks(entryTestTicks(rows, engine.namespace, 0))
+	clock.ms.Add(1000)
+	engine.OnTicks(entryTestTicks(rows, engine.namespace, 1))
+	state := engine.armed["NIFTY"]
+	if state == nil || state.Baseline.Price != 23850 || state.Baseline.T > state.ArmedAt {
+		t.Fatalf("baseline was not pinned at arming: %+v", state)
+	}
+	history := engine.spots["NIFTY"]
+	history.add(spotSample{T: state.ArmedAt + spotHistoryMs + 1, Price: 24000})
+	if history.atOrBefore(state.ArmedAt).T != 0 || state.Baseline.Price != 23850 {
+		t.Fatal("pruning history lost a live arm's baseline")
+	}
+}
+
+func TestResetsDisarmAndClearSpotHistory(t *testing.T) {
+	for _, reset := range []string{"disconnect", "invalidate", "runtime ready", "day"} {
+		t.Run(reset, func(t *testing.T) {
+			engine, clock, rows := newRuleTestEngine(t)
+			engine.OnTicks(entryTestTicks(rows, engine.namespace, 0))
+			clock.ms.Add(1000)
+			engine.OnTicks(entryTestTicks(rows, engine.namespace, 1))
+			if len(engine.armed) != 2 {
+				t.Fatal("both independent symbols should be armed")
+			}
+			switch reset {
+			case "disconnect":
+				engine.OnConnection(false)
+			case "invalidate":
+				engine.Invalidate()
+			case "runtime ready":
+				engine.OnRuntimeReady()
+			case "day":
+				clock.ms.Add(24 * 60 * 60_000)
+				if err := engine.reconcile(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(engine.armed) != 0 || len(engine.spots) != 0 || len(engine.previous) != 0 {
+				t.Fatal("reset retained arms, spot, or crossover continuity")
+			}
+		})
+	}
+}
+
+func TestOpenOrPendingSpreadPreventsArmingAnotherForThatSymbol(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		engine, clock, rows := newRuleTestEngine(t)
+		engine.OnTicks(entryTestTicks(rows, engine.namespace, 0))
+		if pending {
+			engine.pending["NIFTY"] = "pending"
+		} else {
+			engine.open["NIFTY"] = Trade{ID: "existing", Symbol: "NIFTY"}
+		}
+		clock.ms.Add(1000)
+		engine.OnTicks(entryTestTicks(rows, engine.namespace, 1))
+		if engine.armed["NIFTY"] != nil || engine.armed["SENSEX"] == nil {
+			t.Fatal("one-open gate leaked across symbols or allowed another arm")
+		}
+		clock.ms.Add(1000)
+		engine.OnTicks(entryTestTicks(rows, engine.namespace, 2))
+		if engine.views["NIFTY"].Signal != nil || len(engine.candidates) != 0 {
+			t.Fatal("open/pending symbol evaluated another entry")
+		}
+	}
+}
+
+func TestCrossSideEntryStillRequiresNetCreditAndExecutableDepth(t *testing.T) {
+	engine := New(Deps{})
+	t.Cleanup(engine.cancel)
+	u := buildUniverses(testInstruments(), "2026-11-04")["NIFTY"]
+	const now = int64(10_000_000)
+	for _, direction := range []string{ShortPELongCE, ShortCELongPE} {
+		short, hedge, ok := crossSideLegs(u, u.Pairs[5], direction)
+		if !ok {
+			t.Fatal("missing fixture hedge")
+		}
+		for _, tc := range []struct {
+			name          string
+			bid, hedgeAsk float64
+			quantity      float64
+			bookAt        int64
+			want          bool
+		}{
+			{"credit", 50, 20, 75, now, true},
+			{"zero credit retains existing gate", 20, 20, 75, now, true},
+			{"debit rejected", 19, 20, 75, now, false},
+			{"insufficient depth", 50, 20, 74, now, false},
+			{"stale depth", 50, 20, 75, now - bookAgeMs - 1, false},
+		} {
+			t.Run(direction+"/"+tc.name, func(t *testing.T) {
+				engine.quotes[short.InstrumentToken] = quote{Bid: tc.bid, Ask: tc.bid + 1, BidQty: tc.quantity, AskQty: 75, BookAt: tc.bookAt}
+				engine.quotes[hedge.InstrumentToken] = quote{Bid: tc.hedgeAsk - 1, Ask: tc.hedgeAsk, BidQty: 75, AskQty: tc.quantity, BookAt: tc.bookAt}
+				trade, err := engine.tradeAtCrossLocked("NIFTY", short, hedge, Signal{Direction: direction}, now)
+				if (err == nil) != tc.want {
+					t.Fatalf("trade=%+v err=%v, want success=%v", trade, err, tc.want)
+				}
+				if tc.want && (trade.Short.Entry != tc.bid || trade.Hedge.Entry != tc.hedgeAsk || trade.EntryCredit != 75*(tc.bid-tc.hedgeAsk) || trade.Direction != direction) {
+					t.Fatalf("entry touch pricing changed: %+v", trade)
+				}
+			})
+		}
 	}
 }

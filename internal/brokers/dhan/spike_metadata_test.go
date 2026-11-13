@@ -95,3 +95,50 @@ func TestVolumeProvenanceComesFromEachPacket(t *testing.T) {
 		t.Fatal("later packets mutated previously delivered tick volumes")
 	}
 }
+
+// FULL subscriptions are also used for IDX_I. The index response (code 6),
+// ticker, quote and full responses must all deliver LTP on the same Tick path.
+func TestIndexLTPPacketsReachInternalTickWithoutRefreshingOnOIPackets(t *testing.T) {
+	const token = int64(13)
+	var ticks []market.Tick
+	feed := NewFeed(FeedOptions{
+		Resolve: func(candidate int64) (FeedInstrument, bool) {
+			return FeedInstrument{Segment: SegmentIdxI, SecurityID: token}, candidate == token
+		},
+		OnTicks: func(batch []market.Tick) { ticks = append(ticks, batch...) },
+	})
+	feed.SubscribeTokens([]int64{token})
+	for i, tc := range []struct {
+		code byte
+		size int
+	}{
+		{FeedCodeIndex, tickerBytes},
+		{FeedCodeTicker, tickerBytes},
+		{FeedCodeQuote, quoteBytes},
+		{FeedCodeFull, fullBytes},
+		{FeedCodeOI, oiBytes},
+	} {
+		frame := make([]byte, tc.size)
+		frame[0], frame[3] = tc.code, byte(CodeBySegment[SegmentIdxI])
+		binary.LittleEndian.PutUint16(frame[1:], uint16(tc.size))
+		binary.LittleEndian.PutUint32(frame[4:], uint32(token))
+		if tc.code != FeedCodeOI {
+			binary.LittleEndian.PutUint32(frame[8:], math.Float32bits(float32(23850+i)))
+		}
+		feed.mu.Lock()
+		feed.handleFrameLocked(frame, int64(i+1)*1000)
+		feed.mu.Unlock()
+		feed.drain()
+		if len(ticks) != i+1 {
+			t.Fatalf("index packet %d did not reach OnTicks", tc.code)
+		}
+		tick := ticks[i]
+		wantPrice := float64(23850 + i)
+		if tc.code == FeedCodeOI {
+			wantPrice = 23853
+		}
+		if tick.Token != token || tick.LastPrice != wantPrice || tick.PriceUpdated == nil || *tick.PriceUpdated != (tc.code != FeedCodeOI) {
+			t.Fatalf("wrong index LTP/provenance: %+v", tick)
+		}
+	}
+}

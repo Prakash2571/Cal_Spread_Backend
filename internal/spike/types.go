@@ -133,42 +133,67 @@ func marketOpen(at int64) bool {
 	return local.Weekday() != time.Saturday && local.Weekday() != time.Sunday && minutes >= 9*60+15 && minutes < 15*60+31
 }
 
-// Qualify requires a price-driven crossover NOW, not a delayed confirmation or
-// a crossover caused only by VWAP moving. References are earlier prices <=30m old.
-func Qualify(previous, current Sample, history []Sample) (Signal, bool) {
-	if previous.T <= 0 || current.T < previous.T || current.T-previous.T > quoteAgeMs ||
-		previous.VWAP <= 0 || current.VWAP <= 0 || !finite(current.Premium) || !finite(current.VWAP) {
-		return Signal{}, false
+// Directions describe the actual cross-side short/long structure.
+const (
+	ShortPELongCE = "SHORT_PE_LONG_CE" // underlying rose since arming
+	ShortCELongPE = "SHORT_CE_LONG_PE" // underlying fell since arming
+)
+
+type armedState struct {
+	ArmedAt   int64
+	Reference Sample
+	Baseline  spotSample // pinned at arming, even if the arm outlives history retention
+}
+
+// armReference finds an earlier +5% reference. The engine supplies priceWindow's
+// rolling extrema before adding current, so its low is sufficient.
+func armReference(current Sample, references []Sample) (Sample, bool) {
+	if current.T <= 0 || current.Premium <= 0 || !finite(current.Premium) {
+		return Sample{}, false
 	}
-	direction := ""
-	if previous.Premium <= previous.VWAP && current.Premium > current.VWAP && current.Premium > previous.Premium {
-		direction = "CALL_CREDIT"
-	} else if previous.Premium >= previous.VWAP && current.Premium < current.VWAP && current.Premium < previous.Premium {
-		direction = "PUT_CREDIT"
-	}
-	if direction == "" {
-		return Signal{}, false
-	}
-	var reference *Sample
-	for i := range history {
-		sample := &history[i]
-		if sample.T >= current.T || current.T-sample.T > WindowMs || sample.Premium <= 0 || !finite(sample.Premium) {
+	var low Sample
+	for _, sample := range references {
+		if sample.T <= 0 || sample.T >= current.T || current.T-sample.T > WindowMs || sample.Premium <= 0 || !finite(sample.Premium) {
 			continue
 		}
-		if reference == nil || (direction == "CALL_CREDIT" && sample.Premium < reference.Premium) ||
-			(direction == "PUT_CREDIT" && sample.Premium > reference.Premium) {
-			reference = sample
+		if low.T == 0 || sample.Premium < low.Premium {
+			low = sample
 		}
 	}
-	if reference == nil {
-		return Signal{}, false
+	return low, low.T > 0 && (current.Premium/low.Premium-1)*100+1e-9 >= MinimumMovePct
+}
+
+func downwardVWAPCross(previous, current Sample) bool {
+	return previous.T > 0 && current.T >= previous.T && current.T-previous.T <= quoteAgeMs &&
+		finite(previous.Premium) && finite(previous.VWAP) && finite(current.Premium) && finite(current.VWAP) &&
+		previous.Premium > 0 && current.Premium > 0 && previous.VWAP > 0 && current.VWAP > 0 &&
+		previous.Premium >= previous.VWAP && current.Premium < current.VWAP && current.Premium < previous.Premium
+}
+
+// advanceArmed arms independently of a cross. Once armed, a pullback may fall
+// below +5% until the reference ages out. A surviving +5% reference refreshes
+// Reference, never ArmedAt. Every trigger consumes the arm, including skips.
+// Newly armed samples start waiting for the next sample's downward cross.
+func advanceArmed(state *armedState, previous, current Sample, references []Sample) (*armedState, *armedState) {
+	reference, qualifies := armReference(current, references)
+	if state == nil {
+		if qualifies {
+			return &armedState{ArmedAt: current.T, Reference: reference}, nil
+		}
+		return nil, nil
 	}
-	move := (current.Premium/reference.Premium - 1) * 100
-	if (direction == "CALL_CREDIT" && move+1e-9 < MinimumMovePct) || (direction == "PUT_CREDIT" && move-1e-9 > -MinimumMovePct) {
-		return Signal{}, false
+	if current.T-state.Reference.T > WindowMs {
+		if !qualifies {
+			return nil, nil
+		}
+		refreshed := *state
+		refreshed.Reference = reference
+		state = &refreshed
 	}
-	return Signal{Direction: direction, T: current.T, Reference: reference.Premium, ReferenceAt: reference.T,
-		MovePct: move, Premium: current.Premium, VWAP: current.VWAP}, true
+	if downwardVWAPCross(previous, current) {
+		return nil, state
+	}
+	return state, nil
 }
 
 func grossPNL(trade Trade, shortAsk, hedgeBid float64) float64 {

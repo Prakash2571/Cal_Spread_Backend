@@ -1,36 +1,185 @@
 package spike
 
 import (
+	"math"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/Prakash2571/Cal_Spread_Backend/internal/market"
 )
 
-func TestCrossoverRequiresFivePercentAtThatUpdate(t *testing.T) {
+func TestArmUsesEarlierThirtyMinuteLow(t *testing.T) {
 	now := time.Date(2026, 11, 4, 10, 20, 0, 0, ist).UnixMilli()
 	for _, tc := range []struct {
-		name      string
-		previous  Sample
-		current   Sample
-		history   []Sample
-		direction string
+		name    string
+		premium float64
+		age     int64
+		want    bool
 	}{
-		{"up after one minute", Sample{T: now - 1000, Premium: 104, VWAP: 105}, Sample{T: now, Premium: 106, VWAP: 105}, []Sample{{T: now - 60_000, Premium: 100}}, "CALL_CREDIT"},
-		{"exact five percent 29m", Sample{T: now - 1000, Premium: 104, VWAP: 104.5}, Sample{T: now, Premium: 105, VWAP: 104.5}, []Sample{{T: now - 29*60_000, Premium: 100}}, "CALL_CREDIT"},
-		{"down at five percent", Sample{T: now - 1000, Premium: 99, VWAP: 96}, Sample{T: now, Premium: 95, VWAP: 96}, []Sample{{T: now - 20*60_000, Premium: 100}}, "PUT_CREDIT"},
-		{"any earlier price", Sample{T: now - 1000, Premium: 104, VWAP: 105}, Sample{T: now, Premium: 106, VWAP: 105}, []Sample{{T: now - 29*60_000, Premium: 100}, {T: now - 60_000, Premium: 103}}, "CALL_CREDIT"},
-		{"30m inclusive", Sample{T: now - 1000, Premium: 104, VWAP: 105}, Sample{T: now, Premium: 106, VWAP: 105}, []Sample{{T: now - WindowMs, Premium: 100}}, "CALL_CREDIT"},
-		{"reference expired", Sample{T: now - 1000, Premium: 104, VWAP: 105}, Sample{T: now, Premium: 106, VWAP: 105}, []Sample{{T: now - WindowMs - 1, Premium: 100}}, ""},
-		{"insufficient move", Sample{T: now - 1000, Premium: 103, VWAP: 104}, Sample{T: now, Premium: 104.5, VWAP: 104}, []Sample{{T: now - 60_000, Premium: 100}}, ""},
-		{"late post-cross confirmation", Sample{T: now - 1000, Premium: 104, VWAP: 103}, Sample{T: now, Premium: 106, VWAP: 103}, []Sample{{T: now - 60_000, Premium: 100}}, ""},
-		{"VWAP alone crossed", Sample{T: now - 1000, Premium: 106, VWAP: 107}, Sample{T: now, Premium: 106, VWAP: 105}, []Sample{{T: now - 60_000, Premium: 100}}, ""},
-		{"freshness gap", Sample{T: now - quoteAgeMs - 1, Premium: 104, VWAP: 105}, Sample{T: now, Premium: 106, VWAP: 105}, []Sample{{T: now - 60_000, Premium: 100}}, ""},
+		{"exact five percent", 105, 1000, true},
+		{"above five percent", 106, 29 * 60_000, true},
+		{"below five percent", 104.99, 1000, false},
+		{"thirty minutes inclusive", 105, WindowMs, true},
+		{"expired low", 105, WindowMs + 1, false},
+		{"same sample is not earlier", 105, 0, false},
+		{"invalid premium", math.NaN(), 1000, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			signal, qualified := Qualify(tc.previous, tc.current, tc.history)
-			if qualified != (tc.direction != "") || (qualified && signal.Direction != tc.direction) {
-				t.Fatalf("qualification %v %+v; want %q", qualified, signal, tc.direction)
+			w := &priceWindow{}
+			w.Add(Sample{T: now - tc.age, Premium: 100})
+			if tc.age > 1000 {
+				w.Add(Sample{T: now - 500, Premium: 103})
+			}
+			state, trigger := advanceArmed(nil, Sample{}, Sample{T: now, Premium: tc.premium}, w.References(now))
+			if (state != nil) != tc.want || trigger != nil {
+				t.Fatalf("state=%+v trigger=%+v, want armed=%v", state, trigger, tc.want)
+			}
+			if state != nil && (state.ArmedAt != now || state.Reference.Premium != 100) {
+				t.Fatalf("wrong arm/reference: %+v", state)
 			}
 		})
+	}
+}
+
+func TestTriggerOnlyPriceDrivenDownwardCrossWhileArmed(t *testing.T) {
+	const now = int64(10_000_000)
+	for _, tc := range []struct {
+		name     string
+		armed    bool
+		previous Sample
+		current  Sample
+		want     bool
+	}{
+		{"downward inclusive previous VWAP", true, Sample{T: now - 1000, Premium: 105, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, true},
+		{"unarmed down cross", false, Sample{T: now - 1000, Premium: 105, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, false},
+		{"upward cross", true, Sample{T: now - 1000, Premium: 104, VWAP: 105}, Sample{T: now, Premium: 106, VWAP: 105}, false},
+		{"VWAP driven", true, Sample{T: now - 1000, Premium: 104, VWAP: 103}, Sample{T: now, Premium: 104, VWAP: 105}, false},
+		{"already below", true, Sample{T: now - 1000, Premium: 104, VWAP: 105}, Sample{T: now, Premium: 103, VWAP: 105}, false},
+		{"current equal VWAP", true, Sample{T: now - 1000, Premium: 106, VWAP: 105}, Sample{T: now, Premium: 105, VWAP: 105}, false},
+		{"sixty seconds inclusive", true, Sample{T: now - quoteAgeMs, Premium: 106, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, true},
+		{"sample gap", true, Sample{T: now - quoteAgeMs - 1, Premium: 106, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, false},
+		{"time reversed", true, Sample{T: now + 1, Premium: 106, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, false},
+		{"missing VWAP", true, Sample{T: now - 1, Premium: 106, VWAP: 0}, Sample{T: now, Premium: 104, VWAP: 105}, false},
+		{"nonfinite prior premium", true, Sample{T: now - 1, Premium: math.Inf(1), VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, false},
+		{"nonfinite prior VWAP", true, Sample{T: now - 1, Premium: 106, VWAP: math.Inf(1)}, Sample{T: now, Premium: 104, VWAP: 105}, false},
+		{"nonfinite current VWAP", true, Sample{T: now - 1, Premium: 106, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: math.NaN()}, false},
+		{"nonfinite current premium", true, Sample{T: now - 1, Premium: 106, VWAP: 105}, Sample{T: now, Premium: math.NaN(), VWAP: 105}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var state *armedState
+			if tc.armed {
+				state = &armedState{ArmedAt: now - 2000, Reference: Sample{T: now - 3000, Premium: 100}}
+			}
+			next, trigger := advanceArmed(state, tc.previous, tc.current, nil)
+			if (trigger != nil) != tc.want || (tc.want && next != nil) {
+				t.Fatalf("next=%+v trigger=%+v, want trigger=%v", next, trigger, tc.want)
+			}
+		})
+	}
+}
+
+func TestArmedPersistenceExpiryAndRearm(t *testing.T) {
+	const now = int64(10_000_000)
+	low := Sample{T: now - 1000, Premium: 100}
+	state, _ := advanceArmed(nil, Sample{}, Sample{T: now, Premium: 106, VWAP: 105}, []Sample{low})
+	// Falling below +5% without crossing does not disarm before the low expires.
+	state, trigger := advanceArmed(state, Sample{T: now, Premium: 106, VWAP: 100}, Sample{T: now + 1000, Premium: 104, VWAP: 100}, []Sample{low})
+	if state == nil || state.ArmedAt != now || trigger != nil {
+		t.Fatal("pullback prematurely consumed the arm")
+	}
+	state, trigger = advanceArmed(state, Sample{T: now + 1000, Premium: 104, VWAP: 100}, Sample{T: now + 2000, Premium: 103, VWAP: 104}, []Sample{low})
+	if state != nil || trigger == nil {
+		t.Fatal("first downward cross did not consume arm")
+	}
+	state, trigger = advanceArmed(state, Sample{}, Sample{T: now + 3000, Premium: 106}, []Sample{low})
+	if state == nil || trigger != nil || state.ArmedAt != now+3000 {
+		t.Fatal("fresh +5% could not re-arm")
+	}
+	expired := low.T + WindowMs + 1
+	state, trigger = advanceArmed(state, Sample{}, Sample{T: expired, Premium: 104}, []Sample{{T: expired - 1000, Premium: 103}})
+	if state != nil || trigger != nil {
+		t.Fatal("expired +5% reference retained arm")
+	}
+	state, _ = advanceArmed(nil, Sample{}, Sample{T: expired + 1000, Premium: 109}, []Sample{{T: expired, Premium: 103}})
+	if state == nil {
+		t.Fatal("could not re-arm after reference expiry")
+	}
+	// Another valid low keeps an old arm alive, preserving its spot baseline.
+	state.Baseline = spotSample{T: state.ArmedAt, Price: 23850}
+	armedAt := state.ArmedAt
+	later := expired + WindowMs + 1
+	state, _ = advanceArmed(state, Sample{}, Sample{T: later, Premium: 116}, []Sample{{T: later - 1000, Premium: 110}})
+	if state == nil || state.ArmedAt != armedAt || state.Reference.Premium != 110 || state.Baseline.Price != 23850 {
+		t.Fatal("reference renewal changed the arm time or spot baseline")
+	}
+}
+
+func TestAttributeUnderlyingDirectionAndFreshness(t *testing.T) {
+	const armedAt = int64(10_000_000)
+	const triggerAt = armedAt + 10_000
+	for _, tc := range []struct {
+		name      string
+		baseline  spotSample
+		current   spotSample
+		direction string
+		note      string
+	}{
+		{"up", spotSample{armedAt, 100}, spotSample{triggerAt, 101}, ShortPELongCE, ""},
+		{"down", spotSample{armedAt, 100}, spotSample{triggerAt, 99}, ShortCELongPE, ""},
+		{"flat", spotSample{armedAt, 100}, spotSample{triggerAt, 100}, "", "flat"},
+		{"missing baseline", spotSample{}, spotSample{triggerAt, 101}, "", "unavailable"},
+		{"missing current", spotSample{armedAt, 100}, spotSample{}, "", "unavailable"},
+		{"stale baseline", spotSample{armedAt - spotBaselineAgeMs - 1, 100}, spotSample{triggerAt, 101}, "", "unavailable"},
+		{"stale current", spotSample{armedAt, 100}, spotSample{triggerAt - quoteAgeMs - 1, 101}, "", "unavailable"},
+		{"inclusive ages", spotSample{armedAt - spotBaselineAgeMs, 100}, spotSample{triggerAt - quoteAgeMs, 101}, ShortPELongCE, ""},
+		{"baseline after arm", spotSample{armedAt + 1, 100}, spotSample{triggerAt, 101}, "", "unavailable"},
+		{"future current", spotSample{armedAt, 100}, spotSample{triggerAt + 1, 101}, "", "unavailable"},
+		{"invalid baseline", spotSample{armedAt, math.NaN()}, spotSample{triggerAt, 101}, "", "unavailable"},
+		{"invalid current", spotSample{armedAt, 100}, spotSample{triggerAt, math.Inf(1)}, "", "unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			direction, note := attributeUnderlyingDirection(tc.baseline, tc.current, armedAt, triggerAt)
+			if direction != tc.direction || !strings.Contains(note, tc.note) {
+				t.Fatalf("direction=%s note=%s, want %s/%s", direction, note, tc.direction, tc.note)
+			}
+		})
+	}
+}
+
+func TestCrossSideLegsBothDirectionsAndMissingFourthHedge(t *testing.T) {
+	u := buildUniverses(testInstruments(), "2026-11-04")["NIFTY"]
+	selected := u.Pairs[5]
+	for _, tc := range []struct {
+		direction, shortKind, longKind string
+		shortToken, longToken          int64
+	}{
+		{ShortPELongCE, "PE", "CE", selected.PE.InstrumentToken, u.Calls[9].InstrumentToken},
+		{ShortCELongPE, "CE", "PE", selected.CE.InstrumentToken, u.Puts[1].InstrumentToken},
+	} {
+		t.Run(tc.direction, func(t *testing.T) {
+			short, long, ok := crossSideLegs(u, selected, tc.direction)
+			if !ok || short.InstrumentType != tc.shortKind || long.InstrumentType != tc.longKind || short.InstrumentToken != tc.shortToken || long.InstrumentToken != tc.longToken {
+				t.Fatalf("wrong legs: %+v %+v %v", short, long, ok)
+			}
+			missing := u
+			if tc.direction == ShortPELongCE {
+				missing.Calls = u.Calls[:9]
+			} else {
+				missing.Puts = u.Puts[2:]
+			}
+			if _, _, ok := crossSideLegs(missing, selected, tc.direction); ok {
+				t.Fatal("selected nonexistent fourth hedge")
+			}
+		})
+	}
+	if _, _, ok := crossSideLegs(u, selected, "unknown"); ok {
+		t.Fatal("unknown direction silently selected legs")
+	}
+	// Count actual listed opposite-side strikes even if its ATM row is absent.
+	u.Calls = append(append([]market.Instrument{}, u.Calls[:5]...), u.Calls[6:]...)
+	if _, hedge, ok := crossSideLegs(u, selected, ShortPELongCE); !ok || hedge.Strike != 24050 {
+		t.Fatal("cross-side selection required the opposite-side ATM anchor")
 	}
 }
 
@@ -57,5 +206,29 @@ func TestRollingExtremaKeepTheEntireThirtyMinuteWindow(t *testing.T) {
 		if len(refs) != 2 || refs[0].Premium != minimum || refs[1].Premium != maximum {
 			t.Fatalf("rolling extrema differ at second %d: %+v, expected %v/%v", second, refs, minimum, maximum)
 		}
+	}
+}
+
+func TestResolveSpotTokensFromIndexMasterRowsWithoutSecurityIDConstants(t *testing.T) {
+	rows := []market.Instrument{
+		{InstrumentToken: 101, Name: "NIFTY", Tradingsymbol: "NIFTY 50", InstrumentType: "INDEX", Exchange: "INDICES", Segment: "INDICES"},
+		{InstrumentToken: 202, Name: "SENSEX", Tradingsymbol: "SENSEX", InstrumentType: "INDEX", Exchange: "INDICES", Segment: "INDICES"},
+		{InstrumentToken: 303, Name: "NIFTY BANK", Tradingsymbol: "BANKNIFTY", InstrumentType: "INDEX", Exchange: "INDICES", Segment: "INDICES"},
+		{InstrumentToken: 404, Name: "NIFTY", InstrumentType: "CE", Exchange: "NFO", Segment: "NFO-OPT"},
+		{InstrumentToken: 505, Name: "SENSEX", InstrumentType: "EQ", Exchange: "BSE", Segment: "BSE"},
+	}
+	got := resolveSpotTokens(rows)
+	if len(got) != 2 || got[101] != "NIFTY" || got[202] != "SENSEX" {
+		t.Fatalf("resolved names to the wrong instruments: %+v", got)
+	}
+	rows[0].Name, rows[0].Tradingsymbol = "", "  nifty  50 "
+	if got = resolveSpotTokens(rows); got[101] != "NIFTY" {
+		t.Fatal("exact normalized NIFTY 50 alias was not recognized")
+	}
+	duplicate := rows[0]
+	duplicate.InstrumentToken = 606
+	got = resolveSpotTokens(append(rows, duplicate))
+	if len(got) != 1 || got[202] != "SENSEX" {
+		t.Fatalf("ambiguous NIFTY master match did not fail closed: %+v", got)
 	}
 }

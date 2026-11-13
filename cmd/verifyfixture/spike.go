@@ -62,11 +62,17 @@ func (f *fixture) spikeQuote(id int64) (float64, float64) {
 	if stage > 3 {
 		stage = 3
 	}
+	if id == 13 {
+		return []float64{23850, 23850, 23860, 23860}[stage], 0
+	}
+	if id == 51 {
+		return []float64{80000, 80000, 79990, 79990}[stage], 0
+	}
 	if index == 0 {
 		if slot == 10 {
-			price, average = []float64{60, 64, 66, 63.5}[stage], 55
+			price, average = 60, 55
 		} else if slot == 11 {
-			price, average = 40, 50
+			price, average = []float64{40, 46, 44, 41.5}[stage], 50
 		} else if slot == 18 {
 			price = 20
 			if stage == 3 {
@@ -75,9 +81,9 @@ func (f *fixture) spikeQuote(id int64) (float64, float64) {
 		}
 	} else {
 		if slot == 10 {
-			price, average = 60, 55
+			price, average = []float64{60, 66, 64, 64}[stage], 55
 		} else if slot == 11 {
-			price, average = []float64{60, 52, 49, 49}[stage], 55
+			price, average = 40, 50
 		} else if slot == 3 {
 			price = 15
 		}
@@ -135,6 +141,16 @@ func (f *fixture) spikeFeed(w http.ResponseWriter, r *http.Request) {
 			for segment, ids := range wanted {
 				for id := range ids {
 					price, average := f.spikeQuote(id)
+					if segment == "IDX_I" {
+						packet := make([]byte, 16)
+						packet[0], packet[3] = dhan.FeedCodeIndex, byte(dhan.CodeBySegment[dhan.SegmentIdxI])
+						binary.LittleEndian.PutUint16(packet[1:], 16)
+						binary.LittleEndian.PutUint32(packet[4:], uint32(id))
+						binary.LittleEndian.PutUint32(packet[8:], math.Float32bits(float32(price)))
+						binary.LittleEndian.PutUint32(packet[12:], uint32(time.Now().Unix()))
+						frame = append(frame, packet...)
+						continue
+					}
 					packet := make([]byte, 162)
 					packet[0], packet[3] = 8, byte(dhan.CodeBySegment[dhan.Segment(segment)])
 					binary.LittleEndian.PutUint16(packet[1:], 162)
@@ -173,7 +189,7 @@ func (f *fixture) seedSpike(pool *db.Pool) error {
 	for _, name := range []string{"NIFTY", "SENSEX"} {
 		price, average, strike := 90.0, 105.0, 23850.0
 		if name == "SENSEX" {
-			price, average, strike = 120, 110, 80000
+			price, average, strike = 100, 105, 80000
 		}
 		for at := start; at.Before(now.Add(-time.Minute)); at = at.Add(time.Minute) {
 			bars = append(bars, spike.Bar{Sample: spike.Sample{T: at.UnixMilli(), Premium: price, VWAP: average,
@@ -192,9 +208,6 @@ func (f *fixture) spikeMarketQuote(w http.ResponseWriter, r *http.Request) {
 		book := map[string]any{}
 		for _, id := range ids {
 			price, average := f.spikeQuote(id)
-			if segment == "IDX_I" {
-				price, average = 23850, 23850
-			}
 			book[fmt.Sprint(id)] = map[string]any{"last_price": price, "average_price": average, "oi": 10000,
 				"last_trade_time": time.Now().In(time.FixedZone("IST", 330*60)).Format("02/01/2006 15:04:05")}
 		}
