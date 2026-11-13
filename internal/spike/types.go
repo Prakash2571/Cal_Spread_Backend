@@ -73,7 +73,15 @@ type Trade struct {
 	MarkHedge   *float64 `json:"mark_hedge,omitempty"`
 	MarkAt      *int64   `json:"mark_at,omitempty"`
 	PNL         *float64 `json:"pnl,omitempty"`
+	PeakPNL     *float64 `json:"peak_pnl,omitempty"`
+	PeakAt      *int64   `json:"peak_at,omitempty"`
 	MarkStale   bool     `json:"mark_stale"`
+}
+
+func (t *Trade) updatePeak(pnl float64, at int64) {
+	if t.PeakPNL == nil || pnl > *t.PeakPNL {
+		t.PeakPNL, t.PeakAt = &pnl, &at
+	}
 }
 
 type IndexView struct {

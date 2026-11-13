@@ -63,6 +63,7 @@ func (e *Engine) Close(ctx context.Context, id string) (Trade, error) {
 	short, hedge, pnl := a.Ask, b.Bid, grossPNL(trade, a.Ask, b.Bid)
 	trade.Status, trade.ClosedAt, trade.Short.Exit, trade.Hedge.Exit = "closed", &now, &short, &hedge
 	trade.MarkShort, trade.MarkHedge, trade.MarkAt, trade.PNL, trade.MarkStale = &short, &hedge, &now, &pnl, false
+	trade.updatePeak(pnl, now)
 	e.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()

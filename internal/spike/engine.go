@@ -519,6 +519,7 @@ func (e *Engine) updateMarksLocked(now int64) {
 		if !trade.MarkStale {
 			short, hedge, pnl, at := a.Ask, b.Bid, grossPNL(trade, a.Ask, b.Bid), now
 			trade.MarkShort, trade.MarkHedge, trade.PNL, trade.MarkAt = &short, &hedge, &pnl, &at
+			trade.updatePeak(pnl, at)
 		}
 		e.open[symbol] = trade
 	}

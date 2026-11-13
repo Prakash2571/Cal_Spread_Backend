@@ -2,6 +2,7 @@ package spike
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sync/atomic"
@@ -348,5 +349,160 @@ func TestMinuteBoundaryTicksCannotOverwriteTheCompletedPreviousMinute(t *testing
 	points = engine.Series("NIFTY", 1)
 	if len(points) != 2 || points[1].Premium != 104 {
 		t.Fatalf("next minute did not preserve its own observed close: %+v", points)
+	}
+}
+
+func TestMarksTrackPeakGrossPNLAndValuationTime(t *testing.T) {
+	namespace := brokers.Namespace{Broker: brokers.Dhan, Generation: 1}
+	engine := New(Deps{Namespace: func() brokers.Namespace { return namespace }, Ready: func() bool { return true }})
+	t.Cleanup(engine.cancel)
+	engine.active, engine.connected, engine.namespace = true, true, namespace
+	engine.open["NIFTY"] = Trade{ID: "marked", Symbol: "NIFTY", Status: "open", Quantity: 75,
+		Short: Leg{Token: 1, Entry: 100}, Hedge: Leg{Token: 2, Entry: 20}}
+	start := time.Date(2026, 11, 4, 10, 0, 0, 0, ist).UnixMilli()
+	for i, tc := range []struct {
+		name       string
+		shortAsk   float64
+		pnl        float64
+		peak       float64
+		peakOffset int64
+	}{
+		{"first negative mark", 101, -150, -150, 0},
+		{"zero becomes peak", 99, 0, 0, 1000},
+		{"higher mark", 97, 150, 150, 2000},
+		{"lower mark", 98, 75, 150, 2000},
+		{"equal mark keeps first time", 97, 150, 150, 2000},
+		{"new higher mark", 96, 225, 225, 5000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			at := start + int64(i)*1000
+			engine.quotes[1] = quote{Bid: tc.shortAsk - 1, Ask: tc.shortAsk, BidQty: 1000, AskQty: 1000, BookAt: at}
+			engine.quotes[2] = quote{Bid: 19, Ask: 20, BidQty: 1000, AskQty: 1000, BookAt: at}
+			engine.updateMarksLocked(at)
+			trade := engine.Snapshot().Open[0]
+			if trade.MarkStale || trade.PNL == nil || *trade.PNL != tc.pnl || trade.MarkAt == nil || *trade.MarkAt != at {
+				t.Fatalf("incorrect current valuation: %+v", trade)
+			}
+			if trade.PeakPNL == nil || *trade.PeakPNL != tc.peak || trade.PeakAt == nil || *trade.PeakAt != start+tc.peakOffset {
+				t.Fatalf("incorrect peak for %s: %+v", tc.name, trade)
+			}
+		})
+	}
+}
+
+func TestCloseCountsExitValuationAndFreezesStoredPeak(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		hadPeak   bool
+		priorPeak float64
+		shortAsk  float64
+		pnl       float64
+		peak      float64
+		moves     bool
+	}{
+		{"first valuation at exit", false, 0, 101, -150, -150, true},
+		{"exit raises peak", true, 75, 97, 150, 150, true},
+		{"lower exit preserves peak", true, 225, 97, 150, 225, false},
+		{"equal exit preserves time", true, 150, 97, 150, 150, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &Store{Pool: dbtest.New(t)}
+			ctx := context.Background()
+			clock := &fakeClock{}
+			at := time.Date(2026, 11, 4, 10, 0, 0, 0, ist).UnixMilli()
+			clock.ms.Store(at)
+			priorAt := at - 1000
+			trade := Trade{ID: "000000000000000000000001", Symbol: "NIFTY", Status: "open", LotSize: 75, Quantity: 75,
+				OpenedAt: at - 2000, Short: Leg{Token: 1, Entry: 100}, Hedge: Leg{Token: 2, Entry: 20}}
+			if tc.hadPeak {
+				trade.PeakPNL, trade.PeakAt = &tc.priorPeak, &priorAt
+			}
+			if err := store.Insert(ctx, trade); err != nil {
+				t.Fatal(err)
+			}
+			_, open, _, _, err := store.Load(ctx, dayKey(at))
+			if err != nil || len(open) != 1 {
+				t.Fatalf("load open trade: %+v, %v", open, err)
+			}
+			namespace := brokers.Namespace{Broker: brokers.Dhan, Generation: 1}
+			engine := New(Deps{Store: store, Now: clock.Now, Namespace: func() brokers.Namespace { return namespace },
+				Ready: func() bool { return true }})
+			t.Cleanup(engine.cancel)
+			engine.active, engine.connected, engine.namespace = true, true, namespace
+			engine.open[trade.Symbol] = open[0]
+			// Supply exit depth without marking it first, so Close must count this valuation.
+			engine.quotes[1] = quote{Bid: tc.shortAsk - 1, Ask: tc.shortAsk, BidQty: 1000, AskQty: 1000, BookAt: at}
+			engine.quotes[2] = quote{Bid: 19, Ask: 20, BidQty: 1000, AskQty: 1000, BookAt: at}
+			wantAt := priorAt
+			if tc.moves {
+				wantAt = at
+			}
+			assertClosed := func(closed Trade) {
+				t.Helper()
+				if closed.Status != "closed" || closed.PNL == nil || *closed.PNL != tc.pnl || closed.MarkAt == nil || *closed.MarkAt != at {
+					t.Fatalf("incorrect closing valuation: %+v", closed)
+				}
+				if closed.PeakPNL == nil || *closed.PeakPNL != tc.peak || closed.PeakAt == nil || *closed.PeakAt != wantAt {
+					t.Fatalf("incorrect frozen peak: %+v", closed)
+				}
+			}
+			closed, err := engine.Close(ctx, trade.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertClosed(closed)
+			clock.ms.Add(1000)
+			engine.quotes[1] = quote{Bid: 89, Ask: 90, BidQty: 1000, AskQty: 1000, BookAt: clock.ms.Load()}
+			engine.quotes[2] = quote{Bid: 19, Ask: 20, BidQty: 1000, AskQty: 1000, BookAt: clock.ms.Load()}
+			engine.updateMarksLocked(clock.ms.Load()) // This would value an open trade at a new high of 675.
+			closed, err = engine.Close(ctx, trade.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertClosed(closed)
+			snapshot := engine.Snapshot()
+			if len(snapshot.Open) != 0 || len(snapshot.Closed) != 1 {
+				t.Fatalf("closed trade remained open: %+v", snapshot)
+			}
+			assertClosed(snapshot.Closed[0])
+			_, open, stored, _, err := store.Load(ctx, dayKey(at))
+			if err != nil || len(open) != 0 || len(stored) != 1 {
+				t.Fatalf("reload closed trade: open=%+v closed=%+v, %v", open, stored, err)
+			}
+			assertClosed(stored[0])
+		})
+	}
+}
+
+func TestTradePeakJSONContract(t *testing.T) {
+	var trade Trade
+	if err := json.Unmarshal([]byte(`{"id":"legacy","pnl":75,"mark_at":1793766600000}`), &trade); err != nil {
+		t.Fatal(err)
+	}
+	if trade.PeakPNL != nil || trade.PeakAt != nil {
+		t.Fatalf("legacy trade acquired a peak without a valuation: %+v", trade)
+	}
+	for _, withPeak := range []bool{false, true} {
+		if withPeak {
+			pnl, at := 0.0, int64(1793766601000)
+			trade.PeakPNL, trade.PeakAt = &pnl, &at
+		}
+		raw, err := json.Marshal(trade)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			t.Fatal(err)
+		}
+		if withPeak {
+			if string(fields["peak_pnl"]) != "0" || string(fields["peak_at"]) != "1793766601000" {
+				t.Fatalf("peak JSON names or number types were wrong: %s", raw)
+			}
+		} else if _, ok := fields["peak_pnl"]; ok {
+			t.Fatalf("nil peak_pnl was not omitted: %s", raw)
+		} else if _, ok := fields["peak_at"]; ok {
+			t.Fatalf("nil peak_at was not omitted: %s", raw)
+		}
 	}
 }
