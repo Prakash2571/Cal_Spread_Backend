@@ -31,8 +31,8 @@ const (
 	purgeTimeout = 30 * time.Second
 )
 
-// Start runs index.ts's boot chain once and returns when it has finished; the Synthetic
-// and Fair Value boots keep running in the background (`void module.boot()`). Requests
+// Start runs index.ts's boot chain once and returns when it has finished; the
+// Fair Value boot keeps running in the background (`void module.boot()`). Requests
 // may be served while it runs, as in Node. A step that panics ends the chain with
 // "[Startup] initialisation chain failed" and the service keeps serving, like Node's
 // .catch on the chain. Cancelling ctx (or Shutdown) stops the chain between steps.
@@ -48,8 +48,8 @@ const (
 //  4. the main chain: restore today's Kite session, restore the active broker, start its
 //     runtime, restore admin sessions, restore the risk-free rate, the hourly scheduler
 //     with its backfill and the day review, the analytics warm load followed by the
-//     flush-retry timer and the option-OI capture, then the Synthetic and Fair Value
-//     boots in the background.
+//     flush-retry timer and the option-OI capture, then Spike and Fair Value.
+//     Synthetic is intentionally disabled.
 func (a *App) Start(ctx context.Context) {
 	a.mu.Lock()
 	if a.started || a.stopping {
@@ -99,7 +99,9 @@ func (a *App) Start(ctx context.Context) {
 				a.logf("[Spike] boot: %v", err)
 			}
 		}},
-		{"Synthetic boot", func() { a.background(a.synth.Boot, "[Synthetic] boot failed: %v") }},
+		// Synthetic is intentionally disabled: the owner does not use it. Restoring
+		// the Synthetic boot step re-enables background work; also remove the
+		// start-route guard in mountSynthetic to allow discovery again.
 		{"Fair Value boot", func() { a.background(a.fv.Boot, "[Fair Value] boot failed: %v") }},
 	}
 	for _, s := range steps {

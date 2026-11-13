@@ -48,8 +48,8 @@ func TestBrokerSwitchRunsTheHooks(t *testing.T) {
 	}
 	defer stream.Body.Close()
 	waitFor(t, "the hub socket", func() bool { return containsEvent(h.ticker.log(), "connect#0 [256265]") })
-	if r := h.do("POST", "/api/synthetic/start", trade, ""); r.status != 200 || !strings.Contains(r.body, `"running":true`) {
-		t.Fatalf("synthetic start: %d %s", r.status, r.body)
+	if r := h.do("POST", "/api/synthetic/start", trade, ""); r.status != 503 || !strings.Contains(r.body, "Synthetic is intentionally disabled.") {
+		t.Fatalf("synthetic must remain disabled: %d %s", r.status, r.body)
 	}
 	fvBefore := h.do("GET", "/api/fair-value/status", full, "")
 	if !strings.Contains(fvBefore.body, `"broker_generation":5,`) {

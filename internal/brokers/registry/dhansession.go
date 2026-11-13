@@ -170,13 +170,13 @@ func (r *Registry) CompleteDhanLogin(ctx context.Context, tokenID string) (Sessi
 		log.Printf("[Dhan] failed to persist the session: %v", err)
 	}
 
-	r.restartDhanRuntime(ctx, false)
+	r.restartDhanRuntime(ctx)
 	return r.SessionFor(brokers.Dhan), nil
 }
 
-// restartDhanRuntime restores each lane's own subscriptions on the new token.
-// Token-service/paste replacements recycle browser, Synthetic and Spike sockets.
-func (r *Registry) restartDhanRuntime(ctx context.Context, bothLanes bool) {
+// restartDhanRuntime replaces the sole Dhan socket with the new token and restores
+// the main, box and Spike tables onto it.
+func (r *Registry) restartDhanRuntime(ctx context.Context) {
 	r.recycleSpikeFeed()
 	// Warm the universe now so the first scan is not waiting on a multi-MB CSV.
 	r.background(func() {
@@ -186,22 +186,17 @@ func (r *Registry) restartDhanRuntime(ctx context.Context, bothLanes bool) {
 	})
 
 	// A reconnect replaces the access token, so the socket opened with the previous
-	// token must not survive. The second-lane Dhan feed is not recycled (as in Node).
-	r.mu.Lock()
-	old := r.dhanFeed
-	r.dhanFeed = nil
-	var oldBox *dhanLane
-	if bothLanes {
-		oldBox, r.boxDhanFeed = r.boxDhanFeed, nil
-	}
-	r.mu.Unlock()
+	// token must not survive.
+	old := r.currentDhanFeed()
 	if old != nil {
 		log.Printf("[Broker] recycling the Dhan feed onto the new access token")
-		old.stop()
+		old.retire()
 		r.lastTickAt.Store(noTick)
-	}
-	if oldBox != nil {
-		oldBox.stop()
+		// Keep the old lane visible until its socket has closed. Late operations on
+		// it are ignored by retire; the tables below replay their current sets.
+		r.mu.Lock()
+		r.dhanFeed = nil
+		r.mu.Unlock()
 	}
 
 	// Establishing a session is the first moment the static IP can be checked.
@@ -212,8 +207,8 @@ func (r *Registry) restartDhanRuntime(ctx context.Context, bothLanes bool) {
 			log.Printf("[Dhan] universe load after login failed: %v", err)
 		}
 		r.StartActiveFeed()
-		// Replay EACH lane's own table onto its own socket, lane by lane, so the frames
-		// are on the wire before the state is published (Node did this synchronously).
+		// Replay main and box onto the shared socket, table by table, so the frames are on
+		// the wire before the state is published. Shared tokens are deduplicated.
 		wanted := r.subscriptions.ActiveTokens()
 		wantedBox := r.boxSubscriptions.ActiveTokens()
 		if len(wanted) > 0 || len(wantedBox) > 0 {
@@ -233,28 +228,17 @@ func (r *Registry) restartDhanRuntime(ctx context.Context, bothLanes bool) {
 	}
 }
 
-// LogoutDhan drops the Dhan session and everything derived from it: token, feed (the
-// futures one), instruments, the persisted row.
+// LogoutDhan drops the Dhan session, shared feed, instruments and persisted row.
 func (r *Registry) LogoutDhan(ctx context.Context) {
 	r.opMu.Lock()
 	defer r.opMu.Unlock()
 	r.brokerLogin.mu.Lock()
 	r.brokerLogin.pausedDay = jsx.IstDayKey(r.now())
 	r.brokerLogin.mu.Unlock()
-	_, _, meta := r.dhanSession()
 	r.setDhanSession(nil, nil, nil)
 	r.recycleSpikeFeed()
 	if f := r.currentDhanFeed(); f != nil {
 		f.stop()
-	}
-	if meta != nil && meta.source != "" {
-		r.mu.Lock()
-		box := r.boxDhanFeed
-		r.boxDhanFeed = nil
-		r.mu.Unlock()
-		if box != nil {
-			box.stop()
-		}
 	}
 	r.dhanInstruments.Clear()
 	sctx, cancel := storeCtx()
@@ -277,15 +261,15 @@ func (r *Registry) onDhanFeedSessionLost(lane *dhanLane, reason string) {
 	r.opMu.Lock()
 	defer r.opMu.Unlock()
 	r.mu.Lock()
-	current := lane == r.dhanFeed || lane == r.boxDhanFeed || lane == r.spikeDhanFeed
+	current := lane == r.dhanFeed
 	r.mu.Unlock()
 	if current {
 		r.onDhanSessionLost(reason)
 	}
 }
 
-// onDhanSessionLost handles a session that died mid-flight: fail closed. Token-based
-// sessions stop every Dhan lane; legacy consent sessions keep their original behavior.
+// onDhanSessionLost handles a session that died mid-flight: fail closed, stopping
+// the sole Dhan socket.
 func (r *Registry) onDhanSessionLost(reason string) {
 	r.recycleSpikeFeed()
 	log.Printf("[Dhan] session lost: %s", reason)
@@ -300,13 +284,6 @@ func (r *Registry) onDhanSessionLost(reason string) {
 		}
 		r.brokerLogin.lastErr = "Dhan rejected the saved token. Fetch a new token or paste a fallback."
 		r.brokerLogin.mu.Unlock()
-		r.mu.Lock()
-		box := r.boxDhanFeed
-		r.boxDhanFeed = nil
-		r.mu.Unlock()
-		if box != nil {
-			box.stop()
-		}
 	}
 	if f := r.currentDhanFeed(); f != nil {
 		f.stop()

@@ -19,6 +19,7 @@ import (
 
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/brokerlogin"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/brokers"
+	"github.com/Prakash2571/Cal_Spread_Backend/internal/brokers/dhan"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/db"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/dbtest"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/server"
@@ -353,21 +354,28 @@ func TestPastedFallbackValidationPersistenceAndExpiry(t *testing.T) {
 	}
 }
 
-func TestTokenReplacementRecyclesBothLanesAndIgnoresOldCallbacks(t *testing.T) {
+func TestTokenReplacementRecyclesSharedSocketAndIgnoresOldCallbacks(t *testing.T) {
 	u, service := newTokenRig(t, nil, nil)
 	u.activateDhan("synthetic-old-token")
 	u.reg.StartActiveFeed()
 	u.reg.AcquireBrowserTokens([]int64{2000050000})
 	u.reg.SetSyntheticTokens([]int64{2000060000})
+	u.reg.SetSpikeTokens([]int64{2000070000})
 	u.settle()
+	if len(u.feeds.feeds) != 1 {
+		t.Fatal("main, box and Spike must use exactly one Dhan feed")
+	}
 	u.rec.take()
 	if _, err := u.reg.FetchBrokerToken(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	u.settle()
 	got := strings.Join(u.rec.take(), "\n")
-	if !strings.Contains(got, "feed1:stop") || !strings.Contains(got, "feed2:stop") || !strings.Contains(got, "feed3:subscribe [2000050000]") || !strings.Contains(got, "feed4:subscribe [2000060000]") {
-		t.Fatalf("new token did not recycle and replay both lanes: %s", got)
+	if !strings.Contains(got, "feed1:stop") || strings.Contains(got, "feed2:stop") || !strings.Contains(got, "feed2:subscribe [2000050000]") || !strings.Contains(got, "feed2:subscribe [2000060000]") || !strings.Contains(got, "feed2:subscribe [2000070000]") {
+		t.Fatalf("new token did not replay main + box + Spike on the replacement main feed: %s", got)
+	}
+	if len(u.feeds.feeds) != 2 || u.reg.currentDhanFeed().feed != u.feeds.get(1) {
+		t.Fatal("replacement must create only one new main feed")
 	}
 	u.feeds.get(0).opts.OnSessionLost("superseded socket")
 	u.settle()
@@ -478,5 +486,90 @@ func TestPastedJWTExpiryIsEnforcedBeforeInstallation(t *testing.T) {
 	}
 	if u.reg.usableDhanToken() != "synthetic-working-token" {
 		t.Fatal("expired paste changed the working token")
+	}
+}
+
+// Hold Stop open to exercise subscriptions arriving during token replacement.
+type blockingRetireFeed struct {
+	*fakeDhanFeed
+	entered, release chan struct{}
+	once             sync.Once
+}
+
+func (f *blockingRetireFeed) Stop() {
+	f.once.Do(func() {
+		close(f.entered)
+		<-f.release
+	})
+	f.fakeDhanFeed.Stop()
+}
+
+func TestTokenReplacementCannotOverlapSocketsOrReopenRetiredLane(t *testing.T) {
+	u, _ := newTokenRig(t, nil, nil)
+	u.activateDhan("synthetic-old-token")
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	first := true
+	u.reg.deps.NewDhanFeed = func(opts dhan.FeedOptions) DhanFeed {
+		feed := u.feeds.new(opts).(*fakeDhanFeed)
+		if first {
+			first = false
+			return &blockingRetireFeed{fakeDhanFeed: feed, entered: entered, release: release}
+		}
+		return feed
+	}
+	u.reg.SetAnalyticsTokens([]int64{1})
+	u.reg.SetSyntheticTokens([]int64{2})
+	u.reg.SetSpikeTokens([]int64{3})
+	u.settle()
+	old := u.reg.currentDhanFeed()
+	u.rec.take()
+	done := make(chan error, 1)
+	go func() {
+		_, err := u.reg.FetchBrokerToken(context.Background())
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replacement never stopped the old feed")
+	}
+	// These declarations must keep using the retiring lane until it closes. Their
+	// table changes will replay on the replacement; queued old-lane calls cannot reopen it.
+	u.reg.SetAnalyticsTokens([]int64{1, 4})
+	u.reg.SetSyntheticTokens([]int64{2, 5})
+	u.reg.SetSpikeTokens([]int64{3, 6})
+	if main := u.reg.currentDhanFeed(); main != old {
+		t.Fatal("replacement became visible before the old socket closed")
+	}
+	u.feeds.mu.Lock()
+	count := len(u.feeds.feeds)
+	u.feeds.mu.Unlock()
+	if count != 1 {
+		t.Fatal("constructed a second feed while the first was still stopping")
+	}
+	unblock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("replacement did not finish")
+	}
+	// A caller may have retained the old lane before replacement began.
+	old.subscribeShared(spikeLane, []int64{7})
+	old.ensureSocket()
+	old.flush()
+	u.settle()
+	if len(u.feeds.feeds) != 2 || u.feeds.get(0).WantedCount() != 0 || u.feeds.get(1).WantedCount() != 6 {
+		t.Fatal("replacement must leave only one live feed with all three current tables")
+	}
+	for _, event := range u.rec.take() {
+		if strings.HasPrefix(event, "feed1:subscribe") || strings.HasPrefix(event, "feed1:ensure") {
+			t.Fatalf("retired feed reopened through queued work: %s", event)
+		}
 	}
 }

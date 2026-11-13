@@ -2,7 +2,10 @@ package registry
 
 import (
 	"log"
+	"log/slog"
 	"sync"
+
+	"github.com/Prakash2571/Cal_Spread_Backend/internal/brokers"
 )
 
 // serial runs functions one at a time, in submission order, on a goroutine that exists
@@ -71,23 +74,102 @@ func (s *serial) run() {
 type dhanLane struct {
 	feed DhanFeed
 	wire serial
+	// Main only: one bit per logical lane retains overlapping subscriptions.
+	// Owned by wire, including reset on stop; replay is idempotent per lane.
+	sharedWanted map[int64]uint8
+	// Owned by wire. A replaced lane must never reopen from a late queued operation.
+	retired bool
 }
 
-func (l *dhanLane) subscribe(tokens []int64) {
+func sharedLaneBit(lane brokers.Lane) uint8 {
+	switch lane {
+	case brokers.LaneBox:
+		return 2
+	case spikeLane:
+		return 4
+	default:
+		return 1
+	}
+}
+
+// subscribeShared merges the main, box and Spike tables without subscribing twice. Like
+// all feed mutations, it queues work and never calls back into a coordinator.
+func (l *dhanLane) subscribeShared(lane brokers.Lane, tokens []int64) {
 	cp := append([]int64(nil), tokens...)
-	l.wire.Go(func() { l.feed.SubscribeTokens(cp) })
+	l.wire.Go(func() {
+		if l.retired {
+			return
+		}
+		if l.sharedWanted == nil {
+			l.sharedWanted = map[int64]uint8{}
+		}
+		bit := sharedLaneBit(lane)
+		var fresh []int64
+		for _, token := range cp {
+			if l.sharedWanted[token] == 0 {
+				fresh = append(fresh, token)
+			}
+			l.sharedWanted[token] |= bit
+		}
+		if len(fresh) > 0 {
+			before := l.feed.WantedCount()
+			l.feed.SubscribeTokens(fresh)
+			if wanted := l.feed.WantedCount(); before <= 5000 && wanted > 5000 {
+				slog.Warn("Dhan main feed exceeds the per-connection instrument cap", "wanted", wanted, "limit", 5000)
+			}
+		}
+	})
 }
 
-func (l *dhanLane) unsubscribe(tokens []int64) {
+func (l *dhanLane) unsubscribeShared(lane brokers.Lane, tokens []int64) {
 	cp := append([]int64(nil), tokens...)
-	l.wire.Go(func() { l.feed.UnsubscribeTokens(cp) })
+	l.wire.Go(func() {
+		bit := sharedLaneBit(lane)
+		var drop []int64
+		for _, token := range cp {
+			bits := l.sharedWanted[token]
+			if bits&bit == 0 {
+				continue
+			}
+			if bits&^bit == 0 {
+				delete(l.sharedWanted, token)
+				drop = append(drop, token)
+			} else {
+				l.sharedWanted[token] = bits &^ bit
+			}
+		}
+		if len(drop) > 0 {
+			l.feed.UnsubscribeTokens(drop)
+		}
+	})
 }
 
-func (l *dhanLane) ensureSocket() { l.wire.Do(l.feed.EnsureSocket) }
+func (l *dhanLane) ensureSocket() {
+	l.wire.Do(func() {
+		if !l.retired {
+			l.feed.EnsureSocket()
+		}
+	})
+}
+
+// retire permanently closes a replaced lane. The registry keeps it installed until
+// this returns, so no replacement socket can open while the old one is still stopping.
+func (l *dhanLane) retire() {
+	l.wire.Do(func() {
+		l.retired = true
+		l.sharedWanted = nil
+		l.feed.Stop()
+	})
+}
 
 // stop runs after every queued operation and returns once the feed has stopped, so a
 // broker switch never continues while the old socket can still be (re)opened.
-func (l *dhanLane) stop() { l.wire.Do(l.feed.Stop) }
+func (l *dhanLane) stop() {
+	l.wire.Do(func() {
+		l.sharedWanted = nil
+		l.feed.Stop()
+	})
+}
 
 // flush waits for every queued operation (tests and diagnostics).
 func (l *dhanLane) flush() { l.wire.Do(func() {}) }

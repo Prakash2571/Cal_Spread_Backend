@@ -167,7 +167,7 @@ func TestSessionLostWhileDhanActiveFailsClosed(t *testing.T) {
 	u.settle()
 	got := u.rec.take()
 	want := []string{
-		"feed1:stop", "hub:external false", "publish",
+		"feed1:stop", "hub:external false", "boxLaneConnection false", "publish",
 		"invalidateBooks",
 		"sessionLost dhan Dhan feed rejected the session (close code 4401) — the access token is invalid or expired.",
 		"publish",
@@ -195,7 +195,7 @@ func TestSessionLostWhileZerodhaActiveTouchesNoHook(t *testing.T) {
 	u.rec.take()
 	u.feeds.get(0).opts.OnSessionLost("gone")
 	u.settle()
-	if got := u.rec.take(); strings.Join(got, ",") != "feed1:stop,hub:external false,publish" {
+	if got := u.rec.take(); strings.Join(got, ",") != "feed1:stop,hub:external false,boxLaneConnection false,publish" {
 		t.Fatalf("events %q", got)
 	}
 	if u.reg.usableDhanToken() != "" {
@@ -227,10 +227,10 @@ func TestReLoginWhileDhanActiveRecyclesTheFeedAndReplaysBothLanes(t *testing.T) 
 	}
 	got := u.rec.take()
 	want := []string{
-		"feed1:stop", "hub:external false", "publish", // the futures feed on the old token goes
-		"feed3:ensure token=new-tok", // a fresh one starts on the new token
-		"feed3:subscribe [1000000438,2000050000]",
-		"feed2:subscribe [2000050000]", // the second lane keeps its feed (not recycled, as in Node)
+		"feed1:stop", "hub:external false", "boxLaneConnection false", "publish",
+		// Both logical tables share this fresh socket; Box's overlap is retained once.
+		"feed2:ensure token=new-tok",
+		"feed2:subscribe [1000000438,2000050000]",
 		"publish",
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
@@ -409,11 +409,10 @@ func TestLaneTickRouting(t *testing.T) {
 	u.reg.Attach(h)
 	u.activateDhan("tok")
 	u.reg.StartActiveFeed()
-	u.reg.SetSyntheticTokens([]int64{2000060000})
+	u.reg.SetSyntheticTokens([]int64{3})
 	u.settle()
 	u.rec.take()
-	// Futures-lane Dhan ticks go to the hub (and count as liveness); second-lane ticks
-	// never reach the hub.
+	// Tokens in neither table retain main's historical hub delivery.
 	u.clock.advance(5)
 	u.feeds.get(0).opts.OnTicks([]market.Tick{{Token: 1}, {Token: 2}})
 	if got := u.rec.take(); strings.Join(got, ",") != "hub:ingest 2" {
@@ -423,7 +422,7 @@ func TestLaneTickRouting(t *testing.T) {
 		t.Fatalf("lastTick %v", last)
 	}
 	u.clock.advance(7)
-	u.feeds.get(1).opts.OnTicks([]market.Tick{{Token: 3}})
+	u.feeds.get(0).opts.OnTicks([]market.Tick{{Token: 3}})
 	if got := u.rec.take(); len(got) != 0 || box.Load() != 1 {
 		t.Fatalf("box ticks reached %q, consumer got %d", got, box.Load())
 	}

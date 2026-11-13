@@ -29,8 +29,8 @@ func TestKiteTokenRejectedClearsTheSession(t *testing.T) {
 	expect(t, "GET / with the restored session", h.do("GET", "/", "", ""), 200,
 		`{"status":"ok","authenticated":true,"hint":"Visit /api/login to authenticate with Zerodha."}`)
 	trade := h.tradeToken()
-	if r := h.do("POST", "/api/synthetic/start", trade, ""); r.status != 200 || !strings.Contains(r.body, `"running":true`) {
-		t.Fatalf("synthetic start: %d %s", r.status, r.body)
+	if r := h.do("POST", "/api/synthetic/start", trade, ""); r.status != 503 || !strings.Contains(r.body, "Synthetic is intentionally disabled.") {
+		t.Fatalf("synthetic must remain disabled: %d %s", r.status, r.body)
 	}
 
 	created := h.do("POST", "/api/stream/session", "", `{"tokens":[256265]}`)

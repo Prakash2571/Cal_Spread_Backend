@@ -115,6 +115,34 @@ func loadRoutesGolden(t *testing.T) routesGolden {
 	if err := json.Unmarshal(raw, &g); err != nil {
 		t.Fatalf("decode golden: %v", err)
 	}
+	// Keep the original Node recording intact, but pin the intentional Dhan lane
+	// merge: the switch scenario opens one shared socket, and its disconnect now
+	// notifies both consumers before publishing. Zerodha recordings are unchanged.
+	for i := range g.Scenarios {
+		sc := &g.Scenarios[i]
+		if sc.Name == "switch to Dhan and back with a database: teardown order, durable generation" {
+			if len(sc.Sockets) != 2 || sc.Sockets[0] != sc.Sockets[1] {
+				t.Fatal("unexpected original main/box socket recording")
+			}
+			sc.Sockets = sc.Sockets[:1]
+		}
+		for j := range sc.Results {
+			events := sc.Results[j].Events
+			var merged []string
+			for k := 0; k < len(events); k++ {
+				merged = append(merged, events[k])
+				if events[k] == "hub:external false" {
+					merged = append(merged, "boxLaneConnection false")
+					// The old box socket emitted this after main's Publish.
+					if k+2 < len(events) && events[k+1] == "publish" && events[k+2] == "boxLaneConnection false" {
+						merged = append(merged, "publish")
+						k += 2
+					}
+				}
+			}
+			sc.Results[j].Events = merged
+		}
+	}
 	return g
 }
 

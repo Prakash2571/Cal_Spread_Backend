@@ -30,7 +30,6 @@ var wantBoot = []string{
 	"hourly capture scheduler, backfill and day review",
 	"analytics warm load and capture schedulers",
 	"Spike boot",
-	"Synthetic boot",
 	"Fair Value boot",
 }
 
@@ -116,6 +115,7 @@ func TestBootAndShutdownWithDatabase(t *testing.T) {
 	if got := h.trace.with("boot: "); !reflect.DeepEqual(got, wantBoot) {
 		t.Fatalf("boot order\n got %q\nwant %q", got, wantBoot)
 	}
+	assertSyntheticNeverStarted(t, h)
 
 	// Each restore step really ran against PostgreSQL.
 	expect(t, "admin status with a restored session", h.do("GET", "/api/admin/status", "seeded-full-token", ""),
@@ -181,6 +181,7 @@ func TestBootAndShutdownWithoutDatabase(t *testing.T) {
 	if got := h.trace.with("boot: "); !reflect.DeepEqual(got, wantBoot) {
 		t.Fatalf("boot order\n got %q\nwant %q", got, wantBoot)
 	}
+	assertSyntheticNeverStarted(t, h)
 	// Memory only, as Node without MongoDB: nothing restored, trades refused.
 	expect(t, "admin status", h.do("GET", "/api/admin/status", "seeded-full-token", ""),
 		200, `{"authenticated":false,"role":null,"broker":"zerodha"}`)

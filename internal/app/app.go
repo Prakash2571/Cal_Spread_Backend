@@ -426,7 +426,7 @@ func (a *App) mounts() []func(chi.Router) {
 		a.analytics.Mount,
 		a.calendar.Mount,
 		func(r chi.Router) { spike.Mount(r, a.spike, sessions) },
-		func(r chi.Router) { synthetic.Register(r, a.synth, synthetic.RouteDeps{Role: sessions.Role}) },
+		a.mountSynthetic,
 		func(r chi.Router) {
 			fairvalue.Mount(r, fairvalue.RouteDeps{Engine: a.fv, IsFullAdmin: func(t string) bool { return sessions.Role(t) == auth.RoleFull }})
 		},

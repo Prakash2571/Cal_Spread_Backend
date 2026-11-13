@@ -465,7 +465,7 @@ func (r *Registry) installDhanAccessToken(ctx context.Context, clientID, token s
 	r.setDhanSession(&token, copyInt(expiry), &dhanMeta{clientID: clientID, clientName: name, clientUcc: ucc,
 		powerOfAttorney: poa, loginDay: rec.LoginDate, loginAt: now.UnixMilli(), source: source})
 	if oldToken == nil || *oldToken != token {
-		r.restartDhanRuntime(ctx, true)
+		r.restartDhanRuntime(ctx)
 	}
 	log.Printf("[Dhan] access token installed (%s); session saved when PostgreSQL is enabled", source)
 	return nil

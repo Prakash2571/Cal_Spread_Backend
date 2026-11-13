@@ -159,8 +159,8 @@ type Hooks struct {
 	// OnBrokerChanged runs after a successful POST /api/broker/select (Node: Box
 	// publishNow).
 	OnBrokerChanged func(broker brokers.ID)
-	// OnBoxLaneTicks receives every tick of the second lane (Synthetic.OnTicks). Box-lane
-	// ticks never reach the hub.
+	// OnBoxLaneTicks receives every tick wanted by the box lane (Synthetic.OnTicks).
+	// Box-only ticks never reach the hub; Dhan tokens shared with main reach both.
 	OnBoxLaneTicks func(ticks []market.Tick)
 	// OnBoxLaneConnection receives the second lane's connection changes
 	// (Synthetic.InvalidateBooks).
@@ -228,8 +228,6 @@ type Registry struct {
 	mu               sync.Mutex
 	hooks            Hooks
 	dhanFeed         *dhanLane
-	boxDhanFeed      *dhanLane
-	spikeDhanFeed    *dhanLane
 	boxLaneFeed      LaneFeed
 	lastMarginSource *market.MarginSource
 	ip               ipVerdict
@@ -409,7 +407,7 @@ func (r *Registry) subscribeUpstream(lane brokers.Lane, tokens []int64) {
 		if active == brokers.Zerodha {
 			r.ensureBoxLaneFeed().SubscribeTokens(append([]int64(nil), tokens...))
 		} else {
-			r.ensureBoxDhanFeed().subscribe(tokens)
+			r.ensureDhanFeed().subscribeShared(lane, tokens)
 		}
 		return
 	}
@@ -417,7 +415,7 @@ func (r *Registry) subscribeUpstream(lane brokers.Lane, tokens []int64) {
 		r.hub.SubscribeTokens(append([]int64(nil), tokens...))
 		return
 	}
-	r.ensureDhanFeed().subscribe(tokens)
+	r.ensureDhanFeed().subscribeShared(lane, tokens)
 }
 
 func (r *Registry) unsubscribeUpstream(lane brokers.Lane, tokens []int64) {
@@ -426,15 +424,15 @@ func (r *Registry) unsubscribeUpstream(lane brokers.Lane, tokens []int64) {
 	}
 	active := r.ActiveBroker()
 	r.mu.Lock()
-	boxLane, boxDhan, futDhan := r.boxLaneFeed, r.boxDhanFeed, r.dhanFeed
+	boxLane, futDhan := r.boxLaneFeed, r.dhanFeed
 	r.mu.Unlock()
 	if lane == brokers.LaneBox {
 		if active == brokers.Zerodha {
 			if boxLane != nil {
 				boxLane.UnsubscribeTokens(append([]int64(nil), tokens...))
 			}
-		} else if boxDhan != nil {
-			boxDhan.unsubscribe(tokens)
+		} else if futDhan != nil {
+			futDhan.unsubscribeShared(lane, tokens)
 		}
 		return
 	}
@@ -443,7 +441,7 @@ func (r *Registry) unsubscribeUpstream(lane brokers.Lane, tokens []int64) {
 		return
 	}
 	if futDhan != nil {
-		futDhan.unsubscribe(tokens)
+		futDhan.unsubscribeShared(lane, tokens)
 	}
 }
 
@@ -453,8 +451,8 @@ func (r *Registry) AcquireBrowserTokens(tokens []int64) func() {
 	return r.subscriptions.Acquire(brokers.OwnerBrowser, tokens).Release
 }
 
-// SetSyntheticTokens declares the Synthetic scanner's whole token set on the second lane
-// (owner "scanner").
+// SetSyntheticTokens declares the Synthetic scanner's whole token set on the box
+// logical lane (owner "scanner").
 func (r *Registry) SetSyntheticTokens(tokens []int64) {
 	r.boxSubscriptions.SetOwnerTokens(brokers.OwnerScanner, tokens)
 }
@@ -500,8 +498,8 @@ func (r *Registry) newDhanFeed(opts dhan.FeedOptions) DhanFeed {
 	return dhan.NewFeed(opts)
 }
 
-// ensureDhanFeed is the futures-lane Dhan socket, built lazily so a Zerodha-only
-// deployment never makes one.
+// ensureDhanFeed is the sole Dhan socket, shared by main, box and Spike and built
+// lazily so a Zerodha-only deployment never makes one.
 func (r *Registry) ensureDhanFeed() *dhanLane {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -511,13 +509,50 @@ func (r *Registry) ensureDhanFeed() *dhanLane {
 			AccessToken: r.usableDhanToken,
 			ClientID:    r.dhanClientID,
 			OnTicks: func(ticks []market.Tick) {
-				// index.ts onDhanTicks: liveness, then the shared hub fan-out.
 				r.NoteTick()
-				r.hub.IngestExternalTicks(ticks)
+				var mainTicks, boxTicks, spikeTicks []market.Tick
+				for _, tick := range ticks {
+					// Each CountsFor is an O(1) map lookup. Build independent slices
+					// before stamping Spike's namespace; the hub broadcasts unfiltered.
+					mainWanted := r.subscriptions.CountsFor(tick.Token) != nil
+					boxWanted := r.boxSubscriptions.CountsFor(tick.Token) != nil
+					spikeWanted := r.spikeSubscriptions.CountsFor(tick.Token) != nil
+					if boxWanted {
+						boxTicks = append(boxTicks, tick)
+					}
+					if spikeWanted {
+						spikeTicks = append(spikeTicks, tick)
+					}
+					if (!boxWanted && !spikeWanted) || mainWanted {
+						mainTicks = append(mainTicks, tick)
+					}
+				}
+				if len(mainTicks) > 0 {
+					r.hub.IngestExternalTicks(mainTicks)
+				}
+				if h := r.getHooks(); len(boxTicks) > 0 && h.OnBoxLaneTicks != nil {
+					h.OnBoxLaneTicks(boxTicks)
+				}
+				if len(spikeTicks) > 0 && r.ActiveBroker() == brokers.Dhan && !r.Switching() {
+					namespace := r.Namespace()
+					for i := range spikeTicks {
+						spikeTicks[i].Namespace = &namespace
+					}
+					if hook := r.getHooks().OnSpikeTicks; hook != nil {
+						hook(spikeTicks)
+					}
+				}
 			},
 			OnConnection: func(connected bool) {
 				r.hub.SetExternalConnected(connected)
-				if h := r.getHooks(); h.Publish != nil {
+				h := r.getHooks()
+				if h.OnBoxLaneConnection != nil {
+					h.OnBoxLaneConnection(connected)
+				}
+				if h.OnSpikeConnection != nil {
+					h.OnSpikeConnection(connected)
+				}
+				if h.Publish != nil {
 					h.Publish()
 				}
 			},
@@ -528,35 +563,6 @@ func (r *Registry) ensureDhanFeed() *dhanLane {
 		r.dhanFeed = lane
 	}
 	return r.dhanFeed
-}
-
-// ensureBoxDhanFeed is the second lane's Dhan socket (Dhan permits five per user).
-func (r *Registry) ensureBoxDhanFeed() *dhanLane {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.boxDhanFeed == nil {
-		lane := &dhanLane{}
-		lane.feed = r.newDhanFeed(dhan.FeedOptions{
-			AccessToken: r.usableDhanToken,
-			ClientID:    r.dhanClientID,
-			OnTicks: func(ticks []market.Tick) {
-				r.NoteTick()
-				if h := r.getHooks(); h.OnBoxLaneTicks != nil {
-					h.OnBoxLaneTicks(ticks)
-				}
-			},
-			OnConnection: func(connected bool) {
-				if h := r.getHooks(); h.OnBoxLaneConnection != nil {
-					h.OnBoxLaneConnection(connected)
-				}
-			},
-			OnSessionLost: func(reason string) { r.background(func() { r.onDhanFeedSessionLost(lane, reason) }) },
-			Resolve:       r.dhanInstruments.Identify,
-			DepthLevel:    5,
-		})
-		r.boxDhanFeed = lane
-	}
-	return r.boxDhanFeed
 }
 
 // ensureBoxLaneFeed is the second lane's Zerodha socket (the second of the three Kite
@@ -604,14 +610,13 @@ func (r *Registry) currentDhanFeed() *dhanLane {
 	return r.dhanFeed
 }
 
-// stopAllLanes stops BOTH lanes of BOTH brokers. The second-lane feeds are forgotten
-// (the next use builds fresh ones under the new generation); the futures Dhan feed is
-// kept, stopped but restartable, as in Node.
+// stopAllLanes drops Spike's shared holds and stops main Dhan and both Zerodha feeds.
+// The Zerodha box feed is forgotten; main Dhan is kept, stopped but restartable.
 func (r *Registry) stopAllLanes() {
 	r.recycleSpikeFeed()
 	r.mu.Lock()
-	futDhan, boxLane, boxDhan := r.dhanFeed, r.boxLaneFeed, r.boxDhanFeed
-	r.boxLaneFeed, r.boxDhanFeed = nil, nil
+	futDhan, boxLane := r.dhanFeed, r.boxLaneFeed
+	r.boxLaneFeed = nil
 	r.mu.Unlock()
 	attempt := func(what string, fn func()) {
 		defer func() {
@@ -627,9 +632,6 @@ func (r *Registry) stopAllLanes() {
 	}
 	if boxLane != nil {
 		attempt("boxZerodhaFeed.stop()", boxLane.Stop)
-	}
-	if boxDhan != nil {
-		attempt("boxDhanFeed.stop()", boxDhan.stop)
 	}
 }
 
@@ -649,25 +651,17 @@ func (r *Registry) StopFeeds() { r.stopAllLanes() }
 
 // flushFeeds waits until every queued Dhan feed operation has run (tests).
 func (r *Registry) flushFeeds() {
-	r.mu.Lock()
-	lanes := []*dhanLane{r.dhanFeed, r.boxDhanFeed, r.spikeDhanFeed}
-	r.mu.Unlock()
-	for _, l := range lanes {
-		if l != nil {
-			l.flush()
-		}
+	if l := r.currentDhanFeed(); l != nil {
+		l.flush()
 	}
 }
 
-// flushLane waits for one lane's queued Dhan feed operations. Only for callers that hold
-// no consumer lock (switch, login): a queued unsubscribe may be waiting for a tick
-// delivery that needs one.
+// flushLane waits for main's queue for either logical lane (futures or box). Only
+// for callers that hold no consumer lock (switch, login): a queued unsubscribe may
+// be waiting for a tick delivery that needs one.
 func (r *Registry) flushLane(lane brokers.Lane) {
 	r.mu.Lock()
 	l := r.dhanFeed
-	if lane == brokers.LaneBox {
-		l = r.boxDhanFeed
-	}
 	r.mu.Unlock()
 	if l != nil {
 		l.flush()
@@ -688,7 +682,7 @@ func (r *Registry) LaneStats(lane brokers.Lane) brokers.LaneFeedStats {
 	}
 	empty := brokers.LaneFeedStats{Lane: lane, WantedTokens: wanted, Generation: gen}
 	r.mu.Lock()
-	boxLane, boxDhan, futDhan := r.boxLaneFeed, r.boxDhanFeed, r.dhanFeed
+	boxLane, futDhan := r.boxLaneFeed, r.dhanFeed
 	r.mu.Unlock()
 	dhanStats := func(l *dhanLane) brokers.LaneFeedStats {
 		return brokers.LaneFeedStats{
@@ -708,10 +702,12 @@ func (r *Registry) LaneStats(lane brokers.Lane) brokers.LaneFeedStats {
 				Reconnects: s.Reconnects, Generation: int(s.Generation),
 			}
 		}
-		if boxDhan == nil {
+		if futDhan == nil {
 			return empty
 		}
-		return dhanStats(boxDhan)
+		stats := dhanStats(futDhan)
+		stats.WantedTokens = wanted
+		return stats
 	}
 	if st.active == brokers.Dhan {
 		if futDhan == nil {
