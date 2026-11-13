@@ -152,8 +152,10 @@ func TestBothIndexesSelectMinimumAndPaperTradeOneLotUntilManualClose(t *testing.
 			sensex = trade
 		}
 	}
-	if nifty.Quantity != 75 || nifty.LotSize != 75 || nifty.Direction != ShortPELongCE || nifty.Hedge.Strike-nifty.Short.Strike != 200 ||
-		sensex.Quantity != 20 || sensex.Direction != ShortCELongPE || sensex.Short.Strike-sensex.Hedge.Strike != 400 {
+	if nifty.Quantity != 75 || nifty.LotSize != 75 || nifty.Direction != CallCredit || nifty.Hedge.Strike-nifty.Short.Strike != 200 ||
+		!strings.HasSuffix(nifty.Short.Symbol, "CE") || !strings.HasSuffix(nifty.Hedge.Symbol, "CE") ||
+		sensex.Quantity != 20 || sensex.Direction != PutCredit || sensex.Short.Strike-sensex.Hedge.Strike != 400 ||
+		!strings.HasSuffix(sensex.Short.Symbol, "PE") || !strings.HasSuffix(sensex.Hedge.Symbol, "PE") {
 		t.Fatalf("one-lot fourth-strike spreads were wrong: %+v %+v", nifty, sensex)
 	}
 	for stage := 3; stage <= 4; stage++ {
@@ -166,8 +168,8 @@ func TestBothIndexesSelectMinimumAndPaperTradeOneLotUntilManualClose(t *testing.
 	clock.ms.Add(1000)
 	depth, updated := true, true
 	engine.OnTicks([]market.Tick{
-		{Token: nifty.Short.Token, LastPrice: 41.5, PriceUpdated: &updated, Namespace: &namespace, DepthUpdated: &depth,
-			Bid: 41, Ask: 42, Bids: []market.DepthLevel{{Price: 41, Qty: 1000}}, Asks: []market.DepthLevel{{Price: 42, Qty: 1000}}},
+		{Token: nifty.Short.Token, LastPrice: 57.5, PriceUpdated: &updated, Namespace: &namespace, DepthUpdated: &depth,
+			Bid: 57, Ask: 58, Bids: []market.DepthLevel{{Price: 57, Qty: 1000}}, Asks: []market.DepthLevel{{Price: 58, Qty: 1000}}},
 		{Token: nifty.Hedge.Token, LastPrice: 18.5, PriceUpdated: &updated, Namespace: &namespace, DepthUpdated: &depth,
 			Bid: 18, Ask: 19, Bids: []market.DepthLevel{{Price: 18, Qty: 1000}}, Asks: []market.DepthLevel{{Price: 19, Qty: 1000}}},
 	})
@@ -279,7 +281,7 @@ func TestUnreadableEntrySizeIsSkippedRatherThanFilledAfterTheCross(t *testing.T)
 		ticks := entryTestTicks(rows, namespace, stage)
 		if stage == 2 {
 			for i, row := range rows {
-				if row.Strike == 23850 && row.InstrumentType == "PE" {
+				if row.Strike == 23850 && row.InstrumentType == "CE" {
 					ticks[i].Bids[0].Qty = math.NaN()
 				}
 			}
@@ -1027,8 +1029,8 @@ func TestTriggerConsumesArmForUpDownFlatAndUnavailableSpot(t *testing.T) {
 		spot                  float64
 		omit                  bool
 	}{
-		{"up", ShortPELongCE, "PostgreSQL", 23860, false},
-		{"down", ShortCELongPE, "PostgreSQL", 23840, false},
+		{"up", CallCredit, "PostgreSQL", 23860, false},
+		{"down", PutCredit, "PostgreSQL", 23840, false},
 		{"flat", "", "underlying was flat", 23850, false},
 		{"missing", "", "spot was unavailable", 0, true},
 		{"invalid", "", "spot was unavailable", math.NaN(), false},
@@ -1150,13 +1152,13 @@ func TestOpenOrPendingSpreadPreventsArmingAnotherForThatSymbol(t *testing.T) {
 	}
 }
 
-func TestCrossSideEntryStillRequiresNetCreditAndExecutableDepth(t *testing.T) {
+func TestCreditSpreadEntryStillRequiresNetCreditAndExecutableDepth(t *testing.T) {
 	engine := New(Deps{})
 	t.Cleanup(engine.cancel)
 	u := buildUniverses(testInstruments(), "2026-11-04")["NIFTY"]
 	const now = int64(10_000_000)
-	for _, direction := range []string{ShortPELongCE, ShortCELongPE} {
-		short, hedge, ok := crossSideLegs(u, u.Pairs[5], direction)
+	for _, direction := range []string{CallCredit, PutCredit} {
+		short, hedge, ok := creditSpreadLegs(u, u.Pairs[5], direction)
 		if !ok {
 			t.Fatal("missing fixture hedge")
 		}

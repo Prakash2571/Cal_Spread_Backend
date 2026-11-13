@@ -54,14 +54,14 @@ func buildUniverses(all []market.Instrument, day string) map[string]universe {
 	return result
 }
 
-// crossSideLegs counts listed strikes strictly above/below the selected ATM
-// strike on the opposite option side; missing intermediate strikes are allowed.
-func crossSideLegs(u universe, selected pair, direction string) (market.Instrument, market.Instrument, bool) {
+// creditSpreadLegs counts listed strikes strictly above/below the selected ATM
+// strike on the same option side; missing intermediate strikes are allowed.
+func creditSpreadLegs(u universe, selected pair, direction string) (market.Instrument, market.Instrument, bool) {
 	var short market.Instrument
 	var options []market.Instrument
 	switch direction {
-	case ShortPELongCE:
-		short, options = selected.PE, u.Calls
+	case CallCredit:
+		short, options = selected.CE, u.Calls
 		count := 0
 		for _, option := range options {
 			if option.Strike > short.Strike {
@@ -71,8 +71,8 @@ func crossSideLegs(u universe, selected pair, direction string) (market.Instrume
 				}
 			}
 		}
-	case ShortCELongPE:
-		short, options = selected.CE, u.Puts
+	case PutCredit:
+		short, options = selected.PE, u.Puts
 		count := 0
 		for i := len(options) - 1; i >= 0; i-- {
 			if options[i].Strike < short.Strike {

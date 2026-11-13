@@ -125,14 +125,14 @@ func TestAttributeUnderlyingDirectionAndFreshness(t *testing.T) {
 		direction string
 		note      string
 	}{
-		{"up", spotSample{armedAt, 100}, spotSample{triggerAt, 101}, ShortPELongCE, ""},
-		{"down", spotSample{armedAt, 100}, spotSample{triggerAt, 99}, ShortCELongPE, ""},
+		{"up", spotSample{armedAt, 100}, spotSample{triggerAt, 101}, CallCredit, ""},
+		{"down", spotSample{armedAt, 100}, spotSample{triggerAt, 99}, PutCredit, ""},
 		{"flat", spotSample{armedAt, 100}, spotSample{triggerAt, 100}, "", "flat"},
 		{"missing baseline", spotSample{}, spotSample{triggerAt, 101}, "", "unavailable"},
 		{"missing current", spotSample{armedAt, 100}, spotSample{}, "", "unavailable"},
 		{"stale baseline", spotSample{armedAt - spotBaselineAgeMs - 1, 100}, spotSample{triggerAt, 101}, "", "unavailable"},
 		{"stale current", spotSample{armedAt, 100}, spotSample{triggerAt - quoteAgeMs - 1, 101}, "", "unavailable"},
-		{"inclusive ages", spotSample{armedAt - spotBaselineAgeMs, 100}, spotSample{triggerAt - quoteAgeMs, 101}, ShortPELongCE, ""},
+		{"inclusive ages", spotSample{armedAt - spotBaselineAgeMs, 100}, spotSample{triggerAt - quoteAgeMs, 101}, CallCredit, ""},
 		{"baseline after arm", spotSample{armedAt + 1, 100}, spotSample{triggerAt, 101}, "", "unavailable"},
 		{"future current", spotSample{armedAt, 100}, spotSample{triggerAt + 1, 101}, "", "unavailable"},
 		{"invalid baseline", spotSample{armedAt, math.NaN()}, spotSample{triggerAt, 101}, "", "unavailable"},
@@ -147,39 +147,47 @@ func TestAttributeUnderlyingDirectionAndFreshness(t *testing.T) {
 	}
 }
 
-func TestCrossSideLegsBothDirectionsAndMissingFourthHedge(t *testing.T) {
+func TestCreditSpreadLegsBothDirectionsAndMissingFourthHedge(t *testing.T) {
 	u := buildUniverses(testInstruments(), "2026-11-04")["NIFTY"]
 	selected := u.Pairs[5]
 	for _, tc := range []struct {
 		direction, shortKind, longKind string
 		shortToken, longToken          int64
 	}{
-		{ShortPELongCE, "PE", "CE", selected.PE.InstrumentToken, u.Calls[9].InstrumentToken},
-		{ShortCELongPE, "CE", "PE", selected.CE.InstrumentToken, u.Puts[1].InstrumentToken},
+		{CallCredit, "CE", "CE", selected.CE.InstrumentToken, u.Calls[9].InstrumentToken},
+		{PutCredit, "PE", "PE", selected.PE.InstrumentToken, u.Puts[1].InstrumentToken},
 	} {
 		t.Run(tc.direction, func(t *testing.T) {
-			short, long, ok := crossSideLegs(u, selected, tc.direction)
+			short, long, ok := creditSpreadLegs(u, selected, tc.direction)
 			if !ok || short.InstrumentType != tc.shortKind || long.InstrumentType != tc.longKind || short.InstrumentToken != tc.shortToken || long.InstrumentToken != tc.longToken {
 				t.Fatalf("wrong legs: %+v %+v %v", short, long, ok)
 			}
 			missing := u
-			if tc.direction == ShortPELongCE {
+			if tc.direction == CallCredit {
 				missing.Calls = u.Calls[:9]
 			} else {
 				missing.Puts = u.Puts[2:]
 			}
-			if _, _, ok := crossSideLegs(missing, selected, tc.direction); ok {
+			if _, _, ok := creditSpreadLegs(missing, selected, tc.direction); ok {
 				t.Fatal("selected nonexistent fourth hedge")
+			}
+			// A missing intermediate strike moves the fourth listed hedge farther out.
+			gapped := u
+			var wantHedge market.Instrument
+			if tc.direction == CallCredit {
+				gapped.Calls = append(append([]market.Instrument{}, u.Calls[:6]...), u.Calls[7:]...)
+				wantHedge = u.Calls[10]
+			} else {
+				gapped.Puts = append(append([]market.Instrument{}, u.Puts[:4]...), u.Puts[5:]...)
+				wantHedge = u.Puts[0]
+			}
+			if short, hedge, ok := creditSpreadLegs(gapped, selected, tc.direction); !ok || short.InstrumentToken != tc.shortToken || hedge.InstrumentToken != wantHedge.InstrumentToken {
+				t.Fatalf("wrong legs across missing intermediate strike: %+v %+v %v", short, hedge, ok)
 			}
 		})
 	}
-	if _, _, ok := crossSideLegs(u, selected, "unknown"); ok {
+	if _, _, ok := creditSpreadLegs(u, selected, "unknown"); ok {
 		t.Fatal("unknown direction silently selected legs")
-	}
-	// Count actual listed opposite-side strikes even if its ATM row is absent.
-	u.Calls = append(append([]market.Instrument{}, u.Calls[:5]...), u.Calls[6:]...)
-	if _, hedge, ok := crossSideLegs(u, selected, ShortPELongCE); !ok || hedge.Strike != 24050 {
-		t.Fatal("cross-side selection required the opposite-side ATM anchor")
 	}
 }
 

@@ -70,7 +70,7 @@ func (f *fixture) spikeQuote(id int64) (float64, float64) {
 	}
 	if index == 0 {
 		if slot == 10 {
-			price, average = 60, 55
+			price, average = []float64{60, 60, 60, 57.5}[stage], 55
 		} else if slot == 11 {
 			price, average = []float64{40, 46, 44, 41.5}[stage], 50
 		} else if slot == 18 {

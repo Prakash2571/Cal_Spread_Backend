@@ -59,10 +59,10 @@ func attributeUnderlyingDirection(baseline, current spotSample, armedAt, trigger
 		return "", "Signal skipped: underlying spot was unavailable or stale"
 	}
 	if current.Price > baseline.Price {
-		return ShortPELongCE, ""
+		return CallCredit, ""
 	}
 	if current.Price < baseline.Price {
-		return ShortCELongPE, ""
+		return PutCredit, ""
 	}
 	return "", "Signal skipped: underlying was flat since arming"
 }

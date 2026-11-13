@@ -133,10 +133,10 @@ func marketOpen(at int64) bool {
 	return local.Weekday() != time.Saturday && local.Weekday() != time.Sunday && minutes >= 9*60+15 && minutes < 15*60+31
 }
 
-// Directions describe the actual cross-side short/long structure.
+// Directions describe same-side credit spreads.
 const (
-	ShortPELongCE = "SHORT_PE_LONG_CE" // underlying rose since arming
-	ShortCELongPE = "SHORT_CE_LONG_PE" // underlying fell since arming
+	CallCredit = "CALL_CREDIT" // underlying rose since arming
+	PutCredit  = "PUT_CREDIT"  // underlying fell since arming
 )
 
 type armedState struct {

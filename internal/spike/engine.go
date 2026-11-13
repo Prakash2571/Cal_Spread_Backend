@@ -502,7 +502,7 @@ func (e *Engine) evaluateLocked(symbol string, now int64) {
 				} else if !e.dbEnabled() {
 					view.Note = "Paper entry needs PostgreSQL"
 				} else {
-					short, hedge, exists := crossSideLegs(u, *minimum, signal.Direction)
+					short, hedge, exists := creditSpreadLegs(u, *minimum, signal.Direction)
 					if !exists {
 						view.Note = "Qualified signal has no fourth-OTM hedge"
 					} else if trade, err := e.tradeAtCrossLocked(symbol, short, hedge, signal, now); err != nil {
