@@ -52,8 +52,10 @@ type Tick struct {
 	// Broker-native metadata for headless strategies; legacy browser tick JSON
 	// stays unchanged. Dhan average traded price is that contract's day VWAP.
 	AveragePrice   *float64           `json:"-"`
+	Volume         *float64           `json:"-"` // cumulative day traded volume
 	PriceUpdated   *bool              `json:"-"`
 	AverageUpdated *bool              `json:"-"`
+	VolumeUpdated  *bool              `json:"-"`
 	Namespace      *brokers.Namespace `json:"-"`
 }
 

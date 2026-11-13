@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -25,6 +26,7 @@ type Deps struct {
 type quote struct {
 	LTP, VWAP, Bid, Ask, BidQty, AskQty float64
 	PriceAt, BookAt                     int64
+	Volume                             *float64 // last known cumulative day volume; nil until observed
 }
 
 func (q quote) freshBook(now int64) bool {
@@ -62,6 +64,7 @@ type Engine struct {
 	previous       map[string]Sample
 	windows        map[string]*priceWindow
 	forming        map[string]Bar
+	chartVWAP      map[string]*chartVWAPAccumulator
 	bars           map[string]map[int64]Bar
 	pendingBars    map[string]Bar
 	open           map[string]Trade
@@ -81,6 +84,7 @@ func New(d Deps) *Engine {
 	e := &Engine{d: d, ctx: ctx, cancel: cancel, paper: true,
 		universes: map[string]universe{}, wanted: map[int64]bool{}, quotes: map[int64]quote{}, views: map[string]IndexView{},
 		previous: map[string]Sample{}, windows: map[string]*priceWindow{}, forming: map[string]Bar{}, bars: map[string]map[int64]Bar{},
+		chartVWAP: map[string]*chartVWAPAccumulator{},
 		pendingBars: map[string]Bar{}, open: map[string]Trade{}, pending: map[string]string{}, closed: []Trade{},
 		refresh: make(chan struct{}, 1), candidates: make(chan candidate, 2), watchers: map[uint64]chan Snapshot{}}
 	for _, symbol := range Symbols {
@@ -206,6 +210,7 @@ func (e *Engine) reconcile(parent context.Context) error {
 			e.open[trade.Symbol] = trade
 		}
 		e.bars, e.windows, e.forming = map[string]map[int64]Bar{}, map[string]*priceWindow{}, map[string]Bar{}
+		e.chartVWAP = map[string]*chartVWAPAccumulator{}
 		for _, symbol := range Symbols {
 			e.bars[symbol] = map[int64]Bar{}
 			e.windows[symbol] = &priceWindow{}
@@ -353,6 +358,10 @@ func (e *Engine) OnTicks(ticks []market.Tick) {
 			if *tick.AveragePrice > 0 && finite(*tick.AveragePrice) {
 				q.VWAP = *tick.AveragePrice
 			}
+		}
+		if tick.VolumeUpdated != nil && *tick.VolumeUpdated && tick.Volume != nil && *tick.Volume >= 0 && finite(*tick.Volume) {
+			volume := *tick.Volume
+			q.Volume = &volume
 		}
 		if tick.DepthUpdated != nil && *tick.DepthUpdated {
 			q.Bid, q.Ask, q.BidQty, q.AskQty, q.BookAt = tick.Bid, tick.Ask, 0, 0, now
@@ -528,6 +537,40 @@ func (e *Engine) updateMarksLocked(now int64) {
 func (e *Engine) completeBarsLocked(now int64, force bool) {
 	for symbol, bar := range e.forming {
 		if bar.T <= now || force {
+			// Stamp only the chart copy; current samples and crossover inputs retain
+			// their unrounded premium and Dhan average-price sum.
+			bar.Premium = math.Round(bar.Premium*100) / 100
+			acc := e.chartVWAP[symbol]
+			if acc == nil {
+				acc = &chartVWAPAccumulator{marks: map[int64]float64{}}
+				e.chartVWAP[symbol] = acc
+			}
+			minuteVolume := func(token int64) float64 {
+				current := e.quotes[token].Volume
+				prior, ok := acc.marks[token]
+				if current == nil || !ok {
+					return 0
+				}
+				return math.Max(0, *current-prior)
+			}
+			weight := math.Min(minuteVolume(bar.CEToken), minuteVolume(bar.PEToken))
+			if weight > 0 {
+				acc.weighted += bar.Premium * weight
+				acc.total += weight
+			}
+			bar.VWAP = 0
+			if acc.total > 0 {
+				bar.VWAP = acc.weighted / acc.total
+			}
+			// Mark every quoted token at each completion, including unselected
+			// strikes, so a pair switch uses this minute's volume only. Missing
+			// readings must establish a new baseline when they next appear.
+			acc.marks = map[int64]float64{}
+			for token, q := range e.quotes {
+				if q.Volume != nil {
+					acc.marks[token] = *q.Volume
+				}
+			}
 			e.bars[symbol][bar.T] = bar
 			e.pendingBars[fmt.Sprintf("%s:%s:%d", symbol, bar.Day, bar.T)] = bar
 			delete(e.forming, symbol)

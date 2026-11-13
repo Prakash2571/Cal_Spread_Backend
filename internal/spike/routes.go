@@ -63,6 +63,19 @@ func Mount(router chi.Router, engine *Engine, sessions *auth.Sessions) {
 		}
 		httpx.JSON(w, 200, trade)
 	}))
+	router.Post("/api/spike/trades/{id}/delete", admin(func(w http.ResponseWriter, r *http.Request) {
+		kind, id := db.CheckID(chi.URLParam(r, "id"))
+		if kind != db.IDValid {
+			httpx.Error(w, 400, "Invalid paper trade id")
+			return
+		}
+		trade, err := engine.Delete(r.Context(), id)
+		if err != nil {
+			httpx.Error(w, 409, err.Error())
+			return
+		}
+		httpx.JSON(w, 200, trade)
+	}))
 	router.Get("/api/spike/stream", func(w http.ResponseWriter, r *http.Request) {
 		token := httpx.AdminToken(r)
 		if token == "" {

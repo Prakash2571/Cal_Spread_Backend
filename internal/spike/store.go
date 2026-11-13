@@ -130,6 +130,14 @@ func (s *Store) Close(ctx context.Context, trade Trade) error {
 	return err
 }
 
+func (s *Store) Delete(ctx context.Context, id string) error {
+	if !s.Enabled() {
+		return nil
+	}
+	_, err := s.Pool.Exec(ctx, `delete from spike_trades where id=$1`, id)
+	return err
+}
+
 func (s *Store) SetPaper(ctx context.Context, enabled bool) error {
 	if !s.Enabled() {
 		return fmt.Errorf("Spike paper persistence is unavailable")

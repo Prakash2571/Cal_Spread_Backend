@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -474,6 +475,195 @@ func TestCloseCountsExitValuationAndFreezesStoredPeak(t *testing.T) {
 	}
 }
 
+func TestDeletePaperTradeRemovesMemoryAndPersistedRow(t *testing.T) {
+	for _, status := range []string{"open", "closed"} {
+		t.Run(status, func(t *testing.T) {
+			store := &Store{Pool: dbtest.New(t)}
+			ctx := context.Background()
+			clock := &fakeClock{}
+			at := time.Date(2026, 11, 4, 18, 0, 0, 0, ist).UnixMilli()
+			clock.ms.Store(at)
+			trades := []Trade{
+				{ID: "000000000000000000000001", Symbol: "NIFTY", Status: "open", LotSize: 75, Quantity: 75, OpenedAt: at - 3000},
+				{ID: "000000000000000000000002", Symbol: "NIFTY", Status: "open", LotSize: 75, Quantity: 75, OpenedAt: at - 2000,
+					Short: Leg{Token: 1, Entry: 100}, Hedge: Leg{Token: 2, Entry: 20}, MarkStale: true},
+				{ID: "000000000000000000000003", Symbol: "SENSEX", Status: "open", LotSize: 20, Quantity: 20, OpenedAt: at - 1000},
+			}
+			for i := range trades {
+				if err := store.Insert(ctx, trades[i]); err != nil {
+					t.Fatal(err)
+				}
+				if i != 1 || status == "closed" {
+					trades[i].Status, trades[i].ClosedAt = "closed", &at
+					if err := store.Close(ctx, trades[i]); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			_, open, closed, _, err := store.Load(ctx, dayKey(at))
+			if err != nil {
+				t.Fatal(err)
+			}
+			engine := New(Deps{Store: store, Now: clock.Now})
+			t.Cleanup(engine.cancel)
+			for _, trade := range open {
+				engine.open[trade.Symbol] = trade
+			}
+			engine.closed = closed
+			engine.paper = false
+			// Delete must work outside market hours, while disconnected and with stale, undersized depth.
+			engine.quotes[1] = quote{Bid: 99, Ask: 100, BidQty: 1, AskQty: 1, BookAt: at - bookAgeMs - 1}
+			engine.quotes[2] = quote{Bid: 19, Ask: 20, BidQty: 1, AskQty: 1, BookAt: at - bookAgeMs - 1}
+			updates, release := engine.Subscribe()
+			defer release()
+			<-updates
+			deleted, err := engine.Delete(ctx, trades[1].ID)
+			if err != nil || !reflect.DeepEqual(deleted, trades[1]) {
+				t.Fatalf("delete returned the wrong trade: %+v, %v", deleted, err)
+			}
+			snapshot := engine.Snapshot()
+			if len(snapshot.Open) != 0 || len(snapshot.Closed) != 2 {
+				t.Fatalf("deleted trade remained in memory or removed other trades: %+v", snapshot)
+			}
+			if _, held := engine.open[trades[1].Symbol]; held {
+				t.Fatal("deleted trade still occupies its primary spread symbol")
+			}
+			if snapshot.Closed[0].ID != trades[2].ID || snapshot.Closed[1].ID != trades[0].ID {
+				t.Fatalf("delete changed surviving closed trades or their order: %+v", snapshot.Closed)
+			}
+			select {
+			case update := <-updates:
+				if !reflect.DeepEqual(update, snapshot) {
+					t.Fatalf("delete published the wrong snapshot: %+v", update)
+				}
+			default:
+				t.Fatal("delete did not publish a snapshot")
+			}
+			_, open, closed, _, err = store.Load(ctx, dayKey(at))
+			if err != nil || !reflect.DeepEqual(open, snapshot.Open) || !reflect.DeepEqual(closed, snapshot.Closed) {
+				t.Fatalf("deleted trade returned on reload: open=%+v closed=%+v, %v", open, closed, err)
+			}
+			var count int
+			if err := store.Pool.QueryRow(ctx, `select count(*) from spike_trades where id=$1`, deleted.ID).Scan(&count); err != nil || count != 0 {
+				t.Fatalf("deleted database row still exists: count=%d, %v", count, err)
+			}
+			if err := store.Delete(ctx, deleted.ID); err != nil {
+				t.Fatalf("store delete was not idempotent: %v", err)
+			}
+		})
+	}
+}
+
+func TestDeleteUnknownPaperTradeChangesNothing(t *testing.T) {
+	engine := New(Deps{})
+	t.Cleanup(engine.cancel)
+	engine.open["NIFTY"] = Trade{ID: "open", Symbol: "NIFTY", Status: "open"}
+	engine.closed = []Trade{{ID: "closed", Symbol: "SENSEX", Status: "closed"}}
+	before := engine.Snapshot()
+	deleted, err := engine.Delete(context.Background(), "unknown")
+	if err == nil || err.Error() != "Paper trade is not found" || deleted.ID != "" {
+		t.Fatalf("unknown trade delete: %+v, %v", deleted, err)
+	}
+	if after := engine.Snapshot(); !reflect.DeepEqual(after, before) {
+		t.Fatalf("unknown trade delete changed state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestDeletePaperTradeWithDisabledStore(t *testing.T) {
+	for _, status := range []string{"open", "closed"} {
+		for _, tc := range []struct {
+			name  string
+			store *Store
+		}{
+			{"nil store", nil},
+			{"disabled store", &Store{}},
+		} {
+			t.Run(status+"/"+tc.name, func(t *testing.T) {
+				engine := New(Deps{Store: tc.store})
+				t.Cleanup(engine.cancel)
+				trade := Trade{ID: "memory-only", Symbol: "NIFTY", Status: status}
+				if status == "open" {
+					engine.open[trade.Symbol] = trade
+				} else {
+					engine.closed = []Trade{trade}
+				}
+				deleted, err := engine.Delete(context.Background(), trade.ID)
+				if err != nil || !reflect.DeepEqual(deleted, trade) {
+					t.Fatalf("memory-only delete failed: %+v, %v", deleted, err)
+				}
+				if snapshot := engine.Snapshot(); len(engine.open) != 0 || len(snapshot.Open) != 0 || len(snapshot.Closed) != 0 {
+					t.Fatalf("memory-only trade remained after delete: %+v", snapshot)
+				}
+			})
+		}
+	}
+}
+
+func TestDeleteStoreErrorLeavesPaperTradeForRetry(t *testing.T) {
+	for _, status := range []string{"open", "closed"} {
+		t.Run(status, func(t *testing.T) {
+			store := &Store{Pool: dbtest.New(t)}
+			ctx := context.Background()
+			clock := &fakeClock{}
+			at := time.Date(2026, 11, 4, 10, 0, 0, 0, ist).UnixMilli()
+			clock.ms.Store(at)
+			trade := Trade{ID: "000000000000000000000001", Symbol: "NIFTY", Status: "open", LotSize: 75, Quantity: 75, OpenedAt: at}
+			if err := store.Insert(ctx, trade); err != nil {
+				t.Fatal(err)
+			}
+			engine := New(Deps{Store: store, Now: clock.Now})
+			t.Cleanup(engine.cancel)
+			if status == "closed" {
+				trade.Status, trade.ClosedAt = status, &at
+				if err := store.Close(ctx, trade); err != nil {
+					t.Fatal(err)
+				}
+				engine.closed = []Trade{trade}
+			} else {
+				engine.open[trade.Symbol] = trade
+			}
+			before := engine.Snapshot()
+			// The isolated test schema lets us make deletion fail without losing the row.
+			if _, err := store.Pool.Exec(ctx, `alter table spike_trades rename to spike_trades_unavailable`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := engine.Delete(ctx, trade.ID); err == nil {
+				t.Fatal("database error was not returned")
+			}
+			if after := engine.Snapshot(); !reflect.DeepEqual(after, before) {
+				t.Fatalf("database failure changed memory: before=%+v after=%+v", before, after)
+			}
+			if _, err := store.Pool.Exec(ctx, `alter table spike_trades_unavailable rename to spike_trades`); err != nil {
+				t.Fatal(err)
+			}
+			var count int
+			if err := store.Pool.QueryRow(ctx, `select count(*) from spike_trades where id=$1`, trade.ID).Scan(&count); err != nil || count != 1 {
+				t.Fatalf("failed delete lost the database row: count=%d, %v", count, err)
+			}
+			if _, err := engine.Delete(ctx, trade.ID); err != nil {
+				t.Fatalf("retry failed: %v", err)
+			}
+			if snapshot := engine.Snapshot(); len(snapshot.Open) != 0 || len(snapshot.Closed) != 0 {
+				t.Fatalf("retry left the trade in memory: %+v", snapshot)
+			}
+		})
+	}
+}
+
+func TestDeleteStoppedEngineLeavesPaperTrade(t *testing.T) {
+	engine := New(Deps{})
+	t.Cleanup(engine.cancel)
+	engine.open["NIFTY"] = Trade{ID: "open", Symbol: "NIFTY", Status: "open"}
+	engine.stopped = true
+	before := engine.Snapshot()
+	if _, err := engine.Delete(context.Background(), "open"); err == nil || err.Error() != "Spike is stopping" {
+		t.Fatalf("stopped engine delete: %v", err)
+	}
+	if after := engine.Snapshot(); !reflect.DeepEqual(after, before) {
+		t.Fatalf("stopped engine delete changed state: before=%+v after=%+v", before, after)
+	}
+}
+
 func TestTradePeakJSONContract(t *testing.T) {
 	var trade Trade
 	if err := json.Unmarshal([]byte(`{"id":"legacy","pnl":75,"mark_at":1793766600000}`), &trade); err != nil {
@@ -504,5 +694,246 @@ func TestTradePeakJSONContract(t *testing.T) {
 		} else if _, ok := fields["peak_at"]; ok {
 			t.Fatalf("nil peak_at was not omitted: %s", raw)
 		}
+	}
+}
+
+func newChartTestEngine(t *testing.T) (*Engine, *fakeClock) {
+	t.Helper()
+	clock := &fakeClock{}
+	clock.ms.Store(time.Date(2026, 11, 4, 10, 0, 10, 0, ist).UnixMilli())
+	namespace := brokers.Namespace{Broker: brokers.Dhan, Generation: 1}
+	engine := New(Deps{Namespace: func() brokers.Namespace { return namespace }, Ready: func() bool { return true },
+		Instruments: func(context.Context) ([]market.Instrument, error) { return testInstruments(), nil }, Now: clock.Now})
+	t.Cleanup(engine.cancel)
+	// Reconcile synchronously without starting the background timers.
+	if err := engine.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	engine.OnConnection(true)
+	return engine, clock
+}
+
+func finishChartTestMinute(t *testing.T, engine *Engine, clock *fakeClock, stage int, ceVolume, peVolume *float64) Bar {
+	t.Helper()
+	rows := testInstruments()
+	ticks := testTicks(rows, engine.namespace, stage)
+	updated := true
+	for i, row := range rows {
+		ticks[i].VolumeUpdated = &updated
+		ticks[i].Volume = ceVolume
+		if row.InstrumentType == "PE" {
+			ticks[i].Volume = peVolume
+		}
+	}
+	engine.OnTicks(ticks)
+	clock.ms.Store(bucketEnd(clock.ms.Load()+1, 1))
+	engine.mu.Lock()
+	engine.completeBarsLocked(clock.ms.Load(), false)
+	engine.mu.Unlock()
+	points := engine.Series("NIFTY", 1)
+	if len(points) == 0 {
+		t.Fatal("minute completion did not produce a chart bar")
+	}
+	bar := points[len(points)-1]
+	if pending := engine.pendingBars[fmt.Sprintf("NIFTY:%s:%d", bar.Day, bar.T)]; !reflect.DeepEqual(pending, bar) {
+		t.Fatalf("persisted chart copy differs from the series: %+v, %+v", pending, bar)
+	}
+	return bar
+}
+
+func TestChartVWAPUsesMinutePairVolumeAndSeriesKeepsLastStampedValue(t *testing.T) {
+	engine, clock := newChartTestEngine(t)
+	weighted := (104.0*10 + 106.0*20) / 30
+	for i, tc := range []struct {
+		name     string
+		stage    int
+		ce, pe   float64
+		wantVWAP float64
+	}{
+		{"first readings only establish marks", 0, 100, 200, 0},
+		{"first weighted minute", 1, 110, 230, 104},
+		{"second weighted minute", 2, 140, 250, weighted},
+		{"one leg has zero volume", 3, 160, 250, weighted},
+		{"decreasing volume contributes zero", 4, 150, 260, weighted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bar := finishChartTestMinute(t, engine, clock, tc.stage, &tc.ce, &tc.pe)
+			if math.Abs(bar.VWAP-tc.wantVWAP) > 1e-9 {
+				t.Fatalf("minute %d: chart VWAP=%v, want %v", i, bar.VWAP, tc.wantVWAP)
+			}
+			// Chart stamping must leave header and signal inputs on Dhan's averages.
+			current := engine.views["NIFTY"].Current
+			if current == nil || current.VWAP != 105 || engine.previous["NIFTY"].VWAP != 105 {
+				t.Fatalf("chart VWAP leaked into live signal samples: %+v", current)
+			}
+		})
+	}
+	points := engine.Series("NIFTY", 5)
+	last := engine.Series("NIFTY", 1)[4]
+	if len(points) != 1 || !reflect.DeepEqual(points[0], last) || math.Abs(points[0].VWAP-weighted) > 1e-9 {
+		t.Fatalf("five-minute bucket lost the last stamped cumulative VWAP: %+v", points)
+	}
+	sensex := engine.Series("SENSEX", 1)
+	if len(sensex) != 5 || math.Abs(sensex[4].VWAP-(112.0*10+109.0*20)/30) > 1e-9 {
+		t.Fatalf("indexes did not accumulate independently: %+v", sensex)
+	}
+	// A decreased reading becomes the next mark, so only the recovery's new
+	// volume (5), rather than the old higher reading, weights the next minute.
+	ce, pe := 155.0, 267.0
+	bar := finishChartTestMinute(t, engine, clock, 4, &ce, &pe)
+	if want := (104.0*10 + 106.0*20 + 108.0*5) / 35; math.Abs(bar.VWAP-want) > 1e-9 {
+		t.Fatalf("decreasing volume did not reset the minute mark: %v, want %v", bar.VWAP, want)
+	}
+}
+
+func TestChartVWAPWaitsForBothVolumeBaselines(t *testing.T) {
+	engine, clock := newChartTestEngine(t)
+	ce, pe := 100.0, 200.0
+	if bar := finishChartTestMinute(t, engine, clock, 0, &ce, nil); bar.VWAP != 0 {
+		t.Fatalf("missing put volume contributed weight: %+v", bar)
+	}
+	ce = 110
+	if bar := finishChartTestMinute(t, engine, clock, 1, &ce, &pe); bar.VWAP != 0 {
+		t.Fatalf("first put reading was treated as minute volume: %+v", bar)
+	}
+	ce, pe = 120, 230
+	if bar := finishChartTestMinute(t, engine, clock, 2, &ce, &pe); bar.VWAP != 106 {
+		t.Fatalf("paired volume after both baselines did not contribute: %+v", bar)
+	}
+}
+
+func TestChartVWAPPairSwitchUsesOnlySelectedPairMinuteVolume(t *testing.T) {
+	engine, clock := newChartTestEngine(t)
+	ce, pe := 100.0, 200.0
+	finishChartTestMinute(t, engine, clock, 0, &ce, &pe)
+	ce, pe = 110, 230
+	finishChartTestMinute(t, engine, clock, 1, &ce, &pe)
+	rows := testInstruments()
+	ticks := testTicks(rows, engine.namespace, 0)
+	updated := true
+	for i, row := range rows {
+		volume := 1000.0 // Large unrelated volumes must not enter the weight.
+		if row.InstrumentType == "PE" {
+			volume = 2000
+		}
+		if row.Name == "NIFTY" && row.Strike == 23900 {
+			ticks[i].LastPrice = 45.012
+			volume = 115 // CE delta = 5 since the previous completion.
+			if row.InstrumentType == "PE" {
+				volume = 237 // PE delta = 7; the pair's weight is 5.
+			}
+		}
+		ticks[i].Volume, ticks[i].VolumeUpdated = &volume, &updated
+	}
+	engine.OnTicks(ticks)
+	end := bucketEnd(clock.ms.Load()+1, 1)
+	clock.ms.Store(end)
+	engine.completeBarsLocked(end, false)
+	bar := engine.Series("NIFTY", 1)[2]
+	want := (104.0*10 + 90.02*5) / 15
+	if bar.Strike != 23900 || bar.Premium != 90.02 || math.Abs(bar.VWAP-want) > 1e-9 {
+		t.Fatalf("pair switch used old/multiminute/chain volume or unrounded premium: %+v, want VWAP %v", bar, want)
+	}
+}
+
+func TestChartVWAPResetsWithTradingDay(t *testing.T) {
+	engine, clock := newChartTestEngine(t)
+	ce, pe := 100.0, 200.0
+	finishChartTestMinute(t, engine, clock, 0, &ce, &pe)
+	ce, pe = 110, 230
+	if bar := finishChartTestMinute(t, engine, clock, 1, &ce, &pe); bar.VWAP != 104 {
+		t.Fatalf("previous day did not accumulate: %+v", bar)
+	}
+	clock.ms.Store(time.Date(2026, 11, 5, 10, 0, 10, 0, ist).UnixMilli())
+	if err := engine.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(engine.chartVWAP) != 0 || len(engine.quotes) != 0 {
+		t.Fatal("day reset retained chart accumulators or volume readings")
+	}
+	ce, pe = 1000, 2000
+	if bar := finishChartTestMinute(t, engine, clock, 2, &ce, &pe); bar.VWAP != 0 {
+		t.Fatalf("first new-day reading reused yesterday's marks/weight: %+v", bar)
+	}
+	ce, pe = 1010, 2030
+	if bar := finishChartTestMinute(t, engine, clock, 4, &ce, &pe); bar.VWAP != 108 {
+		t.Fatalf("new-day VWAP included yesterday's weighted sum: %+v", bar)
+	}
+}
+
+func TestChartBarUsesLastRoundedMinimumPairAndKeepsIntraminuteExtremes(t *testing.T) {
+	engine, clock := newChartTestEngine(t)
+	engine.OnTicks(testTicks(testInstruments(), engine.namespace, 0)) // Minimum premium 100.
+	clock.ms.Add(1000)
+	rows := testInstruments()
+	ticks := testTicks(rows, engine.namespace, 0)
+	var wantCE, wantPE int64
+	for i, row := range rows {
+		if row.Name == "NIFTY" {
+			ticks[i].LastPrice = 100
+			if row.Strike == 23850 || row.Strike == 23900 {
+				// Equal minimum pairs: the lower strike must still win.
+				ticks[i].LastPrice = 53.004
+			}
+			if row.Strike == 23850 {
+				if row.InstrumentType == "CE" {
+					wantCE = row.InstrumentToken
+				} else {
+					wantPE = row.InstrumentToken
+				}
+			}
+		}
+	}
+	engine.OnTicks(ticks)
+	current := *engine.views["NIFTY"].Current
+	if current.Premium != 53.004+53.004 || current.VWAP != 105 {
+		t.Fatalf("live sample changed before chart stamping: %+v", current)
+	}
+	end := bucketEnd(clock.ms.Load()+1, 1)
+	clock.ms.Store(end - 1)
+	engine.completeBarsLocked(clock.ms.Load(), false)
+	if len(engine.bars["NIFTY"]) != 0 || engine.forming["NIFTY"].Premium != current.Premium {
+		t.Fatal("forming bar was stamped before minute completion")
+	}
+	clock.ms.Store(end)
+	engine.completeBarsLocked(end, false)
+	bar := engine.Series("NIFTY", 1)[0]
+	if bar.Premium != 106.01 || bar.Low != 100 || bar.High != current.Premium ||
+		bar.LowAt != end-50_000 || bar.HighAt != end-49_000 || bar.Strike != 23850 || bar.CEToken != wantCE || bar.PEToken != wantPE {
+		t.Fatalf("bar did not keep its last rounded minimum and raw extremes: %+v", bar)
+	}
+	if !reflect.DeepEqual(*engine.views["NIFTY"].Current, current) || !reflect.DeepEqual(engine.previous["NIFTY"], current) || bar.VWAP != 0 {
+		t.Fatal("chart stamping changed the live sample or reused Dhan's VWAP")
+	}
+}
+
+func TestVolumeUpdatesRequirePacketProvenanceAndNonnegativeFiniteReading(t *testing.T) {
+	engine, _ := newChartTestEngine(t)
+	token := testInstruments()[0].InstrumentToken
+	yes, no := true, false
+	hundred, zero := 100.0, 0.0
+	for _, tc := range []struct {
+		name    string
+		volume  float64
+		updated *bool
+		want    *float64
+	}{
+		{"unknown provenance before any reading", 100, nil, nil},
+		{"packet without volume before any reading", 100, &no, nil},
+		{"negative before any reading", -1, &yes, nil},
+		{"explicit volume reading", 100, &yes, &hundred},
+		{"packet without volume keeps reading", 200, &no, &hundred},
+		{"unknown provenance keeps reading", 200, nil, &hundred},
+		{"negative keeps reading", -1, &yes, &hundred},
+		{"NaN keeps reading", math.NaN(), &yes, &hundred},
+		{"infinite keeps reading", math.Inf(1), &yes, &hundred},
+		{"zero is a valid reading", 0, &yes, &zero},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine.OnTicks([]market.Tick{{Token: token, Volume: &tc.volume, VolumeUpdated: tc.updated}})
+			if got := engine.quotes[token].Volume; !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("volume=%v, want %v", got, tc.want)
+			}
+		})
 	}
 }

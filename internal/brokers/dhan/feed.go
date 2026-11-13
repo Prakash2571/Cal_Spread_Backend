@@ -112,6 +112,7 @@ func ToTick(state FeedState, depthUpdated bool) market.Tick {
 		Asks:         asks,
 		DepthUpdated: &du,
 		AveragePrice: &state.AveragePrice,
+		Volume:       &state.Volume,
 	}
 }
 
@@ -536,6 +537,8 @@ func (f *Feed) handleFrameLocked(buf []byte, now int64) {
 		tick.PriceUpdated = &priceUpdated
 		averageUpdated := p.AveragePrice != nil
 		tick.AverageUpdated = &averageUpdated
+		volumeUpdated := p.Volume != nil
+		tick.VolumeUpdated = &volumeUpdated
 		ticks = append(ticks, tick)
 	}
 	if len(ticks) == 0 {

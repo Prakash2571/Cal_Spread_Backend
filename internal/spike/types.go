@@ -37,6 +37,13 @@ type Bar struct {
 	HighAt int64   `json:"high_at"`
 }
 
+// Chart-only day state. Bars persist the stamped VWAP, but not the volume weights
+// or token marks needed to rebuild this accumulator after a mid-day restart.
+type chartVWAPAccumulator struct {
+	weighted, total float64
+	marks           map[int64]float64
+}
+
 type Signal struct {
 	Direction   string  `json:"direction"`
 	T           int64   `json:"t"`

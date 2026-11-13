@@ -78,6 +78,51 @@ func (e *Engine) Close(ctx context.Context, id string) (Trade, error) {
 	return trade, nil
 }
 
+func (e *Engine) Delete(ctx context.Context, id string) (Trade, error) {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+	e.mu.Lock()
+	if e.stopped {
+		e.mu.Unlock()
+		return Trade{}, fmt.Errorf("Spike is stopping")
+	}
+	var trade Trade
+	closedIndex := -1
+	for _, open := range e.open {
+		if open.ID == id {
+			trade = open
+			break
+		}
+	}
+	if trade.ID == "" {
+		for i, closed := range e.closed {
+			if closed.ID == id {
+				trade, closedIndex = closed, i
+				break
+			}
+		}
+	}
+	if trade.ID == "" {
+		e.mu.Unlock()
+		return Trade{}, fmt.Errorf("Paper trade is not found")
+	}
+	e.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := e.d.Store.Delete(ctx, id); err != nil {
+		return Trade{}, err
+	}
+	e.mu.Lock()
+	if closedIndex >= 0 {
+		e.closed = append(e.closed[:closedIndex], e.closed[closedIndex+1:]...)
+	} else {
+		delete(e.open, trade.Symbol)
+	}
+	e.publishLocked()
+	e.mu.Unlock()
+	return trade, nil
+}
+
 func (e *Engine) snapshotLocked() Snapshot {
 	result := Snapshot{Mode: "PAPER_ONLY", Day: e.day, Active: e.active, Connected: e.connected, Database: e.dbEnabled(), PaperEnabled: e.paper,
 		WantedTokens: len(e.wanted), WindowMinutes: 30, MovePct: MinimumMovePct, HedgeSteps: HedgeSteps, VWAPMethod: "Dhan CE average traded price + PE average traded price",
