@@ -174,6 +174,39 @@ func TestAttributeUnderlyingDirectionAndFreshness(t *testing.T) {
 	}
 }
 
+func TestATMPairIsNearestSpotNotMinimumStraddle(t *testing.T) {
+	u := buildUniverses(testInstruments(), "2026-11-04")["NIFTY"] // 23600..24100 by 50
+	for _, tc := range []struct {
+		spot, strike float64
+	}{
+		{23921, 23900}, {23874, 23850}, {23875, 23850}, // midpoint tie takes the lower strike
+		{23876, 23900}, {20000, 23600}, {30000, 24100},
+	} {
+		p, ok := atmPair(u, tc.spot)
+		if !ok || p.CE.Strike != tc.strike || p.PE.Strike != tc.strike {
+			t.Fatalf("spot %v: got strike %v, want %v", tc.spot, p.CE.Strike, tc.strike)
+		}
+	}
+	for _, spot := range []float64{0, -1, math.NaN(), math.Inf(1)} {
+		if _, ok := atmPair(u, spot); ok {
+			t.Fatalf("invalid spot %v selected a strike", spot)
+		}
+	}
+	if _, ok := atmPair(universe{}, 23900); ok {
+		t.Fatal("empty chain selected a strike")
+	}
+	// Spot 23921 with a rising underlying: sell ATM 23900 CE, hedge the 4th higher CE.
+	atm, _ := atmPair(u, 23921)
+	short, hedge, ok := creditSpreadLegs(u, atm, CallCredit)
+	if !ok || short.Strike != 23900 || short.InstrumentType != "CE" || hedge.Strike != 24100 || hedge.InstrumentType != "CE" {
+		t.Fatalf("wrong ATM call credit legs: %+v %+v", short, hedge)
+	}
+	short, hedge, ok = creditSpreadLegs(u, atm, PutCredit)
+	if !ok || short.Strike != 23900 || short.InstrumentType != "PE" || hedge.Strike != 23700 || hedge.InstrumentType != "PE" {
+		t.Fatalf("wrong ATM put credit legs: %+v %+v", short, hedge)
+	}
+}
+
 func TestCreditSpreadLegsBothDirectionsAndMissingFourthHedge(t *testing.T) {
 	u := buildUniverses(testInstruments(), "2026-11-04")["NIFTY"]
 	selected := u.Pairs[5]

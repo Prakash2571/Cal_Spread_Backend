@@ -26,7 +26,7 @@ type Deps struct {
 type quote struct {
 	LTP, VWAP, Bid, Ask, BidQty, AskQty float64
 	PriceAt, BookAt                     int64
-	Volume                             *float64 // last known cumulative day volume; nil until observed
+	Volume                              *float64 // last known cumulative day volume; nil until observed
 }
 
 func (q quote) freshBook(now int64) bool {
@@ -88,7 +88,7 @@ func New(d Deps) *Engine {
 		universes: map[string]universe{}, wanted: map[int64]bool{}, quotes: map[int64]quote{}, views: map[string]IndexView{},
 		previous: map[string]Sample{}, windows: map[string]*priceWindow{}, forming: map[string]Bar{}, bars: map[string]map[int64]Bar{},
 		chartVWAP: map[string]*chartVWAPAccumulator{},
-		armed: map[string]*armedState{}, spotTokens: map[int64]string{}, spots: map[string]spotHistory{},
+		armed:     map[string]*armedState{}, spotTokens: map[int64]string{}, spots: map[string]spotHistory{},
 		pendingBars: map[string]Bar{}, open: map[string]Trade{}, pending: map[string]string{}, closed: []Trade{},
 		refresh: make(chan struct{}, 1), candidates: make(chan candidate, 2), watchers: map[uint64]chan Snapshot{}}
 	for _, symbol := range Symbols {
@@ -480,17 +480,24 @@ func (e *Engine) evaluateLocked(symbol string, now int64) {
 	} else {
 		prior := e.armed[symbol]
 		state, triggered := advanceArmed(prior, e.previous[symbol], sample, window.References(now))
+		// Pin spot at the straddle low that armed the index (re-pinned when the
+		// reference renews), so direction reflects what drove the premium up.
+		pin := func(s *armedState) {
+			if s != nil && (prior == nil || prior.Reference.T != s.Reference.T) {
+				s.Baseline = history.atOrBefore(s.Reference.T)
+			}
+		}
+		pin(state)
+		pin(triggered)
 		if state == nil {
 			delete(e.armed, symbol)
 		} else {
-			if prior == nil {
-				state.Baseline = history.atOrBefore(state.ArmedAt)
-			}
 			e.armed[symbol] = state
 			view.Note = "Armed after +5%; waiting for price-driven downward VWAP cross"
 		}
 		if triggered != nil {
-			direction, note := attributeUnderlyingDirection(triggered.Baseline, history.atOrBefore(now), triggered.ArmedAt, now)
+			spotNow := history.atOrBefore(now)
+			direction, note := attributeUnderlyingDirection(triggered.Baseline, spotNow, triggered.Reference.T, now)
 			view.Note = note
 			if direction != "" {
 				signal := Signal{Direction: direction, T: now, Reference: triggered.Reference.Premium, ReferenceAt: triggered.Reference.T,
@@ -501,8 +508,11 @@ func (e *Engine) evaluateLocked(symbol string, now int64) {
 					view.Note = "Signal observed; paper entries paused"
 				} else if !e.dbEnabled() {
 					view.Note = "Paper entry needs PostgreSQL"
+				} else if atm, ok := atmPair(u, spotNow.Price); !ok {
+					view.Note = "Signal skipped: no listed ATM strike for underlying spot"
 				} else {
-					short, hedge, exists := creditSpreadLegs(u, *minimum, signal.Direction)
+					// Sell the strike nearest spot, not the minimum-straddle strike.
+					short, hedge, exists := creditSpreadLegs(u, atm, signal.Direction)
 					if !exists {
 						view.Note = "Qualified signal has no fourth-OTM hedge"
 					} else if trade, err := e.tradeAtCrossLocked(symbol, short, hedge, signal, now); err != nil {

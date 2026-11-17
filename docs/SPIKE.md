@@ -31,7 +31,9 @@ For this feature, ATM follows the requested **minimum-premium definition**:
 2. For each strike having both a CE and PE in that same expiry, add their LTPs.
 3. Select the strike with the smallest valid `CE LTP + PE LTP`.
 
-This is not necessarily the strike nearest spot. A tie chooses the lower listed
+This is not necessarily the strike nearest spot, and it is only used for the
+chart and the arm/VWAP signal; entries sell the ATM strike nearest index spot
+(see the entry rule below). A tie chooses the lower listed
 strike deterministically. Candidate legs need positive, finite prices received
 within the last minute. No arbitrary strike band is substituted for the chain.
 The selected strike may change as prices change; an entered spread retains its
@@ -56,44 +58,36 @@ separate from the browser/Fair Value and Synthetic lanes. It also keeps the legs
 of open Spike paper positions subscribed until manual close. Token replacement,
 logout and broker-generation changes recycle/fence this lane.
 
-## Exact entry rule: crossover only
+## Exact entry rule: arm, VWAP touch or cross, then attribute
 
-The 30 minutes are a **rolling lookback**, not a fixed half-hour candle. A reference
-can be one minute, twenty minutes, twenty-nine minutes or exactly thirty minutes
-old. The 5% move must already be present on the **exact price-driven VWAP crossover
-update**. Moving another 5% after an earlier cross does not create a delayed entry.
+The chart's straddle is the **minimum-premium** pair above. It is only the
+signal; the traded short strike is the **ATM strike nearest index spot**.
 
-### Upward crossover → call credit spread
+1. **Arm.** The minimum straddle premium is at least 5% above its lowest value
+   in the preceding rolling 30 minutes. That low is the arm's reference.
+2. **Trigger.** On the next fresh update after arming, the premium turns down at
+   VWAP: it crossed above VWAP and comes back below it, or it touched VWAP from
+   below (within ₹1) and bounces back down. Any lower tick counts as the bounce.
 
-On a fresh update:
+   ```text
+   previous premium >= previous VWAP − ₹1
+   current premium  <  current VWAP
+   current premium  <  previous premium
+   ```
 
-```text
-previous premium <= previous VWAP
-current premium  >  current VWAP
-current premium  >  previous premium
-current premium >= 1.05 × some earlier premium in the preceding 30 minutes
-```
+3. **Attribute the cause.** Compare index spot at the reference low with index
+   spot at the trigger, i.e. the move that pushed the straddle up into VWAP.
+   - Spot rose → **call credit**: sell one lot of the ATM CE, buy the CE four
+     listed strikes higher.
+   - Spot fell → **put credit**: sell one lot of the ATM PE, buy the PE four
+     listed strikes lower.
+   - Flat or stale spot (baseline older than 5 minutes before the low, current
+     older than 1 minute) skips the entry and consumes the arm.
 
-The lowest earlier premium is the qualifying reference. On qualification, sell
-one lot of the minimum-pair CE and buy one lot of the CE **four listed strikes
-higher**, in the same expiry.
-
-Example: an earlier premium is 100; the previous update is 104 below VWAP 105;
-the new update is 106 above VWAP 105. The +6% move and upward crossover qualify
-now. If the selected NIFTY strike is 23,850 with 50-point listed intervals, the
-primary spread is short 23,850 CE / long 24,050 CE.
-
-### Downward crossover → put credit spread
-
-```text
-previous premium >= previous VWAP
-current premium  <  current VWAP
-current premium  <  previous premium
-current premium <= 0.95 × some earlier premium in the preceding 30 minutes
-```
-
-The highest earlier premium is the reference. Sell one lot of the selected PE
-and buy one lot of the PE **four listed strikes lower**, in the same expiry.
+ATM is the listed same-strike CE + PE nearest spot at the trigger; an exact
+midpoint tie takes the lower strike. Example: NIFTY low at spot 23,850, arms at
+23,900, touches VWAP and turns down at 23,880 → spot rose, so with spot 23,880
+and 50-point strikes the spread is short 23,900 CE / long 24,100 CE.
 
 The fourth strike is counted from the actual listed ladder; spacing is not
 hardcoded. Both contracts must have the same positive integer lot size. Lot

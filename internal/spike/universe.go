@@ -1,6 +1,7 @@
 package spike
 
 import (
+	"math"
 	"sort"
 	"strings"
 
@@ -52,6 +53,21 @@ func buildUniverses(all []market.Instrument, day string) map[string]universe {
 		result[symbol] = u
 	}
 	return result
+}
+
+// atmPair is the listed same-strike CE+PE nearest the underlying spot. Pairs are
+// sorted by strike, so an exact midpoint tie takes the lower strike.
+func atmPair(u universe, spot float64) (pair, bool) {
+	if spot <= 0 || !finite(spot) || len(u.Pairs) == 0 {
+		return pair{}, false
+	}
+	best := 0
+	for i := range u.Pairs {
+		if math.Abs(u.Pairs[i].CE.Strike-spot) < math.Abs(u.Pairs[best].CE.Strike-spot) {
+			best = i
+		}
+	}
+	return u.Pairs[best], true
 }
 
 // creditSpreadLegs counts listed strikes strictly above/below the selected ATM
