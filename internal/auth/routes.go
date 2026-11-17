@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -103,9 +104,15 @@ func (h *Routes) adminVerify(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Routes) accessVerify(w http.ResponseWriter, r *http.Request) {
-	// Node threw on a request without a JSON body here (an accidental 500). A missing body
-	// is treated as an empty one, which falls through to the usual wrong-code answer.
+	// A string secret in the body takes precedence, including an empty string.
 	secret, isStr := httpx.BodyObject(r)["secret"].(string)
+	if !isStr {
+		scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+		if ok && strings.EqualFold(scheme, "Bearer") {
+			secret = strings.TrimSpace(token)
+			isStr = secret != ""
+		}
+	}
 	switch CheckPasscode(h.AccessSecret, secret, isStr) {
 	case PasscodeNotConfigured:
 		httpx.Error(w, http.StatusInternalServerError, "Access secret not configured on server")

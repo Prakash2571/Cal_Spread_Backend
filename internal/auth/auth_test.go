@@ -354,6 +354,73 @@ func TestAccessVerify(t *testing.T) {
 	}
 }
 
+func TestAccessVerifyAuthorization(t *testing.T) {
+	for _, c := range []struct {
+		name, body, header string
+		code               int
+	}{
+		{"header only", "", "Bearer access-s", 200},
+		{"case insensitive scheme and trimmed token", "", "bEaReR   access-s  ", 200},
+		{"missing body secret", `{}`, "Bearer access-s", 200},
+		{"non-string body secret", `{"secret":123}`, "Bearer access-s", 200},
+		{"null body secret", `{"secret":null}`, "Bearer access-s", 200},
+		{"wrong header secret", "", "Bearer wrong", 401},
+		{"missing header", "", "", 401},
+		{"wrong scheme", "", "Basic access-s", 401},
+		{"missing separator", "", "Beareraccess-s", 401},
+		{"missing token", "", "Bearer", 401},
+		{"empty token", "", "Bearer   ", 401},
+		{"body wins", `{"secret":"access-s"}`, "Bearer wrong", 200},
+		{"wrong body wins", `{"secret":"wrong"}`, "Bearer access-s", 401},
+		{"empty body secret wins", `{"secret":""}`, "Bearer access-s", 401},
+		{"body secret is not trimmed", `{"secret":" access-s "}`, "Bearer access-s", 401},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h, s, fb := routes(t)
+			r := httptest.NewRequest("POST", "/api/access/verify", strings.NewReader(c.body))
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("Authorization", c.header)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != c.code {
+				t.Fatalf("status %d, want %d: %s", w.Code, c.code, w.Body)
+			}
+			if c.code == 200 {
+				var out struct {
+					Success bool      `json:"success"`
+					Token   string    `json:"token"`
+					Role    auth.Role `json:"role"`
+				}
+				if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+					t.Fatal(err)
+				}
+				if !out.Success || out.Role != auth.RoleTrade || s.Role(out.Token) != auth.RoleTrade {
+					t.Fatalf("invalid trade session: %s", w.Body)
+				}
+			} else if w.Body.String() != `{"error":"Invalid access code"}` {
+				t.Errorf("error response: %s", w.Body)
+			}
+			if len(fb.switched) != 0 {
+				t.Error("access verify must never switch the broker")
+			}
+		})
+	}
+}
+
+func TestAccessVerifyAuthorizationNotConfigured(t *testing.T) {
+	s, _, _ := newSessions()
+	r := chi.NewRouter()
+	r.Use(httpx.ParseBody)
+	(&auth.Routes{Sessions: s, AccessSecret: "", Brokers: &fakeBrokers{active: brokers.Dhan}}).Mount(r)
+	req := httptest.NewRequest("POST", "/api/access/verify", nil)
+	req.Header.Set("Authorization", "Bearer access-s")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != 500 || w.Body.String() != `{"error":"Access secret not configured on server"}` {
+		t.Errorf("unconfigured: %d %s", w.Code, w.Body)
+	}
+}
+
 func TestVerifyIsRateLimited(t *testing.T) {
 	h, _, _ := routes(t)
 	for i := 0; i < 10; i++ {
