@@ -303,6 +303,8 @@ func (a *App) Shutdown(ctx context.Context, signal string) lifecycle.Result {
 // browsers reconnect to the next process). It then waits briefly for the handlers of the
 // closed connections to finish their cleanup.
 func (a *App) stopHTTP(ctx context.Context) error {
+	// net/http does not close hijacked websocket connections on Shutdown.
+	a.live.Close()
 	grace, cancel := context.WithTimeout(ctx, HTTPDrainGrace)
 	err := a.server.Shutdown(grace)
 	cancel()

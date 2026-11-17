@@ -157,6 +157,11 @@ func TestRouteInventoryMatchesNodeWithoutBox(t *testing.T) {
 		}
 		listed[route] = true
 	}
+	// The read-only websocket relay extends the frozen SSE route contract.
+	if !mounted["GET /api/stream/live"] {
+		t.Error("live relay route is not mounted")
+	}
+	listed["GET /api/stream/live"] = true
 	for k := range mounted {
 		if !listed[k] {
 			extra = append(extra, k)

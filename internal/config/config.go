@@ -32,6 +32,7 @@ type Config struct {
 	AccessSecret        string
 	TokenRouteSecret    string
 	InternalTokenSecret string
+	StreamSecret        string
 
 	KiteAPIKey    string
 	KiteAPISecret string
@@ -54,6 +55,7 @@ func Load(get Getter) Config {
 		AccessSecret:        strings.TrimSpace(get("ACCESS_SECRET")),
 		TokenRouteSecret:    strings.TrimSpace(get("TOKEN_ROUTE_SECRET")),
 		InternalTokenSecret: strings.TrimSpace(get("INTERNAL_TOKEN_SECRET")),
+		StreamSecret:        strings.TrimSpace(get("CALSPREAD_STREAM_SECRET")),
 		KiteAPIKey:          strings.TrimSpace(get("KITE_API_KEY")),
 		KiteAPISecret:       strings.TrimSpace(get("KITE_API_SECRET")),
 		ExtraSessionDays:    map[string]bool{},

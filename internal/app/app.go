@@ -38,6 +38,7 @@ import (
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/kite/ticker"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/kv"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/lifecycle"
+	"github.com/Prakash2571/Cal_Spread_Backend/internal/livestream"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/market"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/marketdata"
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/server"
@@ -118,6 +119,7 @@ type App struct {
 	spike     *spike.Engine
 	fv        *fairvalue.Engine
 	fvRows    *fvInstruments
+	live      *livestream.Relay
 
 	handler  http.Handler
 	server   *http.Server
@@ -370,6 +372,7 @@ func New(cfg config.Config, opts Options) (*App, error) {
 		OnSpikeConnection: a.spike.OnConnection,
 	})
 
+	a.live = livestream.New(a.hub, cfg.StreamSecret)
 	a.handler = server.New(server.Options{FrontendOrigin: cfg.FrontendURL}, a.mounts()...)
 	a.server = &http.Server{
 		Handler: a.track(a.handler),
@@ -421,6 +424,7 @@ func (a *App) openDatabase() *db.Pool {
 func (a *App) mounts() []func(chi.Router) {
 	sessions := a.sessions
 	return []func(chi.Router){
+		a.live.Mount,
 		a.core.Mount,
 		(&auth.Routes{Sessions: sessions, AdminSecret: a.cfg.AdminSecret, AccessSecret: a.cfg.AccessSecret, Brokers: a.reg}).Mount,
 		a.analytics.Mount,
