@@ -51,9 +51,12 @@ func (h spotHistory) atOrBefore(at int64) spotSample {
 }
 
 // attributeUnderlyingDirection is the single policy for mapping the underlying
-// move to legs. Timestamps are local receipt times, like option quoteAgeMs.
-func attributeUnderlyingDirection(baseline, current spotSample, armedAt, triggerAt int64) (string, string) {
-	if baseline.T <= 0 || baseline.T > armedAt || armedAt-baseline.T > spotBaselineAgeMs ||
+// move to legs. The baseline is spot at the straddle's 30-minute low (the arm's
+// reference), so the comparison covers the move that drove the straddle up into
+// VWAP, not only the drift after arming. Timestamps are local receipt times,
+// like option quoteAgeMs.
+func attributeUnderlyingDirection(baseline, current spotSample, referenceAt, triggerAt int64) (string, string) {
+	if baseline.T <= 0 || baseline.T > referenceAt || referenceAt-baseline.T > spotBaselineAgeMs ||
 		current.T <= 0 || current.T > triggerAt || triggerAt-current.T > quoteAgeMs ||
 		baseline.Price <= 0 || current.Price <= 0 || !finite(baseline.Price) || !finite(current.Price) {
 		return "", "Signal skipped: underlying spot was unavailable or stale"
@@ -64,7 +67,7 @@ func attributeUnderlyingDirection(baseline, current spotSample, armedAt, trigger
 	if current.Price < baseline.Price {
 		return PutCredit, ""
 	}
-	return "", "Signal skipped: underlying was flat since arming"
+	return "", "Signal skipped: underlying was flat since the straddle low"
 }
 
 // resolveSpotTokens uses normalized Instruments() master rows, never security-ID

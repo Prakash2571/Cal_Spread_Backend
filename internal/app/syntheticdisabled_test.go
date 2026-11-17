@@ -52,7 +52,7 @@ func TestSyntheticNeverBootsAndCannotStartThroughMountedRoutes(t *testing.T) {
 	trade := h.tradeToken()
 	for _, route := range []struct {
 		method, path, body, contains string
-		status                      int
+		status                       int
 	}{
 		{"GET", "/api/synthetic/status", "", `"running":false`, 200},
 		{"GET", "/api/synthetic/opportunities", "", `"opportunities":[]`, 200},

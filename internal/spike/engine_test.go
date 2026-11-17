@@ -1072,6 +1072,49 @@ func TestTriggerConsumesArmForUpDownFlatAndUnavailableSpot(t *testing.T) {
 	}
 }
 
+// The cause of the straddle rise is the spot move from the straddle's 30-minute
+// low, not the drift after arming: a rally that eases back before the VWAP touch
+// is still a rise (call credit), and a sell-off that bounces is still a fall.
+func TestDirectionUsesSpotAtStraddleLowNotAtArming(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		spots     [3]float64 // straddle low, arming, VWAP cross
+		direction string
+	}{
+		{"rally eases back before cross", [3]float64{23850, 23900, 23880}, CallCredit},
+		{"sell-off bounces before cross", [3]float64{23850, 23800, 23820}, PutCredit},
+		{"back to the low's spot is flat", [3]float64{23850, 23900, 23850}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine, clock, rows := newRuleTestEngine(t)
+			for stage := 0; stage <= 2; stage++ {
+				clock.ms.Add(1000)
+				ticks := entryTestTicks(rows, engine.namespace, stage)
+				for i := range ticks {
+					if ticks[i].Token == 13 {
+						ticks[i].LastPrice = tc.spots[stage]
+					}
+				}
+				engine.OnTicks(ticks)
+				if stage == 1 {
+					state := engine.armed["NIFTY"]
+					if state == nil || state.Baseline.Price != tc.spots[0] || state.Baseline.T > state.Reference.T {
+						t.Fatalf("baseline not pinned at the straddle low: %+v", state)
+					}
+				}
+			}
+			view := engine.views["NIFTY"]
+			if tc.direction == "" {
+				if view.Signal != nil || !strings.Contains(view.Note, "flat since the straddle low") {
+					t.Fatalf("flat move produced a signal: %+v", view)
+				}
+			} else if view.Signal == nil || view.Signal.Direction != tc.direction {
+				t.Fatalf("direction=%+v, want %s", view.Signal, tc.direction)
+			}
+		})
+	}
+}
+
 func TestSpotHistoryBaselineIsAtOrBeforeArmingAndPruned(t *testing.T) {
 	const now = int64(10_000_000)
 	h := spotHistory{}
