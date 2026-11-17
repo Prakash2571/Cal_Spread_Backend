@@ -8,6 +8,7 @@ import (
 const (
 	WindowMs       = int64(30 * time.Minute / time.Millisecond)
 	MinimumMovePct = 5.0
+	TouchBand      = 1.0 // Rupees below VWAP that still count as a touch.
 	HedgeSteps     = 4
 	quoteAgeMs     = int64(time.Minute / time.Millisecond)
 	bookAgeMs      = int64(15 * time.Second / time.Millisecond)
@@ -167,7 +168,7 @@ func downwardVWAPCross(previous, current Sample) bool {
 	return previous.T > 0 && current.T >= previous.T && current.T-previous.T <= quoteAgeMs &&
 		finite(previous.Premium) && finite(previous.VWAP) && finite(current.Premium) && finite(current.VWAP) &&
 		previous.Premium > 0 && current.Premium > 0 && previous.VWAP > 0 && current.VWAP > 0 &&
-		previous.Premium >= previous.VWAP && current.Premium < current.VWAP && current.Premium < previous.Premium
+		previous.Premium >= previous.VWAP-TouchBand && current.Premium < current.VWAP && current.Premium < previous.Premium
 }
 
 // advanceArmed arms independently of a cross. Once armed, a pullback may fall

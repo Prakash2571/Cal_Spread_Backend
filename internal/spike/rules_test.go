@@ -42,7 +42,7 @@ func TestArmUsesEarlierThirtyMinuteLow(t *testing.T) {
 	}
 }
 
-func TestTriggerOnlyPriceDrivenDownwardCrossWhileArmed(t *testing.T) {
+func TestTriggerOnlyPriceDrivenDownwardCrossOrTouchWhileArmed(t *testing.T) {
 	const now = int64(10_000_000)
 	for _, tc := range []struct {
 		name     string
@@ -52,10 +52,19 @@ func TestTriggerOnlyPriceDrivenDownwardCrossWhileArmed(t *testing.T) {
 		want     bool
 	}{
 		{"downward inclusive previous VWAP", true, Sample{T: now - 1000, Premium: 105, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, true},
+		{"downward above previous VWAP", true, Sample{T: now - 1000, Premium: 106, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, true},
 		{"unarmed down cross", false, Sample{T: now - 1000, Premium: 105, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, false},
 		{"upward cross", true, Sample{T: now - 1000, Premium: 104, VWAP: 105}, Sample{T: now, Premium: 106, VWAP: 105}, false},
 		{"VWAP driven", true, Sample{T: now - 1000, Premium: 104, VWAP: 103}, Sample{T: now, Premium: 104, VWAP: 105}, false},
-		{"already below", true, Sample{T: now - 1000, Premium: 104, VWAP: 105}, Sample{T: now, Premium: 103, VWAP: 105}, false},
+		{"touch then fall", true, Sample{T: now - 1000, Premium: 104.5, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, true},
+		{"touch exactly one rupee below", true, Sample{T: now - 1000, Premium: 104, VWAP: 105}, Sample{T: now, Premium: 103, VWAP: 105}, true},
+		{"fall without touch at one rupee and one paisa below", true, Sample{T: now - 1000, Premium: 103.99, VWAP: 105}, Sample{T: now, Premium: 103, VWAP: 105}, false},
+		{"touch without fall at equal premium", true, Sample{T: now - 1000, Premium: 104.5, VWAP: 105}, Sample{T: now, Premium: 104.5, VWAP: 105}, false},
+		{"touch without fall at rising premium", true, Sample{T: now - 1000, Premium: 104.5, VWAP: 105}, Sample{T: now, Premium: 104.75, VWAP: 105}, false},
+		{"unarmed touch then fall", false, Sample{T: now - 1000, Premium: 104.5, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, false},
+		{"touch current equal VWAP", true, Sample{T: now - 1000, Premium: 104.5, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 104}, false},
+		{"touch sixty seconds inclusive", true, Sample{T: now - quoteAgeMs, Premium: 104.5, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, true},
+		{"touch sample gap", true, Sample{T: now - quoteAgeMs - 1, Premium: 104.5, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, false},
 		{"current equal VWAP", true, Sample{T: now - 1000, Premium: 106, VWAP: 105}, Sample{T: now, Premium: 105, VWAP: 105}, false},
 		{"sixty seconds inclusive", true, Sample{T: now - quoteAgeMs, Premium: 106, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, true},
 		{"sample gap", true, Sample{T: now - quoteAgeMs - 1, Premium: 106, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, false},
@@ -76,6 +85,24 @@ func TestTriggerOnlyPriceDrivenDownwardCrossWhileArmed(t *testing.T) {
 				t.Fatalf("next=%+v trigger=%+v, want trigger=%v", next, trigger, tc.want)
 			}
 		})
+	}
+}
+
+func TestArmingSampleCannotTriggerTouchThenFall(t *testing.T) {
+	const now = int64(10_000_000)
+	low := Sample{T: now - 2000, Premium: 100}
+	previous := Sample{T: now - 1000, Premium: 106.5, VWAP: 107}
+	current := Sample{T: now, Premium: 106, VWAP: 107}
+	if !downwardVWAPCross(previous, current) {
+		t.Fatal("fixture must qualify for the touch trigger")
+	}
+	state, trigger := advanceArmed(nil, previous, current, []Sample{low})
+	if state == nil || state.ArmedAt != now || state.Reference != low || trigger != nil {
+		t.Fatalf("arming sample triggered or failed to arm: state=%+v trigger=%+v", state, trigger)
+	}
+	next, trigger := advanceArmed(state, current, Sample{T: now + 1000, Premium: 105.5, VWAP: 107}, []Sample{low})
+	if next != nil || trigger != state {
+		t.Fatalf("subsequent touch did not consume the original arm: next=%+v trigger=%+v", next, trigger)
 	}
 }
 
