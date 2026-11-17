@@ -143,6 +143,7 @@ All Spike endpoints require an existing full/trade admin session:
 | `GET /api/spike/series?symbol=NIFTY&frame=1m` | Completed history (`NIFTY`/`SENSEX`; `1m`/`5m`/`30m`/`1h`) |
 | `POST /api/spike/paper` with `{enabled}` | Persist pause/resume of paper entries |
 | `POST /api/spike/trades/{id}/close` | Manual two-leg paper exit |
+| `POST /api/spike/trades/{id}/delete` | Delete an open or closed paper trade record |
 | `GET /api/spike/stream` | Bounded snapshot SSE; upstream market data remains Dhan WebSocket |
 
 Database migration `0007_spike.sql` adds `spike_bars`, `spike_trades` and
