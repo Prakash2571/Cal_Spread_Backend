@@ -141,9 +141,7 @@ it is not a complete historical-feed replay:
   exercises spot on both sides of 82,150 without requiring a single ATM strike.
 - Separate no-cross continuations preserve unpinned qualification and the first
   pin through **10:07:52**, beyond the old reference-expiry time.
-- Sensitivity: under a flat **409.21** chart line, a 120-second run pins at
-  **09:46:04**. The threshold is sensitive to the VWAP line; Prakash chose
-  120 seconds knowing this. This observation is not a test pass/fail expectation.
+- Sensitivity: flat whole-day chart lines give early-morning artefact pins (09:17:18 under flat 409.21, 09:18:08 under flat 410.39, entries ~09:19:45) - a cumulative VWAP cannot sit at 409.21 at 09:16 when the premium was 410-470 then; under a realistic reconstructed chart-VWAP path the pin is 09:52:26-09:52:33 and the entry 09:52:59-09:53:40. The 09:46:04 figure does not apply to the pin form. This observation is not a test pass/fail expectation.
 - NIFTY has no trade as far as checkable, but its chart VWAP is absent from
   stored data. A verified historical NIFTY no-entry cannot be claimed.
 
