@@ -8,7 +8,7 @@ import (
 const (
 	WindowMs       = int64(30 * time.Minute / time.Millisecond)
 	MinimumMovePct = 5.0
-	TouchBand      = 1.0 // Rupees below VWAP that still count as a touch.
+	TouchBand      = 1.0 // Rupees on either side of chart VWAP that count as a touch.
 	HedgeSteps     = 4
 	quoteAgeMs     = int64(time.Minute / time.Millisecond)
 	bookAgeMs      = int64(15 * time.Second / time.Millisecond)
@@ -93,14 +93,15 @@ func (t *Trade) updatePeak(pnl float64, at int64) {
 }
 
 type IndexView struct {
-	Symbol         string  `json:"symbol"`
-	Expiry         string  `json:"expiry"`
-	Pairs          int     `json:"pairs"`
-	LotSize        int     `json:"lot_size"`
-	Current        *Sample `json:"current"`
-	Signal         *Signal `json:"signal"`
-	Note           string  `json:"note"`
-	RecordingSince *int64  `json:"recording_since"`
+	Symbol         string   `json:"symbol"`
+	Expiry         string   `json:"expiry"`
+	Pairs          int      `json:"pairs"`
+	LotSize        int      `json:"lot_size"`
+	Current        *Sample  `json:"current"`
+	ChartVWAP      *float64 `json:"chart_vwap,omitempty"`
+	Signal         *Signal  `json:"signal"`
+	Note           string   `json:"note"`
+	RecordingSince *int64   `json:"recording_since"`
 }
 
 type Snapshot struct {
@@ -136,14 +137,18 @@ func marketOpen(at int64) bool {
 
 // Directions describe same-side credit spreads.
 const (
-	CallCredit = "CALL_CREDIT" // underlying rose since arming
-	PutCredit  = "PUT_CREDIT"  // underlying fell since arming
+	CallCredit = "CALL_CREDIT" // underlying rose from the reference low to the pin
+	PutCredit  = "PUT_CREDIT"  // underlying fell from the reference low to the pin
 )
 
+// Qualification latches at ArmedAt. Reference slides until PinnedAt, then the
+// reference, spot baseline and direction stay fixed through entry.
 type armedState struct {
 	ArmedAt   int64
 	Reference Sample
-	Baseline  spotSample // pinned at arming, even if the arm outlives history retention
+	Baseline  spotSample
+	PinnedAt  int64
+	Direction string
 }
 
 // armReference finds an earlier +5% reference. The engine supplies priceWindow's
@@ -164,37 +169,75 @@ func armReference(current Sample, references []Sample) (Sample, bool) {
 	return low, low.T > 0 && (current.Premium/low.Premium-1)*100+1e-9 >= MinimumMovePct
 }
 
-func downwardVWAPCross(previous, current Sample) bool {
+// Each sample uses the chart line available at its own evaluation time.
+func validChartSamples(previous, current Sample, previousChartVWAP, currentChartVWAP float64) bool {
 	return previous.T > 0 && current.T >= previous.T && current.T-previous.T <= quoteAgeMs &&
-		finite(previous.Premium) && finite(previous.VWAP) && finite(current.Premium) && finite(current.VWAP) &&
-		previous.Premium > 0 && current.Premium > 0 && previous.VWAP > 0 && current.VWAP > 0 &&
-		previous.Premium >= previous.VWAP-TouchBand && current.Premium < current.VWAP && current.Premium < previous.Premium
+		finite(previous.Premium) && finite(previousChartVWAP) && finite(current.Premium) && finite(currentChartVWAP) &&
+		previous.Premium > 0 && current.Premium > 0 && previousChartVWAP > 0 && currentChartVWAP > 0
 }
 
-// advanceArmed arms independently of a cross. Once armed, a pullback may fall
-// below +5% until the reference ages out. A surviving +5% reference refreshes
-// Reference, never ArmedAt. Every trigger consumes the arm, including skips.
-// Newly armed samples start waiting for the next sample's downward cross.
-func advanceArmed(state *armedState, previous, current Sample, references []Sample) (*armedState, *armedState) {
+func downwardVWAPCross(previous, current Sample, previousChartVWAP, currentChartVWAP float64) bool {
+	return validChartSamples(previous, current, previousChartVWAP, currentChartVWAP) &&
+		previous.Premium >= previousChartVWAP-TouchBand && current.Premium < currentChartVWAP && current.Premium < previous.Premium
+}
+
+func chartVWAPPin(previous, current Sample, previousChartVWAP, currentChartVWAP float64) bool {
+	if !finite(current.Premium) || current.Premium <= 0 || !finite(currentChartVWAP) || currentChartVWAP <= 0 {
+		return false
+	}
+	if math.Abs(current.Premium-currentChartVWAP) <= TouchBand {
+		return true
+	}
+	if !validChartSamples(previous, current, previousChartVWAP, currentChartVWAP) {
+		return false
+	}
+	return (previous.Premium < previousChartVWAP && current.Premium >= currentChartVWAP) ||
+		(previous.Premium >= previousChartVWAP && current.Premium < currentChartVWAP) ||
+		downwardVWAPCross(previous, current, previousChartVWAP, currentChartVWAP)
+}
+
+// advanceArmed qualifies independently of either VWAP. The rolling low keeps
+// sliding until the first chart cross/touch pins direction. Flat/stale pins and
+// the first downward cross consume qualification, including skipped entries.
+// Neither qualification nor a pin expires with WindowMs or a loss of +5%.
+func advanceArmed(state *armedState, previous, current Sample, references []Sample, previousChartVWAP, currentChartVWAP float64, history spotHistory) (*armedState, *armedState, string) {
+	if state != nil && dayKey(state.ArmedAt) != dayKey(current.T) {
+		state = nil
+	}
 	reference, qualifies := armReference(current, references)
 	if state == nil {
-		if qualifies {
-			return &armedState{ArmedAt: current.T, Reference: reference}, nil
-		}
-		return nil, nil
-	}
-	if current.T-state.Reference.T > WindowMs {
 		if !qualifies {
-			return nil, nil
+			return nil, nil, "Monitoring for +5% qualification"
 		}
-		refreshed := *state
-		refreshed.Reference = reference
-		state = &refreshed
+		state = &armedState{ArmedAt: current.T, Reference: reference}
 	}
-	if downwardVWAPCross(previous, current) {
-		return nil, state
+	if state.PinnedAt == 0 {
+		if reference.T > 0 {
+			state.Reference = reference
+		}
+		if chartVWAPPin(previous, current, previousChartVWAP, currentChartVWAP) {
+			state.Baseline = history.atOrBefore(state.Reference.T)
+			direction, note := attributeUnderlyingDirection(state.Baseline, history.atOrBefore(current.T), state.Reference.T, current.T)
+			if direction == "" {
+				return nil, nil, note + "; direction pin consumed"
+			}
+			state.PinnedAt, state.Direction = current.T, direction
+		}
 	}
-	return state, nil
+	if currentChartVWAP <= 0 || !finite(currentChartVWAP) {
+		return state, nil, "Waiting for first completed chart bar with valid VWAP"
+	}
+	if state.PinnedAt == 0 {
+		return state, nil, "Qualified after +5%; waiting for chart-VWAP cross or touch to pin direction"
+	}
+	direction := "SHORT"
+	if state.Direction == PutCredit {
+		direction = "LONG"
+	}
+	if downwardVWAPCross(previous, current, previousChartVWAP, currentChartVWAP) {
+		return nil, state, "Direction pinned " + direction + "; downward chart-VWAP cross observed"
+	}
+	return state, nil, "Direction pinned " + direction + "; waiting for downward chart-VWAP cross"
 }
 
 func grossPNL(trade Trade, shortAsk, hedgeBid float64) float64 {

@@ -32,7 +32,7 @@ For this feature, ATM follows the requested **minimum-premium definition**:
 3. Select the strike with the smallest valid `CE LTP + PE LTP`.
 
 This is not necessarily the strike nearest spot, and it is only used for the
-chart and the arm/VWAP signal; entries sell the ATM strike nearest index spot
+chart and the qualification/pin signal; entries sell the ATM strike nearest index spot
 (see the entry rule below). A tie chooses the lower listed
 strike deterministically. Candidate legs need positive, finite prices received
 within the last minute. No arbitrary strike band is substituted for the chain.
@@ -49,45 +49,94 @@ minimum straddle premium = CE LTP + PE LTP
 straddle VWAP baseline   = CE day average traded price + PE day average traded price
 ```
 
-Premium and VWAP are plotted on **separate charts**. An absent/zero leg average
-does not become an invented VWAP; qualification waits for both leg averages.
-Ticker-only/OI-only packets do not refresh an old average as if it were new.
+The live header's **signal VWAP** is this Dhan average-price sum and is display
+only. Missing or invalid leg averages leave that displayed value unavailable;
+they do not block qualification, pinning or entry. Ticker-only/OI-only packets do
+not refresh an old average as if it were new.
+
+The **chart VWAP** is a separate cumulative volume-weighted figure. The existing
+chart calculation stamps each completed one-minute bar with its VWAP, weighting
+the rounded selected-pair premium by the smaller CE/PE minute-volume delta. All
+pin and entry decisions use the latest completed bar's stamped `bar.VWAP` at
+that sample's time, including restored bars. The line steps only on completion;
+it never reads the in-memory accumulator or a forming bar. An invalid latest
+stamp fails closed rather than falling back to an older valid stamp. Without a
+completed chart bar with valid VWAP, the note is “Waiting for first completed
+chart bar with valid VWAP”; +5% qualification can still latch while pin/entry wait.
+`IndexView.chart_vwap` exposes the completed chart line when available, while
+`Current.vwap` remains the Dhan sum. `Signal.vwap` records chart VWAP at entry.
 
 The backend uses one fixed, dedicated Dhan FULL-feed socket for the two chains,
 separate from the browser/Fair Value and Synthetic lanes. It also keeps the legs
 of open Spike paper positions subscribed until manual close. Token replacement,
 logout and broker-generation changes recycle/fence this lane.
 
-## Exact entry rule: arm, VWAP touch or cross, then attribute
+## Exact entry rule: qualify, pin direction, enter on a downward chart cross
 
-The chart's straddle is the **minimum-premium** pair above. It is only the
-signal; the traded short strike is the **ATM strike nearest index spot**.
+The chart's straddle is the **minimum-premium** pair above. The traded short
+strike is always the **ATM strike nearest index spot at entry**.
 
-1. **Arm.** The minimum straddle premium is at least 5% above its lowest value
-   in the preceding rolling 30 minutes. That low is the arm's reference.
-2. **Trigger.** On the next fresh update after arming, the premium turns down at
-   VWAP: it crossed above VWAP and comes back below it, or it touched VWAP from
-   below (within ₹1) and bounces back down. Any lower tick counts as the bounce.
+1. **Qualify and latch.** The premium reaches at least 5% above its lowest
+   observed value in the preceding rolling 30 minutes (`WindowMs`). Qualification
+   requires no VWAP condition and does not expire when the low ages out or the
+   premium falls below +5%. Until a direction is pinned, the reference low keeps
+   sliding with the window.
+2. **Pin the first direction.** While qualified, the first cross of chart VWAP
+   in either direction between consecutive evaluated samples, or a touch within
+   ₹1 on either side (`TouchBand`), pins direction. Cross samples must be at most
+   60 seconds apart. Compare index spot at the reference low **as of this pin**
+   with spot now:
+   - Spot rose → pin **SHORT**, a bearish **CALL_CREDIT** spread.
+   - Spot fell → pin **LONG**, a bullish **PUT_CREDIT** spread.
+   - Flat, missing or stale spot skips and consumes qualification/the pin. The
+     baseline must be at/before the low and no more than 5 minutes older; current
+     spot must be at/before the pin and no more than 60 seconds older.
+
+   First pin wins. Its direction, reference and baseline stay fixed until entry
+   or day end. Later touches, spot reversals and rolling-low changes cannot
+   change it. Qualification and pin may coincide on the same evaluated sample.
+3. **Enter on the first downward chart-VWAP cross after pinning.** There is no
+   +5% re-check or reference-age expiry. The existing price-driven touch-and-fall
+   shape applies, using the chart line available at each sample's own time:
 
    ```text
-   previous premium >= previous VWAP − ₹1
-   current premium  <  current VWAP
+   previous premium >= previous completed chart VWAP − ₹1
+   current premium  <  current completed chart VWAP
    current premium  <  previous premium
+   current time − previous time is between 0 and 60 seconds inclusive
    ```
 
-3. **Attribute the cause.** Compare index spot at the reference low with index
-   spot at the trigger, i.e. the move that pushed the straddle up into VWAP.
-   - Spot rose → **call credit**: sell one lot of the ATM CE, buy the CE four
-     listed strikes higher.
-   - Spot fell → **put credit**: sell one lot of the ATM PE, buy the PE four
-     listed strikes lower.
-   - Flat or stale spot (baseline older than 5 minutes before the low, current
-     older than 1 minute) skips the entry and consumes the arm.
+   If this is also the pinning cross, pin and entry coincide immediately. Every
+   entry trigger consumes the latch, including a skipped paper entry. A later
+   trade needs a fresh qualification. A pin consumed by flat/stale spot cannot
+   supply direction to a later cross.
+4. **Sell ATM, buy the fourth hedge.** Use fresh spot at entry to select the
+   nearest listed same-strike CE + PE pair (an exact midpoint tie takes the lower
+   strike). SHORT sells one lot of its ATM CE and buys the fourth higher listed
+   CE. LONG sells one lot of its ATM PE and buys the fourth lower listed PE.
+   Both directions sell the ATM leg. Direction comes from the pin, while the
+   exact ATM contracts come from spot at entry.
 
-ATM is the listed same-strike CE + PE nearest spot at the trigger; an exact
-midpoint tie takes the lower strike. Example: NIFTY low at spot 23,850, arms at
-23,900, touches VWAP and turns down at 23,880 → spot rose, so with spot 23,880
-and 50-point strikes the spread is short 23,900 CE / long 24,100 CE.
+### 19 November 2026 worked check
+
+The deterministic Go fixture `TestNineteenNovemberSensexDirectionPin` uses the
+supplied observations plus explicit intermediate ticks to establish sequence:
+
+- SENSEX low **393.15 at 09:37:51 IST**; **422.05 at 09:38:33** is +7.3509%,
+  latching qualification. An unqualified upward cross just before that tick
+  cannot pin direction.
+- With completed chart VWAP about **410.4**, **410.45 at 09:53:35** touches and
+  pins SHORT: reference spot **81,955** rose to about **82,165**. The **412.50 at
+  09:53:39** then **408.90 at 09:53:40** samples produce entry at **09:53:40 IST**.
+  Entry is already below +5% and still fires.
+- The shape is **short spot-ATM CE + buy fourth higher CE**, one lot. The fixture
+  exercises spot on both sides of 82,150 without requiring a single ATM strike.
+- Separate no-cross continuations preserve both unpinned qualification and the
+  first pin through **10:07:52**, the old reference-expiry time. The actual
+  worked sequence has already consumed its pin at 09:53:40.
+- The NIFTY fixture crosses/touches its chart line but stays below +5%; it emits
+  no signal. This is a focused supplied-data check, not a complete historical
+  feed replay or independent verification of every NIFTY tick on that date.
 
 The fourth strike is counted from the actual listed ladder; spacing is not
 hardcoded. Both contracts must have the same positive integer lot size. Lot
@@ -126,9 +175,13 @@ The 30-minute rule limits signal qualification, not how long a position is held.
   reference extrema across restart, rather than replacing them with just closes.
 - Open trades, entry contracts/prices, paper-enabled control, closed-today records
   and today's minute history restore after restart.
-- A restart/reconnect does not replay a historical crossover into a new entry.
-  Qualification needs a fresh live previous/current pair; a price gap longer than
-  one minute cannot be treated as an observed crossover.
+- Qualification and direction pins are in-memory day state. An unchanged
+  five-minute instrument refresh preserves them, the spot history, previous
+  sample and evaluated note. Feed/runtime resets discard quote/spot continuity
+  but preserve the day latch and any pinned direction. A new day clears them;
+  a process restart cannot restore an unentered pin from persisted bars.
+  A restart/reconnect does not replay a historical crossover into a new entry;
+  a price gap longer than one minute cannot be treated as an observed crossover.
 - Monitoring and entries require active Dhan data. Old broker-generation packets
   and queued candidates are rejected. Open paper contracts stay fixed while the
   minimum changes or the nearest monitored expiry rolls forward.

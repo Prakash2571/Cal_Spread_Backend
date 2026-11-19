@@ -129,6 +129,10 @@ func (e *Engine) snapshotLocked() Snapshot {
 		Indexes: []IndexView{}, Open: []Trade{}, Closed: append([]Trade{}, e.closed...), Error: e.lastError}
 	for _, symbol := range Symbols {
 		view := e.views[symbol]
+		view.ChartVWAP = nil
+		if value := e.chartVWAPAtLocked(symbol, e.now()); value > 0 {
+			view.ChartVWAP = &value
+		}
 		if view.Current != nil && e.now()-view.Current.T > quoteAgeMs {
 			view.Note = "Paired price stream is stale"
 		}

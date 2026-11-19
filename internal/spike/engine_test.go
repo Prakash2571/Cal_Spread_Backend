@@ -76,8 +76,8 @@ func testTicks(rows []market.Instrument, namespace brokers.Namespace, stage int)
 	return ticks
 }
 
-// Keep chart fixtures unchanged; entry fixtures exercise arm then down-cross
-// with rising NIFTY spot and falling SENSEX spot independently.
+// Keep chart fixtures unchanged; entry fixtures qualify/pin on an upward cross
+// before entry, with rising NIFTY spot and falling SENSEX spot independently.
 func entryTestInstruments() []market.Instrument {
 	return append(testInstruments(),
 		market.Instrument{InstrumentToken: 13, Name: "NIFTY", Tradingsymbol: "NIFTY", InstrumentType: "INDEX", Exchange: "INDICES", Segment: "INDICES"},
@@ -89,9 +89,9 @@ func entryTestTicks(rows []market.Instrument, namespace brokers.Namespace, stage
 	for i, row := range rows {
 		price := ticks[i].LastPrice
 		if row.InstrumentType == "INDEX" {
-			price = []float64{23850, 23850, 23860, 23850, 23860}[stage]
+			price = []float64{23850, 23860, 23860, 23850, 23860}[stage]
 			if row.Name == "SENSEX" {
-				price = []float64{80000, 80000, 79990, 80000, 79990}[stage]
+				price = []float64{80000, 79990, 79990, 80000, 79990}[stage]
 			}
 		} else if row.Name == "NIFTY" && row.Strike == 23850 {
 			price = 60
@@ -110,6 +110,18 @@ func entryTestTicks(rows []market.Instrument, namespace brokers.Namespace, stage
 		ticks[i].Bids[0].Price, ticks[i].Asks[0].Price = price-.5, price+.5
 	}
 	return ticks
+}
+
+// Entry tests start with a completed chart bar and established volume history.
+// Chart-construction tests use their own unseeded engine.
+func seedEntryChartBars(engine *Engine) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	at := bucketEnd(engine.now(), 1) - 60_000
+	for _, symbol := range Symbols {
+		engine.bars[symbol][at] = Bar{Symbol: symbol, Day: engine.day, Sample: Sample{T: at, Premium: 105, VWAP: 105}}
+		engine.chartVWAP[symbol] = &chartVWAPAccumulator{weighted: 1050, total: 10, marks: map[int64]float64{}}
+	}
 }
 
 func waitOpen(t *testing.T, engine *Engine, count int) {
@@ -136,6 +148,7 @@ func TestBothIndexesSelectMinimumAndPaperTradeOneLotUntilManualClose(t *testing.
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = engine.Stop(context.Background()) })
+	seedEntryChartBars(engine)
 	engine.OnConnection(true)
 	for stage := 0; stage <= 2; stage++ {
 		if stage > 0 {
@@ -207,6 +220,7 @@ func TestDataGapsAndWrongNamespaceCannotOpenPaperTrades(t *testing.T) {
 		Instruments: func(context.Context) ([]market.Instrument, error) { return rows, nil }, Store: &Store{Pool: pool}, Now: clock.Now})
 	_ = engine.Start(context.Background())
 	t.Cleanup(func() { _ = engine.Stop(context.Background()) })
+	seedEntryChartBars(engine)
 	engine.OnConnection(true)
 	engine.OnTicks(entryTestTicks(rows, namespace, 0))
 	clock.ms.Add(WindowMs + 1)
@@ -223,7 +237,7 @@ func TestDataGapsAndWrongNamespaceCannotOpenPaperTrades(t *testing.T) {
 	}
 }
 
-func TestInvalidUpdatedAverageCannotTriggerUsingAnOlderVWAP(t *testing.T) {
+func TestInvalidUpdatedSignalAverageDoesNotBlockChartVWAPTrigger(t *testing.T) {
 	for _, invalid := range []float64{0, math.NaN()} {
 		clock := &fakeClock{}
 		clock.ms.Store(time.Date(2026, 11, 4, 10, 0, 0, 0, ist).UnixMilli())
@@ -235,6 +249,7 @@ func TestInvalidUpdatedAverageCannotTriggerUsingAnOlderVWAP(t *testing.T) {
 		if err := engine.Start(context.Background()); err != nil {
 			t.Fatal(err)
 		}
+		seedEntryChartBars(engine)
 		engine.OnConnection(true)
 		for stage := 0; stage <= 2; stage++ {
 			clock.ms.Add(1000)
@@ -249,8 +264,8 @@ func TestInvalidUpdatedAverageCannotTriggerUsingAnOlderVWAP(t *testing.T) {
 			engine.OnTicks(ticks)
 		}
 		view := engine.Snapshot().Indexes[0]
-		if view.Current == nil || view.Current.VWAP != 0 || view.Signal != nil {
-			t.Fatalf("invalid new average reused an old VWAP: %+v", view)
+		if view.Current == nil || view.Current.VWAP != 0 || view.Signal == nil || view.Signal.VWAP != 105 {
+			t.Fatalf("invalid signal average was reused or blocked the chart cross: %+v", view)
 		}
 		if err := engine.Stop(context.Background()); err != nil {
 			t.Fatal(err)
@@ -275,6 +290,7 @@ func TestUnreadableEntrySizeIsSkippedRatherThanFilledAfterTheCross(t *testing.T)
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = engine.Stop(context.Background()) })
+	seedEntryChartBars(engine)
 	engine.OnConnection(true)
 	for stage := 0; stage <= 2; stage++ {
 		clock.ms.Add(1000)
@@ -321,6 +337,7 @@ func TestMalformedClosingDepthLeavesThePaperPositionOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = engine.Stop(context.Background()) })
+	seedEntryChartBars(engine)
 	engine.OnConnection(true)
 	for stage := 0; stage <= 2; stage++ {
 		clock.ms.Add(1000)
@@ -996,6 +1013,7 @@ func newRuleTestEngine(t *testing.T) (*Engine, *fakeClock, []market.Instrument) 
 	if len(subscribed) != len(rows) || !engine.wanted[13] || !engine.wanted[51] || engine.spotTokens[13] != "NIFTY" || engine.spotTokens[51] != "SENSEX" {
 		t.Fatalf("spot tokens did not join wanted/SetTokens: %v, %+v", subscribed, engine.spotTokens)
 	}
+	seedEntryChartBars(engine)
 	engine.OnConnection(true)
 	return engine, clock, rows
 }
@@ -1023,7 +1041,7 @@ func TestSpotTicksAreSeparateAndNonWantedOrWrongNamespaceTicksAreDropped(t *test
 	}
 }
 
-func TestTriggerConsumesArmForUpDownFlatAndUnavailableSpot(t *testing.T) {
+func TestPinConsumesQualificationForFlatAndUnavailableSpot(t *testing.T) {
 	for _, tc := range []struct {
 		name, direction, note string
 		spot                  float64
@@ -1046,15 +1064,18 @@ func TestTriggerConsumesArmForUpDownFlatAndUnavailableSpot(t *testing.T) {
 						if tc.omit {
 							continue
 						}
-						if stage == 2 {
+						if stage >= 1 {
 							tick.LastPrice = tc.spot
 						}
 					}
 					filtered = append(filtered, tick)
 				}
 				engine.OnTicks(filtered)
-				if stage == 1 && engine.armed["NIFTY"] == nil {
+				if stage == 1 && tc.direction != "" && engine.armed["NIFTY"] == nil {
 					t.Fatal("+5% did not arm before cross")
+				}
+				if stage == 1 && tc.direction == "" {
+					break
 				}
 			}
 			view := engine.views["NIFTY"]
@@ -1072,18 +1093,17 @@ func TestTriggerConsumesArmForUpDownFlatAndUnavailableSpot(t *testing.T) {
 	}
 }
 
-// The cause of the straddle rise is the spot move from the straddle's 30-minute
-// low, not the drift after arming: a rally that eases back before the VWAP touch
-// is still a rise (call credit), and a sell-off that bounces is still a fall.
-func TestDirectionUsesSpotAtStraddleLowNotAtArming(t *testing.T) {
+// Direction measures spot from the straddle low to the first pin. A later
+// reversal before the downward entry cross cannot change that direction.
+func TestDirectionUsesSpotAtStraddleLowAndFirstPin(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
-		spots     [3]float64 // straddle low, arming, VWAP cross
+		spots     [3]float64 // straddle low, upward pin, downward entry
 		direction string
 	}{
 		{"rally eases back before cross", [3]float64{23850, 23900, 23880}, CallCredit},
 		{"sell-off bounces before cross", [3]float64{23850, 23800, 23820}, PutCredit},
-		{"back to the low's spot is flat", [3]float64{23850, 23900, 23850}, ""},
+		{"first pin wins when spot returns to low", [3]float64{23850, 23900, 23850}, CallCredit},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			engine, clock, rows := newRuleTestEngine(t)
@@ -1104,18 +1124,14 @@ func TestDirectionUsesSpotAtStraddleLowNotAtArming(t *testing.T) {
 				}
 			}
 			view := engine.views["NIFTY"]
-			if tc.direction == "" {
-				if view.Signal != nil || !strings.Contains(view.Note, "flat since the straddle low") {
-					t.Fatalf("flat move produced a signal: %+v", view)
-				}
-			} else if view.Signal == nil || view.Signal.Direction != tc.direction {
+			if view.Signal == nil || view.Signal.Direction != tc.direction {
 				t.Fatalf("direction=%+v, want %s", view.Signal, tc.direction)
 			}
 		})
 	}
 }
 
-func TestSpotHistoryBaselineIsAtOrBeforeArmingAndPruned(t *testing.T) {
+func TestSpotHistoryBaselineIsAtOrBeforeReferenceAndPinnedBaselineSurvivesPruning(t *testing.T) {
 	const now = int64(10_000_000)
 	h := spotHistory{}
 	h.add(spotSample{T: now - spotHistoryMs - 1, Price: 90})
@@ -1133,8 +1149,8 @@ func TestSpotHistoryBaselineIsAtOrBeforeArmingAndPruned(t *testing.T) {
 	clock.ms.Add(1000)
 	engine.OnTicks(entryTestTicks(rows, engine.namespace, 1))
 	state := engine.armed["NIFTY"]
-	if state == nil || state.Baseline.Price != 23850 || state.Baseline.T > state.ArmedAt {
-		t.Fatalf("baseline was not pinned at arming: %+v", state)
+	if state == nil || state.Baseline.Price != 23850 || state.Baseline.T > state.Reference.T {
+		t.Fatalf("baseline was not captured from the low at the pin: %+v", state)
 	}
 	history := engine.spots["NIFTY"]
 	history.add(spotSample{T: state.ArmedAt + spotHistoryMs + 1, Price: 24000})
@@ -1143,33 +1159,48 @@ func TestSpotHistoryBaselineIsAtOrBeforeArmingAndPruned(t *testing.T) {
 	}
 }
 
-func TestResetsDisarmAndClearSpotHistory(t *testing.T) {
+func TestContinuityResetsPreserveDayLatchButClearSpotAndPrevious(t *testing.T) {
 	for _, reset := range []string{"disconnect", "invalidate", "runtime ready", "day"} {
-		t.Run(reset, func(t *testing.T) {
-			engine, clock, rows := newRuleTestEngine(t)
-			engine.OnTicks(entryTestTicks(rows, engine.namespace, 0))
-			clock.ms.Add(1000)
-			engine.OnTicks(entryTestTicks(rows, engine.namespace, 1))
-			if len(engine.armed) != 2 {
-				t.Fatal("both independent symbols should be armed")
-			}
-			switch reset {
-			case "disconnect":
-				engine.OnConnection(false)
-			case "invalidate":
-				engine.Invalidate()
-			case "runtime ready":
-				engine.OnRuntimeReady()
-			case "day":
-				clock.ms.Add(24 * 60 * 60_000)
-				if err := engine.reconcile(context.Background()); err != nil {
-					t.Fatal(err)
+		for _, pinned := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/pinned_%v", reset, pinned), func(t *testing.T) {
+				engine, clock, rows := newRuleTestEngine(t)
+				engine.OnTicks(entryTestTicks(rows, engine.namespace, 0))
+				clock.ms.Add(1000)
+				engine.OnTicks(entryTestTicks(rows, engine.namespace, 1))
+				if len(engine.armed) != 2 {
+					t.Fatal("both independent symbols should be qualified")
 				}
-			}
-			if len(engine.armed) != 0 || len(engine.spots) != 0 || len(engine.previous) != 0 {
-				t.Fatal("reset retained arms, spot, or crossover continuity")
-			}
-		})
+				if !pinned {
+					for _, state := range engine.armed {
+						state.PinnedAt, state.Direction, state.Baseline = 0, "", spotSample{}
+					}
+				}
+				original := *engine.armed["NIFTY"]
+				switch reset {
+				case "disconnect":
+					engine.OnConnection(false)
+				case "invalidate":
+					engine.Invalidate()
+				case "runtime ready":
+					engine.OnRuntimeReady()
+				case "day":
+					clock.ms.Add(24 * 60 * 60_000)
+					if err := engine.reconcile(context.Background()); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if len(engine.spots) != 0 || len(engine.previous) != 0 {
+					t.Fatal("continuity reset retained spot history or crossover samples")
+				}
+				if reset == "day" {
+					if len(engine.armed) != 0 {
+						t.Fatal("day reset retained qualification/pin")
+					}
+				} else if state := engine.armed["NIFTY"]; state == nil || *state != original {
+					t.Fatal("same-day continuity reset expired qualification/pin")
+				}
+			})
+		}
 	}
 }
 
@@ -1230,5 +1261,285 @@ func TestCreditSpreadEntryStillRequiresNetCreditAndExecutableDepth(t *testing.T)
 				}
 			})
 		}
+	}
+}
+
+func TestUnchangedFiveMinuteReconcilePreservesPinSpotAndNote(t *testing.T) {
+	engine, clock, rows := newRuleTestEngine(t)
+	engine.OnTicks(entryTestTicks(rows, engine.namespace, 0))
+	clock.ms.Add(1000)
+	engine.OnTicks(entryTestTicks(rows, engine.namespace, 1))
+	state := engine.armed["NIFTY"]
+	if state == nil || !strings.HasPrefix(engine.views["NIFTY"].Note, "Direction pinned SHORT") {
+		t.Fatal("fixture did not arm")
+	}
+	original := *state
+	clock.ms.Add(5 * 60_000)
+	engine.OnTicks(entryTestTicks(rows, engine.namespace, 1))
+	history := append(spotHistory{}, engine.spots["NIFTY"]...)
+	previous, note := engine.previous["NIFTY"], engine.views["NIFTY"].Note
+	if err := engine.reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if engine.armed["NIFTY"] != state || *state != original || !reflect.DeepEqual(engine.spots["NIFTY"], history) || engine.previous["NIFTY"] != previous {
+		t.Fatal("unchanged refresh reset arm, baseline, spot history or crossover continuity")
+	}
+	if engine.views["NIFTY"].Note != note || engine.Snapshot().Indexes[0].Note != note {
+		t.Fatalf("refresh published a false disarm: %q", engine.views["NIFTY"].Note)
+	}
+	// A fresh update after the refresh preserves the pin; the next entry cross
+	// uses its stored direction and reference, independent of instrument refresh.
+	engine.OnTicks(entryTestTicks(rows, engine.namespace, 1))
+	if engine.armed["NIFTY"] != state || *state != original || engine.Snapshot().Indexes[0].Note != note {
+		t.Fatal("first post-refresh tick changed the latch or its note")
+	}
+	clock.ms.Add(1000)
+	engine.OnTicks(entryTestTicks(rows, engine.namespace, 2))
+	if engine.armed["NIFTY"] != nil || engine.views["NIFTY"].Signal == nil || engine.views["NIFTY"].Signal.Direction != CallCredit {
+		t.Fatal("refresh prevented the subsequent cross from consuming the original arm")
+	}
+}
+
+func TestNoChartBarAllowsQualificationButFailsClosedForPinAndEntry(t *testing.T) {
+	for _, alreadyQualified := range []bool{false, true} {
+		engine, clock, rows := newRuleTestEngine(t)
+		engine.bars["NIFTY"] = map[int64]Bar{}
+		var state *armedState
+		if alreadyQualified {
+			state = &armedState{ArmedAt: clock.ms.Load(), Reference: Sample{T: clock.ms.Load() - 1000, Premium: 100}}
+			engine.armed["NIFTY"] = state
+		}
+		for stage := 0; stage <= 2; stage++ {
+			clock.ms.Add(1000)
+			engine.OnTicks(entryTestTicks(rows, engine.namespace, stage))
+		}
+		view := engine.Snapshot().Indexes[0]
+		next := engine.armed["NIFTY"]
+		if next == nil || next.PinnedAt != 0 || (state != nil && next != state) || view.Signal != nil || view.ChartVWAP != nil || !strings.Contains(view.Note, "Waiting for first completed chart bar") {
+			t.Fatalf("missing chart bar prevented qualification, pinned, triggered or lost a latch: %+v, %+v", next, view)
+		}
+		if view.Current == nil || view.Current.VWAP != 105 {
+			t.Fatal("missing chart VWAP changed the displayed signal VWAP")
+		}
+	}
+}
+
+func TestChartVWAPAccessorUsesLatestCompletedStampAndSnapshotOmitsUnavailable(t *testing.T) {
+	engine, clock := newChartTestEngine(t)
+	now := clock.ms.Load()
+	engine.chartVWAP["NIFTY"] = &chartVWAPAccumulator{weighted: 9990, total: 10}
+	engine.bars["NIFTY"][now-60_000] = Bar{Day: engine.day, Sample: Sample{T: now - 60_000, VWAP: 100}}
+	engine.bars["NIFTY"][now] = Bar{Day: engine.day, Sample: Sample{T: now, VWAP: 105}}
+	engine.bars["NIFTY"][now+60_000] = Bar{Day: engine.day, Sample: Sample{T: now + 60_000, VWAP: 110}}
+	engine.bars["NIFTY"][now-1] = Bar{Day: "2026-11-03", Sample: Sample{T: now - 1, VWAP: 999}}
+	if engine.chartVWAPAtLocked("NIFTY", now-1) != 100 || engine.chartVWAPAtLocked("NIFTY", now) != 105 || engine.chartVWAPAtLocked("NIFTY", now-60_001) != 0 {
+		t.Fatal("chart line used a future/wrong-day bar, accumulator or wrong timestamp")
+	}
+	view := engine.Snapshot().Indexes[0]
+	if view.ChartVWAP == nil || *view.ChartVWAP != 105 {
+		t.Fatalf("snapshot did not expose the stamped chart line: %+v", view)
+	}
+	raw, err := json.Marshal(view)
+	if err != nil || !strings.Contains(string(raw), `"chart_vwap":105`) {
+		t.Fatalf("wrong chart VWAP JSON: %s, %v", raw, err)
+	}
+	for _, invalid := range []float64{0, math.NaN(), math.Inf(1)} {
+		engine.bars["NIFTY"][now] = Bar{Day: engine.day, Sample: Sample{T: now, VWAP: invalid}}
+		view = engine.Snapshot().Indexes[0]
+		raw, err = json.Marshal(view)
+		if err != nil || view.ChartVWAP != nil || strings.Contains(string(raw), `"chart_vwap"`) || engine.chartVWAPAtLocked("NIFTY", now) != 0 {
+			t.Fatalf("invalid latest stamp reused an older line or leaked into JSON: %s, %v", raw, err)
+		}
+	}
+}
+
+func TestTriggerUsesEachSamplesChartLineAcrossMinuteStep(t *testing.T) {
+	engine, clock, rows := newRuleTestEngine(t)
+	clock.ms.Add(59_000)
+	now := clock.ms.Load()
+	engine.bars["NIFTY"][now-59_000] = Bar{Day: engine.day, Sample: Sample{T: now - 59_000, VWAP: 106}}
+	engine.chartVWAP["NIFTY"] = &chartVWAPAccumulator{weighted: 1040, total: 10, marks: map[int64]float64{}}
+	engine.OnTicks(entryTestTicks(rows, engine.namespace, 2)) // 104 is outside the old 106 touch band.
+	state := &armedState{ArmedAt: now - 1000, Reference: Sample{T: now, Premium: 100}, Baseline: spotSample{T: now, Price: 23850}, PinnedAt: now - 1000, Direction: CallCredit}
+	engine.armed["NIFTY"] = state
+	clock.ms.Add(1000)
+	ticks := entryTestTicks(rows, engine.namespace, 2)
+	for i, row := range rows {
+		if row.Name == "NIFTY" && row.Strike == 23850 && row.InstrumentType == "PE" {
+			ticks[i].LastPrice = 43 // 103, below the new completed chart line of 104.
+		}
+	}
+	engine.OnTicks(ticks)
+	if engine.chartVWAPAtLocked("NIFTY", clock.ms.Load()) != 104 || engine.armed["NIFTY"] != state || engine.views["NIFTY"].Signal != nil {
+		t.Fatal("minute step retroactively applied the new chart line to the previous sample")
+	}
+	clock.ms.Add(1000)
+	engine.OnTicks(entryTestTicks(rows, engine.namespace, 2)) // Return to the new line (104).
+	clock.ms.Add(1000)
+	engine.OnTicks(ticks) // Then fall to 103.
+	if engine.armed["NIFTY"] != nil || engine.views["NIFTY"].Signal == nil || engine.views["NIFTY"].Signal.VWAP != 104 || engine.views["NIFTY"].Current.VWAP != 105 {
+		t.Fatal("chart cross failed or recorded the signal VWAP instead of the chart line")
+	}
+}
+
+func TestReconcileReloadsStampedChartVWAPWithoutAccumulator(t *testing.T) {
+	store := &Store{Pool: dbtest.New(t)}
+	ctx := context.Background()
+	clock := &fakeClock{}
+	clock.ms.Store(time.Date(2026, 11, 4, 10, 0, 0, 0, ist).UnixMilli())
+	at := clock.ms.Load() - 60_000
+	bar := Bar{Symbol: "NIFTY", Day: dayKey(at), Sample: Sample{T: at, Premium: 100, VWAP: 105}, Low: 100, LowAt: at, High: 100, HighAt: at}
+	if err := store.SaveBars(ctx, []Bar{bar}); err != nil {
+		t.Fatal(err)
+	}
+	namespace := brokers.Namespace{Broker: brokers.Dhan, Generation: 1}
+	rows := entryTestInstruments()
+	engine := New(Deps{Namespace: func() brokers.Namespace { return namespace }, Ready: func() bool { return true },
+		Instruments: func(context.Context) ([]market.Instrument, error) { return rows, nil }, Store: store, Now: clock.Now})
+	t.Cleanup(engine.cancel)
+	if engine.Snapshot().Indexes[0].ChartVWAP != nil {
+		t.Fatal("restart invented a chart line before reload")
+	}
+	if err := engine.reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	view := engine.Snapshot().Indexes[0]
+	if view.ChartVWAP == nil || *view.ChartVWAP != 105 || len(engine.chartVWAP) != 0 || !reflect.DeepEqual(engine.Series("NIFTY", 1), []Bar{bar}) {
+		t.Fatal("reload did not restore the persisted chart stamp independently of the accumulator")
+	}
+	engine.OnConnection(true)
+	engine.spots["NIFTY"] = spotHistory{{T: at, Price: 23850}}
+	engine.OnTicks(entryTestTicks(rows, namespace, 1))
+	if state := engine.armed["NIFTY"]; state == nil || state.Reference.T != at || engine.views["NIFTY"].Signal != nil {
+		t.Fatal("restored chart/reference did not allow fresh arming without replaying a trigger")
+	}
+}
+
+// Worked check from the supplied 19 November observations, with explicit
+// intermediate samples to make consecutive-sample pin/entry timing testable.
+// This is a deterministic fixture, not a replay of a complete historical feed.
+func TestNineteenNovemberSensexDirectionPin(t *testing.T) {
+	at := func(hour, minute, second int) int64 {
+		return time.Date(2026, 11, 19, hour, minute, second, 0, ist).UnixMilli()
+	}
+	for _, entrySpot := range []float64{82140, 82165} {
+		t.Run(fmt.Sprintf("spot_%.0f", entrySpot), func(t *testing.T) {
+			clock := &fakeClock{}
+			clock.ms.Store(at(9, 37, 0))
+			rows := entryTestInstruments()
+			for i := range rows {
+				if rows[i].InstrumentType == "INDEX" {
+					continue
+				}
+				rows[i].Expiry = "2026-11-23"
+				if rows[i].Name == "SENSEX" {
+					rows[i].Strike += 2100
+				}
+			}
+			namespace := brokers.Namespace{Broker: brokers.Dhan, Generation: 1}
+			engine := New(Deps{Namespace: func() brokers.Namespace { return namespace }, Ready: func() bool { return true },
+				Instruments: func(context.Context) ([]market.Instrument, error) { return rows, nil }, Now: clock.Now})
+			t.Cleanup(engine.cancel)
+			if err := engine.reconcile(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			engine.OnConnection(true)
+			// Use a persisted/completed chart stamp. The deliberately different
+			// Dhan average must never become the trigger line.
+			for _, symbol := range Symbols {
+				line := 410.4
+				if symbol == "NIFTY" {
+					line = 183
+				}
+				engine.bars[symbol][at(9, 37, 0)] = Bar{Symbol: symbol, Day: engine.day, Sample: Sample{T: at(9, 37, 0), VWAP: line}}
+				engine.chartVWAP[symbol] = &chartVWAPAccumulator{weighted: line * 10, total: 10, marks: map[int64]float64{}}
+			}
+			tick := func(when int64, sensexPremium, spot, niftyPremium float64) {
+				clock.ms.Store(when)
+				ticks := []market.Tick{}
+				for _, row := range rows {
+					price := 1000.0
+					if row.InstrumentType == "INDEX" {
+						price = 23850
+						if row.Name == "SENSEX" {
+							price = spot
+						}
+					} else if row.Name == "SENSEX" {
+						if row.Strike == 82100 {
+							price = sensexPremium / 2
+						} else if row.InstrumentType == "CE" {
+							price = 180 - (row.Strike-82100)/10
+						}
+					} else if row.Strike == 23850 {
+						price = niftyPremium / 2
+					}
+					average, updated := 230.0, true
+					ticks = append(ticks, market.Tick{Token: row.InstrumentToken, LastPrice: price, AveragePrice: &average,
+						PriceUpdated: &updated, AverageUpdated: &updated, DepthUpdated: &updated, Namespace: &namespace,
+						Bid: price - .5, Ask: price + .5, Bids: []market.DepthLevel{{Price: price - .5, Qty: 1000}},
+						Asks: []market.DepthLevel{{Price: price + .5, Qty: 1000}}})
+				}
+				engine.OnTicks(ticks)
+			}
+			tick(at(9, 37, 51), 393.15, 81955, 180)
+			// An unqualified upward cross cannot pin. The next tick qualifies
+			// above the line without a new cross or touch.
+			tick(at(9, 38, 32), 412.50, 82000, 182)
+			tick(at(9, 38, 33), 422.05, 82005, 184)
+			qualified := engine.armed["SENSEX"]
+			if qualified == nil || qualified.ArmedAt != at(9, 38, 33) || qualified.PinnedAt != 0 || qualified.Reference.T != at(9, 37, 51) || math.Abs((422.05/393.15-1)*100-7.3508838866) > 1e-6 {
+				t.Fatalf("wrong +5%% qualification at 09:38:33: %+v", qualified)
+			}
+			qualifiedCopy := *qualified
+			tick(at(9, 52, 0), 421.55, 82165, 182)
+			tick(at(9, 53, 34), 413.0, 82165, 184)
+			tick(at(9, 53, 35), 410.45, 82165, 183.5)
+			pinned := engine.armed["SENSEX"]
+			if pinned == nil || pinned.Direction != CallCredit || pinned.PinnedAt != at(9, 53, 35) || pinned.Baseline.Price != 81955 || engine.views["SENSEX"].Signal != nil || !strings.Contains(engine.views["SENSEX"].Note, "Direction pinned SHORT") {
+				t.Fatalf("09:53:35 touch failed to pin SHORT without entry: %+v", pinned)
+			}
+			pinnedCopy := *pinned
+			tick(at(9, 53, 39), 412.50, 82165, 184)
+			tick(at(9, 53, 40), 408.90, entrySpot, 181)
+			view := engine.views["SENSEX"]
+			if view.Signal == nil || view.Signal.T != at(9, 53, 40) || view.Signal.Direction != CallCredit || math.Abs(view.Signal.VWAP-410.4) > 1e-9 || view.Signal.ReferenceAt != at(9, 37, 51) || view.Signal.MovePct >= MinimumMovePct || engine.armed["SENSEX"] != nil {
+				t.Fatalf("wrong worked-check entry time/direction/line: %+v", view)
+			}
+			// PostgreSQL is deliberately absent. Exercise the same ATM, hedge
+			// and executable-depth path synchronously using the emitted signal.
+			u := engine.universes["SENSEX"]
+			atm, ok := atmPair(u, entrySpot)
+			if !ok {
+				t.Fatal("worked-check chain has no spot ATM")
+			}
+			short, hedge, ok := creditSpreadLegs(u, atm, view.Signal.Direction)
+			if !ok || short.Strike != atm.CE.Strike || short.InstrumentType != "CE" || hedge.InstrumentType != "CE" || hedge.Strike-short.Strike != 400 {
+				t.Fatalf("wrong ATM-sold/fourth-higher-CE leg shape: %+v, %+v", short, hedge)
+			}
+			trade, err := engine.tradeAtCrossLocked("SENSEX", short, hedge, *view.Signal, at(9, 53, 40))
+			if err != nil || trade.OpenedAt != at(9, 53, 40) || trade.Direction != CallCredit || trade.Quantity != int(short.LotSize) || trade.Short.Token != atm.CE.InstrumentToken || trade.Hedge.Token != hedge.InstrumentToken {
+				t.Fatalf("worked-check one-lot paper fill failed: %+v, %v", trade, err)
+			}
+			if engine.armed["NIFTY"] != nil || engine.views["NIFTY"].Signal != nil || len(engine.candidates) != 0 {
+				t.Fatal("unqualified NIFTY chart crosses produced a false entry")
+			}
+			// Separate no-entry continuations prove BOTH a qualification and a
+			// pin survive 10:07:52; the actual sequence already entered at 09:53:40.
+			later := Sample{T: at(10, 7, 52), Premium: 414.20, VWAP: 460}
+			newLow := Sample{T: at(9, 53, 40), Premium: 408.90}
+			for _, original := range []armedState{qualifiedCopy, pinnedCopy} {
+				latched := original
+				next, trigger, _ := advanceArmed(&latched, Sample{}, later, []Sample{newLow}, 0, 410.4, nil)
+				if next == nil || next.ArmedAt != at(9, 38, 33) || next.PinnedAt != original.PinnedAt || next.Direction != original.Direction || trigger != nil {
+					t.Fatal("10:07:52 expired qualification or direction pin")
+				}
+				if original.PinnedAt == 0 && next.Reference != newLow {
+					t.Fatal("un-pinned reference stopped sliding after old low expired")
+				}
+				if original.PinnedAt != 0 && *next != original {
+					t.Fatal("pinned reference or baseline changed after expiry")
+				}
+			}
+		})
 	}
 }

@@ -9,7 +9,7 @@ import (
 	"github.com/Prakash2571/Cal_Spread_Backend/internal/market"
 )
 
-func TestArmUsesEarlierThirtyMinuteLow(t *testing.T) {
+func TestQualificationUsesEarlierThirtyMinuteLowWithoutChartVWAP(t *testing.T) {
 	now := time.Date(2026, 11, 4, 10, 20, 0, 0, ist).UnixMilli()
 	for _, tc := range []struct {
 		name    string
@@ -31,7 +31,7 @@ func TestArmUsesEarlierThirtyMinuteLow(t *testing.T) {
 			if tc.age > 1000 {
 				w.Add(Sample{T: now - 500, Premium: 103})
 			}
-			state, trigger := advanceArmed(nil, Sample{}, Sample{T: now, Premium: tc.premium}, w.References(now))
+			state, trigger, _ := advanceArmed(nil, Sample{}, Sample{T: now, Premium: tc.premium}, w.References(now), 0, 0, nil)
 			if (state != nil) != tc.want || trigger != nil {
 				t.Fatalf("state=%+v trigger=%+v, want armed=%v", state, trigger, tc.want)
 			}
@@ -42,45 +42,49 @@ func TestArmUsesEarlierThirtyMinuteLow(t *testing.T) {
 	}
 }
 
-func TestTriggerOnlyPriceDrivenDownwardCrossOrTouchWhileArmed(t *testing.T) {
+func TestPinnedEntryOnlyPriceDrivenDownwardChartCrossOrTouchAndFall(t *testing.T) {
 	const now = int64(10_000_000)
 	for _, tc := range []struct {
-		name     string
-		armed    bool
-		previous Sample
-		current  Sample
-		want     bool
+		name                               string
+		armed                              bool
+		previous                           Sample
+		current                            Sample
+		previousChartVWAP, currentChartVWAP float64
+		want                               bool
 	}{
-		{"downward inclusive previous VWAP", true, Sample{T: now - 1000, Premium: 105, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, true},
-		{"downward above previous VWAP", true, Sample{T: now - 1000, Premium: 106, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, true},
-		{"unarmed down cross", false, Sample{T: now - 1000, Premium: 105, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, false},
-		{"upward cross", true, Sample{T: now - 1000, Premium: 104, VWAP: 105}, Sample{T: now, Premium: 106, VWAP: 105}, false},
-		{"VWAP driven", true, Sample{T: now - 1000, Premium: 104, VWAP: 103}, Sample{T: now, Premium: 104, VWAP: 105}, false},
-		{"touch then fall", true, Sample{T: now - 1000, Premium: 104.5, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, true},
-		{"touch exactly one rupee below", true, Sample{T: now - 1000, Premium: 104, VWAP: 105}, Sample{T: now, Premium: 103, VWAP: 105}, true},
-		{"fall without touch at one rupee and one paisa below", true, Sample{T: now - 1000, Premium: 103.99, VWAP: 105}, Sample{T: now, Premium: 103, VWAP: 105}, false},
-		{"touch without fall at equal premium", true, Sample{T: now - 1000, Premium: 104.5, VWAP: 105}, Sample{T: now, Premium: 104.5, VWAP: 105}, false},
-		{"touch without fall at rising premium", true, Sample{T: now - 1000, Premium: 104.5, VWAP: 105}, Sample{T: now, Premium: 104.75, VWAP: 105}, false},
-		{"unarmed touch then fall", false, Sample{T: now - 1000, Premium: 104.5, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, false},
-		{"touch current equal VWAP", true, Sample{T: now - 1000, Premium: 104.5, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 104}, false},
-		{"touch sixty seconds inclusive", true, Sample{T: now - quoteAgeMs, Premium: 104.5, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, true},
-		{"touch sample gap", true, Sample{T: now - quoteAgeMs - 1, Premium: 104.5, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, false},
-		{"current equal VWAP", true, Sample{T: now - 1000, Premium: 106, VWAP: 105}, Sample{T: now, Premium: 105, VWAP: 105}, false},
-		{"sixty seconds inclusive", true, Sample{T: now - quoteAgeMs, Premium: 106, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, true},
-		{"sample gap", true, Sample{T: now - quoteAgeMs - 1, Premium: 106, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, false},
-		{"time reversed", true, Sample{T: now + 1, Premium: 106, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, false},
-		{"missing VWAP", true, Sample{T: now - 1, Premium: 106, VWAP: 0}, Sample{T: now, Premium: 104, VWAP: 105}, false},
-		{"nonfinite prior premium", true, Sample{T: now - 1, Premium: math.Inf(1), VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, false},
-		{"nonfinite prior VWAP", true, Sample{T: now - 1, Premium: 106, VWAP: math.Inf(1)}, Sample{T: now, Premium: 104, VWAP: 105}, false},
-		{"nonfinite current VWAP", true, Sample{T: now - 1, Premium: 106, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: math.NaN()}, false},
-		{"nonfinite current premium", true, Sample{T: now - 1, Premium: 106, VWAP: 105}, Sample{T: now, Premium: math.NaN(), VWAP: 105}, false},
+		{"downward inclusive previous VWAP", true, Sample{T: now - 1000, Premium: 105, VWAP: 200}, Sample{T: now, Premium: 104, VWAP: 200}, 105, 105, true},
+		{"downward above previous VWAP", true, Sample{T: now - 1000, Premium: 106, VWAP: 200}, Sample{T: now, Premium: 104, VWAP: 200}, 105, 105, true},
+		{"unarmed down cross", false, Sample{T: now - 1000, Premium: 105, VWAP: 200}, Sample{T: now, Premium: 104, VWAP: 200}, 105, 105, false},
+		{"upward cross", true, Sample{T: now - 1000, Premium: 104, VWAP: 200}, Sample{T: now, Premium: 106, VWAP: 200}, 105, 105, false},
+		{"VWAP driven", true, Sample{T: now - 1000, Premium: 104, VWAP: 200}, Sample{T: now, Premium: 104, VWAP: 200}, 103, 105, false},
+		{"touch then fall", true, Sample{T: now - 1000, Premium: 104.5, VWAP: 200}, Sample{T: now, Premium: 104, VWAP: 200}, 105, 105, true},
+		{"touch exactly one rupee below", true, Sample{T: now - 1000, Premium: 104, VWAP: 200}, Sample{T: now, Premium: 103, VWAP: 200}, 105, 105, true},
+		{"fall without touch at one rupee and one paisa below", true, Sample{T: now - 1000, Premium: 103.99, VWAP: 200}, Sample{T: now, Premium: 103, VWAP: 200}, 105, 105, false},
+		{"touch without fall at equal premium", true, Sample{T: now - 1000, Premium: 104.5, VWAP: 200}, Sample{T: now, Premium: 104.5, VWAP: 200}, 105, 105, false},
+		{"touch without fall at rising premium", true, Sample{T: now - 1000, Premium: 104.5, VWAP: 200}, Sample{T: now, Premium: 104.75, VWAP: 200}, 105, 105, false},
+		{"unarmed touch then fall", false, Sample{T: now - 1000, Premium: 104.5, VWAP: 200}, Sample{T: now, Premium: 104, VWAP: 200}, 105, 105, false},
+		{"touch current equal VWAP", true, Sample{T: now - 1000, Premium: 104.5, VWAP: 200}, Sample{T: now, Premium: 104, VWAP: 200}, 105, 104, false},
+		{"touch sixty seconds inclusive", true, Sample{T: now - quoteAgeMs, Premium: 104.5, VWAP: 200}, Sample{T: now, Premium: 104, VWAP: 200}, 105, 105, true},
+		{"touch sample gap", true, Sample{T: now - quoteAgeMs - 1, Premium: 104.5, VWAP: 200}, Sample{T: now, Premium: 104, VWAP: 200}, 105, 105, false},
+		{"current equal VWAP", true, Sample{T: now - 1000, Premium: 106, VWAP: 200}, Sample{T: now, Premium: 105, VWAP: 200}, 105, 105, false},
+		{"sixty seconds inclusive", true, Sample{T: now - quoteAgeMs, Premium: 106, VWAP: 200}, Sample{T: now, Premium: 104, VWAP: 200}, 105, 105, true},
+		{"sample gap", true, Sample{T: now - quoteAgeMs - 1, Premium: 106, VWAP: 200}, Sample{T: now, Premium: 104, VWAP: 200}, 105, 105, false},
+		{"time reversed", true, Sample{T: now + 1, Premium: 106, VWAP: 200}, Sample{T: now, Premium: 104, VWAP: 200}, 105, 105, false},
+		{"missing VWAP", true, Sample{T: now - 1, Premium: 106, VWAP: 200}, Sample{T: now, Premium: 104, VWAP: 200}, 0, 105, false},
+		{"nonfinite prior premium", true, Sample{T: now - 1, Premium: math.Inf(1), VWAP: 200}, Sample{T: now, Premium: 104, VWAP: 200}, 105, 105, false},
+		{"nonfinite prior VWAP", true, Sample{T: now - 1, Premium: 106, VWAP: 200}, Sample{T: now, Premium: 104, VWAP: 200}, math.Inf(1), 105, false},
+		{"nonfinite current VWAP", true, Sample{T: now - 1, Premium: 106, VWAP: 200}, Sample{T: now, Premium: 104, VWAP: 200}, 105, math.NaN(), false},
+		{"nonfinite current premium", true, Sample{T: now - 1, Premium: 106, VWAP: 200}, Sample{T: now, Premium: math.NaN(), VWAP: 200}, 105, 105, false},
+		{"signal cross only", true, Sample{T: now - 1000, Premium: 106, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, 100, 100, false},
+		{"chart cross only", true, Sample{T: now - 1000, Premium: 106, VWAP: 150}, Sample{T: now, Premium: 104, VWAP: 150}, 105, 105, true},
+		{"missing current chart VWAP", true, Sample{T: now - 1000, Premium: 106, VWAP: 105}, Sample{T: now, Premium: 104, VWAP: 105}, 105, 0, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var state *armedState
 			if tc.armed {
-				state = &armedState{ArmedAt: now - 2000, Reference: Sample{T: now - 3000, Premium: 100}}
+				state = &armedState{ArmedAt: now - 2000, Reference: Sample{T: now - 3000, Premium: 100}, PinnedAt: now - 2000, Direction: CallCredit}
 			}
-			next, trigger := advanceArmed(state, tc.previous, tc.current, nil)
+			next, trigger, _ := advanceArmed(state, tc.previous, tc.current, nil, tc.previousChartVWAP, tc.currentChartVWAP, nil)
 			if (trigger != nil) != tc.want || (tc.want && next != nil) {
 				t.Fatalf("next=%+v trigger=%+v, want trigger=%v", next, trigger, tc.want)
 			}
@@ -88,63 +92,145 @@ func TestTriggerOnlyPriceDrivenDownwardCrossOrTouchWhileArmed(t *testing.T) {
 	}
 }
 
-func TestArmingSampleCannotTriggerTouchThenFall(t *testing.T) {
+func TestQualificationBelowChartAndSlidingReferenceAtPin(t *testing.T) {
 	const now = int64(10_000_000)
-	low := Sample{T: now - 2000, Premium: 100}
-	previous := Sample{T: now - 1000, Premium: 106.5, VWAP: 107}
-	current := Sample{T: now, Premium: 106, VWAP: 107}
-	if !downwardVWAPCross(previous, current) {
-		t.Fatal("fixture must qualify for the touch trigger")
+	low := Sample{T: now - 1000, Premium: 100}
+	state, trigger, _ := advanceArmed(nil, Sample{}, Sample{T: now, Premium: 106}, []Sample{low}, 0, 110, nil)
+	if state == nil || state.PinnedAt != 0 || trigger != nil {
+		t.Fatal("+5% below chart VWAP must qualify without pinning")
 	}
-	state, trigger := advanceArmed(nil, previous, current, []Sample{low})
-	if state == nil || state.ArmedAt != now || state.Reference != low || trigger != nil {
-		t.Fatalf("arming sample triggered or failed to arm: state=%+v trigger=%+v", state, trigger)
-	}
-	next, trigger := advanceArmed(state, current, Sample{T: now + 1000, Premium: 105.5, VWAP: 107}, []Sample{low})
-	if next != nil || trigger != state {
-		t.Fatalf("subsequent touch did not consume the original arm: next=%+v trigger=%+v", next, trigger)
+	// The original low ages out. Qualification stays; the current rolling low
+	// supplies the baseline at pin even though +5% no longer holds.
+	later := low.T + WindowMs + 1
+	newLow := Sample{T: later - 1000, Premium: 105}
+	history := spotHistory{{T: newLow.T, Price: 23800}, {T: later, Price: 23810}}
+	state, trigger, _ = advanceArmed(state, Sample{T: later - 1000, Premium: 108}, Sample{T: later, Premium: 109.5}, []Sample{newLow}, 110, 110, history)
+	if state == nil || state.ArmedAt != now || state.Reference != newLow || state.Baseline.Price != 23800 || state.Direction != CallCredit || state.PinnedAt != later || trigger != nil {
+		t.Fatalf("pin failed to use the sliding low without requalification: %+v, %+v", state, trigger)
 	}
 }
 
-func TestArmedPersistenceExpiryAndRearm(t *testing.T) {
+func TestPinOnUpwardCrossOrSymmetricTouch(t *testing.T) {
 	const now = int64(10_000_000)
-	low := Sample{T: now - 1000, Premium: 100}
-	state, _ := advanceArmed(nil, Sample{}, Sample{T: now, Premium: 106, VWAP: 105}, []Sample{low})
-	// Falling below +5% without crossing does not disarm before the low expires.
-	state, trigger := advanceArmed(state, Sample{T: now, Premium: 106, VWAP: 100}, Sample{T: now + 1000, Premium: 104, VWAP: 100}, []Sample{low})
-	if state == nil || state.ArmedAt != now || trigger != nil {
-		t.Fatal("pullback prematurely consumed the arm")
+	for _, tc := range []struct {
+		name              string
+		previous, current float64
+		gap               int64
+		want              bool
+	}{
+		{"upward cross outside band", 102, 108, 1000, true},
+		{"touch from below", 102, 104.5, 1000, true},
+		{"touch from above", 108, 105.5, 1000, true},
+		{"touch upper edge", 108, 106, 1000, true},
+		{"touch lower edge while rising", 102, 104, 1000, true},
+		{"above without crossing or touching", 108, 107, 1000, false},
+		{"below without crossing or touching", 102, 103.99, 1000, false},
+		{"upward cross sixty seconds", 102, 108, quoteAgeMs, true},
+		{"upward cross sample gap", 102, 108, quoteAgeMs + 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := &armedState{ArmedAt: now - 2000, Reference: Sample{T: now - 3000, Premium: 100}}
+			history := spotHistory{{T: now - 3000, Price: 100}, {T: now, Price: 101}}
+			next, trigger, _ := advanceArmed(state, Sample{T: now - tc.gap, Premium: tc.previous, VWAP: 999}, Sample{T: now, Premium: tc.current, VWAP: 999}, nil, 105, 105, history)
+			if next == nil || trigger != nil || (next.PinnedAt == now) != tc.want || (tc.want && next.Direction != CallCredit) {
+				t.Fatalf("wrong upward/touch pin: next=%+v trigger=%+v", next, trigger)
+			}
+		})
 	}
-	state, trigger = advanceArmed(state, Sample{T: now + 1000, Premium: 104, VWAP: 100}, Sample{T: now + 2000, Premium: 103, VWAP: 104}, []Sample{low})
-	if state != nil || trigger == nil {
-		t.Fatal("first downward cross did not consume arm")
+}
+
+func TestFirstPinWinsAndEntryDoesNotRecheckFivePercent(t *testing.T) {
+	const now = int64(10_000_000)
+	low := Sample{T: now - 2000, Premium: 100}
+	history := spotHistory{{T: low.T, Price: 100}, {T: now, Price: 101}}
+	state, trigger, _ := advanceArmed(nil, Sample{T: now - 1000, Premium: 102}, Sample{T: now, Premium: 108}, []Sample{low}, 105, 105, history)
+	if state == nil || state.PinnedAt != now || trigger != nil {
+		t.Fatal("qualifying upward cross did not pin")
 	}
-	state, trigger = advanceArmed(state, Sample{}, Sample{T: now + 3000, Premium: 106}, []Sample{low})
-	if state == nil || trigger != nil || state.ArmedAt != now+3000 {
-		t.Fatal("fresh +5% could not re-arm")
+	original := *state
+	// A later touch would imply LONG, but the original SHORT must win.
+	history.add(spotSample{T: now + 1000, Price: 99})
+	state, trigger, _ = advanceArmed(state, Sample{T: now, Premium: 108}, Sample{T: now + 1000, Premium: 105.5}, []Sample{{T: now, Premium: 90}}, 105, 105, history)
+	if state == nil || *state != original || trigger != nil {
+		t.Fatal("later touch changed the first pin or its reference")
 	}
-	expired := low.T + WindowMs + 1
-	state, trigger = advanceArmed(state, Sample{}, Sample{T: expired, Premium: 104}, []Sample{{T: expired - 1000, Premium: 103}})
-	if state != nil || trigger != nil {
-		t.Fatal("expired +5% reference retained arm")
+	// Qualification and pin survive the old low's expiry, then enter below +5%.
+	later := low.T + WindowMs + 1
+	state, trigger, _ = advanceArmed(state, Sample{}, Sample{T: later, Premium: 105.5}, nil, 0, 105, nil)
+	if state == nil || *state != original || trigger != nil {
+		t.Fatal("window age expired the qualification/pin")
 	}
-	state, _ = advanceArmed(nil, Sample{}, Sample{T: expired + 1000, Premium: 109}, []Sample{{T: expired, Premium: 103}})
-	if state == nil {
-		t.Fatal("could not re-arm after reference expiry")
+	next, trigger, _ := advanceArmed(state, Sample{T: later, Premium: 105.5}, Sample{T: later + 1000, Premium: 103}, nil, 105, 105, nil)
+	if next != nil || trigger == nil || *trigger != original || trigger.Direction != CallCredit {
+		t.Fatal("entry rechecked +5%, spot direction, reference age or pin")
 	}
-	// Another valid low keeps an old arm alive, preserving its spot baseline.
-	state.Baseline = spotSample{T: state.ArmedAt, Price: 23850}
-	armedAt := state.ArmedAt
-	later := expired + WindowMs + 1
-	state, _ = advanceArmed(state, Sample{}, Sample{T: later, Premium: 116}, []Sample{{T: later - 1000, Premium: 110}})
-	if state == nil || state.ArmedAt != armedAt || state.Reference.Premium != 110 || state.Baseline.Price != 23850 {
-		t.Fatal("reference renewal changed the arm time or spot baseline")
+	// Consumption allows a fresh qualification later in the same day.
+	next, trigger, _ = advanceArmed(next, Sample{}, Sample{T: later + 3000, Premium: 106}, []Sample{{T: later + 2000, Premium: 100}}, 0, 110, nil)
+	if next == nil || next.ArmedAt != later+3000 || trigger != nil {
+		t.Fatal("consumed qualification could not rearm")
+	}
+}
+
+func TestPinAndEntryCanCoincideOnFirstDownwardCross(t *testing.T) {
+	const now = int64(10_000_000)
+	for _, newlyQualified := range []bool{false, true} {
+		var state *armedState
+		low := Sample{T: now - 3000, Premium: 95}
+		if !newlyQualified {
+			state = &armedState{ArmedAt: now - 2000, Reference: low}
+		}
+		history := spotHistory{{T: low.T, Price: 100}, {T: now, Price: 99}}
+		next, trigger, _ := advanceArmed(state, Sample{T: now - 1000, Premium: 108}, Sample{T: now, Premium: 103}, []Sample{low}, 105, 105, history)
+		if next != nil || trigger == nil || trigger.PinnedAt != now || trigger.Direction != PutCredit || trigger.Reference != low {
+			t.Fatalf("downward cross did not pin LONG and enter together: %+v, %+v", next, trigger)
+		}
+	}
+}
+
+func TestFlatOrStaleSpotConsumesFirstPinWithoutEntry(t *testing.T) {
+	const now = int64(10_000_000)
+	low := Sample{T: now - 120_000, Premium: 100}
+	for _, tc := range []struct {
+		name    string
+		history spotHistory
+	}{
+		{"flat", spotHistory{{T: low.T, Price: 100}, {T: now, Price: 100}}},
+		{"missing", nil},
+		{"stale current", spotHistory{{T: low.T, Price: 100}, {T: now - quoteAgeMs - 1, Price: 101}}},
+		{"stale baseline", spotHistory{{T: low.T - spotBaselineAgeMs - 1, Price: 100}, {T: now, Price: 101}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := &armedState{ArmedAt: now - 1000, Reference: low}
+			next, trigger, note := advanceArmed(state, Sample{T: now - 1000, Premium: 102}, Sample{T: now, Premium: 105.5}, []Sample{low}, 105, 105, tc.history)
+			if next != nil || trigger != nil || !strings.Contains(note, "pin consumed") {
+				t.Fatalf("flat/stale spot retained pin or entered: %+v, %+v, %s", next, trigger, note)
+			}
+			// A later fall cannot use the consumed qualification; no new +5%.
+			next, trigger, _ = advanceArmed(next, Sample{T: now, Premium: 105.5}, Sample{T: now + 1000, Premium: 103}, []Sample{low}, 105, 105, spotHistory{{T: low.T, Price: 100}, {T: now + 1000, Price: 101}})
+			if next != nil || trigger != nil {
+				t.Fatal("consumed pin was reused on a later fall")
+			}
+		})
+	}
+}
+
+func TestQualificationAndPinEndWithDay(t *testing.T) {
+	now := time.Date(2026, 11, 19, 15, 30, 0, 0, ist).UnixMilli()
+	for _, pinned := range []bool{false, true} {
+		state := &armedState{ArmedAt: now, Reference: Sample{T: now - 1000, Premium: 100}}
+		if pinned {
+			state.PinnedAt, state.Direction = now, CallCredit
+		}
+		next, trigger, _ := advanceArmed(state, Sample{}, Sample{T: now + 24*60*60_000, Premium: 110}, nil, 0, 105, nil)
+		if next != nil || trigger != nil {
+			t.Fatal("qualification/pin leaked into the next day")
+		}
 	}
 }
 
 func TestAttributeUnderlyingDirectionAndFreshness(t *testing.T) {
-	const armedAt = int64(10_000_000)
-	const triggerAt = armedAt + 10_000
+	const referenceAt = int64(10_000_000)
+	const pinAt = referenceAt + 10_000
 	for _, tc := range []struct {
 		name      string
 		baseline  spotSample
@@ -152,21 +238,21 @@ func TestAttributeUnderlyingDirectionAndFreshness(t *testing.T) {
 		direction string
 		note      string
 	}{
-		{"up", spotSample{armedAt, 100}, spotSample{triggerAt, 101}, CallCredit, ""},
-		{"down", spotSample{armedAt, 100}, spotSample{triggerAt, 99}, PutCredit, ""},
-		{"flat", spotSample{armedAt, 100}, spotSample{triggerAt, 100}, "", "flat"},
-		{"missing baseline", spotSample{}, spotSample{triggerAt, 101}, "", "unavailable"},
-		{"missing current", spotSample{armedAt, 100}, spotSample{}, "", "unavailable"},
-		{"stale baseline", spotSample{armedAt - spotBaselineAgeMs - 1, 100}, spotSample{triggerAt, 101}, "", "unavailable"},
-		{"stale current", spotSample{armedAt, 100}, spotSample{triggerAt - quoteAgeMs - 1, 101}, "", "unavailable"},
-		{"inclusive ages", spotSample{armedAt - spotBaselineAgeMs, 100}, spotSample{triggerAt - quoteAgeMs, 101}, CallCredit, ""},
-		{"baseline after arm", spotSample{armedAt + 1, 100}, spotSample{triggerAt, 101}, "", "unavailable"},
-		{"future current", spotSample{armedAt, 100}, spotSample{triggerAt + 1, 101}, "", "unavailable"},
-		{"invalid baseline", spotSample{armedAt, math.NaN()}, spotSample{triggerAt, 101}, "", "unavailable"},
-		{"invalid current", spotSample{armedAt, 100}, spotSample{triggerAt, math.Inf(1)}, "", "unavailable"},
+		{"up", spotSample{referenceAt, 100}, spotSample{pinAt, 101}, CallCredit, ""},
+		{"down", spotSample{referenceAt, 100}, spotSample{pinAt, 99}, PutCredit, ""},
+		{"flat", spotSample{referenceAt, 100}, spotSample{pinAt, 100}, "", "flat"},
+		{"missing baseline", spotSample{}, spotSample{pinAt, 101}, "", "unavailable"},
+		{"missing current", spotSample{referenceAt, 100}, spotSample{}, "", "unavailable"},
+		{"stale baseline", spotSample{referenceAt - spotBaselineAgeMs - 1, 100}, spotSample{pinAt, 101}, "", "unavailable"},
+		{"stale current", spotSample{referenceAt, 100}, spotSample{pinAt - quoteAgeMs - 1, 101}, "", "unavailable"},
+		{"inclusive ages", spotSample{referenceAt - spotBaselineAgeMs, 100}, spotSample{pinAt - quoteAgeMs, 101}, CallCredit, ""},
+		{"baseline after low", spotSample{referenceAt + 1, 100}, spotSample{pinAt, 101}, "", "unavailable"},
+		{"future current", spotSample{referenceAt, 100}, spotSample{pinAt + 1, 101}, "", "unavailable"},
+		{"invalid baseline", spotSample{referenceAt, math.NaN()}, spotSample{pinAt, 101}, "", "unavailable"},
+		{"invalid current", spotSample{referenceAt, 100}, spotSample{pinAt, math.Inf(1)}, "", "unavailable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			direction, note := attributeUnderlyingDirection(tc.baseline, tc.current, armedAt, triggerAt)
+			direction, note := attributeUnderlyingDirection(tc.baseline, tc.current, referenceAt, pinAt)
 			if direction != tc.direction || !strings.Contains(note, tc.note) {
 				t.Fatalf("direction=%s note=%s, want %s/%s", direction, note, tc.direction, tc.note)
 			}

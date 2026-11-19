@@ -167,8 +167,9 @@ func (e *Engine) run() {
 	}
 }
 
-func (e *Engine) resetArmedAndSpotLocked() {
-	e.armed = map[string]*armedState{}
+// Feed continuity resets discard quote/spot history, but day qualification and
+// an already measured direction pin remain latched until consumed or day load.
+func (e *Engine) resetSpotHistoryLocked() {
 	e.spots = map[string]spotHistory{}
 }
 
@@ -187,7 +188,7 @@ func sameSpotTokens(a, b map[int64]string) bool {
 func (e *Engine) OnRuntimeReady() {
 	e.mu.Lock()
 	e.quotes, e.previous = map[int64]quote{}, map[string]Sample{}
-	e.resetArmedAndSpotLocked()
+	e.resetSpotHistoryLocked()
 	e.updateMarksLocked(e.now())
 	e.mu.Unlock()
 	select {
@@ -233,6 +234,7 @@ func (e *Engine) reconcile(parent context.Context) error {
 		}
 		e.bars, e.windows, e.forming = map[string]map[int64]Bar{}, map[string]*priceWindow{}, map[string]Bar{}
 		e.chartVWAP = map[string]*chartVWAPAccumulator{}
+		e.armed = map[string]*armedState{}
 		for _, symbol := range Symbols {
 			e.bars[symbol] = map[int64]Bar{}
 			e.windows[symbol] = &priceWindow{}
@@ -266,14 +268,14 @@ func (e *Engine) reconcile(parent context.Context) error {
 			}
 		}
 		e.quotes, e.previous = map[int64]quote{}, map[string]Sample{}
-		e.resetArmedAndSpotLocked()
+		e.resetSpotHistoryLocked()
 		e.mu.Unlock()
 	}
 	if !e.dataReady() {
 		e.mu.Lock()
 		e.active, e.connected, e.namespace = false, false, namespace
 		e.quotes, e.previous, e.pending = map[int64]quote{}, map[string]Sample{}, map[string]string{}
-		e.resetArmedAndSpotLocked()
+		e.resetSpotHistoryLocked()
 		for _, symbol := range Symbols {
 			view := e.views[symbol]
 			view.Note = "Waiting for active Dhan session"
@@ -316,19 +318,23 @@ func (e *Engine) reconcile(parent context.Context) error {
 		e.mu.Unlock()
 		return fmt.Errorf("Spike full chains exceed the dedicated feed's %d-token limit", maxTokens)
 	}
+	continuityReset := load || e.namespace != namespace || !sameSpotTokens(e.spotTokens, spotTokens)
 	if e.namespace != namespace {
 		e.quotes, e.previous, e.pending = map[int64]quote{}, map[string]Sample{}, map[string]string{}
-		e.resetArmedAndSpotLocked()
+		e.resetSpotHistoryLocked()
 	}
 	if !sameSpotTokens(e.spotTokens, spotTokens) {
-		e.resetArmedAndSpotLocked()
+		e.resetSpotHistoryLocked()
 	}
 	e.spotTokens = spotTokens
 	e.namespace, e.active, e.universes, e.wanted, e.lastError = namespace, true, universes, wanted, ""
 	for _, symbol := range Symbols {
 		u, view := universes[symbol], e.views[symbol]
 		view.Expiry, view.Pairs = u.Expiry, len(u.Pairs)
-		view.Note = "Waiting for full WebSocket quotes"
+		// Preserve the evaluated note and qualification/pin on an unchanged refresh.
+		if continuityReset || view.Current == nil || e.previous[symbol].T == 0 {
+			view.Note = "Waiting for full WebSocket quotes"
+		}
 		if len(u.Pairs) > 0 {
 			view.LotSize = int(u.Pairs[0].CE.LotSize)
 		} else {
@@ -353,7 +359,7 @@ func (e *Engine) Invalidate() {
 	e.mu.Lock()
 	e.active, e.connected = false, false
 	e.quotes, e.previous, e.pending = map[int64]quote{}, map[string]Sample{}, map[string]string{}
-	e.resetArmedAndSpotLocked()
+	e.resetSpotHistoryLocked()
 	e.publishLocked()
 	e.mu.Unlock()
 	e.OnRuntimeReady()
@@ -364,7 +370,7 @@ func (e *Engine) OnConnection(connected bool) {
 	e.connected = connected
 	if !connected {
 		e.quotes, e.previous = map[int64]quote{}, map[string]Sample{}
-		e.resetArmedAndSpotLocked()
+		e.resetSpotHistoryLocked()
 		e.updateMarksLocked(e.now())
 	}
 	e.publishLocked()
@@ -461,10 +467,10 @@ func (e *Engine) evaluateLocked(symbol string, now int64) {
 		at := now
 		view.RecordingSince = &at
 	}
-	view.Note = "Monitoring for +5% arming"
-	if sample.VWAP <= 0 {
-		view.Note = "Waiting for both leg volume-weighted average prices"
-	}
+	chartVWAP := e.chartVWAPAtLocked(symbol, now)
+	previous := e.previous[symbol]
+	previousChartVWAP := e.chartVWAPAtLocked(symbol, previous.T)
+	view.Note = "Monitoring for +5% qualification"
 	window := e.windows[symbol]
 	if window == nil {
 		window = &priceWindow{}
@@ -478,32 +484,27 @@ func (e *Engine) evaluateLocked(symbol string, now int64) {
 		delete(e.armed, symbol)
 		view.Note = "Primary paper spread already open or pending"
 	} else {
-		prior := e.armed[symbol]
-		state, triggered := advanceArmed(prior, e.previous[symbol], sample, window.References(now))
-		// Pin spot at the straddle low that armed the index (re-pinned when the
-		// reference renews), so direction reflects what drove the premium up.
-		pin := func(s *armedState) {
-			if s != nil && (prior == nil || prior.Reference.T != s.Reference.T) {
-				s.Baseline = history.atOrBefore(s.Reference.T)
-			}
-		}
-		pin(state)
-		pin(triggered)
+		state, triggered, note := advanceArmed(e.armed[symbol], previous, sample, window.References(now), previousChartVWAP, chartVWAP, history)
+		view.Note = note
 		if state == nil {
 			delete(e.armed, symbol)
 		} else {
 			e.armed[symbol] = state
-			view.Note = "Armed after +5%; waiting for price-driven downward VWAP cross"
+		}
+		if chartVWAP <= 0 {
+			view.Note = "Waiting for first completed chart bar with valid VWAP"
 		}
 		if triggered != nil {
 			spotNow := history.atOrBefore(now)
-			direction, note := attributeUnderlyingDirection(triggered.Baseline, spotNow, triggered.Reference.T, now)
-			view.Note = note
-			if direction != "" {
-				signal := Signal{Direction: direction, T: now, Reference: triggered.Reference.Premium, ReferenceAt: triggered.Reference.T,
-					MovePct: (sample.Premium/triggered.Reference.Premium - 1) * 100, Premium: sample.Premium, VWAP: sample.VWAP}
+			// Direction is fixed at the first pin, but entry still needs fresh
+			// current spot to select its ATM contracts.
+			if spotNow.T <= 0 || spotNow.T > now || now-spotNow.T > quoteAgeMs || spotNow.Price <= 0 || !finite(spotNow.Price) {
+				view.Note = "Signal skipped: underlying spot was unavailable or stale"
+			} else {
+				signal := Signal{Direction: triggered.Direction, T: now, Reference: triggered.Reference.Premium, ReferenceAt: triggered.Reference.T,
+					MovePct: (sample.Premium/triggered.Reference.Premium - 1) * 100, Premium: sample.Premium, VWAP: chartVWAP}
 				view.Signal = &signal
-				view.Note = "Armed downward VWAP cross attributed to underlying move"
+				view.Note = note
 				if !e.paper {
 					view.Note = "Signal observed; paper entries paused"
 				} else if !e.dbEnabled() {
@@ -614,11 +615,27 @@ func (e *Engine) updateMarksLocked(now int64) {
 	}
 }
 
+// chartVWAPAtLocked uses the latest completed bar at this sample's time, including
+// bars restored by reconcile. Never fall back to an older valid stamp when the
+// latest bar has no VWAP, or to the non-persisted volume accumulator.
+func (e *Engine) chartVWAPAtLocked(symbol string, at int64) float64 {
+	var latest Bar
+	for _, bar := range e.bars[symbol] {
+		if bar.Day == e.day && bar.T <= at && bar.T > latest.T {
+			latest = bar
+		}
+	}
+	if latest.VWAP > 0 && finite(latest.VWAP) {
+		return latest.VWAP
+	}
+	return 0
+}
+
 func (e *Engine) completeBarsLocked(now int64, force bool) {
 	for symbol, bar := range e.forming {
 		if bar.T <= now || force {
-			// Stamp only the chart copy; current samples and crossover inputs retain
-			// their unrounded premium and Dhan average-price sum.
+			// Stamp only the chart copy; live samples retain their unrounded premium
+			// and Dhan average-price sum. Rules read the completed chart stamp.
 			bar.Premium = math.Round(bar.Premium*100) / 100
 			acc := e.chartVWAP[symbol]
 			if acc == nil {
