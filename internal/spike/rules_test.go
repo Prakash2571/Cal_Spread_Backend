@@ -96,61 +96,142 @@ func TestQualificationBelowChartAndSlidingReferenceAtPin(t *testing.T) {
 	const now = int64(10_000_000)
 	low := Sample{T: now - 1000, Premium: 100}
 	state, trigger, _ := advanceArmed(nil, Sample{}, Sample{T: now, Premium: 106}, []Sample{low}, 0, 110, nil)
-	if state == nil || state.PinnedAt != 0 || trigger != nil {
-		t.Fatal("+5% below chart VWAP must qualify without pinning")
+	if state == nil || state.PinnedAt != 0 || state.AboveSince != 0 || trigger != nil {
+		t.Fatal("+5% below chart VWAP must qualify without starting an above run")
 	}
 	// The original low ages out. Qualification stays; the current rolling low
 	// supplies the baseline at pin even though +5% no longer holds.
 	later := low.T + WindowMs + 1
 	newLow := Sample{T: later - 1000, Premium: 105}
-	history := spotHistory{{T: newLow.T, Price: 23800}, {T: later, Price: 23810}}
-	state, trigger, _ = advanceArmed(state, Sample{T: later - 1000, Premium: 108}, Sample{T: later, Premium: 109.5}, []Sample{newLow}, 110, 110, history)
-	if state == nil || state.ArmedAt != now || state.Reference != newLow || state.Baseline.Price != 23800 || state.Direction != CallCredit || state.PinnedAt != later || trigger != nil {
+	pinAt := later + DirectionPinMs
+	history := spotHistory{{T: newLow.T, Price: 23800}, {T: pinAt, Price: 23810}}
+	previous := Sample{}
+	for at := later; at <= pinAt; at += quoteAgeMs {
+		current := Sample{T: at, Premium: 110}
+		state, trigger, _ = advanceArmed(state, previous, current, []Sample{newLow}, 110, 110, history)
+		previous = current
+	}
+	if state == nil || state.ArmedAt != now || state.Reference != newLow || state.Baseline.Price != 23800 || state.Direction != CallCredit || state.PinnedAt != pinAt || trigger != nil {
 		t.Fatalf("pin failed to use the sliding low without requalification: %+v, %+v", state, trigger)
 	}
 }
 
-func TestPinOnUpwardCrossOrSymmetricTouch(t *testing.T) {
+func TestPinRequires120SecondsContinuouslyAtOrAboveChart(t *testing.T) {
+	const now = int64(10_000_000)
+	for _, direction := range []string{CallCredit, PutCredit} {
+		for _, premium := range []float64{105, 108} {
+			state := &armedState{ArmedAt: now, Reference: Sample{T: now - 1000, Premium: 100}}
+			spot := 101.0
+			if direction == PutCredit {
+				spot = 99
+			}
+			history := spotHistory{{T: now - 1000, Price: 100}, {T: now + DirectionPinMs, Price: spot}}
+			previous := Sample{}
+			for second := int64(0); second <= 120; second++ {
+				current := Sample{T: now + second*1000, Premium: premium, VWAP: 999}
+				next, trigger, note := advanceArmed(state, previous, current, nil, 105, 105, history)
+				if next == nil || trigger != nil || next.AboveSince != now || (next.PinnedAt != 0) != (second == 120) {
+					t.Fatalf("premium=%v second=%d: next=%+v trigger=%+v", premium, second, next, trigger)
+				}
+				if second == 120 && (next.Direction != direction || !strings.Contains(note, "after 2 min above chart VWAP")) {
+					t.Fatalf("wrong sustained-above pin direction/note: %+v, %s", next, note)
+				}
+				state, previous = next, current
+			}
+		}
+	}
+}
+
+func TestShortAboveRunsAndWhipsawsDoNotPin(t *testing.T) {
+	const now = int64(10_000_000)
+	// The morning's 86 s run and the interpolated-line 119 s run are too short.
+	for _, seconds := range []int64{2, 86, 119} {
+		state := &armedState{ArmedAt: now, Reference: Sample{T: now - 1000, Premium: 100}}
+		history := spotHistory{{T: now - 1000, Price: 100}, {T: now, Price: 101}}
+		previous := Sample{}
+		for second := int64(0); second <= seconds+1; second++ {
+			premium := 108.0
+			if second > seconds {
+				premium = 104.5 // Downward cross/touch must reset, never pin/enter.
+			}
+			current := Sample{T: now + second*1000, Premium: premium}
+			next, trigger, _ := advanceArmed(state, previous, current, nil, 105, 105, history)
+			if next == nil || next.PinnedAt != 0 || trigger != nil || (second > seconds && next.AboveSince != 0) {
+				t.Fatalf("%d s run pinned or entered at second %d: %+v, %+v", seconds, second, next, trigger)
+			}
+			state, previous = next, current
+		}
+	}
+}
+
+func TestAboveRunResetsOnBelowInvalidLineOrSampleGap(t *testing.T) {
 	const now = int64(10_000_000)
 	for _, tc := range []struct {
-		name              string
-		previous, current float64
-		gap               int64
-		want              bool
+		name          string
+		previous      Sample
+		premium, line float64
+		wantSince     int64
 	}{
-		{"upward cross outside band", 102, 108, 1000, true},
-		{"touch from below", 102, 104.5, 1000, true},
-		{"touch from above", 108, 105.5, 1000, true},
-		{"touch upper edge", 108, 106, 1000, true},
-		{"touch lower edge while rising", 102, 104, 1000, true},
-		{"above without crossing or touching", 108, 107, 1000, false},
-		{"below without crossing or touching", 102, 103.99, 1000, false},
-		{"upward cross sixty seconds", 102, 108, quoteAgeMs, true},
-		{"upward cross sample gap", 102, 108, quoteAgeMs + 1, false},
+		{"below by a paisa", Sample{T: now - 1000, Premium: 108}, 104.99, 105, 0},
+		{"touch below", Sample{T: now - 1000, Premium: 108}, 104.5, 105, 0},
+		{"chart steps above premium", Sample{T: now - 1000, Premium: 108}, 108, 109, 0},
+		{"missing chart", Sample{T: now - 1000, Premium: 108}, 108, 0, 0},
+		{"invalid chart", Sample{T: now - 1000, Premium: 108}, 108, math.NaN(), 0},
+		{"invalid premium", Sample{T: now - 1000, Premium: 108}, math.NaN(), 105, 0},
+		{"sixty seconds plus one ms", Sample{T: now - quoteAgeMs - 1, Premium: 108}, 108, 105, now},
+		{"continuity reset", Sample{}, 108, 105, now},
+		{"time reversed", Sample{T: now + 1, Premium: 108}, 108, 105, now},
+		{"previous below", Sample{T: now - 1000, Premium: 104}, 108, 105, now},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			state := &armedState{ArmedAt: now - 2000, Reference: Sample{T: now - 3000, Premium: 100}}
-			history := spotHistory{{T: now - 3000, Price: 100}, {T: now, Price: 101}}
-			next, trigger, _ := advanceArmed(state, Sample{T: now - tc.gap, Premium: tc.previous, VWAP: 999}, Sample{T: now, Premium: tc.current, VWAP: 999}, nil, 105, 105, history)
-			if next == nil || trigger != nil || (next.PinnedAt == now) != tc.want || (tc.want && next.Direction != CallCredit) {
-				t.Fatalf("wrong upward/touch pin: next=%+v trigger=%+v", next, trigger)
+			state := &armedState{ArmedAt: now - DirectionPinMs, AboveSince: now - DirectionPinMs, Reference: Sample{T: now - DirectionPinMs - 1000, Premium: 100}}
+			next, trigger, _ := advanceArmed(state, tc.previous, Sample{T: now, Premium: tc.premium}, nil, 105, tc.line, nil)
+			if next == nil || next.PinnedAt != 0 || next.AboveSince != tc.wantSince || trigger != nil {
+				t.Fatalf("interrupted run did not reset: %+v, %+v", next, trigger)
+			}
+			// A fresh sample starts/restarts the run; 119 further seconds do
+			// not inherit any elapsed time from before the interruption.
+			previous := Sample{}
+			for second := int64(1); second <= 120; second++ {
+				current := Sample{T: now + second*1000, Premium: 108}
+				next, trigger, _ = advanceArmed(next, previous, current, nil, 105, 105, nil)
+				if next == nil || next.PinnedAt != 0 || trigger != nil || next.AboveSince != now+1000 {
+					t.Fatal("interrupted run retained time toward the next pin")
+				}
+				previous = current
 			}
 		})
+	}
+}
+
+func TestQualificationDoesNotInheritUnqualifiedAboveRun(t *testing.T) {
+	const now = int64(10_000_000)
+	previous := Sample{T: now - 1000, Premium: 104}
+	state, trigger, _ := advanceArmed(nil, previous, Sample{T: now, Premium: 106}, []Sample{{T: now - DirectionPinMs, Premium: 100}}, 100, 100, nil)
+	if state == nil || state.AboveSince != now || state.PinnedAt != 0 || trigger != nil {
+		t.Fatal("qualification inherited an above run from before it latched")
 	}
 }
 
 func TestFirstPinWinsAndEntryDoesNotRecheckFivePercent(t *testing.T) {
 	const now = int64(10_000_000)
 	low := Sample{T: now - 2000, Premium: 100}
-	history := spotHistory{{T: low.T, Price: 100}, {T: now, Price: 101}}
-	state, trigger, _ := advanceArmed(nil, Sample{T: now - 1000, Premium: 102}, Sample{T: now, Premium: 108}, []Sample{low}, 105, 105, history)
-	if state == nil || state.PinnedAt != now || trigger != nil {
-		t.Fatal("qualifying upward cross did not pin")
+	pinAt := now + DirectionPinMs
+	history := spotHistory{{T: low.T, Price: 100}, {T: pinAt, Price: 101}}
+	var state, trigger *armedState
+	previous := Sample{}
+	for at := now; at <= pinAt; at += quoteAgeMs {
+		current := Sample{T: at, Premium: 108}
+		state, trigger, _ = advanceArmed(state, previous, current, []Sample{low}, 105, 105, history)
+		previous = current
+	}
+	if state == nil || state.PinnedAt != pinAt || trigger != nil {
+		t.Fatal("sustained-above run did not pin")
 	}
 	original := *state
 	// A later touch would imply LONG, but the original SHORT must win.
-	history.add(spotSample{T: now + 1000, Price: 99})
-	state, trigger, _ = advanceArmed(state, Sample{T: now, Premium: 108}, Sample{T: now + 1000, Premium: 105.5}, []Sample{{T: now, Premium: 90}}, 105, 105, history)
+	history.add(spotSample{T: pinAt + 1000, Price: 99})
+	state, trigger, _ = advanceArmed(state, previous, Sample{T: pinAt + 1000, Premium: 105.5}, []Sample{{T: pinAt, Premium: 90}}, 105, 105, history)
 	if state == nil || *state != original || trigger != nil {
 		t.Fatal("later touch changed the first pin or its reference")
 	}
@@ -171,25 +252,9 @@ func TestFirstPinWinsAndEntryDoesNotRecheckFivePercent(t *testing.T) {
 	}
 }
 
-func TestPinAndEntryCanCoincideOnFirstDownwardCross(t *testing.T) {
-	const now = int64(10_000_000)
-	for _, newlyQualified := range []bool{false, true} {
-		var state *armedState
-		low := Sample{T: now - 3000, Premium: 95}
-		if !newlyQualified {
-			state = &armedState{ArmedAt: now - 2000, Reference: low}
-		}
-		history := spotHistory{{T: low.T, Price: 100}, {T: now, Price: 99}}
-		next, trigger, _ := advanceArmed(state, Sample{T: now - 1000, Premium: 108}, Sample{T: now, Premium: 103}, []Sample{low}, 105, 105, history)
-		if next != nil || trigger == nil || trigger.PinnedAt != now || trigger.Direction != PutCredit || trigger.Reference != low {
-			t.Fatalf("downward cross did not pin LONG and enter together: %+v, %+v", next, trigger)
-		}
-	}
-}
-
 func TestFlatOrStaleSpotConsumesFirstPinWithoutEntry(t *testing.T) {
 	const now = int64(10_000_000)
-	low := Sample{T: now - 120_000, Premium: 100}
+	low := Sample{T: now - DirectionPinMs - 1000, Premium: 100}
 	for _, tc := range []struct {
 		name    string
 		history spotHistory
@@ -200,13 +265,13 @@ func TestFlatOrStaleSpotConsumesFirstPinWithoutEntry(t *testing.T) {
 		{"stale baseline", spotHistory{{T: low.T - spotBaselineAgeMs - 1, Price: 100}, {T: now, Price: 101}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			state := &armedState{ArmedAt: now - 1000, Reference: low}
-			next, trigger, note := advanceArmed(state, Sample{T: now - 1000, Premium: 102}, Sample{T: now, Premium: 105.5}, []Sample{low}, 105, 105, tc.history)
+			state := &armedState{ArmedAt: now - DirectionPinMs, AboveSince: now - DirectionPinMs, Reference: low}
+			next, trigger, note := advanceArmed(state, Sample{T: now - 1000, Premium: 108}, Sample{T: now, Premium: 108}, []Sample{low}, 105, 105, tc.history)
 			if next != nil || trigger != nil || !strings.Contains(note, "pin consumed") {
 				t.Fatalf("flat/stale spot retained pin or entered: %+v, %+v, %s", next, trigger, note)
 			}
 			// A later fall cannot use the consumed qualification; no new +5%.
-			next, trigger, _ = advanceArmed(next, Sample{T: now, Premium: 105.5}, Sample{T: now + 1000, Premium: 103}, []Sample{low}, 105, 105, spotHistory{{T: low.T, Price: 100}, {T: now + 1000, Price: 101}})
+			next, trigger, _ = advanceArmed(next, Sample{T: now, Premium: 108}, Sample{T: now + 1000, Premium: 103}, []Sample{low}, 105, 105, spotHistory{{T: low.T, Price: 100}, {T: now + 1000, Price: 101}})
 			if next != nil || trigger != nil {
 				t.Fatal("consumed pin was reused on a later fall")
 			}
@@ -217,7 +282,7 @@ func TestFlatOrStaleSpotConsumesFirstPinWithoutEntry(t *testing.T) {
 func TestQualificationAndPinEndWithDay(t *testing.T) {
 	now := time.Date(2026, 11, 19, 15, 30, 0, 0, ist).UnixMilli()
 	for _, pinned := range []bool{false, true} {
-		state := &armedState{ArmedAt: now, Reference: Sample{T: now - 1000, Premium: 100}}
+		state := &armedState{ArmedAt: now, AboveSince: now, Reference: Sample{T: now - 1000, Premium: 100}}
 		if pinned {
 			state.PinnedAt, state.Direction = now, CallCredit
 		}

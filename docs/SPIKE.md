@@ -80,12 +80,15 @@ strike is always the **ATM strike nearest index spot at entry**.
    observed value in the preceding rolling 30 minutes (`WindowMs`). Qualification
    requires no VWAP condition and does not expire when the low ages out or the
    premium falls below +5%. Until a direction is pinned, the reference low keeps
-   sliding with the window.
-2. **Pin the first direction.** While qualified, the first cross of chart VWAP
-   in either direction between consecutive evaluated samples, or a touch within
-   ₹1 on either side (`TouchBand`), pins direction. Cross samples must be at most
-   60 seconds apart. Compare index spot at the reference low **as of this pin**
-   with spot now:
+   sliding with the window. A one-second flicker low can qualify the trade;
+   there is deliberately no extra guard for that known limitation.
+2. **Pin after 120 seconds continuously above chart VWAP.** While qualified,
+   start `AboveSince` at the first evaluated sample with premium **>= chart
+   VWAP**. Every evaluated sample must remain at/above its own completed chart
+   line, with no evaluated-sample gap over 60 seconds (`quoteAgeMs`). A below-line
+   sample, missing/invalid chart line or continuity gap resets the run. At the
+   first sample where `now - AboveSince >= 120 seconds` (`DirectionPinMs`),
+   compare index spot at the reference low **as of this pin** with spot now:
    - Spot rose → pin **SHORT**, a bearish **CALL_CREDIT** spread.
    - Spot fell → pin **LONG**, a bullish **PUT_CREDIT** spread.
    - Flat, missing or stale spot skips and consumes qualification/the pin. The
@@ -94,7 +97,7 @@ strike is always the **ATM strike nearest index spot at entry**.
 
    First pin wins. Its direction, reference and baseline stay fixed until entry
    or day end. Later touches, spot reversals and rolling-low changes cannot
-   change it. Qualification and pin may coincide on the same evaluated sample.
+   change it. Time above the line before qualification does not count.
 3. **Enter on the first downward chart-VWAP cross after pinning.** There is no
    +5% re-check or reference-age expiry. The existing price-driven touch-and-fall
    shape applies, using the chart line available at each sample's own time:
@@ -106,9 +109,9 @@ strike is always the **ATM strike nearest index spot at entry**.
    current time − previous time is between 0 and 60 seconds inclusive
    ```
 
-   If this is also the pinning cross, pin and entry coincide immediately. Every
-   entry trigger consumes the latch, including a skipped paper entry. A later
-   trade needs a fresh qualification. A pin consumed by flat/stale spot cannot
+   Pinning requires an at/above-line sample; entry follows on a later downward
+   cross. Every entry trigger consumes the latch, including a skipped paper entry.
+   A later trade needs a fresh qualification. A pin consumed by flat/stale spot cannot
    supply direction to a later cross.
 4. **Sell ATM, buy the fourth hedge.** Use fresh spot at entry to select the
    nearest listed same-strike CE + PE pair (an exact midpoint tie takes the lower
@@ -120,23 +123,29 @@ strike is always the **ATM strike nearest index spot at entry**.
 ### 19 November 2026 worked check
 
 The deterministic Go fixture `TestNineteenNovemberSensexDirectionPin` uses the
-supplied observations plus explicit intermediate ticks to establish sequence:
+supplied observations plus explicit intermediate ticks to establish sequence;
+it is not a complete historical-feed replay:
 
-- SENSEX low **393.15 at 09:37:51 IST**; **422.05 at 09:38:33** is +7.3509%,
-  latching qualification. An unqualified upward cross just before that tick
-  cannot pin direction.
-- With completed chart VWAP about **410.4**, **410.45 at 09:53:35** touches and
-  pins SHORT: reference spot **81,955** rose to about **82,165**. The **412.50 at
-  09:53:39** then **408.90 at 09:53:40** samples produce entry at **09:53:40 IST**.
-  Entry is already below +5% and still fires.
+- Qualification is already latched from the open: first +5% hit **09:16:20
+  stored / 09:15:18 engine**, off the **410.15** flicker low (neighbours 431.85
+  and 423.35). The fixture uses the stored clock for this qualification.
+- The rolling SENSEX reference becomes **393.15 at 09:37:51 IST**. With completed
+  chart VWAP about **410.39**, the **09:38:10 / 09:38:12** whipsaw cannot pin or
+  enter. Earlier downward crosses cannot trigger entry without a sustained run;
+  explicit 86-second and 119-second runs also fail to pin.
+- The at/above-chart run starts **09:50:24**, reaches 120 seconds and pins
+  **SHORT at 09:52:24**. Reference spot about **81,956** rose to about **82,165**,
+  so the direction is **CALL_CREDIT**. The first subsequent downward cross,
+  **408.90 versus 410.39 at 09:53:40**, enters even though +5% no longer holds.
 - The shape is **short spot-ATM CE + buy fourth higher CE**, one lot. The fixture
   exercises spot on both sides of 82,150 without requiring a single ATM strike.
-- Separate no-cross continuations preserve both unpinned qualification and the
-  first pin through **10:07:52**, the old reference-expiry time. The actual
-  worked sequence has already consumed its pin at 09:53:40.
-- The NIFTY fixture crosses/touches its chart line but stays below +5%; it emits
-  no signal. This is a focused supplied-data check, not a complete historical
-  feed replay or independent verification of every NIFTY tick on that date.
+- Separate no-cross continuations preserve unpinned qualification and the first
+  pin through **10:07:52**, beyond the old reference-expiry time.
+- Sensitivity: under a flat **409.21** chart line, a 120-second run pins at
+  **09:46:04**. The threshold is sensitive to the VWAP line; Prakash chose
+  120 seconds knowing this. This observation is not a test pass/fail expectation.
+- NIFTY has no trade as far as checkable, but its chart VWAP is absent from
+  stored data. A verified historical NIFTY no-entry cannot be claimed.
 
 The fourth strike is counted from the actual listed ladder; spacing is not
 hardcoded. Both contracts must have the same positive integer lot size. Lot
@@ -178,8 +187,9 @@ The 30-minute rule limits signal qualification, not how long a position is held.
 - Qualification and direction pins are in-memory day state. An unchanged
   five-minute instrument refresh preserves them, the spot history, previous
   sample and evaluated note. Feed/runtime resets discard quote/spot continuity
-  but preserve the day latch and any pinned direction. A new day clears them;
-  a process restart cannot restore an unentered pin from persisted bars.
+  but preserve the day latch and any pinned direction. An unfinished above run
+  starts over on the next evaluation after continuity is lost. A new day clears
+  them; a process restart cannot restore an unentered pin from persisted bars.
   A restart/reconnect does not replay a historical crossover into a new entry;
   a price gap longer than one minute cannot be treated as an observed crossover.
 - Monitoring and entries require active Dhan data. Old broker-generation packets

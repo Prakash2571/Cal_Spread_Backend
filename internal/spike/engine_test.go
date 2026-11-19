@@ -76,8 +76,8 @@ func testTicks(rows []market.Instrument, namespace brokers.Namespace, stage int)
 	return ticks
 }
 
-// Keep chart fixtures unchanged; entry fixtures qualify/pin on an upward cross
-// before entry, with rising NIFTY spot and falling SENSEX spot independently.
+// Keep chart fixtures unchanged; entry fixtures sustain 120 s at/above chart
+// VWAP before entry, with rising NIFTY spot and falling SENSEX spot independently.
 func entryTestInstruments() []market.Instrument {
 	return append(testInstruments(),
 		market.Instrument{InstrumentToken: 13, Name: "NIFTY", Tradingsymbol: "NIFTY", InstrumentType: "INDEX", Exchange: "INDICES", Segment: "INDICES"},
@@ -124,6 +124,15 @@ func seedEntryChartBars(engine *Engine) {
 	}
 }
 
+// Repeat qualified above-line ticks at the inclusive 60 s gap boundary. Entry
+// fixtures use this before their fall, refreshing spot and one-lot depth too.
+func holdEntryAboveChart(engine *Engine, clock *fakeClock, ticks []market.Tick) {
+	for step := 0; step < 2; step++ {
+		clock.ms.Add(quoteAgeMs)
+		engine.OnTicks(ticks)
+	}
+}
+
 func waitOpen(t *testing.T, engine *Engine, count int) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
@@ -155,6 +164,9 @@ func TestBothIndexesSelectMinimumAndPaperTradeOneLotUntilManualClose(t *testing.
 			clock.ms.Add(60_000)
 		}
 		engine.OnTicks(entryTestTicks(rows, namespace, stage))
+		if stage == 1 {
+			holdEntryAboveChart(engine, clock, entryTestTicks(rows, namespace, stage))
+		}
 	}
 	waitOpen(t, engine, 2)
 	var nifty, sensex Trade
@@ -262,6 +274,9 @@ func TestInvalidUpdatedSignalAverageDoesNotBlockChartVWAPTrigger(t *testing.T) {
 				}
 			}
 			engine.OnTicks(ticks)
+			if stage == 1 {
+				holdEntryAboveChart(engine, clock, ticks)
+			}
 		}
 		view := engine.Snapshot().Indexes[0]
 		if view.Current == nil || view.Current.VWAP != 0 || view.Signal == nil || view.Signal.VWAP != 105 {
@@ -303,6 +318,9 @@ func TestUnreadableEntrySizeIsSkippedRatherThanFilledAfterTheCross(t *testing.T)
 			}
 		}
 		engine.OnTicks(ticks)
+		if stage == 1 {
+			holdEntryAboveChart(engine, clock, ticks)
+		}
 	}
 	engine.mu.Lock()
 	queued := len(engine.pending)
@@ -321,6 +339,9 @@ func TestUnreadableEntrySizeIsSkippedRatherThanFilledAfterTheCross(t *testing.T)
 	for _, stage := range []int{1, 2} {
 		clock.ms.Add(1000)
 		engine.OnTicks(entryTestTicks(rows, namespace, stage))
+		if stage == 1 {
+			holdEntryAboveChart(engine, clock, entryTestTicks(rows, namespace, stage))
+		}
 	}
 	waitOpen(t, engine, 1)
 }
@@ -342,6 +363,9 @@ func TestMalformedClosingDepthLeavesThePaperPositionOpen(t *testing.T) {
 	for stage := 0; stage <= 2; stage++ {
 		clock.ms.Add(1000)
 		engine.OnTicks(entryTestTicks(rows, namespace, stage))
+		if stage == 1 {
+			holdEntryAboveChart(engine, clock, entryTestTicks(rows, namespace, stage))
+		}
 	}
 	waitOpen(t, engine, 2)
 	nifty := engine.Snapshot().Open[0]
@@ -1071,6 +1095,9 @@ func TestPinConsumesQualificationForFlatAndUnavailableSpot(t *testing.T) {
 					filtered = append(filtered, tick)
 				}
 				engine.OnTicks(filtered)
+				if stage == 1 {
+					holdEntryAboveChart(engine, clock, filtered)
+				}
 				if stage == 1 && tc.direction != "" && engine.armed["NIFTY"] == nil {
 					t.Fatal("+5% did not arm before cross")
 				}
@@ -1098,7 +1125,7 @@ func TestPinConsumesQualificationForFlatAndUnavailableSpot(t *testing.T) {
 func TestDirectionUsesSpotAtStraddleLowAndFirstPin(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
-		spots     [3]float64 // straddle low, upward pin, downward entry
+		spots     [3]float64 // straddle low, sustained-above pin, downward entry
 		direction string
 	}{
 		{"rally eases back before cross", [3]float64{23850, 23900, 23880}, CallCredit},
@@ -1117,6 +1144,7 @@ func TestDirectionUsesSpotAtStraddleLowAndFirstPin(t *testing.T) {
 				}
 				engine.OnTicks(ticks)
 				if stage == 1 {
+					holdEntryAboveChart(engine, clock, ticks)
 					state := engine.armed["NIFTY"]
 					if state == nil || state.Baseline.Price != tc.spots[0] || state.Baseline.T > state.Reference.T {
 						t.Fatalf("baseline not pinned at the straddle low: %+v", state)
@@ -1148,6 +1176,7 @@ func TestSpotHistoryBaselineIsAtOrBeforeReferenceAndPinnedBaselineSurvivesPrunin
 	engine.OnTicks(entryTestTicks(rows, engine.namespace, 0))
 	clock.ms.Add(1000)
 	engine.OnTicks(entryTestTicks(rows, engine.namespace, 1))
+	holdEntryAboveChart(engine, clock, entryTestTicks(rows, engine.namespace, 1))
 	state := engine.armed["NIFTY"]
 	if state == nil || state.Baseline.Price != 23850 || state.Baseline.T > state.Reference.T {
 		t.Fatalf("baseline was not captured from the low at the pin: %+v", state)
@@ -1170,10 +1199,11 @@ func TestContinuityResetsPreserveDayLatchButClearSpotAndPrevious(t *testing.T) {
 				if len(engine.armed) != 2 {
 					t.Fatal("both independent symbols should be qualified")
 				}
-				if !pinned {
-					for _, state := range engine.armed {
-						state.PinnedAt, state.Direction, state.Baseline = 0, "", spotSample{}
-					}
+				if pinned {
+					holdEntryAboveChart(engine, clock, entryTestTicks(rows, engine.namespace, 1))
+				}
+				if (engine.armed["NIFTY"].PinnedAt != 0) != pinned {
+					t.Fatal("fixture has wrong qualification/pin state")
 				}
 				original := *engine.armed["NIFTY"]
 				switch reset {
@@ -1198,6 +1228,18 @@ func TestContinuityResetsPreserveDayLatchButClearSpotAndPrevious(t *testing.T) {
 					}
 				} else if state := engine.armed["NIFTY"]; state == nil || *state != original {
 					t.Fatal("same-day continuity reset expired qualification/pin")
+				}
+				if reset != "day" {
+					clock.ms.Add(1000)
+					engine.OnConnection(true)
+					if err := engine.reconcile(context.Background()); err != nil {
+						t.Fatal(err)
+					}
+					engine.OnTicks(entryTestTicks(rows, engine.namespace, 1))
+					state := engine.armed["NIFTY"]
+					if state == nil || (pinned && *state != original) || (!pinned && (state.PinnedAt != 0 || state.AboveSince != clock.ms.Load() || state.ArmedAt != original.ArmedAt)) {
+						t.Fatal("reset lost a pin/latch or retained unfinished above-run time")
+					}
 				}
 			})
 		}
@@ -1269,6 +1311,7 @@ func TestUnchangedFiveMinuteReconcilePreservesPinSpotAndNote(t *testing.T) {
 	engine.OnTicks(entryTestTicks(rows, engine.namespace, 0))
 	clock.ms.Add(1000)
 	engine.OnTicks(entryTestTicks(rows, engine.namespace, 1))
+	holdEntryAboveChart(engine, clock, entryTestTicks(rows, engine.namespace, 1))
 	state := engine.armed["NIFTY"]
 	if state == nil || !strings.HasPrefix(engine.views["NIFTY"].Note, "Direction pinned SHORT") {
 		t.Fatal("fixture did not arm")
@@ -1418,6 +1461,10 @@ func TestReconcileReloadsStampedChartVWAPWithoutAccumulator(t *testing.T) {
 // Worked check from the supplied 19 November observations, with explicit
 // intermediate samples to make consecutive-sample pin/entry timing testable.
 // This is a deterministic fixture, not a replay of a complete historical feed.
+// Sensitivity only (not a pass/fail expectation): with a flat 409.21 chart line,
+// the exactly-120 s run pins at 09:46:04. Prakash chose 120 s knowing the line
+// matters. NIFTY has no trade as far as checkable, but its chart VWAP is missing
+// from stored data, so this fixture cannot verify a historical NIFTY no-entry.
 func TestNineteenNovemberSensexDirectionPin(t *testing.T) {
 	at := func(hour, minute, second int) int64 {
 		return time.Date(2026, 11, 19, hour, minute, second, 0, ist).UnixMilli()
@@ -1425,7 +1472,7 @@ func TestNineteenNovemberSensexDirectionPin(t *testing.T) {
 	for _, entrySpot := range []float64{82140, 82165} {
 		t.Run(fmt.Sprintf("spot_%.0f", entrySpot), func(t *testing.T) {
 			clock := &fakeClock{}
-			clock.ms.Store(at(9, 37, 0))
+			clock.ms.Store(at(9, 15, 0))
 			rows := entryTestInstruments()
 			for i := range rows {
 				if rows[i].InstrumentType == "INDEX" {
@@ -1446,14 +1493,10 @@ func TestNineteenNovemberSensexDirectionPin(t *testing.T) {
 			engine.OnConnection(true)
 			// Use a persisted/completed chart stamp. The deliberately different
 			// Dhan average must never become the trigger line.
-			for _, symbol := range Symbols {
-				line := 410.4
-				if symbol == "NIFTY" {
-					line = 183
-				}
-				engine.bars[symbol][at(9, 37, 0)] = Bar{Symbol: symbol, Day: engine.day, Sample: Sample{T: at(9, 37, 0), VWAP: line}}
-				engine.chartVWAP[symbol] = &chartVWAPAccumulator{weighted: line * 10, total: 10, marks: map[int64]float64{}}
-			}
+			line := 410.39
+			engine.bars["SENSEX"][at(9, 15, 0)] = Bar{Symbol: "SENSEX", Day: engine.day, Sample: Sample{T: at(9, 15, 0), VWAP: line}}
+			engine.chartVWAP["SENSEX"] = &chartVWAPAccumulator{weighted: line * 10, total: 10, marks: map[int64]float64{}}
+			// No invented NIFTY chart line: its historical stamp is unavailable.
 			tick := func(when int64, sensexPremium, spot, niftyPremium float64) {
 				clock.ms.Store(when)
 				ticks := []market.Tick{}
@@ -1481,28 +1524,73 @@ func TestNineteenNovemberSensexDirectionPin(t *testing.T) {
 				}
 				engine.OnTicks(ticks)
 			}
-			tick(at(9, 37, 51), 393.15, 81955, 180)
-			// An unqualified upward cross cannot pin. The next tick qualifies
-			// above the line without a new cross or touch.
-			tick(at(9, 38, 32), 412.50, 82000, 182)
-			tick(at(9, 38, 33), 422.05, 82005, 184)
-			qualified := engine.armed["SENSEX"]
-			if qualified == nil || qualified.ArmedAt != at(9, 38, 33) || qualified.PinnedAt != 0 || qualified.Reference.T != at(9, 37, 51) || math.Abs((422.05/393.15-1)*100-7.3508838866) > 1e-6 {
-				t.Fatalf("wrong +5%% qualification at 09:38:33: %+v", qualified)
+			// Use stored times for qualification (09:16:20 stored corresponds
+			// to 09:15:18 engine). A single-sample dip is deliberately allowed.
+			tick(at(9, 15, 17), 431.85, 82000, 180)
+			tick(at(9, 15, 18), 410.15, 82000, 180)
+			tick(at(9, 15, 19), 423.35, 82000, 180)
+			tick(at(9, 16, 20), 431.85, 82005, 180)
+			if state := engine.armed["SENSEX"]; state == nil || state.ArmedAt != at(9, 16, 20) || state.PinnedAt != 0 || state.Reference.Premium != 410.15 {
+				t.Fatalf("flicker low did not latch +5%% from the open: %+v", state)
 			}
-			qualifiedCopy := *qualified
-			tick(at(9, 52, 0), 421.55, 82165, 182)
-			tick(at(9, 53, 34), 413.0, 82165, 184)
-			tick(at(9, 53, 35), 410.45, 82165, 183.5)
+			tick(at(9, 37, 51), 393.15, 81956, 180)
+			qualified := engine.armed["SENSEX"]
+			if qualified == nil || qualified.ArmedAt != at(9, 16, 20) || qualified.PinnedAt != 0 {
+				t.Fatalf("qualification was lost before the new low entered the window: %+v", qualified)
+			}
+			assertUnpinned := func() {
+				t.Helper()
+				state := engine.armed["SENSEX"]
+				if state == nil || state.ArmedAt != at(9, 16, 20) || state.PinnedAt != 0 || engine.views["SENSEX"].Signal != nil || len(engine.candidates) != 0 {
+					t.Fatalf("early cross pinned or entered at %s: %+v", clock.Now().In(ist).Format("15:04:05"), state)
+				}
+			}
+			tick(at(9, 38, 10), 411, 82000, 180)
+			assertUnpinned()
+			if state := engine.armed["SENSEX"]; state.Reference.T != at(9, 37, 51) || state.Reference.Premium != 393.15 {
+				t.Fatalf("rolling reference did not adopt the 09:37:51 low: %+v", state)
+			}
+			qualifiedCopy := *engine.armed["SENSEX"]
+			tick(at(9, 38, 12), 409, 82000, 180)
+			assertUnpinned()
+			// Explicit synthetic whipsaws exercise 87 downward crosses before
+			// the sustained run, without claiming their historical timestamps.
+			for cross := int64(0); cross < 87; cross++ {
+				tick(at(9, 38, 15)+cross*2000, 411, 82000, 180)
+				assertUnpinned()
+				tick(at(9, 38, 16)+cross*2000, 409, 82000, 180)
+				assertUnpinned()
+			}
+			// Explicit short runs test the 86 s and 119 s rejection boundary.
+			for _, run := range []struct {
+				start   int64
+				seconds int64
+			}{{at(9, 42, 0), 86}, {at(9, 47, 0), 119}} {
+				for second := int64(0); second <= run.seconds; second++ {
+					tick(run.start+second*1000, 425.80, 82100, 180)
+					assertUnpinned()
+				}
+				tick(run.start+(run.seconds+1)*1000, 409, 82100, 180)
+				assertUnpinned()
+			}
+			tick(at(9, 50, 23), 409, 82165, 180)
+			for second := int64(0); second <= 120; second++ {
+				tick(at(9, 50, 24)+second*1000, 415, 82165, 180)
+				if second < 120 {
+					assertUnpinned()
+				}
+			}
 			pinned := engine.armed["SENSEX"]
-			if pinned == nil || pinned.Direction != CallCredit || pinned.PinnedAt != at(9, 53, 35) || pinned.Baseline.Price != 81955 || engine.views["SENSEX"].Signal != nil || !strings.Contains(engine.views["SENSEX"].Note, "Direction pinned SHORT") {
-				t.Fatalf("09:53:35 touch failed to pin SHORT without entry: %+v", pinned)
+			if pinned == nil || pinned.Direction != CallCredit || pinned.AboveSince != at(9, 50, 24) || pinned.PinnedAt != at(9, 52, 24) || pinned.Reference.T != at(9, 37, 51) || pinned.Reference.Premium != 393.15 || pinned.Baseline.Price != 81956 || engine.views["SENSEX"].Signal != nil || !strings.Contains(engine.views["SENSEX"].Note, "Direction pinned SHORT after 2 min above chart VWAP") {
+				t.Fatalf("120 s run failed to pin SHORT at 09:52:24 without entry: %+v", pinned)
 			}
 			pinnedCopy := *pinned
-			tick(at(9, 53, 39), 412.50, 82165, 184)
-			tick(at(9, 53, 40), 408.90, entrySpot, 181)
+			tick(at(9, 53, 0), 413, 82165, 180)
+			tick(at(9, 53, 35), 410.45, 82165, 180)
+			tick(at(9, 53, 39), 412.50, 82165, 180)
+			tick(at(9, 53, 40), 408.90, entrySpot, 180)
 			view := engine.views["SENSEX"]
-			if view.Signal == nil || view.Signal.T != at(9, 53, 40) || view.Signal.Direction != CallCredit || math.Abs(view.Signal.VWAP-410.4) > 1e-9 || view.Signal.ReferenceAt != at(9, 37, 51) || view.Signal.MovePct >= MinimumMovePct || engine.armed["SENSEX"] != nil {
+			if view.Signal == nil || view.Signal.T != at(9, 53, 40) || view.Signal.Direction != CallCredit || math.Abs(view.Signal.VWAP-410.39) > 1e-9 || view.Signal.ReferenceAt != at(9, 37, 51) || view.Signal.MovePct >= MinimumMovePct || engine.armed["SENSEX"] != nil {
 				t.Fatalf("wrong worked-check entry time/direction/line: %+v", view)
 			}
 			// PostgreSQL is deliberately absent. Exercise the same ATM, hedge
@@ -1521,7 +1609,7 @@ func TestNineteenNovemberSensexDirectionPin(t *testing.T) {
 				t.Fatalf("worked-check one-lot paper fill failed: %+v, %v", trade, err)
 			}
 			if engine.armed["NIFTY"] != nil || engine.views["NIFTY"].Signal != nil || len(engine.candidates) != 0 {
-				t.Fatal("unqualified NIFTY chart crosses produced a false entry")
+				t.Fatal("NIFTY without a chart stamp produced an entry")
 			}
 			// Separate no-entry continuations prove BOTH a qualification and a
 			// pin survive 10:07:52; the actual sequence already entered at 09:53:40.
@@ -1529,8 +1617,8 @@ func TestNineteenNovemberSensexDirectionPin(t *testing.T) {
 			newLow := Sample{T: at(9, 53, 40), Premium: 408.90}
 			for _, original := range []armedState{qualifiedCopy, pinnedCopy} {
 				latched := original
-				next, trigger, _ := advanceArmed(&latched, Sample{}, later, []Sample{newLow}, 0, 410.4, nil)
-				if next == nil || next.ArmedAt != at(9, 38, 33) || next.PinnedAt != original.PinnedAt || next.Direction != original.Direction || trigger != nil {
+				next, trigger, _ := advanceArmed(&latched, Sample{}, later, []Sample{newLow}, 0, 410.39, nil)
+				if next == nil || next.ArmedAt != at(9, 16, 20) || next.PinnedAt != original.PinnedAt || next.Direction != original.Direction || trigger != nil {
 					t.Fatal("10:07:52 expired qualification or direction pin")
 				}
 				if original.PinnedAt == 0 && next.Reference != newLow {
